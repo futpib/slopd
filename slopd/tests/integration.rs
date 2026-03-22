@@ -969,6 +969,25 @@ fn tag_invalid_name_returns_error() {
 }
 
 #[test]
+fn tag_empty_name_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["tag", "%0", ""]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "slopctl tag should fail for empty tag name");
+}
+
+#[test]
 fn send_filtered_one_match() {
     build_bin("slopd");
     build_bin("slopctl");
