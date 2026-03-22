@@ -299,7 +299,6 @@ async fn handle_request(
     event_tx: &EventTx,
 ) -> libslop::ResponseBody {
     match body {
-        libslop::RequestBody::Ping => libslop::ResponseBody::Pong,
 
         libslop::RequestBody::Status => {
             let now = SystemTime::now()

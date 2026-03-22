@@ -357,7 +357,6 @@ pub struct EventFilter {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RequestBody {
-    Ping,
     Status,
     Run,
     Kill { pane_id: String },
@@ -384,7 +383,6 @@ pub struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponseBody {
-    Pong,
     Status { state: DaemonState },
     Run { pane_id: String },
     Kill { pane_id: String },

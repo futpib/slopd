@@ -15,7 +15,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Ping,
     Status,
     /// List panes in the slopd session.
     Ps {
@@ -364,7 +363,6 @@ async fn main() {
     }
 
     let body = match cli.command {
-        Command::Ping => libslop::RequestBody::Ping,
         Command::Status => libslop::RequestBody::Status,
         Command::Ps { filters } => {
             // Ps with filters: fetch all, filter client-side, print.
