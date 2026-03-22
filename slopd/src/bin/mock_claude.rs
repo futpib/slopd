@@ -80,6 +80,28 @@ fn main() {
             Ok(l) => l,
             Err(_) => break,
         };
+        if let Some(secs) = prompt.strip_prefix("/sleep ") {
+            let secs: u64 = secs.trim().parse().unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            continue;
+        }
+
+        if let Some(code) = prompt.strip_prefix("/exit ") {
+            let code: i32 = code.trim().parse().unwrap_or(0);
+            std::process::exit(code);
+        }
+
+        if prompt == "/break-stdin" {
+            // Stop reading stdin (simulates a hung/blocked read).
+            return;
+        }
+
+        if prompt == "/break-hooks" {
+            // Keep reading stdin but stop firing hooks (simulates hook delivery failure).
+            for _ in std::io::BufReader::new(std::io::stdin()).lines() {}
+            return;
+        }
+
         fire_hooks(
             &settings,
             "UserPromptSubmit",

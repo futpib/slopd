@@ -168,10 +168,26 @@ mod tests {
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
+///
+/// Uses an exclusive advisory lock on a sidecar `.lock` file to prevent lost
+/// updates when multiple processes run concurrently, and an atomic rename to
+/// prevent torn writes if the process is interrupted mid-write.
 pub fn inject_hooks_into_file(
     settings_path: &PathBuf,
     slopctl: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let lock_path = settings_path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write()?;
+
     let mut settings: serde_json::Value = match std::fs::read_to_string(settings_path) {
         Ok(contents) => serde_json::from_str(&contents)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
@@ -180,10 +196,11 @@ pub fn inject_hooks_into_file(
 
     inject_hooks(&mut settings, slopctl);
 
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(settings_path, serde_json::to_string_pretty(&settings)?)?;
+    let mut file = atomic_write_file::AtomicWriteFile::options().open(settings_path)?;
+    use std::io::Write;
+    write!(file, "{}", serde_json::to_string_pretty(&settings)?)?;
+    file.commit()?;
+
     Ok(())
 }
 

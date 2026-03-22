@@ -391,6 +391,83 @@ fn send_concurrent_all_delivered() {
 
 
 #[test]
+fn send_to_nonexistent_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let output = env.slopctl(&["send", "%999", "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!output.status.success(), "slopctl send should have failed for non-existent pane");
+}
+
+/// Regression test: send to a pane whose process has exited (so UserPromptSubmit will never fire)
+/// must return an error rather than hanging forever.
+#[test]
+fn send_to_dead_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for SessionStart so mock_claude is in its prompt-reading loop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output()
+            .expect("failed to run tmux show-options");
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Put mock_claude into break-hooks mode: it drains stdin but fires no hooks.
+    // Sent directly via tmux (not slopctl) to avoid going through the Send machinery.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/break-hooks", "Enter"])
+        .status()
+        .expect("failed to send /break-hooks");
+
+    // This send reaches a live pane (send-keys succeeds) but UserPromptSubmit will never fire.
+    // It should time out and return an error rather than blocking forever.
+    let output = env.slopctl(&["send", &pane_id, "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!output.status.success(), "slopctl send should have failed for dead pane: {:?}", output);
+}
+
+#[test]
 fn listen_receives_hook_event() {
     build_bin("slopd");
     build_bin("slopctl");
