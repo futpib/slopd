@@ -138,9 +138,10 @@ fn apply_filters(panes: Vec<libslop::PaneInfo>, filters: &[(String, String)]) ->
 async fn send_request(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    id: u64,
     body: libslop::RequestBody,
 ) -> libslop::ResponseBody {
-    let request = libslop::Request { id: 1, body };
+    let request = libslop::Request { id, body };
     let mut json = serde_json::to_string(&request).unwrap();
     debug!("sending: {}", json);
     json.push('\n');
@@ -148,18 +149,22 @@ async fn send_request(
         eprintln!("failed to send request: {}", e);
         std::process::exit(1);
     });
-    match lines.next_line().await {
-        Ok(Some(line)) => {
-            debug!("received: {}", line);
-            let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
-                eprintln!("failed to parse response: {}", e);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                debug!("received: {}", line);
+                let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                    eprintln!("failed to parse response: {}", e);
+                    std::process::exit(1);
+                });
+                if response.id == id {
+                    return response.body;
+                }
+            }
+            _ => {
+                eprintln!("connection closed unexpectedly");
                 std::process::exit(1);
-            });
-            response.body
-        }
-        _ => {
-            eprintln!("connection closed unexpectedly");
-            std::process::exit(1);
+            }
         }
     }
 }
@@ -253,7 +258,7 @@ async fn main() {
         let parsed = parse_filters(filters);
         let filter_desc = parsed.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
 
-        let all_panes = match send_request(&mut writer, &mut lines, libslop::RequestBody::Ps).await {
+        let all_panes = match send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Ps).await {
             libslop::ResponseBody::Ps { panes } => panes,
             libslop::ResponseBody::Error { message } => {
                 eprintln!("error: {}", message);
@@ -299,21 +304,51 @@ async fn main() {
             }
         };
 
-        // Reconnect for each Send — each Send needs its own request/response cycle.
-        // We already used the connection for Ps, so open fresh connections for sends.
-        for pane_id in target_pane_ids {
-            let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
-                eprintln!("Failed to connect to {}: {}", socket_path.display(), e);
-                std::process::exit(1);
-            });
-            let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
+        // Send all requests on the same connection, each with a unique ID,
+        // then read responses correlating by ID.
+        let mut id: u64 = 2; // 1 was used by Ps above
+        let mut pending: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        for pane_id in &target_pane_ids {
             let body = libslop::RequestBody::Send {
                 pane_id: pane_id.clone(),
                 prompt: prompt.clone(),
                 timeout_secs: timeout,
             };
-            match send_request(&mut writer, &mut lines, body).await {
+            let request = libslop::Request { id, body };
+            let mut json = serde_json::to_string(&request).unwrap();
+            debug!("sending: {}", json);
+            json.push('\n');
+            writer.write_all(json.as_bytes()).await.unwrap_or_else(|e| {
+                eprintln!("failed to send request: {}", e);
+                std::process::exit(1);
+            });
+            pending.insert(id, pane_id.clone());
+            id += 1;
+        }
+        // Collect all responses; order may differ from send order.
+        let mut results: std::collections::HashMap<u64, libslop::ResponseBody> = std::collections::HashMap::new();
+        while results.len() < pending.len() {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    debug!("received: {}", line);
+                    let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                        eprintln!("failed to parse response: {}", e);
+                        std::process::exit(1);
+                    });
+                    if pending.contains_key(&response.id) {
+                        results.insert(response.id, response.body);
+                    }
+                }
+                _ => {
+                    eprintln!("connection closed unexpectedly");
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Print results in send order.
+        for req_id in 2..id {
+            let pane_id = &pending[&req_id];
+            match &results[&req_id] {
                 libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
                 libslop::ResponseBody::Error { message } => {
                     eprintln!("error sending to {}: {}", pane_id, message);
@@ -334,7 +369,7 @@ async fn main() {
         Command::Ps { filters } => {
             // Ps with filters: fetch all, filter client-side, print.
             let parsed = parse_filters(filters);
-            let all_panes = match send_request(&mut writer, &mut lines, libslop::RequestBody::Ps).await {
+            let all_panes = match send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Ps).await {
                 libslop::ResponseBody::Ps { panes } => panes,
                 libslop::ResponseBody::Error { message } => {
                     eprintln!("error: {}", message);
@@ -369,16 +404,7 @@ async fn main() {
         Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
     };
 
-    let request = libslop::Request { id: 1, body };
-    let mut json = serde_json::to_string(&request).unwrap();
-    debug!("sending: {}", json);
-    json.push('\n');
-    writer.write_all(json.as_bytes()).await.unwrap();
-
-    if let Ok(Some(line)) = lines.next_line().await {
-        debug!("received: {}", line);
-        let response: libslop::Response = serde_json::from_str(&line).unwrap();
-        match response.body {
+    match send_request(&mut writer, &mut lines, 1, body).await {
             libslop::ResponseBody::Ps { panes } => print_ps(panes),
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
@@ -396,7 +422,6 @@ async fn main() {
                 std::process::exit(1);
             }
             other => println!("{:?}", other),
-        }
     }
 }
 
