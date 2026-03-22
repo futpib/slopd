@@ -1,6 +1,34 @@
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::debug;
+
+#[derive(Parser)]
+#[command(name = "slopctl")]
+struct Cli {
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Ping,
+    Status,
+    Run,
+    Kill {
+        pane_id: String,
+    },
+    Hook {
+        event: String,
+    },
+    Send {
+        pane_id: String,
+        prompt: String,
+    },
+}
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
     match verbosity {
@@ -13,10 +41,9 @@ fn verbosity_to_level(verbosity: u8) -> tracing::Level {
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let verbosity = args.iter().filter(|a| *a == "-v").count() as u8;
+    let cli = Cli::parse();
 
-    let level = verbosity_to_level(verbosity);
+    let level = verbosity_to_level(cli.verbose);
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_env_filter(
@@ -28,8 +55,6 @@ async fn main() {
 
     let _config = libslop::SlopctlConfig::load();
 
-    let command = args.iter().find(|a| !a.starts_with('-') && *a != &args[0]).map(String::as_str).unwrap_or("ping");
-
     let socket_path = libslop::socket_path();
     debug!("connecting to {}", socket_path.display());
 
@@ -40,15 +65,12 @@ async fn main() {
 
     let (reader, mut writer) = stream.into_split();
 
-    let body = match command {
-        "status" => libslop::RequestBody::Status,
-        "ping" => libslop::RequestBody::Ping,
-        "run" => libslop::RequestBody::Run,
-        "hook" => {
-            let event = args.get(2).cloned().unwrap_or_else(|| {
-                eprintln!("Usage: slopctl hook <EventName>");
-                std::process::exit(1);
-            });
+    let body = match cli.command {
+        Command::Ping => libslop::RequestBody::Ping,
+        Command::Status => libslop::RequestBody::Status,
+        Command::Run => libslop::RequestBody::Run,
+        Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
+        Command::Hook { event } => {
             let mut stdin = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin).unwrap();
             let payload: serde_json::Value = serde_json::from_str(&stdin).unwrap_or_else(|e| {
@@ -58,28 +80,7 @@ async fn main() {
             let pane_id = std::env::var("TMUX_PANE").ok();
             libslop::RequestBody::Hook { event, payload, pane_id }
         }
-        "kill" => {
-            let pane_id = args.get(2).cloned().unwrap_or_else(|| {
-                eprintln!("Usage: slopctl kill <pane_id>");
-                std::process::exit(1);
-            });
-            libslop::RequestBody::Kill { pane_id }
-        }
-        "send" => {
-            let pane_id = args.get(2).cloned().unwrap_or_else(|| {
-                eprintln!("Usage: slopctl send <pane_id> <prompt>");
-                std::process::exit(1);
-            });
-            let prompt = args.get(3).cloned().unwrap_or_else(|| {
-                eprintln!("Usage: slopctl send <pane_id> <prompt>");
-                std::process::exit(1);
-            });
-            libslop::RequestBody::Send { pane_id, prompt }
-        }
-        other => {
-            eprintln!("Unknown command: {}", other);
-            std::process::exit(1);
-        }
+        Command::Send { pane_id, prompt } => libslop::RequestBody::Send { pane_id, prompt },
     };
 
     let request = libslop::Request { id: 1, body };
