@@ -625,6 +625,54 @@ fn send_to_pane_with_broken_hooks_times_out() {
 }
 
 #[test]
+fn listen_no_filters_receives_all_events() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Fire two different event types.
+    let stop_payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+    let out = fire_hook(&env, "Stop", stop_payload, None);
+    assert!(out.status.success(), "slopctl hook Stop failed: {:?}", out);
+
+    let prompt_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, None);
+    assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    let mut line1 = String::new();
+    reader.read_line(&mut line1).expect("failed to read first event");
+    let mut line2 = String::new();
+    reader.read_line(&mut line2).expect("failed to read second event");
+
+    listen.kill().unwrap();
+    kill_slopd(slopd);
+
+    let ev1: serde_json::Value = serde_json::from_str(line1.trim()).expect("first event not valid JSON");
+    let ev2: serde_json::Value = serde_json::from_str(line2.trim()).expect("second event not valid JSON");
+    assert_eq!(ev1["event_type"], "Stop");
+    assert_eq!(ev2["event_type"], "UserPromptSubmit");
+}
+
+#[test]
 fn listen_receives_hook_event() {
     build_bin("slopd");
     build_bin("slopctl");
@@ -1061,6 +1109,59 @@ fn send_filtered_all_sends_to_all_matching() {
     let stdout = String::from_utf8_lossy(&send_out.stdout);
     assert!(stdout.contains(&pane1), "output missing pane1 {}: {}", pane1, stdout);
     assert!(stdout.contains(&pane2), "output missing pane2 {}: {}", pane2, stdout);
+}
+
+#[test]
+fn send_filtered_any_sends_to_exactly_one_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+
+    for pane_id in &[&pane1, &pane2] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = env.tmux.tmux()
+                .args(["show-options", "-t", pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+                .output().unwrap();
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    env.slopctl(&["tag", &pane1, "anytarget"]);
+    env.slopctl(&["tag", &pane2, "anytarget"]);
+
+    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=anytarget", "--select", "any", "hello any"]);
+
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send-filtered --select any failed: {:?}", send_out);
+    let stdout = String::from_utf8_lossy(&send_out.stdout);
+    // Exactly one pane ID should appear in the output.
+    let count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(count, 1, "expected exactly one pane in output, got: {}", stdout);
+    let chosen = stdout.trim();
+    assert!(chosen == pane1 || chosen == pane2, "chosen pane {} not one of the tagged panes", chosen);
 }
 
 #[test]
