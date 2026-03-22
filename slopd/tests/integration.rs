@@ -457,6 +457,7 @@ fn ps_lists_panes_with_session_id_and_tags() {
     assert!(tag_out.status.success(), "slopctl tag failed: {:?}", tag_out);
 
     let ps_out = env.slopctl(&["ps"]);
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
 
     kill_slopd(slopd);
 
@@ -465,7 +466,22 @@ fn ps_lists_panes_with_session_id_and_tags() {
     assert!(stdout.contains(&pane_id), "ps output missing pane_id {}: {}", pane_id, stdout);
     assert!(stdout.contains("mock-session-id-1234"), "ps output missing session_id: {}", stdout);
     assert!(stdout.contains("mytest"), "ps output missing tag: {}", stdout);
-    assert!(stdout.contains("ago"), "ps output missing created time: {}", stdout);
+    assert!(stdout.contains("ago") || stdout.contains("now"), "ps output missing created time: {}", stdout);
+    assert!(!stdout.contains("56 years ago"), "created_at is 0 (issue #7): {}", stdout);
+
+    // Verify created_at is a plausible recent Unix timestamp (issue #7).
+    assert!(ps_json_out.status.success(), "ps --json failed: {:?}", ps_json_out);
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json is not valid JSON");
+    let pane_entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("pane {} not in ps --json output", pane_id));
+    let created_at = pane_entry["created_at"].as_u64().expect("created_at is not a u64");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!(created_at > 0, "created_at is 0 (issue #7)");
+    assert!(created_at <= now, "created_at is in the future: {}", created_at);
+    assert!(now - created_at < 60, "created_at is more than 60s ago: {}", created_at);
 }
 
 #[test]

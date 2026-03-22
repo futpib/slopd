@@ -256,7 +256,7 @@ async fn handle_connection(
 
 fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
     let list_out = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{pane_start_time}"])
+        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity}"])
         .output()
         .map_err(|e| e.to_string())?;
     if !list_out.status.success() {
