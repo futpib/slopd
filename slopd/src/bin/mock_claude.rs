@@ -59,19 +59,6 @@ fn main() {
     let session_id = "mock-session-id-1234";
     let cwd = std::env::current_dir().unwrap_or_default();
 
-    fire_hooks(
-        &settings,
-        "SessionStart",
-        &serde_json::json!({
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
-            "transcript_path": "/dev/null",
-            "cwd": cwd,
-            "source": "startup",
-            "model": "mock"
-        }),
-    );
-
     // Put the terminal in raw mode so we receive key bytes directly (Ctrl+C = 0x03,
     // Ctrl+D = 0x04, Escape = 0x1b) rather than having the terminal driver intercept them.
     // This mirrors real Claude's interactive terminal behaviour.
@@ -84,6 +71,19 @@ fn main() {
         libc::tcsetattr(stdin_fd, libc::TCSANOW, &t);
         orig
     };
+
+    fire_hooks(
+        &settings,
+        "SessionStart",
+        &serde_json::json!({
+            "session_id": session_id,
+            "hook_event_name": "SessionStart",
+            "transcript_path": "/dev/null",
+            "cwd": cwd,
+            "source": "startup",
+            "model": "mock"
+        }),
+    );
 
     // Read raw bytes from stdin, accumulating lines.
     // Mirrors real Claude terminal behaviour:
