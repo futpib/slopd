@@ -20,6 +20,7 @@ fn build_bin(name: &str) {
 }
 
 struct TmuxServer {
+    #[allow(dead_code)]
     tmpdir: tempfile::TempDir,
     socket: PathBuf,
 }
@@ -42,11 +43,14 @@ impl TmuxServer {
         Some(TmuxServer { tmpdir, socket })
     }
 
-    // Sets env vars so that slopd's `tmux list-sessions` (no -S flag) finds this server.
-    fn apply(&self, cmd: &mut Command) {
-        cmd.env_remove("TMUX")
-            .env("TMUX_TMPDIR", self.tmpdir.path())
-            .env_remove("TMPDIR");
+    fn write_slopd_config(&self, config_dir: &tempfile::TempDir) {
+        let slopd_config_dir = config_dir.path().join("slopd");
+        std::fs::create_dir_all(&slopd_config_dir).unwrap();
+        std::fs::write(
+            slopd_config_dir.join("config.toml"),
+            format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()),
+        )
+        .unwrap();
     }
 }
 
@@ -79,14 +83,19 @@ fn slopd_starts_with_tmux_running() {
     };
 
     let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    tmux.write_slopd_config(&config_dir);
 
-    let mut cmd = Command::new(cargo_bin("slopd"));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir.path())
+    let mut slopd = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    tmux.apply(&mut cmd);
-
-    let mut slopd = cmd.spawn().expect("failed to spawn slopd");
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopd");
 
     std::thread::sleep(Duration::from_millis(100));
 
@@ -107,12 +116,13 @@ fn slopd_fails_without_tmux_running() {
     }
 
     let runtime_dir = tempfile::tempdir().unwrap();
-    let tmux_tmpdir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
 
     let status = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
         .env_remove("TMUX")
-        .env("TMUX_TMPDIR", tmux_tmpdir.path())
+        .env_remove("TMUX_TMPDIR")
         .env_remove("TMPDIR")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -26,9 +26,11 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let _config = libslop::SlopctlConfig::load();
+
     let command = args.iter().find(|a| !a.starts_with('-') && *a != &args[0]).map(String::as_str).unwrap_or("ping");
 
-    let socket_path = slop_proto::socket_path();
+    let socket_path = libslop::socket_path();
     debug!("connecting to {}", socket_path.display());
 
     let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
@@ -39,15 +41,15 @@ async fn main() {
     let (reader, mut writer) = stream.into_split();
 
     let body = match command {
-        "status" => slop_proto::RequestBody::Status,
-        "ping" => slop_proto::RequestBody::Ping,
+        "status" => libslop::RequestBody::Status,
+        "ping" => libslop::RequestBody::Ping,
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);
         }
     };
 
-    let request = slop_proto::Request { id: 1, body };
+    let request = libslop::Request { id: 1, body };
     let mut json = serde_json::to_string(&request).unwrap();
     debug!("sending: {}", json);
     json.push('\n');
@@ -56,7 +58,7 @@ async fn main() {
     let mut lines = BufReader::new(reader).lines();
     if let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
-        let response: slop_proto::Response = serde_json::from_str(&line).unwrap();
+        let response: libslop::Response = serde_json::from_str(&line).unwrap();
         println!("{:?}", response);
     }
 }

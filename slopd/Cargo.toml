@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-slop-proto = { path = "../slop-proto" }
+libslop = { path = "../libslop" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing = "0.1.44"

@@ -2,6 +2,6 @@
 members = [
     "slopd",
     "slopctl",
-    "slop-proto",
+    "libslop",
 ]
 resolver = "2"

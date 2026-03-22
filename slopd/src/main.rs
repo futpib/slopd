@@ -27,7 +27,13 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let tmux_status = std::process::Command::new("tmux")
+    let config = libslop::SlopdConfig::load();
+
+    let mut tmux_cmd = std::process::Command::new("tmux");
+    if let Some(socket) = &config.tmux.socket {
+        tmux_cmd.args(["-S", socket.to_str().unwrap()]);
+    }
+    let tmux_status = tmux_cmd
         .arg("list-sessions")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -38,7 +44,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let socket_path = slop_proto::socket_path();
+    let socket_path = libslop::socket_path();
     let socket_dir = socket_path.parent().unwrap();
 
     tokio::fs::create_dir_all(&socket_dir).await.unwrap();
@@ -65,17 +71,17 @@ async fn handle_connection(stream: tokio::net::UnixStream, start_time: u64) {
 
     while let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
-        let (id, body) = match serde_json::from_str::<slop_proto::Request>(&line) {
+        let (id, body) = match serde_json::from_str::<libslop::Request>(&line) {
             Ok(req) => {
                 let body = match req.body {
-                    slop_proto::RequestBody::Ping => slop_proto::ResponseBody::Pong,
-                    slop_proto::RequestBody::Status => {
+                    libslop::RequestBody::Ping => libslop::ResponseBody::Pong,
+                    libslop::RequestBody::Status => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
-                        slop_proto::ResponseBody::Status {
-                            state: slop_proto::DaemonState {
+                        libslop::ResponseBody::Status {
+                            state: libslop::DaemonState {
                                 uptime_secs: now.saturating_sub(start_time),
                             },
                         }
@@ -85,11 +91,11 @@ async fn handle_connection(stream: tokio::net::UnixStream, start_time: u64) {
             }
             Err(e) => {
                 warn!("failed to parse request: {}", e);
-                (0, slop_proto::ResponseBody::Error { message: e.to_string() })
+                (0, libslop::ResponseBody::Error { message: e.to_string() })
             }
         };
 
-        let response = slop_proto::Response { id, body };
+        let response = libslop::Response { id, body };
         let mut json = serde_json::to_string(&response).unwrap();
         json.push('\n');
         debug!("sending: {}", json.trim());
