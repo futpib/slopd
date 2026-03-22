@@ -38,13 +38,19 @@ enum Command {
         /// Hook event name (e.g. UserPromptSubmit).
         event: String,
     },
-    /// Type a prompt into a pane and wait for UserPromptSubmit confirmation.
+    /// Type a prompt into pane(s) and wait for UserPromptSubmit confirmation.
     Send {
-        /// Tmux pane ID (e.g. %42).
+        /// Tmux pane ID (e.g. %42) or filter (e.g. tag=worker).
         pane_id: String,
         /// Prompt text to send.
         prompt: String,
-        /// Seconds to wait for UserPromptSubmit confirmation.
+        /// Additional filter by key=value (repeatable, AND semantics). Supported keys: tag.
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filters: Vec<String>,
+        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
+        #[arg(long, default_value = "one")]
+        select: SelectMode,
+        /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
     },
@@ -83,20 +89,6 @@ enum Command {
     Tags {
         /// Tmux pane ID (e.g. %42).
         pane_id: String,
-    },
-    /// Type a prompt into all panes matching a filter.
-    SendFiltered {
-        /// Prompt text to send.
-        prompt: String,
-        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
-        #[arg(long = "filter", value_name = "KEY=VALUE")]
-        filters: Vec<String>,
-        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
-        #[arg(long, default_value = "one")]
-        select: SelectMode,
-        /// Seconds to wait for UserPromptSubmit confirmation per pane.
-        #[arg(long, default_value = "60")]
-        timeout: u64,
     },
 }
 
@@ -202,8 +194,17 @@ async fn main() {
         .init();
 
     // Validate filter arguments eagerly before touching the socket.
-    if let Command::Ps { ref filters, .. } | Command::SendFiltered { ref filters, .. } = cli.command {
+    if let Command::Ps { ref filters, .. } = cli.command {
         parse_filters(filters.clone());
+    }
+    if let Command::Send { ref pane_id, ref filters, .. } = cli.command {
+        if pane_id.contains('=') {
+            let mut all = vec![pane_id.clone()];
+            all.extend(filters.clone());
+            parse_filters(all);
+        } else {
+            parse_filters(filters.clone());
+        }
     }
 
     let _config = libslop::SlopctlConfig::load();
@@ -339,114 +340,120 @@ async fn main() {
         return;
     }
 
-    // Client-side filter resolution for SendFiltered: query Ps first, then Send per pane.
-    if let Command::SendFiltered { prompt, filters, select, timeout } = cli.command {
-        let parsed = parse_filters(filters);
-        let filter_desc = parsed.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
+    // Client-side filter resolution for Send with filter target: query Ps first, then Send per pane.
+    if let Command::Send { ref pane_id, .. } = cli.command {
+        if pane_id.contains('=') {
+            if let Command::Send { pane_id, prompt, filters, select, timeout } = cli.command {
+                let mut all_filters = vec![pane_id];
+                all_filters.extend(filters);
+                let parsed = parse_filters(all_filters);
+                let filter_desc = parsed.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
 
-        let all_panes = match send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Ps).await {
-            libslop::ResponseBody::Ps { panes } => panes,
-            libslop::ResponseBody::Error { message } => {
-                eprintln!("error: {}", message);
-                std::process::exit(1);
-            }
-            other => {
-                eprintln!("unexpected response: {:?}", other);
-                std::process::exit(1);
-            }
-        };
+                let all_panes = match send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Ps).await {
+                    libslop::ResponseBody::Ps { panes } => panes,
+                    libslop::ResponseBody::Error { message } => {
+                        eprintln!("error: {}", message);
+                        std::process::exit(1);
+                    }
+                    other => {
+                        eprintln!("unexpected response: {:?}", other);
+                        std::process::exit(1);
+                    }
+                };
 
-        let matched = apply_filters(all_panes, &parsed);
+                let matched = apply_filters(all_panes, &parsed);
 
-        let target_pane_ids: Vec<String> = match select {
-            SelectMode::One => {
-                if matched.len() != 1 {
-                    eprintln!(
-                        "error: expected exactly one pane matching {}, found {}",
-                        filter_desc, matched.len()
-                    );
-                    std::process::exit(1);
-                }
-                vec![matched.into_iter().next().unwrap().pane_id]
-            }
-            SelectMode::Any => {
-                if matched.is_empty() {
-                    eprintln!("error: no panes match filter {}", filter_desc);
-                    std::process::exit(1);
-                }
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let idx = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos() as usize % matched.len();
-                vec![matched.into_iter().nth(idx).unwrap().pane_id]
-            }
-            SelectMode::All => {
-                if matched.is_empty() {
-                    eprintln!("error: no panes match filter {}", filter_desc);
-                    std::process::exit(1);
-                }
-                matched.into_iter().map(|p| p.pane_id).collect()
-            }
-        };
+                let target_pane_ids: Vec<String> = match select {
+                    SelectMode::One => {
+                        if matched.len() != 1 {
+                            eprintln!(
+                                "error: expected exactly one pane matching {}, found {}",
+                                filter_desc, matched.len()
+                            );
+                            std::process::exit(1);
+                        }
+                        vec![matched.into_iter().next().unwrap().pane_id]
+                    }
+                    SelectMode::Any => {
+                        if matched.is_empty() {
+                            eprintln!("error: no panes match filter {}", filter_desc);
+                            std::process::exit(1);
+                        }
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let idx = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos() as usize % matched.len();
+                        vec![matched.into_iter().nth(idx).unwrap().pane_id]
+                    }
+                    SelectMode::All => {
+                        if matched.is_empty() {
+                            eprintln!("error: no panes match filter {}", filter_desc);
+                            std::process::exit(1);
+                        }
+                        matched.into_iter().map(|p| p.pane_id).collect()
+                    }
+                };
 
-        // Send all requests on the same connection, each with a unique ID,
-        // then read responses correlating by ID.
-        let mut id: u64 = 2; // 1 was used by Ps above
-        let mut pending: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-        for pane_id in &target_pane_ids {
-            let body = libslop::RequestBody::Send {
-                pane_id: pane_id.clone(),
-                prompt: prompt.clone(),
-                timeout_secs: timeout,
-            };
-            let request = libslop::Request { id, body };
-            let mut json = serde_json::to_string(&request).unwrap();
-            debug!("sending: {}", json);
-            json.push('\n');
-            writer.write_all(json.as_bytes()).await.unwrap_or_else(|e| {
-                eprintln!("failed to send request: {}", e);
-                std::process::exit(1);
-            });
-            pending.insert(id, pane_id.clone());
-            id += 1;
-        }
-        // Collect all responses; order may differ from send order.
-        let mut results: std::collections::HashMap<u64, libslop::ResponseBody> = std::collections::HashMap::new();
-        while results.len() < pending.len() {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    debug!("received: {}", line);
-                    let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
-                        eprintln!("failed to parse response: {}", e);
+                // Send all requests on the same connection, each with a unique ID,
+                // then read responses correlating by ID.
+                let mut id: u64 = 2; // 1 was used by Ps above
+                let mut pending: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+                for pane_id in &target_pane_ids {
+                    let body = libslop::RequestBody::Send {
+                        pane_id: pane_id.clone(),
+                        prompt: prompt.clone(),
+                        timeout_secs: timeout,
+                    };
+                    let request = libslop::Request { id, body };
+                    let mut json = serde_json::to_string(&request).unwrap();
+                    debug!("sending: {}", json);
+                    json.push('\n');
+                    writer.write_all(json.as_bytes()).await.unwrap_or_else(|e| {
+                        eprintln!("failed to send request: {}", e);
                         std::process::exit(1);
                     });
-                    if pending.contains_key(&response.id) {
-                        results.insert(response.id, response.body);
+                    pending.insert(id, pane_id.clone());
+                    id += 1;
+                }
+                // Collect all responses; order may differ from send order.
+                let mut results: std::collections::HashMap<u64, libslop::ResponseBody> = std::collections::HashMap::new();
+                while results.len() < pending.len() {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            debug!("received: {}", line);
+                            let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                                eprintln!("failed to parse response: {}", e);
+                                std::process::exit(1);
+                            });
+                            if pending.contains_key(&response.id) {
+                                results.insert(response.id, response.body);
+                            }
+                        }
+                        _ => {
+                            eprintln!("connection closed unexpectedly");
+                            std::process::exit(1);
+                        }
                     }
                 }
-                _ => {
-                    eprintln!("connection closed unexpectedly");
-                    std::process::exit(1);
+                // Print results in send order.
+                for req_id in 2..id {
+                    let pane_id = &pending[&req_id];
+                    match &results[&req_id] {
+                        libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
+                        libslop::ResponseBody::Error { message } => {
+                            eprintln!("error sending to {}: {}", pane_id, message);
+                            std::process::exit(1);
+                        }
+                        other => {
+                            eprintln!("unexpected response for {}: {:?}", pane_id, other);
+                            std::process::exit(1);
+                        }
+                    }
                 }
+                return;
             }
         }
-        // Print results in send order.
-        for req_id in 2..id {
-            let pane_id = &pending[&req_id];
-            match &results[&req_id] {
-                libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
-                libslop::ResponseBody::Error { message } => {
-                    eprintln!("error sending to {}: {}", pane_id, message);
-                    std::process::exit(1);
-                }
-                other => {
-                    eprintln!("unexpected response for {}: {:?}", pane_id, other);
-                    std::process::exit(1);
-                }
-            }
-        }
-        return;
     }
 
     let body = match cli.command {
@@ -477,12 +484,12 @@ async fn main() {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
-        Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
+        Command::Send { pane_id, prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
         Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
-        Command::Hook { .. } | Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
+        Command::Hook { .. } | Command::Listen { .. } => unreachable!(),
     };
 
     match send_request(&mut writer, &mut lines, 1, body).await {

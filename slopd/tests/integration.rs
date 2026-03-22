@@ -647,7 +647,7 @@ fn send_to_pane_with_broken_hooks_times_out() {
 
     // This send reaches a live pane (send-keys succeeds) but UserPromptSubmit will never fire.
     // Pass a short --timeout so slopd returns an error quickly rather than the test hanging.
-    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
+    let output = env.slopctl(&["send", &pane_id, "hello", "--timeout", "2"]);
 
     kill_slopd(slopd);
 
@@ -674,7 +674,7 @@ fn send_timeout_fires_on_non_hook_pane() {
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
     let start = Instant::now();
-    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
+    let output = env.slopctl(&["send", &pane_id, "hello", "--timeout", "2"]);
     let elapsed = start.elapsed();
 
     kill_slopd(slopd);
@@ -1087,11 +1087,11 @@ fn send_filtered_one_match() {
     let tag_out = env.slopctl(&["tag", &pane_id, "mytarget"]);
     assert!(tag_out.status.success());
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=mytarget", "hello from filter"]);
+    let send_out = env.slopctl(&["send", "tag=mytarget", "hello from filter"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send failed: {:?}", send_out);
     assert_eq!(String::from_utf8_lossy(&send_out.stdout).trim(), pane_id);
 }
 
@@ -1107,11 +1107,11 @@ fn send_filtered_one_errors_on_zero_matches() {
 
     let slopd = env.spawn_slopd();
 
-    let out = env.slopctl(&["send-filtered", "--filter", "tag=nonexistent", "hello"]);
+    let out = env.slopctl(&["send", "tag=nonexistent", "hello"]);
 
     kill_slopd(slopd);
 
-    assert!(!out.status.success(), "send-filtered should fail with no matches");
+    assert!(!out.status.success(), "send should fail with no matches");
 }
 
 #[test]
@@ -1132,11 +1132,11 @@ fn send_filtered_one_errors_on_multiple_matches() {
     env.slopctl(&["tag", &pane1, "shared"]);
     env.slopctl(&["tag", &pane2, "shared"]);
 
-    let out = env.slopctl(&["send-filtered", "--filter", "tag=shared", "hello"]);
+    let out = env.slopctl(&["send", "tag=shared", "hello"]);
 
     kill_slopd(slopd);
 
-    assert!(!out.status.success(), "send-filtered --select one should fail with 2 matches");
+    assert!(!out.status.success(), "send --select one should fail with 2 matches");
 }
 
 #[test]
@@ -1180,11 +1180,11 @@ fn send_filtered_all_sends_to_all_matching() {
     env.slopctl(&["tag", &pane1, "broadcast"]);
     env.slopctl(&["tag", &pane2, "broadcast"]);
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=broadcast", "--select", "all", "hello all"]);
+    let send_out = env.slopctl(&["send", "tag=broadcast", "hello all", "--select", "all"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered --select all failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send --select all failed: {:?}", send_out);
     let stdout = String::from_utf8_lossy(&send_out.stdout);
     assert!(stdout.contains(&pane1), "output missing pane1 {}: {}", pane1, stdout);
     assert!(stdout.contains(&pane2), "output missing pane2 {}: {}", pane2, stdout);
@@ -1230,11 +1230,11 @@ fn send_filtered_any_sends_to_exactly_one_pane() {
     env.slopctl(&["tag", &pane1, "anytarget"]);
     env.slopctl(&["tag", &pane2, "anytarget"]);
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=anytarget", "--select", "any", "hello any"]);
+    let send_out = env.slopctl(&["send", "tag=anytarget", "hello any", "--select", "any"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered --select any failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send --select any failed: {:?}", send_out);
     let stdout = String::from_utf8_lossy(&send_out.stdout);
     // Exactly one pane ID should appear in the output.
     let count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
@@ -1270,7 +1270,7 @@ fn ps_filter_shows_only_matching_panes() {
     assert!(!stdout.contains(&pane2), "filtered ps should not show untagged pane");
 }
 
-/// Verify that send-filtered delivers to N panes concurrently: total wall time
+/// Verify that send with --select all delivers to N panes concurrently: total wall time
 /// must be less than 2x the single-pane round-trip, not N times it.
 #[test]
 fn send_filtered_all_is_concurrent() {
@@ -1323,22 +1323,22 @@ fn send_filtered_all_is_concurrent() {
     assert!(single.status.success());
     let baseline = baseline_start.elapsed();
 
-    // Now send-filtered to all N panes and measure wall time.
+    // Now send with filters to all N panes and measure wall time.
     let all_start = Instant::now();
-    let all_out = env.slopctl(&["send-filtered", "--filter", "tag=concurrent",
-                                "--select", "all", "hello concurrent"]);
+    let all_out = env.slopctl(&["send", "tag=concurrent", "hello concurrent",
+                                "--select", "all"]);
     let all_elapsed = all_start.elapsed();
 
     kill_slopd(slopd);
 
-    assert!(all_out.status.success(), "send-filtered failed: {:?}", all_out);
+    assert!(all_out.status.success(), "send failed: {:?}", all_out);
 
     // All N panes received. Wall time should be well under N * baseline.
     // We allow 2x baseline as headroom for scheduling jitter.
     let limit = baseline * 2 + Duration::from_millis(500);
     assert!(
         all_elapsed < limit,
-        "send-filtered to {} panes took {:?}, expected < {:?} (baseline {:?}); \
+        "send to {} panes took {:?}, expected < {:?} (baseline {:?}); \
          sends are likely sequential not concurrent",
         N, all_elapsed, limit, baseline,
     );
@@ -1427,15 +1427,10 @@ fn help_tags_missing_pane_id() {
 }
 
 #[test]
-fn help_send_filtered_missing_prompt() {
-    assert_invalid_usage(&["send-filtered"], "<PROMPT>");
-}
-
-#[test]
-fn help_send_filtered_unknown_filter_key() {
+fn help_send_unknown_filter_key() {
     build_bin("slopctl");
     let out = Command::new(cargo_bin("slopctl"))
-        .args(["send-filtered", "--filter", "foo=bar", "hello"])
+        .args(["send", "foo=bar", "hello"])
         .output()
         .expect("failed to run slopctl");
     let stderr = String::from_utf8_lossy(&out.stderr);
