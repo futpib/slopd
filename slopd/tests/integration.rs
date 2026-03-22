@@ -654,6 +654,36 @@ fn send_to_pane_with_broken_hooks_times_out() {
     assert!(!output.status.success(), "slopctl send should have timed out: {:?}", output);
 }
 
+/// Regression test for issue #9: send timeout must fire even against a pane that
+/// has no hooks at all (no UserPromptSubmit ever fires). Wall time must be close
+/// to --timeout, not infinite.
+#[test]
+fn send_timeout_fires_on_non_hook_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let start = Instant::now();
+    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
+    let elapsed = start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(!output.status.success(), "send should have timed out");
+    assert!(elapsed < Duration::from_secs(10),
+        "send took {:?}, timer appears to have hung (issue #9)", elapsed);
+}
+
 #[test]
 fn listen_no_filters_receives_all_events() {
     build_bin("slopd");
