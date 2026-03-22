@@ -135,13 +135,14 @@ impl TestEnv {
 
     fn spawn_slopd(&self) -> Child {
         Command::new(cargo_bin("slopd"))
+            .args(["-vv"])
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to spawn slopd")
     }
@@ -219,7 +220,7 @@ fn slopd_creates_marked_tmux_session() {
         .success();
 
     let option_output = env.tmux.tmux()
-        .args(["show-options", "-t", "slopd", "-v", "@slopd"])
+        .args(["show-options", "-t", "slopd", "-v", "@slopd_managed"])
         .output()
         .expect("failed to run tmux show-options");
     let option_value = String::from_utf8_lossy(&option_output.stdout);
@@ -228,7 +229,7 @@ fn slopd_creates_marked_tmux_session() {
     slopd.wait().unwrap();
 
     assert!(session_exists, "slopd tmux session does not exist");
-    assert_eq!(option_value.trim(), "true", "@slopd option not set correctly");
+    assert_eq!(option_value.trim(), "true", "@slopd_managed option not set correctly");
 }
 
 #[test]
@@ -299,10 +300,15 @@ fn run_injects_hooks_into_claude_settings() {
         return;
     };
 
+    let config_toml = std::fs::read_to_string(env.config_dir.path().join("slopd/config.toml")).unwrap();
+    eprintln!("config.toml:\n{}", config_toml);
+
     let mut slopd = env.spawn_slopd();
     std::thread::sleep(Duration::from_millis(100));
 
     let output = env.slopctl(&["run"]);
+    eprintln!("slopctl run stdout: {}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("slopctl run stderr: {}", String::from_utf8_lossy(&output.stderr));
 
     slopd.kill().unwrap();
     slopd.wait().unwrap();
@@ -414,11 +420,11 @@ fn session_start_hook_stores_session_id_on_pane() {
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
-    // Poll until @claude_session_id is set on the pane (mock_claude fires the hook then exits)
+    // Poll until @slopd_claude_session_id is set on the pane (mock_claude fires the hook then exits)
     let deadline = Instant::now() + Duration::from_secs(5);
     let session_id = loop {
         let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", "@claude_session_id"])
+            .args(["show-options", "-t", &pane_id, "-p", "-v", "@slopd_claude_session_id"])
             .output()
             .expect("failed to run tmux show-options");
         let val = String::from_utf8_lossy(&out.stdout).trim().to_string();

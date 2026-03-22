@@ -59,11 +59,11 @@ async fn main() {
 
     // Mark the session with a user option so it can be identified
     tmux(&config)
-        .args(["set-option", "-t", "slopd", "@slopd", "true"])
+        .args(["set-option", "-t", "slopd", "@slopd_managed", "true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .expect("failed to set @slopd option on tmux session");
+        .expect("failed to set @slopd_managed option on tmux session");
 
     let socket_path = libslop::socket_path();
     let socket_dir = socket_path.parent().unwrap();
@@ -140,7 +140,7 @@ async fn handle_connection(
                                         "-t",
                                         pane,
                                         "-p",
-                                        "@claude_session_id",
+                                        "@slopd_claude_session_id",
                                         session_id,
                                     ])
                                     .stdout(std::process::Stdio::null())
@@ -155,11 +155,13 @@ async fn handle_connection(
                     }
                     libslop::RequestBody::Run => {
                         let settings_path = config.claude_settings_path();
-                        if let Err(e) = libslop::inject_hooks_into_file(
+                        debug!("injecting hooks into {}", settings_path.display());
+                        match libslop::inject_hooks_into_file(
                             &settings_path,
                             &config.run.slopctl,
                         ) {
-                            warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+                            Ok(()) => debug!("injected hooks into {}", settings_path.display()),
+                            Err(e) => warn!("failed to inject hooks into {}: {}", settings_path.display(), e),
                         }
                         let xdg_runtime_dir = libslop::runtime_dir();
                         let output = tmux(&config)
