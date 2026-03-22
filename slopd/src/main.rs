@@ -48,6 +48,51 @@ fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
         .clone()
 }
 
+/// An event broadcast to all active subscribers.
+#[derive(Debug, Clone)]
+struct BroadcastEvent {
+    source: String,
+    event_type: String,
+    pane_id: Option<String>,
+    payload: serde_json::Value,
+}
+
+type EventTx = Arc<tokio::sync::broadcast::Sender<BroadcastEvent>>;
+
+fn filters_match(filters: &[libslop::EventFilter], ev: &BroadcastEvent) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    filters.iter().any(|f| {
+        if let Some(ref src) = f.source {
+            if src != &ev.source {
+                return false;
+            }
+        }
+        if let Some(ref et) = f.event_type {
+            if et != &ev.event_type {
+                return false;
+            }
+        }
+        if let Some(ref pane_id) = f.pane_id {
+            if ev.pane_id.as_deref() != Some(pane_id.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref session_id) = f.session_id {
+            if ev.payload.get("session_id").and_then(|v| v.as_str()) != Some(session_id.as_str()) {
+                return false;
+            }
+        }
+        for (k, v) in &f.payload_match {
+            if ev.payload.get(k) != Some(v) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -108,6 +153,9 @@ async fn main() {
 
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
 
+    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
+    let event_tx: EventTx = Arc::new(event_tx);
+
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
@@ -117,7 +165,7 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), event_tx.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -127,33 +175,71 @@ async fn main() {
     }
 }
 
+async fn write_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    body: libslop::ResponseBody,
+) -> std::io::Result<()> {
+    let response = libslop::Response { id, body };
+    let mut json = serde_json::to_string(&response).unwrap();
+    debug!("sending: {}", json);
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await
+}
+
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     start_time: u64,
     config: Arc<libslop::SlopdConfig>,
     panes: PaneMap,
+    event_tx: EventTx,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
-        let (id, body) = match serde_json::from_str::<libslop::Request>(&line) {
-            Ok(req) => {
-                let body = handle_request(req.body, start_time, &config, &panes).await;
-                (req.id, body)
-            }
+        let req = match serde_json::from_str::<libslop::Request>(&line) {
+            Ok(req) => req,
             Err(e) => {
                 warn!("failed to parse request: {}", e);
-                (0, libslop::ResponseBody::Error { message: e.to_string() })
+                let _ = write_response(&mut writer, 0, libslop::ResponseBody::Error { message: e.to_string() }).await;
+                continue;
             }
         };
 
-        let response = libslop::Response { id, body };
-        let mut json = serde_json::to_string(&response).unwrap();
-        json.push('\n');
-        debug!("sending: {}", json.trim());
-        if writer.write_all(json.as_bytes()).await.is_err() {
+        if let libslop::RequestBody::Subscribe { filters } = req.body {
+            if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
+                return;
+            }
+            let mut rx = event_tx.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if filters_match(&filters, &ev) {
+                            let body = libslop::ResponseBody::Event {
+                                source: ev.source,
+                                event_type: ev.event_type,
+                                pane_id: ev.pane_id,
+                                payload: ev.payload,
+                            };
+                            if write_response(&mut writer, req.id, body).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("subscriber lagged, dropped {} events", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let body = handle_request(req.body, start_time, &config, &panes, &event_tx).await;
+        if write_response(&mut writer, req.id, body).await.is_err() {
             break;
         }
     }
@@ -164,6 +250,7 @@ async fn handle_request(
     start_time: u64,
     config: &Arc<libslop::SlopdConfig>,
     panes: &PaneMap,
+    event_tx: &EventTx,
 ) -> libslop::ResponseBody {
     match body {
         libslop::RequestBody::Ping => libslop::ResponseBody::Pong,
@@ -225,6 +312,13 @@ async fn handle_request(
                 }
             }
 
+            let _ = event_tx.send(BroadcastEvent {
+                source: "hook".to_string(),
+                event_type: event,
+                pane_id,
+                payload,
+            });
+
             libslop::ResponseBody::Hooked
         }
 
@@ -285,6 +379,11 @@ async fn handle_request(
                     libslop::ResponseBody::Sent { pane_id }
                 }
             }
+        }
+
+        libslop::RequestBody::Subscribe { .. } => {
+            // Handled in handle_connection before reaching here.
+            unreachable!("Subscribe should be handled before handle_request")
         }
     }
 }

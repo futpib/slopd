@@ -102,6 +102,71 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_hooks_into_file_concurrent_no_duplicate_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        const N: usize = 32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    inject_hooks_into_file(&path, "slopctl").map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().unwrap_or_else(|e| panic!("inject_hooks_into_file failed: {}", e));
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            let count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["type"] == "command"
+                            && h["command"].as_str()
+                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                    })
+                })
+            }).count();
+            assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            let count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["type"] == "command"
+                            && h["command"].as_str()
+                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                    })
+                })
+            }).count();
+            assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
+        }
+    }
+}
+
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
 pub fn inject_hooks_into_file(
     settings_path: &PathBuf,
@@ -236,6 +301,24 @@ pub struct Request {
     pub body: RequestBody,
 }
 
+/// Describes which events a subscriber wants to receive.
+/// All specified fields must match (AND within one filter).
+/// Multiple filters in a Subscribe request are OR-ed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventFilter {
+    /// Event source: "hook" or "slopd". Omit to match all sources.
+    pub source: Option<String>,
+    /// Event type, e.g. "UserPromptSubmit". Omit to match all event types.
+    pub event_type: Option<String>,
+    /// Only receive events from this tmux pane. Omit to match all panes.
+    pub pane_id: Option<String>,
+    /// Only receive events whose payload contains this Claude session_id. Omit to match all sessions.
+    pub session_id: Option<String>,
+    /// Additional payload key-value pairs that must all match (shallow equality).
+    #[serde(default)]
+    pub payload_match: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RequestBody {
@@ -245,6 +328,8 @@ pub enum RequestBody {
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     Send { pane_id: String, prompt: String },
+    /// Subscribe to a stream of events. An empty filters vec matches all events.
+    Subscribe { filters: Vec<EventFilter> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -262,6 +347,15 @@ pub enum ResponseBody {
     Kill { pane_id: String },
     Sent { pane_id: String },
     Hooked,
+    /// Sent once to confirm a Subscribe request was accepted.
+    Subscribed,
+    /// Streamed to subscribers as events occur.
+    Event {
+        source: String,
+        event_type: String,
+        pane_id: Option<String>,
+        payload: serde_json::Value,
+    },
     Error { message: String },
 }
 

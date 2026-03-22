@@ -167,4 +167,8 @@ impl TestEnv {
             .output()
             .expect("failed to run slopctl")
     }
+
+    pub fn socket_path(&self) -> PathBuf {
+        self.runtime_dir.path().join("slopd/slopd.sock")
+    }
 }

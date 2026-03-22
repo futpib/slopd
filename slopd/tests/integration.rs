@@ -1,7 +1,24 @@
 use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
+use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Fire a hook event by calling slopctl hook with the given JSON payload on stdin.
+fn fire_hook(env: &TestEnv, event: &str, payload: &str, pane_id: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new(cargo_bin("slopctl"));
+    cmd.args(["hook", event])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(pane) = pane_id {
+        cmd.env("TMUX_PANE", pane);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn slopctl hook");
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
 
 fn tmux_available() -> bool {
     match Command::new("tmux").arg("-V").status() {
@@ -369,4 +386,140 @@ fn send_concurrent_all_delivered() {
         let prompt = format!("prompt {}", i);
         assert!(pane_text.contains(&prompt), "pane missing {:?}, pane contents:\n{}", prompt, pane_text);
     }
+}
+
+
+#[test]
+fn listen_receives_hook_event() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    // Give the subscription time to be established.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", payload, None);
+    assert!(out.status.success(), "slopctl hook failed: {:?}", out);
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read event line");
+
+    listen.kill().unwrap();
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    assert_eq!(event["event_type"], "UserPromptSubmit");
+    assert_eq!(event["source"], "hook");
+    assert_eq!(event["payload"]["prompt"], "hello");
+}
+
+#[test]
+fn listen_filters_out_non_matching_events() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Fire a non-matching event first.
+    let stop_payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+    let out = fire_hook(&env, "Stop", stop_payload, None);
+    assert!(out.status.success(), "slopctl hook Stop failed: {:?}", out);
+
+    // Then fire the matching event.
+    let prompt_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"world"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, None);
+    assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read event line");
+
+    listen.kill().unwrap();
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    // The first event received must be the UserPromptSubmit, not Stop.
+    assert_eq!(event["event_type"], "UserPromptSubmit");
+    assert_eq!(event["payload"]["prompt"], "world");
+}
+
+#[test]
+fn listen_by_pane_id() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let target_pane = "%42";
+    let other_pane = "%99";
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", target_pane])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Fire from the wrong pane first.
+    let other_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"wrong pane"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", other_payload, Some(other_pane));
+    assert!(out.status.success());
+
+    // Then fire from the target pane.
+    let target_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"right pane"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", target_payload, Some(target_pane));
+    assert!(out.status.success());
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read event line");
+
+    listen.kill().unwrap();
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    assert_eq!(event["pane_id"], target_pane);
+    assert_eq!(event["payload"]["prompt"], "right pane");
 }

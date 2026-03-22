@@ -28,6 +28,18 @@ enum Command {
         pane_id: String,
         prompt: String,
     },
+    /// Subscribe to a stream of events and print each as a JSON line.
+    Listen {
+        /// Filter by hook event name (repeatable; omit for all events).
+        #[arg(long = "hook", value_name = "EVENT")]
+        hooks: Vec<String>,
+        /// Only receive events from this tmux pane.
+        #[arg(long)]
+        pane_id: Option<String>,
+        /// Only receive events from this Claude session.
+        #[arg(long)]
+        session_id: Option<String>,
+    },
 }
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
@@ -64,6 +76,64 @@ async fn main() {
     });
 
     let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    if let Command::Listen { hooks, pane_id, session_id } = cli.command {
+        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && pane_id.is_none() && session_id.is_none() {
+            vec![]
+        } else if hooks.is_empty() {
+            vec![libslop::EventFilter {
+                source: None,
+                event_type: None,
+                pane_id,
+                session_id,
+                payload_match: serde_json::Map::new(),
+            }]
+        } else {
+            hooks.into_iter().map(|h| libslop::EventFilter {
+                source: Some("hook".to_string()),
+                event_type: Some(h),
+                pane_id: pane_id.clone(),
+                session_id: session_id.clone(),
+                payload_match: serde_json::Map::new(),
+            }).collect()
+        };
+
+        let request = libslop::Request {
+            id: 1,
+            body: libslop::RequestBody::Subscribe { filters },
+        };
+        let mut json = serde_json::to_string(&request).unwrap();
+        debug!("sending: {}", json);
+        json.push('\n');
+        writer.write_all(json.as_bytes()).await.unwrap();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            debug!("received: {}", line);
+            let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                eprintln!("failed to parse response: {}", e);
+                std::process::exit(1);
+            });
+            match response.body {
+                libslop::ResponseBody::Subscribed => {}
+                libslop::ResponseBody::Event { source, event_type, pane_id, payload } => {
+                    let out = serde_json::json!({
+                        "source": source,
+                        "event_type": event_type,
+                        "pane_id": pane_id,
+                        "payload": payload,
+                    });
+                    println!("{}", out);
+                }
+                libslop::ResponseBody::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
 
     let body = match cli.command {
         Command::Ping => libslop::RequestBody::Ping,
@@ -81,6 +151,7 @@ async fn main() {
             libslop::RequestBody::Hook { event, payload, pane_id }
         }
         Command::Send { pane_id, prompt } => libslop::RequestBody::Send { pane_id, prompt },
+        Command::Listen { .. } => unreachable!(),
     };
 
     let request = libslop::Request { id: 1, body };
@@ -89,7 +160,6 @@ async fn main() {
     json.push('\n');
     writer.write_all(json.as_bytes()).await.unwrap();
 
-    let mut lines = BufReader::new(reader).lines();
     if let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
         let response: libslop::Response = serde_json::from_str(&line).unwrap();
