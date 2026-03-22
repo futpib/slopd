@@ -44,6 +44,13 @@ async fn main() {
         "status" => libslop::RequestBody::Status,
         "ping" => libslop::RequestBody::Ping,
         "run" => libslop::RequestBody::Run,
+        "kill" => {
+            let pane_id = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: slopctl kill <pane_id>");
+                std::process::exit(1);
+            });
+            libslop::RequestBody::Kill { pane_id }
+        }
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);
@@ -62,6 +69,7 @@ async fn main() {
         let response: libslop::Response = serde_json::from_str(&line).unwrap();
         match response.body {
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
             other => println!("{:?}", other),
         }
     }

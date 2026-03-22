@@ -230,3 +230,52 @@ fn run_spawns_executable_in_new_tmux_window() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.trim().starts_with('%'), "expected pane_id in output, got: {}", stdout);
 }
+
+#[test]
+fn kill_terminates_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    tmux.write_slopd_config(&config_dir, Some("sleep"));
+
+    let mut slopd = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopd");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let run_output = Command::new(cargo_bin("slopctl"))
+        .args(["run"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl run");
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let kill_output = Command::new(cargo_bin("slopctl"))
+        .args(["kill", &pane_id])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl kill");
+
+    slopd.kill().unwrap();
+    slopd.wait().unwrap();
+
+    assert!(kill_output.status.success(), "slopctl kill failed: {:?}", kill_output);
+    let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
+    assert_eq!(kill_stdout.trim(), pane_id, "kill should print the pane_id");
+}

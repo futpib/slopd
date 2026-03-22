@@ -111,6 +111,21 @@ async fn handle_connection(
                             },
                         }
                     }
+                    libslop::RequestBody::Kill { pane_id } => {
+                        let output = tmux(&config)
+                            .args(["kill-pane", "-t", &pane_id])
+                            .output();
+                        match output {
+                            Ok(out) if out.status.success() => {
+                                libslop::ResponseBody::Kill { pane_id }
+                            }
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                libslop::ResponseBody::Error { message: stderr }
+                            }
+                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                        }
+                    }
                     libslop::RequestBody::Run => {
                         let output = tmux(&config)
                             .args([

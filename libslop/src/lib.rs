@@ -81,6 +81,7 @@ pub enum RequestBody {
     Ping,
     Status,
     Run,
+    Kill { pane_id: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,6 +96,7 @@ pub enum ResponseBody {
     Pong,
     Status { state: DaemonState },
     Run { pane_id: String },
+    Kill { pane_id: String },
     Error { message: String },
 }
 
