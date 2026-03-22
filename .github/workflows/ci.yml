@@ -16,6 +16,6 @@ jobs:
       - run: sudo apt-get install -y tmux
       - run: cargo install cargo-llvm-cov --locked
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - uses: coverallsapp/github-action@v2
         with:
-          files: lcov.info
+          file: lcov.info
