@@ -79,10 +79,22 @@ async fn main() {
         .unwrap()
         .as_secs();
 
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ).expect("failed to install SIGTERM handler");
+
     loop {
-        let (stream, _addr) = listener.accept().await.unwrap();
-        debug!("accepted connection");
-        tokio::spawn(handle_connection(stream, start_time, config.clone()));
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result.unwrap();
+                debug!("accepted connection");
+                tokio::spawn(handle_connection(stream, start_time, config.clone()));
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
+                break;
+            }
+        }
     }
 }
 
