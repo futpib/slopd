@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
@@ -72,46 +72,90 @@ fn main() {
         }),
     );
 
-    // Read prompts from stdin line by line, firing UserPromptSubmit for each.
-    // This simulates Claude's prompt queue: each line entered into the pane is
-    // a prompt that Claude processes in order.
-    for line in std::io::BufReader::new(std::io::stdin()).lines() {
-        let prompt = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if let Some(secs) = prompt.strip_prefix("/sleep ") {
-            let secs: u64 = secs.trim().parse().unwrap_or(0);
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            continue;
-        }
+    // Put the terminal in raw mode so we receive key bytes directly (Ctrl+C = 0x03,
+    // Ctrl+D = 0x04, Escape = 0x1b) rather than having the terminal driver intercept them.
+    // This mirrors real Claude's interactive terminal behaviour.
+    let stdin_fd = 0i32; // STDIN_FILENO
+    let orig_termios = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(stdin_fd, &mut t);
+        let orig = t;
+        libc::cfmakeraw(&mut t);
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &t);
+        orig
+    };
 
-        if let Some(code) = prompt.strip_prefix("/exit ") {
-            let code: i32 = code.trim().parse().unwrap_or(0);
-            std::process::exit(code);
-        }
+    // Read raw bytes from stdin, accumulating lines.
+    // Mirrors real Claude terminal behaviour:
+    //   - Single Esc, C-c, or C-d: interrupt (drop current work, back to prompt)
+    //   - Two consecutive C-c or two consecutive C-d: exit
+    //   - Two consecutive Esc: rewind mode (ignored here, not an exit)
+    let mut line_buf = Vec::new();
+    let mut last_interrupt: Option<u8> = None;
+    let mut stdin = std::io::stdin();
+    let mut byte = [0u8; 1];
 
-        if prompt == "/break-stdin" {
-            // Stop reading stdin (simulates a hung/blocked read).
-            return;
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
+        let b = byte[0];
+        match b {
+            0x03 | 0x04 => {
+                if last_interrupt == Some(b) {
+                    // Two consecutive C-c or two consecutive C-d: exit.
+                    break;
+                }
+                last_interrupt = Some(b);
+            }
+            0x1b => {
+                // Single or double Esc: interrupt / rewind mode — never exit.
+                last_interrupt = Some(b);
+            }
+            0x0d | 0x0a => {
+                // Carriage return or newline: complete the line.
+                last_interrupt = None;
+                let prompt = String::from_utf8_lossy(&line_buf).into_owned();
+                line_buf.clear();
 
-        if prompt == "/break-hooks" {
-            // Keep reading stdin but stop firing hooks (simulates hook delivery failure).
-            for _ in std::io::BufReader::new(std::io::stdin()).lines() {}
-            return;
+                if let Some(secs) = prompt.strip_prefix("/sleep ") {
+                    let secs: u64 = secs.trim().parse().unwrap_or(0);
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    continue;
+                }
+                if let Some(code) = prompt.strip_prefix("/exit ") {
+                    let code: i32 = code.trim().parse().unwrap_or(0);
+                    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
+                    std::process::exit(code);
+                }
+                if prompt == "/break-stdin" {
+                    break;
+                }
+                if prompt == "/break-hooks" {
+                    let mut buf = [0u8; 256];
+                    while stdin.read(&mut buf).unwrap_or(0) > 0 {}
+                    break;
+                }
+
+                fire_hooks(
+                    &settings,
+                    "UserPromptSubmit",
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "hook_event_name": "UserPromptSubmit",
+                        "transcript_path": "/dev/null",
+                        "cwd": cwd,
+                        "prompt": prompt
+                    }),
+                );
+            }
+            _ => {
+                last_interrupt = None;
+                line_buf.push(b);
+            }
         }
-
-        fire_hooks(
-            &settings,
-            "UserPromptSubmit",
-            &serde_json::json!({
-                "session_id": session_id,
-                "hook_event_name": "UserPromptSubmit",
-                "transcript_path": "/dev/null",
-                "cwd": cwd,
-                "prompt": prompt
-            }),
-        );
     }
+
+    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
 }

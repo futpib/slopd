@@ -712,6 +712,7 @@ name = "slopd"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "libc",
  "libslop",
  "libsloptest",
  "serde_json",

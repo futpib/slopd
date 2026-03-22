@@ -403,7 +403,7 @@ async fn handle_request(
 
             for key in &["C-c", "C-d", "Escape"] {
                 let result = tmux(config)
-                    .args(["send-keys", "-t", &pane_id, key, ""])
+                    .args(["send-keys", "-t", &pane_id, key])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();

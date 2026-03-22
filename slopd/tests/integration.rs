@@ -601,3 +601,64 @@ fn listen_by_pane_id() {
     assert_eq!(event["pane_id"], target_pane);
     assert_eq!(event["payload"]["prompt"], "right pane");
 }
+
+#[test]
+fn interrupt_exits_mock_claude() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for mock_claude to start (SessionStart hook fires).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("timed out waiting for mock_claude to start");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Interrupt: sends C-c, C-d, Escape — enough to drop whatever Claude is doing.
+    let int_out = env.slopctl(&["interrupt", &pane_id]);
+    assert!(int_out.status.success(), "interrupt failed: {:?}", int_out);
+    assert_eq!(String::from_utf8_lossy(&int_out.stdout).trim(), pane_id);
+
+    // mock_claude should still be alive — a single interrupt doesn't exit.
+    std::thread::sleep(Duration::from_millis(100));
+    let pane_alive = env.tmux.tmux()
+        .args(["list-panes", "-t", &pane_id, "-F", "#{pane_id}"])
+        .output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&pane_alive.stdout).contains(&pane_id),
+        "pane should still be alive after interrupt"
+    );
+
+    kill_slopd(slopd);
+}
