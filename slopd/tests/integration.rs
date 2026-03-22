@@ -65,6 +65,17 @@ impl Drop for TmuxServer {
     }
 }
 
+impl TmuxServer {
+    fn tmux(&self) -> Command {
+        let mut cmd = Command::new("tmux");
+        cmd.args(["-S", self.socket.to_str().unwrap()])
+            .env_remove("TMUX")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR");
+        cmd
+    }
+}
+
 fn tmux_available() -> bool {
     match Command::new("tmux").arg("-V").status() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -130,4 +141,51 @@ fn slopd_fails_without_tmux_running() {
         .expect("failed to run slopd");
 
     assert!(!status.success(), "slopd should have failed without tmux");
+}
+
+#[test]
+fn slopd_creates_marked_tmux_session() {
+    build_bin("slopd");
+
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    tmux.write_slopd_config(&config_dir);
+
+    let mut slopd = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopd");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Verify the slopd session exists
+    let session_exists = tmux.tmux()
+        .args(["has-session", "-t", "slopd"])
+        .status()
+        .expect("failed to run tmux has-session")
+        .success();
+
+    // Verify the @slopd user option is set on the session
+    let option_output = tmux.tmux()
+        .args(["show-options", "-t", "slopd", "-v", "@slopd"])
+        .output()
+        .expect("failed to run tmux show-options");
+    let option_value = String::from_utf8_lossy(&option_output.stdout);
+
+    slopd.kill().unwrap();
+    slopd.wait().unwrap();
+
+    assert!(session_exists, "slopd tmux session does not exist");
+    assert_eq!(option_value.trim(), "true", "@slopd option not set correctly");
 }

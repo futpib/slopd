@@ -12,6 +12,14 @@ fn verbosity_to_level(verbosity: u8) -> tracing::Level {
     }
 }
 
+fn tmux(config: &libslop::SlopdConfig) -> std::process::Command {
+    let mut cmd = std::process::Command::new("tmux");
+    if let Some(socket) = &config.tmux.socket {
+        cmd.args(["-S", socket.to_str().unwrap()]);
+    }
+    cmd
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -29,20 +37,32 @@ async fn main() {
 
     let config = libslop::SlopdConfig::load();
 
-    let mut tmux_cmd = std::process::Command::new("tmux");
-    if let Some(socket) = &config.tmux.socket {
-        tmux_cmd.args(["-S", socket.to_str().unwrap()]);
-    }
-    let tmux_status = tmux_cmd
+    let status = tmux(&config)
         .arg("list-sessions")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .expect("failed to run tmux");
-    if !tmux_status.success() {
+    if !status.success() {
         error!("tmux is not running");
         std::process::exit(1);
     }
+
+    // Create the slopd session if it doesn't exist (-A: attach if exists, -d: keep detached)
+    tmux(&config)
+        .args(["new-session", "-d", "-A", "-s", "slopd"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to create slopd tmux session");
+
+    // Mark the session with a user option so it can be identified
+    tmux(&config)
+        .args(["set-option", "-t", "slopd", "@slopd", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to set @slopd option on tmux session");
 
     let socket_path = libslop::socket_path();
     let socket_dir = socket_path.parent().unwrap();
