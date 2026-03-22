@@ -284,7 +284,7 @@ fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, S
                 for opt_line in stdout.lines() {
                     let mut words = opt_line.splitn(2, ' ');
                     let key = words.next().unwrap_or("").trim();
-                    let val = words.next().unwrap_or("").trim();
+                    let val = words.next().unwrap_or("").trim().trim_matches('"');
                     if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
                         session_id = Some(val.to_string());
                     } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
