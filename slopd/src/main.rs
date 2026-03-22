@@ -391,8 +391,10 @@ async fn handle_request(
             let mut cmd = tmux(config);
             cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                 .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())])
                 .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)]);
+            if let Some(ref custom_dir) = config.claude_config_dir {
+                cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
+            }
             // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
             // write their coverage data even when launched inside a tmux window.
             if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {

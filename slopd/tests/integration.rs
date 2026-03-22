@@ -1487,6 +1487,62 @@ fn run_from_pane_sets_parent_pane_attribute() {
 }
 
 #[test]
+fn run_does_not_set_claude_config_dir_when_not_configured() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // No claude_config_dir — slopd should not set CLAUDE_CONFIG_DIR in the pane env.
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // mock_claude starts immediately (no hook injection needed — we bypass slopctl send).
+    // Give it a moment to enter raw mode before sending keys.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Send keys directly via tmux (bypasses slopctl send / UserPromptSubmit hook).
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/env CLAUDE_CONFIG_DIR", "Enter"])
+        .status().unwrap();
+
+    // Poll pane output for the /env response.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let env_line = loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", &pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // tmux may wrap long lines; join the full output before searching.
+        let joined = text.replace('\n', "").replace('\r', "");
+        if let Some(pos) = joined.find("/env:CLAUDE_CONFIG_DIR=") {
+            break joined[pos..].split_whitespace().next().unwrap_or("").to_string();
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for /env output");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    kill_slopd(slopd);
+
+    assert_eq!(env_line, "/env:CLAUDE_CONFIG_DIR=UNSET",
+        "CLAUDE_CONFIG_DIR should not be set when no custom dir is configured");
+}
+
+#[test]
 fn run_without_tmux_pane_has_no_parent_attribute() {
     build_bin("slopd");
     build_bin("slopctl");

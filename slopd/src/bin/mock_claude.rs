@@ -129,6 +129,12 @@ fn main() {
                     unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
                     std::process::exit(code);
                 }
+                if let Some(key) = prompt.strip_prefix("/env ") {
+                    let val = std::env::var(key.trim())
+                        .unwrap_or_else(|_| "UNSET".to_string());
+                    println!("/env:{}={}", key.trim(), val);
+                    continue;
+                }
                 if prompt == "/break-stdin" {
                     break;
                 }
