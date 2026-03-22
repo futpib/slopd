@@ -26,7 +26,8 @@ pub fn build_bin(name: &str) {
 
 pub fn kill_slopd(mut child: Child) {
     // Use SIGTERM instead of SIGKILL so the process can flush LLVM coverage data on exit.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM); }
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
     child.wait().unwrap();
 }
 
