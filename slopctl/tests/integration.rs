@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
@@ -69,38 +69,57 @@ impl Drop for TmuxServer {
     }
 }
 
+struct TestEnv {
+    #[allow(dead_code)]
+    tmux: TmuxServer,
+    runtime_dir: tempfile::TempDir,
+    config_dir: tempfile::TempDir,
+}
+
+impl TestEnv {
+    fn new(executable: Option<&[&str]>) -> Option<Self> {
+        let tmux = TmuxServer::start()?;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        tmux.write_slopd_config(&config_dir, executable);
+        Some(TestEnv { tmux, runtime_dir, config_dir })
+    }
+
+    fn spawn_slopd(&self) -> Child {
+        Command::new(cargo_bin("slopd"))
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env_remove("TMUX")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn slopd")
+    }
+
+    fn slopctl(&self, args: &[&str]) -> std::process::Output {
+        Command::new(cargo_bin("slopctl"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .output()
+            .expect("failed to run slopctl")
+    }
+}
+
 #[test]
 fn status_with_slopd_running() {
     build_bin("slopd");
 
-    let Some(tmux) = TmuxServer::start() else {
+    let Some(env) = TestEnv::new(None) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
-    let runtime_dir = tempfile::tempdir().unwrap();
-    let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir, None);
-
-    let mut slopd = Command::new(cargo_bin("slopd"))
-        .env("XDG_RUNTIME_DIR", runtime_dir.path())
-        .env("XDG_CONFIG_HOME", config_dir.path())
-        .env_remove("TMUX")
-        .env_remove("TMUX_TMPDIR")
-        .env_remove("TMPDIR")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn slopd");
-
-    // Give slopd time to bind the socket
+    let mut slopd = env.spawn_slopd();
     std::thread::sleep(Duration::from_millis(100));
 
-    let output = Command::new(cargo_bin("slopctl"))
-        .arg("status")
-        .env("XDG_RUNTIME_DIR", runtime_dir.path())
-        .output()
-        .expect("failed to run slopctl");
+    let output = env.slopctl(&["status"]);
 
     slopd.kill().unwrap();
     slopd.wait().unwrap();
