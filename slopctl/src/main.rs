@@ -296,28 +296,41 @@ async fn main() {
         json.push('\n');
         writer.write_all(json.as_bytes()).await.unwrap();
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            debug!("received: {}", line);
-            let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
-                eprintln!("failed to parse response: {}", e);
-                std::process::exit(1);
-            });
-            match response.body {
-                libslop::ResponseBody::Subscribed => {}
-                libslop::ResponseBody::Event { source, event_type, pane_id, payload } => {
-                    let out = serde_json::json!({
-                        "source": source,
-                        "event_type": event_type,
-                        "pane_id": pane_id,
-                        "payload": payload,
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to install SIGTERM handler");
+
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => break,
+                result = lines.next_line() => {
+                    let line = match result {
+                        Ok(Some(line)) => line,
+                        _ => break,
+                    };
+                    debug!("received: {}", line);
+                    let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                        eprintln!("failed to parse response: {}", e);
+                        std::process::exit(1);
                     });
-                    println!("{}", out);
+                    match response.body {
+                        libslop::ResponseBody::Subscribed => {}
+                        libslop::ResponseBody::Event { source, event_type, pane_id, payload } => {
+                            let out = serde_json::json!({
+                                "source": source,
+                                "event_type": event_type,
+                                "pane_id": pane_id,
+                                "payload": payload,
+                            });
+                            println!("{}", out);
+                        }
+                        libslop::ResponseBody::Error { message } => {
+                            eprintln!("error: {}", message);
+                            std::process::exit(1);
+                        }
+                        _ => {}
+                    }
                 }
-                libslop::ResponseBody::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                _ => {}
             }
         }
         return;
