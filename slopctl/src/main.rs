@@ -22,6 +22,9 @@ enum Command {
         /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
         #[arg(long = "filter", value_name = "KEY=VALUE")]
         filters: Vec<String>,
+        /// Output as JSON array instead of table.
+        #[arg(long)]
+        json: bool,
     },
     /// Open a new Claude pane in the slopd tmux session.
     Run,
@@ -199,7 +202,7 @@ async fn main() {
         .init();
 
     // Validate filter arguments eagerly before touching the socket.
-    if let Command::Ps { ref filters } | Command::SendFiltered { ref filters, .. } = cli.command {
+    if let Command::Ps { ref filters, .. } | Command::SendFiltered { ref filters, .. } = cli.command {
         parse_filters(filters.clone());
     }
 
@@ -448,7 +451,7 @@ async fn main() {
 
     let body = match cli.command {
         Command::Status => libslop::RequestBody::Status,
-        Command::Ps { filters } => {
+        Command::Ps { filters, json } => {
             // Ps with filters: fetch all, filter client-side, print.
             let parsed = parse_filters(filters);
             let all_panes = match send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Ps).await {
@@ -463,7 +466,11 @@ async fn main() {
                 }
             };
             let panes = apply_filters(all_panes, &parsed);
-            print_ps(panes);
+            if json {
+                println!("{}", serde_json::to_string(&panes).unwrap());
+            } else {
+                print_ps(panes);
+            }
             return;
         }
         Command::Run => libslop::RequestBody::Run {
