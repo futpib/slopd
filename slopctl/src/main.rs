@@ -1,12 +1,35 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::debug;
+
+fn verbosity_to_level(verbosity: u8) -> tracing::Level {
+    match verbosity {
+        0 => tracing::Level::WARN,
+        1 => tracing::Level::INFO,
+        2 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    }
+}
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(String::as_str).unwrap_or("ping");
+    let verbosity = args.iter().filter(|a| *a == "-v").count() as u8;
+
+    let level = verbosity_to_level(verbosity);
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.as_str())),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let command = args.iter().find(|a| !a.starts_with('-') && *a != &args[0]).map(String::as_str).unwrap_or("ping");
 
     let socket_path = slop_proto::socket_path();
+    debug!("connecting to {}", socket_path.display());
 
     let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
         eprintln!("Failed to connect to {}: {}", socket_path.display(), e);
@@ -26,11 +49,13 @@ async fn main() {
 
     let request = slop_proto::Request { id: 1, body };
     let mut json = serde_json::to_string(&request).unwrap();
+    debug!("sending: {}", json);
     json.push('\n');
     writer.write_all(json.as_bytes()).await.unwrap();
 
     let mut lines = BufReader::new(reader).lines();
     if let Ok(Some(line)) = lines.next_line().await {
+        debug!("received: {}", line);
         let response: slop_proto::Response = serde_json::from_str(&line).unwrap();
         println!("{:?}", response);
     }
