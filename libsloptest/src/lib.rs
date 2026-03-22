@@ -24,11 +24,16 @@ pub fn build_bin(name: &str) {
     assert!(status.success(), "cargo build --bin {} failed", name);
 }
 
-pub fn kill_slopd(mut child: Child) {
-    // Use SIGTERM instead of SIGKILL so the process can flush LLVM coverage data on exit.
+/// Send SIGTERM and wait. Use instead of Child::kill() so instrumented binaries
+/// can flush LLVM coverage data before exiting.
+pub fn kill_child(mut child: Child) {
     let pid = nix::unistd::Pid::from_raw(child.id() as i32);
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).unwrap();
     child.wait().unwrap();
+}
+
+pub fn kill_slopd(child: Child) {
+    kill_child(child);
 }
 
 pub struct TmuxServer {

@@ -1,4 +1,4 @@
-use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
+use libsloptest::{build_bin, cargo_bin, kill_child, kill_slopd, tempfile, TestEnv};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -663,7 +663,7 @@ fn listen_no_filters_receives_all_events() {
     let mut line2 = String::new();
     reader.read_line(&mut line2).expect("failed to read second event");
 
-    listen.kill().unwrap();
+    kill_child(listen);
     kill_slopd(slopd);
 
     let ev1: serde_json::Value = serde_json::from_str(line1.trim()).expect("first event not valid JSON");
@@ -704,7 +704,7 @@ fn listen_receives_hook_event() {
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
-    listen.kill().unwrap();
+    kill_child(listen);
     kill_slopd(slopd);
 
     let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
@@ -750,7 +750,7 @@ fn listen_filters_out_non_matching_events() {
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
-    listen.kill().unwrap();
+    kill_child(listen);
     kill_slopd(slopd);
 
     let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
@@ -799,7 +799,7 @@ fn listen_by_pane_id() {
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
-    listen.kill().unwrap();
+    kill_child(listen);
     kill_slopd(slopd);
 
     let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
