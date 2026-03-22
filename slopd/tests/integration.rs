@@ -47,12 +47,32 @@ impl TmuxServer {
     }
 
     fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&[&str]>) {
+        self.write_slopd_config_full(config_dir, executable, None, None);
+    }
+
+    fn write_slopd_config_full(
+        &self,
+        config_dir: &tempfile::TempDir,
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        claude_settings: Option<&PathBuf>,
+    ) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
-        if let Some(exe) = executable {
-            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
-            config.push_str(&format!("\n[run]\nexecutable = [{}]\n", toml_array.join(", ")));
+        let has_run_section = executable.is_some() || slopctl.is_some();
+        if has_run_section {
+            config.push_str("\n[run]\n");
+            if let Some(exe) = executable {
+                let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+                config.push_str(&format!("executable = [{}]\n", toml_array.join(", ")));
+            }
+            if let Some(s) = slopctl {
+                config.push_str(&format!("slopctl = {:?}\n", s));
+            }
+        }
+        if let Some(path) = claude_settings {
+            config.push_str(&format!("\nclaude_settings = {:?}\n", path.to_str().unwrap()));
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
@@ -282,4 +302,152 @@ fn kill_terminates_pane() {
     assert!(kill_output.status.success(), "slopctl kill failed: {:?}", kill_output);
     let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
     assert_eq!(kill_stdout.trim(), pane_id, "kill should print the pane_id");
+}
+
+#[test]
+fn run_injects_hooks_into_claude_settings() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    tmux.write_slopd_config_full(
+        &config_dir,
+        Some(&["sleep", "infinity"]),
+        Some(&slopctl_path),
+        Some(&claude_settings_path),
+    );
+
+    let mut slopd = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopd");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let output = Command::new(cargo_bin("slopctl"))
+        .args(["run"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl run");
+
+    slopd.kill().unwrap();
+    slopd.wait().unwrap();
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+
+    let settings_contents = std::fs::read_to_string(&claude_settings_path)
+        .expect("settings.json was not created");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let has_our_hook = entries.iter().any(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"]
+                            .as_str()
+                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                })
+            })
+        });
+        assert!(has_our_hook, "missing slopctl hook for event {}", event);
+    }
+}
+
+#[test]
+fn run_hook_injection_is_idempotent() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    tmux.write_slopd_config_full(
+        &config_dir,
+        Some(&["sleep", "infinity"]),
+        Some(&slopctl_path),
+        Some(&claude_settings_path),
+    );
+
+    let spawn_slopd = || {
+        Command::new(cargo_bin("slopd"))
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            .env("XDG_CONFIG_HOME", config_dir.path())
+            .env_remove("TMUX")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn slopd")
+    };
+
+    // Run twice to verify idempotency
+    for _ in 0..2 {
+        let mut slopd = spawn_slopd();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let output = Command::new(cargo_bin("slopctl"))
+            .args(["run"])
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            .output()
+            .expect("failed to run slopctl run");
+
+        slopd.kill().unwrap();
+        slopd.wait().unwrap();
+
+        assert!(output.status.success(), "slopctl run failed: {:?}", output);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let settings_contents = std::fs::read_to_string(&claude_settings_path)
+        .expect("settings.json was not created");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+
+    // Each event should have exactly one entry with our hook (not duplicated)
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let our_hook_count = entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"]
+                            .as_str()
+                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                })
+            })
+        }).count();
+        assert_eq!(our_hook_count, 1, "expected exactly one slopctl hook for event {}, got {}", event, our_hook_count);
+    }
 }

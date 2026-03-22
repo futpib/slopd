@@ -131,6 +131,13 @@ async fn handle_connection(
                         libslop::ResponseBody::Hooked
                     }
                     libslop::RequestBody::Run => {
+                        let settings_path = config.claude_settings_path();
+                        if let Err(e) = libslop::inject_hooks_into_file(
+                            &settings_path,
+                            &config.run.slopctl,
+                        ) {
+                            warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+                        }
                         let output = tmux(&config)
                             .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                             .arg(config.run.executable.program())
