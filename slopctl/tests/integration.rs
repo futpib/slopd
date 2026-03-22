@@ -43,12 +43,13 @@ impl TmuxServer {
         Some(TmuxServer { tmpdir, socket })
     }
 
-    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&str>) {
+    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&[&str]>) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
         if let Some(exe) = executable {
-            config.push_str(&format!("\n[run]\nexecutable = {:?}\n", exe));
+            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+            config.push_str(&format!("\n[run]\nexecutable = [{}]\n", toml_array.join(", ")));
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }

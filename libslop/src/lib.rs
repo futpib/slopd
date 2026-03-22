@@ -27,14 +27,43 @@ pub struct SlopdTmuxConfig {
     pub socket: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Executable {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl Executable {
+    pub fn program(&self) -> &str {
+        match self {
+            Executable::String(s) => s.as_str(),
+            Executable::Array(v) => v[0].as_str(),
+        }
+    }
+
+    pub fn args(&self) -> &[String] {
+        match self {
+            Executable::String(_) => &[],
+            Executable::Array(v) => &v[1..],
+        }
+    }
+}
+
+impl Default for Executable {
+    fn default() -> Self {
+        Executable::String("claude".to_string())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdRunConfig {
-    pub executable: String,
+    pub executable: Executable,
 }
 
 impl Default for SlopdRunConfig {
     fn default() -> Self {
-        Self { executable: "claude".to_string() }
+        Self { executable: Executable::default() }
     }
 }
 

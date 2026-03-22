@@ -128,17 +128,14 @@ async fn handle_connection(
                     }
                     libslop::RequestBody::Run => {
                         let output = tmux(&config)
-                            .args([
-                                "new-window",
-                                "-t", "slopd",
-                                "-P", "-F", "#{pane_id}",
-                                config.run.executable.as_str(),
-                            ])
+                            .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+                            .arg(config.run.executable.program())
+                            .args(config.run.executable.args())
                             .output();
                         match output {
                             Ok(out) if out.status.success() => {
                                 let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                debug!("spawned {} in pane {}", config.run.executable, pane_id);
+                                debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                                 libslop::ResponseBody::Run { pane_id }
                             }
                             Ok(out) => {

@@ -43,12 +43,13 @@ impl TmuxServer {
         Some(TmuxServer { tmpdir, socket })
     }
 
-    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&str>) {
+    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&[&str]>) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
         if let Some(exe) = executable {
-            config.push_str(&format!("\n[run]\nexecutable = {:?}\n", exe));
+            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+            config.push_str(&format!("\n[run]\nexecutable = [{}]\n", toml_array.join(", ")));
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
@@ -202,7 +203,7 @@ fn run_spawns_executable_in_new_tmux_window() {
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir, Some("sleep"));
+    tmux.write_slopd_config(&config_dir, Some(&["sleep", "infinity"]));
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
@@ -243,7 +244,7 @@ fn kill_terminates_pane() {
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir, Some("sleep"));
+    tmux.write_slopd_config(&config_dir, Some(&["sleep", "infinity"]));
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
