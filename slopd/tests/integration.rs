@@ -134,6 +134,7 @@ impl TestEnv {
     }
 
     fn spawn_slopd(&self) -> Child {
+        let log = std::fs::File::create(self.runtime_dir.path().join("slopd.log")).unwrap();
         Command::new(cargo_bin("slopd"))
             .args(["-vv"])
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
@@ -142,7 +143,7 @@ impl TestEnv {
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(log)
             .spawn()
             .expect("failed to spawn slopd")
     }
@@ -220,7 +221,7 @@ fn slopd_creates_marked_tmux_session() {
         .success();
 
     let option_output = env.tmux.tmux()
-        .args(["show-options", "-t", "slopd", "-v", "@slopd_managed"])
+        .args(["show-options", "-t", "slopd", "-v", libslop::TmuxOption::SlopdManaged.as_str()])
         .output()
         .expect("failed to run tmux show-options");
     let option_value = String::from_utf8_lossy(&option_output.stdout);
@@ -229,7 +230,7 @@ fn slopd_creates_marked_tmux_session() {
     slopd.wait().unwrap();
 
     assert!(session_exists, "slopd tmux session does not exist");
-    assert_eq!(option_value.trim(), "true", "@slopd_managed option not set correctly");
+    assert_eq!(option_value.trim(), "true", "{} option not set correctly", libslop::TmuxOption::SlopdManaged.as_str());
 }
 
 #[test]
@@ -312,6 +313,9 @@ fn run_injects_hooks_into_claude_settings() {
 
     slopd.kill().unwrap();
     slopd.wait().unwrap();
+
+    let slopd_log = std::fs::read_to_string(env.runtime_dir.path().join("slopd.log")).unwrap_or_default();
+    eprintln!("slopd log:\n{}", slopd_log);
 
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
@@ -420,11 +424,11 @@ fn session_start_hook_stores_session_id_on_pane() {
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
-    // Poll until @slopd_claude_session_id is set on the pane (mock_claude fires the hook then exits)
+    // Poll until SlopdClaudeSessionId is set on the pane (mock_claude fires the hook then exits)
     let deadline = Instant::now() + Duration::from_secs(5);
     let session_id = loop {
         let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", "@slopd_claude_session_id"])
+            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
             .output()
             .expect("failed to run tmux show-options");
         let val = String::from_utf8_lossy(&out.stdout).trim().to_string();

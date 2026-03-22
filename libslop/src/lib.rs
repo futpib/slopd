@@ -18,6 +18,22 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().expect("could not determine home dir")
 }
 
+pub enum TmuxOption {
+    /// Marks the slopd-managed tmux session; value is "true"
+    SlopdManaged,
+    /// Stores the Claude session ID on a pane
+    SlopdClaudeSessionId,
+}
+
+impl TmuxOption {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TmuxOption::SlopdManaged => "@slopd_managed",
+            TmuxOption::SlopdClaudeSessionId => "@slopd_claude_session_id",
+        }
+    }
+}
+
 pub const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",

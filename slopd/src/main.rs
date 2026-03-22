@@ -59,7 +59,7 @@ async fn main() {
 
     // Mark the session with a user option so it can be identified
     tmux(&config)
-        .args(["set-option", "-t", "slopd", "@slopd_managed", "true"])
+        .args(["set-option", "-t", "slopd", libslop::TmuxOption::SlopdManaged.as_str(), "true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -140,7 +140,7 @@ async fn handle_connection(
                                         "-t",
                                         pane,
                                         "-p",
-                                        "@slopd_claude_session_id",
+                                        libslop::TmuxOption::SlopdClaudeSessionId.as_str(),
                                         session_id,
                                     ])
                                     .stdout(std::process::Stdio::null())
