@@ -1,109 +1,5 @@
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::time::Duration;
-
-fn cargo_bin(name: &str) -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join(name)
-}
-
-fn build_bin(name: &str) {
-    if cfg!(coverage) {
-        return;
-    }
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", name, "--bin", name])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(status.success(), "cargo build --bin {} failed", name);
-}
-
-struct TmuxServer {
-    #[allow(dead_code)]
-    tmpdir: tempfile::TempDir,
-    socket: PathBuf,
-}
-
-impl TmuxServer {
-    fn start() -> Option<Self> {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let socket = tmpdir.path().join("tmux.sock");
-        let result = Command::new("tmux")
-            .args(["-S", socket.to_str().unwrap(), "new-session", "-d", "-s", "test"])
-            .env_remove("TMUX")
-            .env_remove("TMUX_TMPDIR")
-            .env_remove("TMPDIR")
-            .status();
-        match result {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => panic!("failed to start tmux: {}", e),
-            Ok(status) => assert!(status.success(), "failed to start tmux server"),
-        }
-        Some(TmuxServer { tmpdir, socket })
-    }
-
-    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&[&str]>) {
-        let slopd_config_dir = config_dir.path().join("slopd");
-        std::fs::create_dir_all(&slopd_config_dir).unwrap();
-        let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
-        if let Some(exe) = executable {
-            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
-            config.push_str(&format!("\n[run]\nexecutable = [{}]\n", toml_array.join(", ")));
-        }
-        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
-    }
-}
-
-impl Drop for TmuxServer {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-S", self.socket.to_str().unwrap(), "kill-server"])
-            .env_remove("TMUX")
-            .env_remove("TMUX_TMPDIR")
-            .env_remove("TMPDIR")
-            .status();
-    }
-}
-
-struct TestEnv {
-    #[allow(dead_code)]
-    tmux: TmuxServer,
-    runtime_dir: tempfile::TempDir,
-    config_dir: tempfile::TempDir,
-}
-
-impl TestEnv {
-    fn new(executable: Option<&[&str]>) -> Option<Self> {
-        let tmux = TmuxServer::start()?;
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config(&config_dir, executable);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
-    }
-
-    fn spawn_slopd(&self) -> Child {
-        Command::new(cargo_bin("slopd"))
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
-            .env("XDG_CONFIG_HOME", self.config_dir.path())
-            .env_remove("TMUX")
-            .env_remove("TMUX_TMPDIR")
-            .env_remove("TMPDIR")
-            .spawn()
-            .expect("failed to spawn slopd")
-    }
-
-    fn slopctl(&self, args: &[&str]) -> std::process::Output {
-        Command::new(cargo_bin("slopctl"))
-            .args(args)
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
-            .output()
-            .expect("failed to run slopctl")
-    }
-}
+use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
+use std::process::Command;
 
 #[test]
 fn status_with_slopd_running() {
@@ -114,13 +10,11 @@ fn status_with_slopd_running() {
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let output = env.slopctl(&["status"]);
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(output.status.success(), "slopctl exited with failure: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);

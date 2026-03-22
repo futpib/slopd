@@ -319,6 +319,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsloptest"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libslop",
+ "tempfile",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -594,8 +603,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "libslop",
+ "libsloptest",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -606,10 +615,9 @@ name = "slopd"
 version = "0.1.0"
 dependencies = [
  "dashmap",
- "libc",
  "libslop",
+ "libsloptest",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

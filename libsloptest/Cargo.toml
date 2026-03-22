@@ -1,0 +1,12 @@
+[package]
+name = "libsloptest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libslop = { path = "../libslop" }
+tempfile = "3.27.0"
+libc = "0.2.183"
+
+[lints]
+workspace = true

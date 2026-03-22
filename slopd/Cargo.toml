@@ -12,10 +12,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 dashmap = "6.1.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+libsloptest = { path = "../libsloptest" }
 libslop = { path = "../libslop" }
 serde_json = "1"
-libc = "0.2.183"
 
 [lints]
 workspace = true

@@ -166,6 +166,8 @@ impl Default for Executable {
     }
 }
 
+
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdRunConfig {
     pub executable: Executable,
