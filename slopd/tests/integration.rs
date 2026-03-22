@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -20,47 +21,52 @@ fn build_bin(name: &str) {
 
 struct TmuxServer {
     tmpdir: tempfile::TempDir,
+    socket: PathBuf,
 }
 
 impl TmuxServer {
     fn start() -> Option<Self> {
         let tmpdir = tempfile::tempdir().unwrap();
+        let socket = tmpdir.path().join("tmux.sock");
         let result = Command::new("tmux")
-            .args(["-S", "default", "new-session", "-d", "-s", "test"])
+            .args(["-S", socket.to_str().unwrap(), "new-session", "-d", "-s", "test"])
             .env_remove("TMUX")
-            .env("TMUX_TMPDIR", tmpdir.path())
-            .env("TMPDIR", tmpdir.path())
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
             .status();
         match result {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => panic!("failed to start tmux: {}", e),
             Ok(status) => assert!(status.success(), "failed to start tmux server"),
         }
-        Some(TmuxServer { tmpdir })
+        Some(TmuxServer { tmpdir, socket })
     }
 
+    // Sets env vars so that slopd's `tmux list-sessions` (no -S flag) finds this server.
     fn apply(&self, cmd: &mut Command) {
         cmd.env_remove("TMUX")
             .env("TMUX_TMPDIR", self.tmpdir.path())
-            .env("TMPDIR", self.tmpdir.path());
+            .env_remove("TMPDIR");
     }
 }
 
 impl Drop for TmuxServer {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
-            .args(["-S", "default", "kill-server"])
+            .args(["-S", self.socket.to_str().unwrap(), "kill-server"])
             .env_remove("TMUX")
-            .env("TMUX_TMPDIR", self.tmpdir.path())
-            .env("TMPDIR", self.tmpdir.path())
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
             .status();
     }
 }
 
-fn isolated_no_tmux(cmd: &mut Command, tmpdir: &tempfile::TempDir) {
-    cmd.env_remove("TMUX")
-        .env("TMUX_TMPDIR", tmpdir.path())
-        .env("TMPDIR", tmpdir.path());
+fn tmux_available() -> bool {
+    match Command::new("tmux").arg("-V").status() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("unexpected error checking for tmux: {}", e),
+        Ok(_) => true,
+    }
 }
 
 #[test]
@@ -95,25 +101,23 @@ fn slopd_starts_with_tmux_running() {
 fn slopd_fails_without_tmux_running() {
     build_bin("slopd");
 
-    match Command::new("tmux").arg("-V").status() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skipping: tmux not found");
-            return;
-        }
-        Err(e) => panic!("unexpected error checking for tmux: {}", e),
-        Ok(_) => {}
+    if !tmux_available() {
+        eprintln!("skipping: tmux not found");
+        return;
     }
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let tmux_tmpdir = tempfile::tempdir().unwrap();
 
-    let mut cmd = Command::new(cargo_bin("slopd"));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir.path())
+    let status = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env_remove("TMUX")
+        .env("TMUX_TMPDIR", tmux_tmpdir.path())
+        .env_remove("TMPDIR")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    isolated_no_tmux(&mut cmd, &tmux_tmpdir);
-
-    let status = cmd.status().expect("failed to run slopd");
+        .stderr(Stdio::null())
+        .status()
+        .expect("failed to run slopd");
 
     assert!(!status.success(), "slopd should have failed without tmux");
 }
