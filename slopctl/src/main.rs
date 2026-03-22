@@ -38,13 +38,26 @@ enum Command {
         /// Hook event name (e.g. UserPromptSubmit).
         event: String,
     },
-    /// Type a prompt into a pane and wait for UserPromptSubmit confirmation.
+    /// Type a prompt into pane(s) and wait for UserPromptSubmit confirmation.
+    #[command(group(
+        clap::ArgGroup::new("target")
+            .required(true)
+            .args(["pane_id", "filters"])
+    ))]
     Send {
-        /// Tmux pane ID (e.g. %42).
-        pane_id: String,
         /// Prompt text to send.
+        #[arg(index = 1)]
         prompt: String,
-        /// Seconds to wait for UserPromptSubmit confirmation.
+        /// Tmux pane ID (e.g. %42). Mutually exclusive with --filter.
+        #[arg(index = 2, conflicts_with = "filters")]
+        pane_id: Option<String>,
+        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filters: Vec<String>,
+        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
+        #[arg(long, default_value = "one")]
+        select: SelectMode,
+        /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
     },
@@ -83,20 +96,6 @@ enum Command {
     Tags {
         /// Tmux pane ID (e.g. %42).
         pane_id: String,
-    },
-    /// Type a prompt into all panes matching a filter.
-    SendFiltered {
-        /// Prompt text to send.
-        prompt: String,
-        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
-        #[arg(long = "filter", value_name = "KEY=VALUE")]
-        filters: Vec<String>,
-        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
-        #[arg(long, default_value = "one")]
-        select: SelectMode,
-        /// Seconds to wait for UserPromptSubmit confirmation per pane.
-        #[arg(long, default_value = "60")]
-        timeout: u64,
     },
 }
 
@@ -202,7 +201,7 @@ async fn main() {
         .init();
 
     // Validate filter arguments eagerly before touching the socket.
-    if let Command::Ps { ref filters, .. } | Command::SendFiltered { ref filters, .. } = cli.command {
+    if let Command::Ps { ref filters, .. } | Command::Send { ref filters, .. } = cli.command {
         parse_filters(filters.clone());
     }
 
@@ -339,8 +338,8 @@ async fn main() {
         return;
     }
 
-    // Client-side filter resolution for SendFiltered: query Ps first, then Send per pane.
-    if let Command::SendFiltered { prompt, filters, select, timeout } = cli.command {
+    // Client-side filter resolution for Send with filters: query Ps first, then Send per pane.
+    if let Command::Send { prompt, pane_id: None, filters, select, timeout } = cli.command {
         let parsed = parse_filters(filters);
         let filter_desc = parsed.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
 
@@ -477,12 +476,12 @@ async fn main() {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
-        Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
+        Command::Send { pane_id: Some(pane_id), prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
         Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
-        Command::Hook { .. } | Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
+        Command::Hook { .. } | Command::Listen { .. } | Command::Send { pane_id: None, .. } => unreachable!(),
     };
 
     match send_request(&mut writer, &mut lines, 1, body).await {

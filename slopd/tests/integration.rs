@@ -356,7 +356,7 @@ fn send_delivers_prompt_to_pane() {
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
-    let send_output = env.slopctl(&["send", &pane_id, "hello from test"]);
+    let send_output = env.slopctl(&["send", "hello from test", &pane_id]);
 
     kill_slopd(slopd);
 
@@ -398,7 +398,7 @@ fn send_concurrent_all_delivered() {
             let env = env.clone();
             let pane_id = pane_id.clone();
             std::thread::spawn(move || {
-                env.slopctl(&["send", &pane_id, &format!("prompt {}", i)])
+                env.slopctl(&["send", &format!("prompt {}", i), &pane_id])
             })
         })
         .collect();
@@ -589,7 +589,7 @@ fn send_to_nonexistent_pane_returns_error() {
 
     let slopd = env.spawn_slopd();
 
-    let output = env.slopctl(&["send", "%999", "hello"]);
+    let output = env.slopctl(&["send", "hello", "%999"]);
 
     kill_slopd(slopd);
 
@@ -647,7 +647,7 @@ fn send_to_pane_with_broken_hooks_times_out() {
 
     // This send reaches a live pane (send-keys succeeds) but UserPromptSubmit will never fire.
     // Pass a short --timeout so slopd returns an error quickly rather than the test hanging.
-    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
+    let output = env.slopctl(&["send", "--timeout", "2", "hello", &pane_id]);
 
     kill_slopd(slopd);
 
@@ -674,7 +674,7 @@ fn send_timeout_fires_on_non_hook_pane() {
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
     let start = Instant::now();
-    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
+    let output = env.slopctl(&["send", "--timeout", "2", "hello", &pane_id]);
     let elapsed = start.elapsed();
 
     kill_slopd(slopd);
@@ -1087,11 +1087,11 @@ fn send_filtered_one_match() {
     let tag_out = env.slopctl(&["tag", &pane_id, "mytarget"]);
     assert!(tag_out.status.success());
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=mytarget", "hello from filter"]);
+    let send_out = env.slopctl(&["send", "--filter", "tag=mytarget", "hello from filter"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send failed: {:?}", send_out);
     assert_eq!(String::from_utf8_lossy(&send_out.stdout).trim(), pane_id);
 }
 
@@ -1107,11 +1107,11 @@ fn send_filtered_one_errors_on_zero_matches() {
 
     let slopd = env.spawn_slopd();
 
-    let out = env.slopctl(&["send-filtered", "--filter", "tag=nonexistent", "hello"]);
+    let out = env.slopctl(&["send", "--filter", "tag=nonexistent", "hello"]);
 
     kill_slopd(slopd);
 
-    assert!(!out.status.success(), "send-filtered should fail with no matches");
+    assert!(!out.status.success(), "send should fail with no matches");
 }
 
 #[test]
@@ -1132,11 +1132,11 @@ fn send_filtered_one_errors_on_multiple_matches() {
     env.slopctl(&["tag", &pane1, "shared"]);
     env.slopctl(&["tag", &pane2, "shared"]);
 
-    let out = env.slopctl(&["send-filtered", "--filter", "tag=shared", "hello"]);
+    let out = env.slopctl(&["send", "--filter", "tag=shared", "hello"]);
 
     kill_slopd(slopd);
 
-    assert!(!out.status.success(), "send-filtered --select one should fail with 2 matches");
+    assert!(!out.status.success(), "send --select one should fail with 2 matches");
 }
 
 #[test]
@@ -1180,11 +1180,11 @@ fn send_filtered_all_sends_to_all_matching() {
     env.slopctl(&["tag", &pane1, "broadcast"]);
     env.slopctl(&["tag", &pane2, "broadcast"]);
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=broadcast", "--select", "all", "hello all"]);
+    let send_out = env.slopctl(&["send", "--filter", "tag=broadcast", "--select", "all", "hello all"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered --select all failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send --select all failed: {:?}", send_out);
     let stdout = String::from_utf8_lossy(&send_out.stdout);
     assert!(stdout.contains(&pane1), "output missing pane1 {}: {}", pane1, stdout);
     assert!(stdout.contains(&pane2), "output missing pane2 {}: {}", pane2, stdout);
@@ -1230,11 +1230,11 @@ fn send_filtered_any_sends_to_exactly_one_pane() {
     env.slopctl(&["tag", &pane1, "anytarget"]);
     env.slopctl(&["tag", &pane2, "anytarget"]);
 
-    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=anytarget", "--select", "any", "hello any"]);
+    let send_out = env.slopctl(&["send", "--filter", "tag=anytarget", "--select", "any", "hello any"]);
 
     kill_slopd(slopd);
 
-    assert!(send_out.status.success(), "send-filtered --select any failed: {:?}", send_out);
+    assert!(send_out.status.success(), "send --select any failed: {:?}", send_out);
     let stdout = String::from_utf8_lossy(&send_out.stdout);
     // Exactly one pane ID should appear in the output.
     let count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
@@ -1270,7 +1270,7 @@ fn ps_filter_shows_only_matching_panes() {
     assert!(!stdout.contains(&pane2), "filtered ps should not show untagged pane");
 }
 
-/// Verify that send-filtered delivers to N panes concurrently: total wall time
+/// Verify that send with --select all delivers to N panes concurrently: total wall time
 /// must be less than 2x the single-pane round-trip, not N times it.
 #[test]
 fn send_filtered_all_is_concurrent() {
@@ -1319,26 +1319,26 @@ fn send_filtered_all_is_concurrent() {
 
     // Measure a single send to one pane to establish a baseline.
     let baseline_start = Instant::now();
-    let single = env.slopctl(&["send", &pane_ids[0], "baseline"]);
+    let single = env.slopctl(&["send", "baseline", &pane_ids[0]]);
     assert!(single.status.success());
     let baseline = baseline_start.elapsed();
 
-    // Now send-filtered to all N panes and measure wall time.
+    // Now send with filters to all N panes and measure wall time.
     let all_start = Instant::now();
-    let all_out = env.slopctl(&["send-filtered", "--filter", "tag=concurrent",
+    let all_out = env.slopctl(&["send", "--filter", "tag=concurrent",
                                 "--select", "all", "hello concurrent"]);
     let all_elapsed = all_start.elapsed();
 
     kill_slopd(slopd);
 
-    assert!(all_out.status.success(), "send-filtered failed: {:?}", all_out);
+    assert!(all_out.status.success(), "send failed: {:?}", all_out);
 
     // All N panes received. Wall time should be well under N * baseline.
     // We allow 2x baseline as headroom for scheduling jitter.
     let limit = baseline * 2 + Duration::from_millis(500);
     assert!(
         all_elapsed < limit,
-        "send-filtered to {} panes took {:?}, expected < {:?} (baseline {:?}); \
+        "send to {} panes took {:?}, expected < {:?} (baseline {:?}); \
          sends are likely sequential not concurrent",
         N, all_elapsed, limit, baseline,
     );
@@ -1388,12 +1388,12 @@ fn help_hook_missing_event() {
 
 #[test]
 fn help_send_missing_args() {
-    assert_invalid_usage(&["send"], "<PANE_ID>");
+    assert_invalid_usage(&["send"], "<PROMPT>");
 }
 
 #[test]
-fn help_send_missing_prompt() {
-    assert_invalid_usage(&["send", "%1"], "<PROMPT>");
+fn help_send_missing_pane_id_or_filter() {
+    assert_invalid_usage(&["send", "my prompt"], "PANE_ID");
 }
 
 #[test]
@@ -1427,15 +1427,15 @@ fn help_tags_missing_pane_id() {
 }
 
 #[test]
-fn help_send_filtered_missing_prompt() {
-    assert_invalid_usage(&["send-filtered"], "<PROMPT>");
+fn help_send_with_filter_missing_prompt() {
+    assert_invalid_usage(&["send", "--filter", "tag=foo"], "<PROMPT>");
 }
 
 #[test]
-fn help_send_filtered_unknown_filter_key() {
+fn help_send_unknown_filter_key() {
     build_bin("slopctl");
     let out = Command::new(cargo_bin("slopctl"))
-        .args(["send-filtered", "--filter", "foo=bar", "hello"])
+        .args(["send", "--filter", "foo=bar", "hello"])
         .output()
         .expect("failed to run slopctl");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1484,7 +1484,7 @@ fn run_from_pane_sets_parent_pane_attribute() {
 
     // Ask mock_claude to spawn a child. TMUX_PANE is set by tmux in mock_claude's
     // environment, so the child gets @slopd_parent_pane set automatically.
-    let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
+    let send_out = env.slopctl(&["send", "/run", &parent_pane]);
     assert!(send_out.status.success(), "slopctl send /run failed: {:?}", send_out);
 
     // mock_claude prints "/run:<child_pane_id>" to the pane; capture it.

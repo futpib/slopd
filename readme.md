@@ -177,14 +177,30 @@ Terminate a Claude pane.
 slopctl kill %2
 ```
 
-### `slopctl send <PANE_ID> <PROMPT> [--timeout SECS]`
+### `slopctl send <PROMPT> <PANE_ID> [--timeout SECS]`
+### `slopctl send <PROMPT> --filter KEY=VALUE [--select one|any|all] [--timeout SECS]`
 
-Type `PROMPT` into a pane and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout.
+Type `PROMPT` into a pane (or panes matching a filter) and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout.
 
 ```bash
-slopctl send %1 "Summarize this file: README.md"
-slopctl send %1 "Run the tests" --timeout 10
+# Send to a specific pane
+slopctl send "Summarize this file: README.md" %1
+slopctl send "Run the tests" %1 --timeout 10
+
+# Send to all panes tagged "worker"
+slopctl send "Report your status" --filter tag=worker --select all
+
+# Send to any one pane tagged "idle"
+slopctl send "Start task X" --filter tag=idle --select one
 ```
+
+`--select` values (only used with `--filter`):
+
+| Value | Behaviour |
+|-------|-----------|
+| `one` (default) | Exactly one matching pane must exist; error otherwise |
+| `any` | Send to one arbitrarily chosen matching pane |
+| `all` | Send to all matching panes |
 
 ### `slopctl interrupt <PANE_ID>`
 
@@ -240,26 +256,6 @@ slopctl tags %1
 # prod
 # web
 ```
-
-### `slopctl send-filtered <PROMPT> --filter KEY=VALUE [--select one|any|all] [--timeout SECS]`
-
-Send a prompt to every pane that matches the given filter.
-
-```bash
-# Send to all panes tagged "worker"
-slopctl send-filtered "Report your status" --filter tag=worker --select all
-
-# Send to any one pane tagged "idle"
-slopctl send-filtered "Start task X" --filter tag=idle --select one
-```
-
-`--select` values:
-
-| Value | Behaviour |
-|-------|-----------|
-| `one` (default) | Exactly one matching pane must exist; error otherwise |
-| `any` | Send to one arbitrarily chosen matching pane |
-| `all` | Send to all matching panes |
 
 ---
 
