@@ -1,6 +1,7 @@
 use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Fire a hook event by calling slopctl hook with the given JSON payload on stdin.

@@ -272,7 +272,10 @@ async fn handle_request(
                 .args(["kill-pane", "-t", &pane_id])
                 .output();
             match output {
-                Ok(out) if out.status.success() => libslop::ResponseBody::Kill { pane_id },
+                Ok(out) if out.status.success() => {
+                    panes.remove(&pane_id);
+                    libslop::ResponseBody::Kill { pane_id }
+                }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     libslop::ResponseBody::Error { message: stderr }
