@@ -1,41 +1,71 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn main() {
-    let session_id = "mock-session-id-1234";
+/// Run all command hooks registered for the given event, passing payload as JSON on stdin.
+/// Mirrors real Claude's hook execution: each command is run via `sh -c` in a non-interactive
+/// shell with the JSON payload on stdin.
+fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::Value) {
+    let Some(entries) = settings["hooks"][event].as_array() else {
+        return;
+    };
+    for entry in entries {
+        let Some(hooks) = entry["hooks"].as_array() else {
+            continue;
+        };
+        for hook in hooks {
+            if hook["type"] != "command" {
+                continue;
+            }
+            let Some(command) = hook["command"].as_str() else {
+                continue;
+            };
+            let mut child = Command::new("sh")
+                .args(["-c", command])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| {
+                    eprintln!("mock_claude: failed to spawn hook {:?}: {}", command, e);
+                    std::process::exit(1);
+                });
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .expect("failed to write hook payload to stdin");
+            let status = child.wait().expect("failed to wait for hook");
+            if !status.success() {
+                eprintln!("mock_claude: hook {:?} exited with {:?}", command, status);
+            }
+        }
+    }
+}
 
-    let payload = serde_json::json!({
-        "session_id": session_id,
-        "hook_event_name": "SessionStart",
-        "transcript_path": "/dev/null",
-        "cwd": std::env::current_dir().unwrap_or_default(),
-        "source": "startup",
-        "model": "mock"
+fn main() {
+    // Real Claude reads ~/.claude/settings.json. We support CLAUDE_SETTINGS as a test seam
+    // since there is no reliable official env var to redirect Claude's config directory.
+    let settings_path = std::env::var("CLAUDE_SETTINGS").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/.claude/settings.json", home)
     });
 
-    let slopctl = std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
+    let settings: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
 
-    let mut child = Command::new(&slopctl)
-        .args(["hook", "SessionStart"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("mock_claude: failed to spawn slopctl: {}", e);
-            std::process::exit(1);
-        });
+    let session_id = "mock-session-id-1234";
 
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin
-        .write_all(payload.to_string().as_bytes())
-        .expect("failed to write to slopctl stdin");
-    drop(child.stdin.take());
-
-    let status = child.wait().expect("failed to wait for slopctl");
-    if !status.success() {
-        eprintln!("mock_claude: slopctl hook SessionStart failed: {:?}", status);
-        std::process::exit(1);
-    }
-
-    // Keep the pane alive so the test can read the pane option before the pane closes
-    std::thread::sleep(std::time::Duration::from_secs(10));
+    fire_hooks(
+        &settings,
+        "SessionStart",
+        &serde_json::json!({
+            "session_id": session_id,
+            "hook_event_name": "SessionStart",
+            "transcript_path": "/dev/null",
+            "cwd": std::env::current_dir().unwrap_or_default(),
+            "source": "startup",
+            "model": "mock"
+        }),
+    );
 }
