@@ -7,3 +7,6 @@ edition = "2024"
 slop-proto = { path = "../slop-proto" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
