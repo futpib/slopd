@@ -1,0 +1,9 @@
+[package]
+name = "slopd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+slop-proto = { path = "../slop-proto" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

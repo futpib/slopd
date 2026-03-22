@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "slopd",
+    "slopctl",
+    "slop-proto",
+]
+resolver = "2"
