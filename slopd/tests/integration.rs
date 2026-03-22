@@ -806,3 +806,173 @@ fn tag_invalid_name_returns_error() {
 
     assert!(!out.status.success(), "slopctl tag should fail for invalid tag name");
 }
+
+#[test]
+fn send_filtered_one_match() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for SessionStart.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let tag_out = env.slopctl(&["tag", &pane_id, "mytarget"]);
+    assert!(tag_out.status.success());
+
+    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=mytarget", "hello from filter"]);
+
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send-filtered failed: {:?}", send_out);
+    assert_eq!(String::from_utf8_lossy(&send_out.stdout).trim(), pane_id);
+}
+
+#[test]
+fn send_filtered_one_errors_on_zero_matches() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["send-filtered", "--filter", "tag=nonexistent", "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "send-filtered should fail with no matches");
+}
+
+#[test]
+fn send_filtered_one_errors_on_multiple_matches() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+
+    env.slopctl(&["tag", &pane1, "shared"]);
+    env.slopctl(&["tag", &pane2, "shared"]);
+
+    let out = env.slopctl(&["send-filtered", "--filter", "tag=shared", "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "send-filtered --select one should fail with 2 matches");
+}
+
+#[test]
+fn send_filtered_all_sends_to_all_matching() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+
+    // Wait for both panes to be ready.
+    for pane_id in &[&pane1, &pane2] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = env.tmux.tmux()
+                .args(["show-options", "-t", pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+                .output().unwrap();
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    env.slopctl(&["tag", &pane1, "broadcast"]);
+    env.slopctl(&["tag", &pane2, "broadcast"]);
+
+    let send_out = env.slopctl(&["send-filtered", "--filter", "tag=broadcast", "--select", "all", "hello all"]);
+
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send-filtered --select all failed: {:?}", send_out);
+    let stdout = String::from_utf8_lossy(&send_out.stdout);
+    assert!(stdout.contains(&pane1), "output missing pane1 {}: {}", pane1, stdout);
+    assert!(stdout.contains(&pane2), "output missing pane2 {}: {}", pane2, stdout);
+}
+
+#[test]
+fn ps_filter_shows_only_matching_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+
+    env.slopctl(&["tag", &pane1, "visible"]);
+
+    let ps_out = env.slopctl(&["ps", "--filter", "tag=visible"]);
+
+    kill_slopd(slopd);
+
+    assert!(ps_out.status.success(), "ps --filter failed: {:?}", ps_out);
+    let stdout = String::from_utf8_lossy(&ps_out.stdout);
+    assert!(stdout.contains(&pane1), "filtered ps missing tagged pane");
+    assert!(!stdout.contains(&pane2), "filtered ps should not show untagged pane");
+}

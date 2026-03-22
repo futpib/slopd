@@ -17,7 +17,12 @@ struct Cli {
 enum Command {
     Ping,
     Status,
-    Ps,
+    /// List panes in the slopd session.
+    Ps {
+        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filters: Vec<String>,
+    },
     Run,
     Kill {
         pane_id: String,
@@ -62,6 +67,29 @@ enum Command {
     Tags {
         pane_id: String,
     },
+    /// Send a prompt to panes selected by filters.
+    SendFiltered {
+        prompt: String,
+        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
+        #[arg(long = "filter", value_name = "KEY=VALUE")]
+        filters: Vec<String>,
+        /// How to select among matching panes: one (default), any, all.
+        #[arg(long, default_value = "one")]
+        select: SelectMode,
+        /// Seconds to wait for UserPromptSubmit confirmation per pane (default: 60).
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum SelectMode {
+    /// Require exactly one matching pane; error otherwise.
+    One,
+    /// Pick one at random from matches; error if none.
+    Any,
+    /// Send to all matching panes; error if none.
+    All,
 }
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
@@ -70,6 +98,69 @@ fn verbosity_to_level(verbosity: u8) -> tracing::Level {
         1 => tracing::Level::INFO,
         2 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
+    }
+}
+
+/// Parse "key=value" filter strings and exit on malformed input.
+fn parse_filters(raw: Vec<String>) -> Vec<(String, String)> {
+    raw.into_iter().map(|f| {
+        match f.split_once('=') {
+            Some((k, v)) => {
+                if k != "tag" {
+                    eprintln!("unknown filter key {:?}: only 'tag' is supported", k);
+                    std::process::exit(1);
+                }
+                (k.to_string(), v.to_string())
+            }
+            None => {
+                eprintln!("invalid filter {:?}: expected key=value", f);
+                std::process::exit(1);
+            }
+        }
+    }).collect()
+}
+
+/// Apply parsed filters to a pane list. AND semantics: pane must satisfy all filters.
+fn apply_filters(panes: Vec<libslop::PaneInfo>, filters: &[(String, String)]) -> Vec<libslop::PaneInfo> {
+    if filters.is_empty() {
+        return panes;
+    }
+    panes.into_iter().filter(|pane| {
+        filters.iter().all(|(key, value)| {
+            match key.as_str() {
+                "tag" => pane.tags.iter().any(|t| t == value),
+                _ => false,
+            }
+        })
+    }).collect()
+}
+
+async fn send_request(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    body: libslop::RequestBody,
+) -> libslop::ResponseBody {
+    let request = libslop::Request { id: 1, body };
+    let mut json = serde_json::to_string(&request).unwrap();
+    debug!("sending: {}", json);
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await.unwrap_or_else(|e| {
+        eprintln!("failed to send request: {}", e);
+        std::process::exit(1);
+    });
+    match lines.next_line().await {
+        Ok(Some(line)) => {
+            debug!("received: {}", line);
+            let response: libslop::Response = serde_json::from_str(&line).unwrap_or_else(|e| {
+                eprintln!("failed to parse response: {}", e);
+                std::process::exit(1);
+            });
+            response.body
+        }
+        _ => {
+            eprintln!("connection closed unexpectedly");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -157,10 +248,107 @@ async fn main() {
         return;
     }
 
+    // Client-side filter resolution for SendFiltered: query Ps first, then Send per pane.
+    if let Command::SendFiltered { prompt, filters, select, timeout } = cli.command {
+        let parsed = parse_filters(filters);
+        let filter_desc = parsed.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
+
+        let all_panes = match send_request(&mut writer, &mut lines, libslop::RequestBody::Ps).await {
+            libslop::ResponseBody::Ps { panes } => panes,
+            libslop::ResponseBody::Error { message } => {
+                eprintln!("error: {}", message);
+                std::process::exit(1);
+            }
+            other => {
+                eprintln!("unexpected response: {:?}", other);
+                std::process::exit(1);
+            }
+        };
+
+        let matched = apply_filters(all_panes, &parsed);
+
+        let target_pane_ids: Vec<String> = match select {
+            SelectMode::One => {
+                if matched.len() != 1 {
+                    eprintln!(
+                        "error: expected exactly one pane matching {}, found {}",
+                        filter_desc, matched.len()
+                    );
+                    std::process::exit(1);
+                }
+                vec![matched.into_iter().next().unwrap().pane_id]
+            }
+            SelectMode::Any => {
+                if matched.is_empty() {
+                    eprintln!("error: no panes match filter {}", filter_desc);
+                    std::process::exit(1);
+                }
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let idx = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as usize % matched.len();
+                vec![matched.into_iter().nth(idx).unwrap().pane_id]
+            }
+            SelectMode::All => {
+                if matched.is_empty() {
+                    eprintln!("error: no panes match filter {}", filter_desc);
+                    std::process::exit(1);
+                }
+                matched.into_iter().map(|p| p.pane_id).collect()
+            }
+        };
+
+        // Reconnect for each Send — each Send needs its own request/response cycle.
+        // We already used the connection for Ps, so open fresh connections for sends.
+        for pane_id in target_pane_ids {
+            let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
+                eprintln!("Failed to connect to {}: {}", socket_path.display(), e);
+                std::process::exit(1);
+            });
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let body = libslop::RequestBody::Send {
+                pane_id: pane_id.clone(),
+                prompt: prompt.clone(),
+                timeout_secs: timeout,
+            };
+            match send_request(&mut writer, &mut lines, body).await {
+                libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
+                libslop::ResponseBody::Error { message } => {
+                    eprintln!("error sending to {}: {}", pane_id, message);
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("unexpected response for {}: {:?}", pane_id, other);
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+
     let body = match cli.command {
         Command::Ping => libslop::RequestBody::Ping,
         Command::Status => libslop::RequestBody::Status,
-        Command::Ps => libslop::RequestBody::Ps,
+        Command::Ps { filters } => {
+            // Ps with filters: fetch all, filter client-side, print.
+            let parsed = parse_filters(filters);
+            let all_panes = match send_request(&mut writer, &mut lines, libslop::RequestBody::Ps).await {
+                libslop::ResponseBody::Ps { panes } => panes,
+                libslop::ResponseBody::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+            };
+            let panes = apply_filters(all_panes, &parsed);
+            print_ps(panes);
+            return;
+        }
         Command::Run => libslop::RequestBody::Run,
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
         Command::Hook { event } => {
@@ -178,7 +366,7 @@ async fn main() {
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
         Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
-        Command::Listen { .. } => unreachable!(),
+        Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
     };
 
     let request = libslop::Request { id: 1, body };
@@ -191,35 +379,7 @@ async fn main() {
         debug!("received: {}", line);
         let response: libslop::Response = serde_json::from_str(&line).unwrap();
         match response.body {
-            libslop::ResponseBody::Ps { panes } => {
-                let now = std::time::SystemTime::now();
-
-                let fmt = timeago::Formatter::new();
-                let rows: Vec<(String, String, String, String)> = panes.iter().map(|p| {
-                    let age = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
-                        .saturating_sub(std::time::Duration::from_secs(p.created_at));
-                    let created = fmt.convert(age);
-                    let session = p.session_id.as_deref().unwrap_or("-").to_string();
-                    let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
-                    (p.pane_id.clone(), created, session, tags)
-                }).collect();
-
-                // Compute column widths.
-                let pane_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
-                let created_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(7);
-                let session_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
-                let tags_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(4);
-
-                println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
-                    "PANE", "CREATED", "SESSION", "TAGS",
-                    pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
-
-                for (pane_id, created, session, tags) in &rows {
-                    println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
-                        pane_id, created, session, tags,
-                        pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
-                }
-            }
+            libslop::ResponseBody::Ps { panes } => print_ps(panes),
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
@@ -240,3 +400,30 @@ async fn main() {
     }
 }
 
+fn print_ps(panes: Vec<libslop::PaneInfo>) {
+    let now = std::time::SystemTime::now();
+    let fmt = timeago::Formatter::new();
+    let rows: Vec<(String, String, String, String)> = panes.iter().map(|p| {
+        let age = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+            .saturating_sub(std::time::Duration::from_secs(p.created_at));
+        let created = fmt.convert(age);
+        let session = p.session_id.as_deref().unwrap_or("-").to_string();
+        let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
+        (p.pane_id.clone(), created, session, tags)
+    }).collect();
+
+    let pane_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+    let created_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(7);
+    let session_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
+    let tags_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(4);
+
+    println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
+        "PANE", "CREATED", "SESSION", "TAGS",
+        pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+
+    for (pane_id, created, session, tags) in &rows {
+        println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
+            pane_id, created, session, tags,
+            pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+    }
+}
