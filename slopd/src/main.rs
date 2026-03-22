@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -35,7 +36,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = libslop::SlopdConfig::load();
+    let config = Arc::new(libslop::SlopdConfig::load());
 
     let status = tmux(&config)
         .arg("list-sessions")
@@ -81,11 +82,15 @@ async fn main() {
     loop {
         let (stream, _addr) = listener.accept().await.unwrap();
         debug!("accepted connection");
-        tokio::spawn(handle_connection(stream, start_time));
+        tokio::spawn(handle_connection(stream, start_time, config.clone()));
     }
 }
 
-async fn handle_connection(stream: tokio::net::UnixStream, start_time: u64) {
+async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    start_time: u64,
+    config: Arc<libslop::SlopdConfig>,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -104,6 +109,28 @@ async fn handle_connection(stream: tokio::net::UnixStream, start_time: u64) {
                             state: libslop::DaemonState {
                                 uptime_secs: now.saturating_sub(start_time),
                             },
+                        }
+                    }
+                    libslop::RequestBody::Run => {
+                        let output = tmux(&config)
+                            .args([
+                                "new-window",
+                                "-t", "slopd",
+                                "-P", "-F", "#{pane_id}",
+                                config.run.executable.as_str(),
+                            ])
+                            .output();
+                        match output {
+                            Ok(out) if out.status.success() => {
+                                let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                debug!("spawned {} in pane {}", config.run.executable, pane_id);
+                                libslop::ResponseBody::Run { pane_id }
+                            }
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                libslop::ResponseBody::Error { message: stderr }
+                            }
+                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
                         }
                     }
                 };

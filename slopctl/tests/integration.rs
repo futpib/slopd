@@ -43,14 +43,14 @@ impl TmuxServer {
         Some(TmuxServer { tmpdir, socket })
     }
 
-    fn write_slopd_config(&self, config_dir: &tempfile::TempDir) {
+    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&str>) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
-        std::fs::write(
-            slopd_config_dir.join("config.toml"),
-            format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()),
-        )
-        .unwrap();
+        let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
+        if let Some(exe) = executable {
+            config.push_str(&format!("\n[run]\nexecutable = {:?}\n", exe));
+        }
+        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
 }
 
@@ -76,7 +76,7 @@ fn status_with_slopd_running() {
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir);
+    tmux.write_slopd_config(&config_dir, None);
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())

@@ -43,14 +43,14 @@ impl TmuxServer {
         Some(TmuxServer { tmpdir, socket })
     }
 
-    fn write_slopd_config(&self, config_dir: &tempfile::TempDir) {
+    fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&str>) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
-        std::fs::write(
-            slopd_config_dir.join("config.toml"),
-            format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()),
-        )
-        .unwrap();
+        let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
+        if let Some(exe) = executable {
+            config.push_str(&format!("\n[run]\nexecutable = {:?}\n", exe));
+        }
+        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
 }
 
@@ -95,7 +95,7 @@ fn slopd_starts_with_tmux_running() {
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir);
+    tmux.write_slopd_config(&config_dir, None);
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
@@ -154,7 +154,7 @@ fn slopd_creates_marked_tmux_session() {
 
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    tmux.write_slopd_config(&config_dir);
+    tmux.write_slopd_config(&config_dir, None);
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
@@ -188,4 +188,45 @@ fn slopd_creates_marked_tmux_session() {
 
     assert!(session_exists, "slopd tmux session does not exist");
     assert_eq!(option_value.trim(), "true", "@slopd option not set correctly");
+}
+
+#[test]
+fn run_spawns_executable_in_new_tmux_window() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    tmux.write_slopd_config(&config_dir, Some("sleep"));
+
+    let mut slopd = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopd");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let output = Command::new(cargo_bin("slopctl"))
+        .args(["run"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl run");
+
+    slopd.kill().unwrap();
+    slopd.wait().unwrap();
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.trim().starts_with('%'), "expected pane_id in output, got: {}", stdout);
 }

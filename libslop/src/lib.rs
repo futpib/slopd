@@ -18,11 +18,24 @@ pub fn config_dir() -> PathBuf {
 pub struct SlopdConfig {
     #[serde(default)]
     pub tmux: SlopdTmuxConfig,
+    #[serde(default)]
+    pub run: SlopdRunConfig,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SlopdTmuxConfig {
     pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SlopdRunConfig {
+    pub executable: String,
+}
+
+impl Default for SlopdRunConfig {
+    fn default() -> Self {
+        Self { executable: "claude".to_string() }
+    }
 }
 
 impl SlopdConfig {
@@ -67,6 +80,7 @@ pub struct Request {
 pub enum RequestBody {
     Ping,
     Status,
+    Run,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +94,7 @@ pub struct Response {
 pub enum ResponseBody {
     Pong,
     Status { state: DaemonState },
+    Run { pane_id: String },
     Error { message: String },
 }
 

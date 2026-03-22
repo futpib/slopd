@@ -43,6 +43,7 @@ async fn main() {
     let body = match command {
         "status" => libslop::RequestBody::Status,
         "ping" => libslop::RequestBody::Ping,
+        "run" => libslop::RequestBody::Run,
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);
@@ -59,6 +60,9 @@ async fn main() {
     if let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
         let response: libslop::Response = serde_json::from_str(&line).unwrap();
-        println!("{:?}", response);
+        match response.body {
+            libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
+            other => println!("{:?}", other),
+        }
     }
 }
