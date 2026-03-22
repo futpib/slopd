@@ -468,6 +468,59 @@ async fn handle_request(
             }
         }
 
+        libslop::RequestBody::Ps => {
+            // List all panes in the slopd session.
+            let list_out = tmux(config)
+                .args(["list-panes", "-t", "slopd", "-F", "#{pane_id} #{pane_start_time}"])
+                .output();
+            let list_out = match list_out {
+                Err(e) => return libslop::ResponseBody::Error { message: e.to_string() },
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return libslop::ResponseBody::Error { message: stderr };
+                }
+                Ok(out) => out,
+            };
+
+            let mut panes = Vec::new();
+            for line in String::from_utf8_lossy(&list_out.stdout).lines() {
+                let mut parts = line.splitn(2, ' ');
+                let pane_id = match parts.next() {
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => continue,
+                };
+                let created_at: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+
+                // One show-options call per pane gets both session_id and tags.
+                let opts_out = tmux(config)
+                    .args(["show-options", "-t", &pane_id, "-p"])
+                    .output();
+                let (session_id, tags) = match opts_out {
+                    Ok(out) if out.status.success() => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let mut session_id = None;
+                        let mut tags = Vec::new();
+                        for opt_line in stdout.lines() {
+                            let mut words = opt_line.splitn(2, ' ');
+                            let key = words.next().unwrap_or("").trim();
+                            let val = words.next().unwrap_or("").trim();
+                            if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
+                                session_id = Some(val.to_string());
+                            } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
+                                tags.push(tag.to_string());
+                            }
+                        }
+                        (session_id, tags)
+                    }
+                    _ => (None, Vec::new()),
+                };
+
+                panes.push(libslop::PaneInfo { pane_id, created_at, session_id, tags });
+            }
+
+            libslop::ResponseBody::Ps { panes }
+        }
+
         libslop::RequestBody::Subscribe { .. } => {
             // Handled in handle_connection before reaching here.
             unreachable!("Subscribe should be handled before handle_request")

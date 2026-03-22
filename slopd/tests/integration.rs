@@ -391,6 +391,59 @@ fn send_concurrent_all_delivered() {
 
 
 #[test]
+fn ps_lists_panes_with_session_id_and_tags() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for SessionStart so session_id is set on the pane.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Add a tag so we can verify it appears in ps output.
+    let tag_out = env.slopctl(&["tag", &pane_id, "mytest"]);
+    assert!(tag_out.status.success(), "slopctl tag failed: {:?}", tag_out);
+
+    let ps_out = env.slopctl(&["ps"]);
+
+    kill_slopd(slopd);
+
+    assert!(ps_out.status.success(), "slopctl ps failed: {:?}", ps_out);
+    let stdout = String::from_utf8_lossy(&ps_out.stdout);
+    assert!(stdout.contains(&pane_id), "ps output missing pane_id {}: {}", pane_id, stdout);
+    assert!(stdout.contains("mock-session-id-1234"), "ps output missing session_id: {}", stdout);
+    assert!(stdout.contains("mytest"), "ps output missing tag: {}", stdout);
+    assert!(stdout.contains("ago"), "ps output missing created time: {}", stdout);
+}
+
+#[test]
 fn send_to_nonexistent_pane_returns_error() {
     build_bin("slopd");
     build_bin("slopctl");

@@ -371,6 +371,8 @@ pub enum RequestBody {
     Tag { pane_id: String, tag: String, remove: bool },
     /// List all user-defined tags on a pane.
     Tags { pane_id: String },
+    /// List all panes in the slopd session.
+    Ps,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -401,7 +403,19 @@ pub enum ResponseBody {
     Tagged { pane_id: String, tag: String },
     Untagged { pane_id: String, tag: String },
     Tags { pane_id: String, tags: Vec<String> },
+    Ps { panes: Vec<PaneInfo> },
     Error { message: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaneInfo {
+    pub pane_id: String,
+    /// Unix timestamp of pane creation.
+    pub created_at: u64,
+    /// Claude session ID stored by the SessionStart hook, if set.
+    pub session_id: Option<String>,
+    /// User-defined tags on this pane.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

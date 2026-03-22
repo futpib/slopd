@@ -714,6 +714,7 @@ dependencies = [
  "libslop",
  "libsloptest",
  "serde_json",
+ "timeago",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -807,6 +808,12 @@ checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "timeago"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e86660b0935ca5912eb155f5b3794e2f8f1a09d8c00c9efd5c1075ca26403638"
 
 [[package]]
 name = "tokio"

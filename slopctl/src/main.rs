@@ -17,6 +17,7 @@ struct Cli {
 enum Command {
     Ping,
     Status,
+    Ps,
     Run,
     Kill {
         pane_id: String,
@@ -159,6 +160,7 @@ async fn main() {
     let body = match cli.command {
         Command::Ping => libslop::RequestBody::Ping,
         Command::Status => libslop::RequestBody::Status,
+        Command::Ps => libslop::RequestBody::Ps,
         Command::Run => libslop::RequestBody::Run,
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
         Command::Hook { event } => {
@@ -189,6 +191,35 @@ async fn main() {
         debug!("received: {}", line);
         let response: libslop::Response = serde_json::from_str(&line).unwrap();
         match response.body {
+            libslop::ResponseBody::Ps { panes } => {
+                let now = std::time::SystemTime::now();
+
+                let fmt = timeago::Formatter::new();
+                let rows: Vec<(String, String, String, String)> = panes.iter().map(|p| {
+                    let age = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                        .saturating_sub(std::time::Duration::from_secs(p.created_at));
+                    let created = fmt.convert(age);
+                    let session = p.session_id.as_deref().unwrap_or("-").to_string();
+                    let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
+                    (p.pane_id.clone(), created, session, tags)
+                }).collect();
+
+                // Compute column widths.
+                let pane_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+                let created_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(7);
+                let session_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
+                let tags_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(4);
+
+                println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
+                    "PANE", "CREATED", "SESSION", "TAGS",
+                    pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+
+                for (pane_id, created, session, tags) in &rows {
+                    println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
+                        pane_id, created, session, tags,
+                        pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+                }
+            }
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
@@ -208,3 +239,4 @@ async fn main() {
         }
     }
 }
+
