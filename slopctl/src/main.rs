@@ -187,20 +187,19 @@ async fn main() {
     let socket_path = libslop::socket_path();
     debug!("connecting to {}", socket_path.display());
 
-    // Hook must never exit 2 — that would block the Claude action. Any error
-    // (daemon unreachable, bad payload, daemon error response) exits 0 so Claude
-    // continues normally; the error is logged to stderr for diagnostics only.
+    // Hook must never exit 2 — that would block the Claude action.
+    // Exit 1 on errors (so failures are visible), but never 2.
     if let Command::Hook { event } = cli.command {
         let mut stdin = String::new();
         if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin) {
             eprintln!("slopctl hook: failed to read stdin: {}", e);
-            std::process::exit(0);
+            std::process::exit(1);
         }
         let payload: serde_json::Value = match serde_json::from_str(&stdin) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("slopctl hook: failed to parse payload: {}", e);
-                std::process::exit(0);
+                std::process::exit(1);
             }
         };
         let pane_id = std::env::var("TMUX_PANE").ok();
@@ -209,7 +208,7 @@ async fn main() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("slopctl hook: failed to connect to {}: {}", socket_path.display(), e);
-                std::process::exit(0);
+                std::process::exit(1);
             }
         };
         let (reader, mut writer) = stream.into_split();
@@ -219,18 +218,20 @@ async fn main() {
         json.push('\n');
         if let Err(e) = writer.write_all(json.as_bytes()).await {
             eprintln!("slopctl hook: failed to send request: {}", e);
-            std::process::exit(0);
+            std::process::exit(1);
         }
         match lines.next_line().await {
             Ok(Some(line)) => {
                 if let Ok(response) = serde_json::from_str::<libslop::Response>(&line) {
                     if let libslop::ResponseBody::Error { message } = response.body {
                         eprintln!("slopctl hook: daemon error: {}", message);
+                        std::process::exit(1);
                     }
                 }
             }
             _ => {
                 eprintln!("slopctl hook: connection closed unexpectedly");
+                std::process::exit(1);
             }
         }
         std::process::exit(0);

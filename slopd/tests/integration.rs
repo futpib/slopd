@@ -30,9 +30,9 @@ fn tmux_available() -> bool {
 }
 
 /// Hook must never exit 2 — that would block the Claude action.
-/// Verify exit 0 even when slopd is not running (most likely failure mode).
+/// Errors should exit 1 (visible failure), never 2.
 #[test]
-fn hook_exits_zero_when_slopd_not_running() {
+fn hook_never_exits_2() {
     build_bin("slopctl");
 
     let runtime_dir = tempfile::tempdir().unwrap();
@@ -51,7 +51,8 @@ fn hook_exits_zero_when_slopd_not_running() {
     child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
     let status = child.wait_with_output().unwrap().status;
 
-    assert_eq!(status.code(), Some(0), "hook must exit 0 when slopd is unreachable, got {:?}", status);
+    assert_ne!(status.code(), Some(2), "hook must never exit 2 (would block Claude action)");
+    assert_ne!(status.code(), Some(0), "hook should exit non-zero on error (slopd unreachable)");
 }
 
 #[test]
