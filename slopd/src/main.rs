@@ -331,10 +331,16 @@ async fn handle_request(
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
             }
             let xdg_runtime_dir = libslop::runtime_dir();
-            let output = tmux(config)
-                .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+            let mut cmd = tmux(config);
+            cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                 .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())])
+                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())]);
+            // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
+            // write their coverage data even when launched inside a tmux window.
+            if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
+                cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", profile_file)]);
+            }
+            let output = cmd
                 .arg(config.run.executable.program())
                 .args(config.run.executable.args())
                 .output();
@@ -387,6 +393,26 @@ async fn handle_request(
                     }
                 }
             }
+        }
+
+        libslop::RequestBody::Interrupt { pane_id } => {
+            let state = pane_state(panes, &pane_id);
+
+            // Acquire the type-mutex so we don't interleave with concurrent sends.
+            let _guard = state.type_mutex.lock().await;
+
+            for key in &["C-c", "C-d", "Escape"] {
+                let result = tmux(config)
+                    .args(["send-keys", "-t", &pane_id, key, ""])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if let Err(e) = result {
+                    return libslop::ResponseBody::Error { message: e.to_string() };
+                }
+            }
+
+            libslop::ResponseBody::Interrupted { pane_id }
         }
 
         libslop::RequestBody::Subscribe { .. } => {

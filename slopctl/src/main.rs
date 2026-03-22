@@ -31,6 +31,10 @@ enum Command {
         #[arg(long, default_value = "60")]
         timeout: u64,
     },
+    /// Send Ctrl+C, Ctrl+D, and Escape to interrupt a running agent.
+    Interrupt {
+        pane_id: String,
+    },
     /// Subscribe to a stream of events and print each as a JSON line.
     Listen {
         /// Filter by hook event name (repeatable; omit for all events).
@@ -154,6 +158,7 @@ async fn main() {
             libslop::RequestBody::Hook { event, payload, pane_id }
         }
         Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
+        Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Listen { .. } => unreachable!(),
     };
 
@@ -170,6 +175,7 @@ async fn main() {
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Interrupted { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Error { message } => {
                 eprintln!("error: {}", message);
                 std::process::exit(1);

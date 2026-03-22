@@ -345,6 +345,8 @@ pub enum RequestBody {
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64 },
+    /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
+    Interrupt { pane_id: String },
     /// Subscribe to a stream of events. An empty filters vec matches all events.
     Subscribe { filters: Vec<EventFilter> },
 }
@@ -363,6 +365,7 @@ pub enum ResponseBody {
     Run { pane_id: String },
     Kill { pane_id: String },
     Sent { pane_id: String },
+    Interrupted { pane_id: String },
     Hooked,
     /// Sent once to confirm a Subscribe request was accepted.
     Subscribed,
