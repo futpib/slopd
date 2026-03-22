@@ -352,7 +352,7 @@ async fn handle_request(
             }
         }
 
-        libslop::RequestBody::Send { pane_id, prompt } => {
+        libslop::RequestBody::Send { pane_id, prompt, timeout_secs } => {
             let state = pane_state(panes, &pane_id);
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
@@ -378,8 +378,13 @@ async fn handle_request(
                 }
                 Ok(_) => {
                     // Wait for UserPromptSubmit from this pane to confirm delivery.
-                    notified.await;
-                    libslop::ResponseBody::Sent { pane_id }
+                    let timeout = std::time::Duration::from_secs(timeout_secs);
+                    match tokio::time::timeout(timeout, notified).await {
+                        Ok(()) => libslop::ResponseBody::Sent { pane_id },
+                        Err(_) => libslop::ResponseBody::Error {
+                            message: format!("timed out after {}s waiting for UserPromptSubmit on pane {}", timeout_secs, pane_id),
+                        },
+                    }
                 }
             }
         }

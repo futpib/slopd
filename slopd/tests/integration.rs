@@ -409,10 +409,10 @@ fn send_to_nonexistent_pane_returns_error() {
     assert!(!output.status.success(), "slopctl send should have failed for non-existent pane");
 }
 
-/// Regression test: send to a pane whose process has exited (so UserPromptSubmit will never fire)
-/// must return an error rather than hanging forever.
+/// Regression test: send to a pane where UserPromptSubmit will never fire must return an error
+/// rather than hanging forever.
 #[test]
-fn send_to_dead_pane_returns_error() {
+fn send_to_pane_with_broken_hooks_times_out() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_claude");
@@ -459,12 +459,12 @@ fn send_to_dead_pane_returns_error() {
         .expect("failed to send /break-hooks");
 
     // This send reaches a live pane (send-keys succeeds) but UserPromptSubmit will never fire.
-    // It should time out and return an error rather than blocking forever.
-    let output = env.slopctl(&["send", &pane_id, "hello"]);
+    // Pass a short --timeout so slopd returns an error quickly rather than the test hanging.
+    let output = env.slopctl(&["send", "--timeout", "2", &pane_id, "hello"]);
 
     kill_slopd(slopd);
 
-    assert!(!output.status.success(), "slopctl send should have failed for dead pane: {:?}", output);
+    assert!(!output.status.success(), "slopctl send should have timed out: {:?}", output);
 }
 
 #[test]

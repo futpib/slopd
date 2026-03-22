@@ -344,7 +344,7 @@ pub enum RequestBody {
     Run,
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
-    Send { pane_id: String, prompt: String },
+    Send { pane_id: String, prompt: String, timeout_secs: u64 },
     /// Subscribe to a stream of events. An empty filters vec matches all events.
     Subscribe { filters: Vec<EventFilter> },
 }

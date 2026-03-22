@@ -27,6 +27,9 @@ enum Command {
     Send {
         pane_id: String,
         prompt: String,
+        /// Seconds to wait for UserPromptSubmit confirmation (default: 60).
+        #[arg(long, default_value = "60")]
+        timeout: u64,
     },
     /// Subscribe to a stream of events and print each as a JSON line.
     Listen {
@@ -150,7 +153,7 @@ async fn main() {
             let pane_id = std::env::var("TMUX_PANE").ok();
             libslop::RequestBody::Hook { event, payload, pane_id }
         }
-        Command::Send { pane_id, prompt } => libslop::RequestBody::Send { pane_id, prompt },
+        Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Listen { .. } => unreachable!(),
     };
 
