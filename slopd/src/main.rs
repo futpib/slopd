@@ -126,6 +126,10 @@ async fn handle_connection(
                             Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
                         }
                     }
+                    libslop::RequestBody::Hook { event, payload: _ } => {
+                        debug!("hook: {}", event);
+                        libslop::ResponseBody::Hooked
+                    }
                     libslop::RequestBody::Run => {
                         let output = tmux(&config)
                             .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])

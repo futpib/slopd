@@ -44,6 +44,19 @@ async fn main() {
         "status" => libslop::RequestBody::Status,
         "ping" => libslop::RequestBody::Ping,
         "run" => libslop::RequestBody::Run,
+        "hook" => {
+            let event = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: slopctl hook <EventName>");
+                std::process::exit(1);
+            });
+            let mut stdin = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&stdin).unwrap_or_else(|e| {
+                eprintln!("Failed to parse hook payload: {}", e);
+                std::process::exit(1);
+            });
+            libslop::RequestBody::Hook { event, payload }
+        }
         "kill" => {
             let pane_id = args.get(2).cloned().unwrap_or_else(|| {
                 eprintln!("Usage: slopctl kill <pane_id>");
