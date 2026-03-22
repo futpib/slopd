@@ -976,3 +976,77 @@ fn ps_filter_shows_only_matching_panes() {
     assert!(stdout.contains(&pane1), "filtered ps missing tagged pane");
     assert!(!stdout.contains(&pane2), "filtered ps should not show untagged pane");
 }
+
+/// Verify that send-filtered delivers to N panes concurrently: total wall time
+/// must be less than 2x the single-pane round-trip, not N times it.
+#[test]
+fn send_filtered_all_is_concurrent() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    const N: usize = 4;
+    let mut pane_ids = Vec::new();
+    for _ in 0..N {
+        let out = env.slopctl(&["run"]);
+        assert!(out.status.success());
+        pane_ids.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+
+    // Wait for all panes to be ready.
+    for pane_id in &pane_ids {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let out = env.tmux.tmux()
+                .args(["show-options", "-t", pane_id, "-p", "-v",
+                       libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+                .output().unwrap();
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        env.slopctl(&["tag", pane_id, "concurrent"]);
+    }
+
+    // Measure a single send to one pane to establish a baseline.
+    let baseline_start = Instant::now();
+    let single = env.slopctl(&["send", &pane_ids[0], "baseline"]);
+    assert!(single.status.success());
+    let baseline = baseline_start.elapsed();
+
+    // Now send-filtered to all N panes and measure wall time.
+    let all_start = Instant::now();
+    let all_out = env.slopctl(&["send-filtered", "--filter", "tag=concurrent",
+                                "--select", "all", "hello concurrent"]);
+    let all_elapsed = all_start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(all_out.status.success(), "send-filtered failed: {:?}", all_out);
+
+    // All N panes received. Wall time should be well under N * baseline.
+    // We allow 2x baseline as headroom for scheduling jitter.
+    let limit = baseline * 2 + Duration::from_millis(500);
+    assert!(
+        all_elapsed < limit,
+        "send-filtered to {} panes took {:?}, expected < {:?} (baseline {:?}); \
+         sends are likely sequential not concurrent",
+        N, all_elapsed, limit, baseline,
+    );
+}
