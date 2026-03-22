@@ -29,6 +29,31 @@ fn tmux_available() -> bool {
     }
 }
 
+/// Hook must never exit 2 — that would block the Claude action.
+/// Verify exit 0 even when slopd is not running (most likely failure mode).
+#[test]
+fn hook_exits_zero_when_slopd_not_running() {
+    build_bin("slopctl");
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+
+    let mut child = Command::new(cargo_bin("slopctl"))
+        .args(["hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl hook");
+
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    let status = child.wait_with_output().unwrap().status;
+
+    assert_eq!(status.code(), Some(0), "hook must exit 0 when slopd is unreachable, got {:?}", status);
+}
+
 #[test]
 fn slopd_starts_with_tmux_running() {
     build_bin("slopd");

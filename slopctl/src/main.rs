@@ -187,6 +187,55 @@ async fn main() {
     let socket_path = libslop::socket_path();
     debug!("connecting to {}", socket_path.display());
 
+    // Hook must never exit 2 — that would block the Claude action. Any error
+    // (daemon unreachable, bad payload, daemon error response) exits 0 so Claude
+    // continues normally; the error is logged to stderr for diagnostics only.
+    if let Command::Hook { event } = cli.command {
+        let mut stdin = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin) {
+            eprintln!("slopctl hook: failed to read stdin: {}", e);
+            std::process::exit(0);
+        }
+        let payload: serde_json::Value = match serde_json::from_str(&stdin) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("slopctl hook: failed to parse payload: {}", e);
+                std::process::exit(0);
+            }
+        };
+        let pane_id = std::env::var("TMUX_PANE").ok();
+        let body = libslop::RequestBody::Hook { event, payload, pane_id };
+        let stream = match UnixStream::connect(&socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("slopctl hook: failed to connect to {}: {}", socket_path.display(), e);
+                std::process::exit(0);
+            }
+        };
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let request = libslop::Request { id: 1, body };
+        let mut json = serde_json::to_string(&request).unwrap();
+        json.push('\n');
+        if let Err(e) = writer.write_all(json.as_bytes()).await {
+            eprintln!("slopctl hook: failed to send request: {}", e);
+            std::process::exit(0);
+        }
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if let Ok(response) = serde_json::from_str::<libslop::Response>(&line) {
+                    if let libslop::ResponseBody::Error { message } = response.body {
+                        eprintln!("slopctl hook: daemon error: {}", message);
+                    }
+                }
+            }
+            _ => {
+                eprintln!("slopctl hook: connection closed unexpectedly");
+            }
+        }
+        std::process::exit(0);
+    }
+
     let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
         eprintln!("Failed to connect to {}: {}", socket_path.display(), e);
         std::process::exit(1);
@@ -384,22 +433,12 @@ async fn main() {
         }
         Command::Run => libslop::RequestBody::Run,
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
-        Command::Hook { event } => {
-            let mut stdin = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin).unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&stdin).unwrap_or_else(|e| {
-                eprintln!("Failed to parse hook payload: {}", e);
-                std::process::exit(1);
-            });
-            let pane_id = std::env::var("TMUX_PANE").ok();
-            libslop::RequestBody::Hook { event, payload, pane_id }
-        }
         Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
         Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
-        Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
+        Command::Hook { .. } | Command::Listen { .. } | Command::SendFiltered { .. } => unreachable!(),
     };
 
     match send_request(&mut writer, &mut lines, 1, body).await {
