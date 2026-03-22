@@ -662,3 +662,103 @@ fn interrupt_exits_mock_claude() {
 
     kill_slopd(slopd);
 }
+
+#[test]
+fn tag_and_untag_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Tag the pane.
+    let tag_out = env.slopctl(&["tag", &pane_id, "my-tag"]);
+    assert!(tag_out.status.success(), "slopctl tag failed: {:?}", tag_out);
+
+    // List tags — should include our tag.
+    let tags_out = env.slopctl(&["tags", &pane_id]);
+    assert!(tags_out.status.success(), "slopctl tags failed: {:?}", tags_out);
+    let tags_stdout = String::from_utf8_lossy(&tags_out.stdout);
+    assert!(tags_stdout.lines().any(|l| l == "my-tag"), "tag not listed: {:?}", tags_stdout);
+
+    // Verify the tmux option was set on the pane.
+    let opt_out = env.tmux.tmux()
+        .args(["show-options", "-t", &pane_id, "-p", "-v",
+               &libslop::tag_option_name("my-tag").unwrap()])
+        .output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&opt_out.stdout).trim(), "1");
+
+    // Untag.
+    let untag_out = env.slopctl(&["untag", &pane_id, "my-tag"]);
+    assert!(untag_out.status.success(), "slopctl untag failed: {:?}", untag_out);
+
+    // Tags should now be empty.
+    let tags_out2 = env.slopctl(&["tags", &pane_id]);
+    assert!(tags_out2.status.success());
+    let tags_stdout2 = String::from_utf8_lossy(&tags_out2.stdout);
+    assert!(!tags_stdout2.lines().any(|l| l == "my-tag"), "tag still listed after untag");
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn tags_survive_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let tag_out = env.slopctl(&["tag", &pane_id, "persistent"]);
+    assert!(tag_out.status.success(), "slopctl tag failed: {:?}", tag_out);
+
+    // Restart slopd — tmux and the pane keep running.
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    let tags_out = env.slopctl(&["tags", &pane_id]);
+    assert!(tags_out.status.success(), "slopctl tags failed after restart: {:?}", tags_out);
+    let tags_stdout = String::from_utf8_lossy(&tags_out.stdout);
+    assert!(
+        tags_stdout.lines().any(|l| l == "persistent"),
+        "tag lost after slopd restart: {:?}",
+        tags_stdout,
+    );
+
+    kill_slopd(slopd2);
+}
+
+#[test]
+fn tag_invalid_name_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["tag", "%0", "bad tag!"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "slopctl tag should fail for invalid tag name");
+}

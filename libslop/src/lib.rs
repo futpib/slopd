@@ -34,6 +34,24 @@ impl TmuxOption {
     }
 }
 
+/// Validate a user-supplied tag name and return the full tmux option name.
+/// Tag names must match `[A-Za-z0-9_-]+` (what tmux accepts in option names).
+pub fn tag_option_name(tag: &str) -> Result<String, String> {
+    if tag.is_empty() {
+        return Err("tag name must not be empty".to_string());
+    }
+    if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "invalid tag {:?}: only ASCII letters, digits, '_', and '-' are allowed",
+            tag
+        ));
+    }
+    Ok(format!("@slopd_tag_{}", tag))
+}
+
+/// The prefix used for tag options; used to enumerate tags on a pane.
+pub const TAG_OPTION_PREFIX: &str = "@slopd_tag_";
+
 pub const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -349,6 +367,10 @@ pub enum RequestBody {
     Interrupt { pane_id: String },
     /// Subscribe to a stream of events. An empty filters vec matches all events.
     Subscribe { filters: Vec<EventFilter> },
+    /// Set or remove a user-defined tag on a pane.
+    Tag { pane_id: String, tag: String, remove: bool },
+    /// List all user-defined tags on a pane.
+    Tags { pane_id: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,6 +398,9 @@ pub enum ResponseBody {
         pane_id: Option<String>,
         payload: serde_json::Value,
     },
+    Tagged { pane_id: String, tag: String },
+    Untagged { pane_id: String, tag: String },
+    Tags { pane_id: String, tags: Vec<String> },
     Error { message: String },
 }
 

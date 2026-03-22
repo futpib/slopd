@@ -415,6 +415,59 @@ async fn handle_request(
             libslop::ResponseBody::Interrupted { pane_id }
         }
 
+        libslop::RequestBody::Tag { pane_id, tag, remove } => {
+            let option_name = match libslop::tag_option_name(&tag) {
+                Ok(name) => name,
+                Err(e) => return libslop::ResponseBody::Error { message: e },
+            };
+            if remove {
+                let result = tmux(config)
+                    .args(["set-option", "-t", &pane_id, "-p", "-u", &option_name])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match result {
+                    Ok(s) if s.success() => libslop::ResponseBody::Untagged { pane_id, tag },
+                    Ok(s) => libslop::ResponseBody::Error { message: format!("tmux exited with {}", s) },
+                    Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                }
+            } else {
+                let result = tmux(config)
+                    .args(["set-option", "-t", &pane_id, "-p", &option_name, "1"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match result {
+                    Ok(s) if s.success() => libslop::ResponseBody::Tagged { pane_id, tag },
+                    Ok(s) => libslop::ResponseBody::Error { message: format!("tmux exited with {}", s) },
+                    Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                }
+            }
+        }
+
+        libslop::RequestBody::Tags { pane_id } => {
+            let output = tmux(config)
+                .args(["show-options", "-t", &pane_id, "-p"])
+                .output();
+            match output {
+                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    libslop::ResponseBody::Error { message: stderr }
+                }
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let tags: Vec<String> = stdout.lines()
+                        .filter_map(|line| {
+                            let opt = line.split_whitespace().next()?;
+                            opt.strip_prefix(libslop::TAG_OPTION_PREFIX).map(|t| t.to_string())
+                        })
+                        .collect();
+                    libslop::ResponseBody::Tags { pane_id, tags }
+                }
+            }
+        }
+
         libslop::RequestBody::Subscribe { .. } => {
             // Handled in handle_connection before reaching here.
             unreachable!("Subscribe should be handled before handle_request")

@@ -47,6 +47,20 @@ enum Command {
         #[arg(long)]
         session_id: Option<String>,
     },
+    /// Add a tag to a pane.
+    Tag {
+        pane_id: String,
+        tag: String,
+    },
+    /// Remove a tag from a pane.
+    Untag {
+        pane_id: String,
+        tag: String,
+    },
+    /// List all tags on a pane.
+    Tags {
+        pane_id: String,
+    },
 }
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
@@ -159,6 +173,9 @@ async fn main() {
         }
         Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
+        Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
+        Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
+        Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
         Command::Listen { .. } => unreachable!(),
     };
 
@@ -176,6 +193,13 @@ async fn main() {
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Interrupted { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Tagged { pane_id, tag } => println!("{} {}", pane_id, tag),
+            libslop::ResponseBody::Untagged { pane_id, tag } => println!("{} {}", pane_id, tag),
+            libslop::ResponseBody::Tags { pane_id: _, tags } => {
+                for tag in tags {
+                    println!("{}", tag);
+                }
+            }
             libslop::ResponseBody::Error { message } => {
                 eprintln!("error: {}", message);
                 std::process::exit(1);
