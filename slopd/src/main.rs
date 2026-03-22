@@ -155,13 +155,11 @@ async fn handle_connection(
                     }
                     libslop::RequestBody::Run => {
                         let settings_path = config.claude_settings_path();
-                        debug!("injecting hooks into {}", settings_path.display());
-                        match libslop::inject_hooks_into_file(
+                        if let Err(e) = libslop::inject_hooks_into_file(
                             &settings_path,
                             &config.run.slopctl,
                         ) {
-                            Ok(()) => debug!("injected hooks into {}", settings_path.display()),
-                            Err(e) => warn!("failed to inject hooks into {}: {}", settings_path.display(), e),
+                            warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
                         }
                         let xdg_runtime_dir = libslop::runtime_dir();
                         let output = tmux(&config)

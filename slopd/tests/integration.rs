@@ -59,10 +59,11 @@ impl TmuxServer {
     ) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
-        let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
+        let mut config = String::new();
         if let Some(path) = claude_settings {
-            config.push_str(&format!("\nclaude_settings = {:?}\n", path.to_str().unwrap()));
+            config.push_str(&format!("claude_settings = {:?}\n\n", path.to_str().unwrap()));
         }
+        config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
         let has_run_section = executable.is_some() || slopctl.is_some();
         if has_run_section {
             config.push_str("\n[run]\n");
@@ -134,16 +135,14 @@ impl TestEnv {
     }
 
     fn spawn_slopd(&self) -> Child {
-        let log = std::fs::File::create(self.runtime_dir.path().join("slopd.log")).unwrap();
         Command::new(cargo_bin("slopd"))
-            .args(["-vv"])
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
             .stdout(Stdio::null())
-            .stderr(log)
+            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn slopd")
     }
@@ -301,21 +300,13 @@ fn run_injects_hooks_into_claude_settings() {
         return;
     };
 
-    let config_toml = std::fs::read_to_string(env.config_dir.path().join("slopd/config.toml")).unwrap();
-    eprintln!("config.toml:\n{}", config_toml);
-
     let mut slopd = env.spawn_slopd();
     std::thread::sleep(Duration::from_millis(100));
 
     let output = env.slopctl(&["run"]);
-    eprintln!("slopctl run stdout: {}", String::from_utf8_lossy(&output.stdout));
-    eprintln!("slopctl run stderr: {}", String::from_utf8_lossy(&output.stderr));
 
     slopd.kill().unwrap();
     slopd.wait().unwrap();
-
-    let slopd_log = std::fs::read_to_string(env.runtime_dir.path().join("slopd.log")).unwrap_or_default();
-    eprintln!("slopd log:\n{}", slopd_log);
 
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
