@@ -266,10 +266,11 @@ fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, S
         let opts_out = tmux(config)
             .args(["show-options", "-t", &pane_id, "-p"])
             .output();
-        let (session_id, tags) = match opts_out {
+        let (session_id, parent_pane_id, tags) = match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let mut session_id = None;
+                let mut parent_pane_id = None;
                 let mut tags = Vec::new();
                 for opt_line in stdout.lines() {
                     let mut words = opt_line.splitn(2, ' ');
@@ -277,16 +278,18 @@ fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, S
                     let val = words.next().unwrap_or("").trim();
                     if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
                         session_id = Some(val.to_string());
+                    } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
+                        parent_pane_id = Some(val.to_string());
                     } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
                         tags.push(tag.to_string());
                     }
                 }
-                (session_id, tags)
+                (session_id, parent_pane_id, tags)
             }
-            _ => (None, Vec::new()),
+            _ => (None, None, Vec::new()),
         };
 
-        panes.push(libslop::PaneInfo { pane_id, created_at, session_id, tags });
+        panes.push(libslop::PaneInfo { pane_id, created_at, session_id, parent_pane_id, tags });
     }
     Ok(panes)
 }

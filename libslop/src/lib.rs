@@ -415,6 +415,8 @@ pub struct PaneInfo {
     pub created_at: u64,
     /// Claude session ID stored by the SessionStart hook, if set.
     pub session_id: Option<String>,
+    /// Parent pane ID if this pane was spawned by another pane via slopctl run.
+    pub parent_pane_id: Option<String>,
     /// User-defined tags on this pane.
     pub tags: Vec<String>,
 }

@@ -461,6 +461,50 @@ fn ps_lists_panes_with_session_id_and_tags() {
 }
 
 #[test]
+fn ps_shows_parent_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let parent_out = env.slopctl(&["run"]);
+    assert!(parent_out.status.success());
+    let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
+
+    let child_out = Command::new(cargo_bin("slopctl"))
+        .args(["run"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("TMUX_PANE", &parent_pane)
+        .output().unwrap();
+    assert!(child_out.status.success());
+    let child_pane = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+
+    let ps_out = env.slopctl(&["ps"]);
+
+    kill_slopd(slopd);
+
+    assert!(ps_out.status.success(), "ps failed: {:?}", ps_out);
+    let stdout = String::from_utf8_lossy(&ps_out.stdout);
+    // The child row should contain the parent pane ID in the PARENT column.
+    let child_line = stdout.lines()
+        .find(|l| l.contains(&child_pane))
+        .unwrap_or_else(|| panic!("child pane {} not found in ps output:\n{}", child_pane, stdout));
+    assert!(child_line.contains(&parent_pane),
+        "child row missing parent pane ID {}:\n{}", parent_pane, child_line);
+    // The parent row should show "-" in the PARENT column.
+    let parent_line = stdout.lines()
+        .find(|l| l.starts_with(&parent_pane))
+        .unwrap_or_else(|| panic!("parent pane {} not found in ps output:\n{}", parent_pane, stdout));
+    assert!(parent_line.contains('-'),
+        "parent row should have '-' for PARENT:\n{}", parent_line);
+}
+
+#[test]
 fn send_to_nonexistent_pane_returns_error() {
     build_bin("slopd");
     build_bin("slopctl");

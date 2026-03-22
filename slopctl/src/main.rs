@@ -489,27 +489,29 @@ async fn main() {
 fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let now = std::time::SystemTime::now();
     let fmt = timeago::Formatter::new();
-    let rows: Vec<(String, String, String, String)> = panes.iter().map(|p| {
+    let rows: Vec<(String, String, String, String, String)> = panes.iter().map(|p| {
         let age = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
             .saturating_sub(std::time::Duration::from_secs(p.created_at));
         let created = fmt.convert(age);
         let session = p.session_id.as_deref().unwrap_or("-").to_string();
+        let parent = p.parent_pane_id.as_deref().unwrap_or("-").to_string();
         let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
-        (p.pane_id.clone(), created, session, tags)
+        (p.pane_id.clone(), created, session, parent, tags)
     }).collect();
 
-    let pane_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+    let pane_w    = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
     let created_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(7);
     let session_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
-    let tags_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(4);
+    let parent_w  = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(6);
+    let tags_w    = rows.iter().map(|r| r.4.len()).max().unwrap_or(0).max(4);
 
-    println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
-        "PANE", "CREATED", "SESSION", "TAGS",
-        pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+    println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}",
+        "PANE", "CREATED", "SESSION", "PARENT", "TAGS",
+        pane_w=pane_w, created_w=created_w, session_w=session_w, parent_w=parent_w, tags_w=tags_w);
 
-    for (pane_id, created, session, tags) in &rows {
-        println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<tags_w$}",
-            pane_id, created, session, tags,
-            pane_w = pane_w, created_w = created_w, session_w = session_w, tags_w = tags_w);
+    for (pane_id, created, session, parent, tags) in &rows {
+        println!("{:<pane_w$}  {:<created_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}",
+            pane_id, created, session, parent, tags,
+            pane_w=pane_w, created_w=created_w, session_w=session_w, parent_w=parent_w, tags_w=tags_w);
     }
 }
