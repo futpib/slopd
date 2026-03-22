@@ -35,4 +35,7 @@ fn main() {
         eprintln!("mock_claude: slopctl hook SessionStart failed: {:?}", status);
         std::process::exit(1);
     }
+
+    // Keep the pane alive so the test can read the pane option before the pane closes
+    std::thread::sleep(std::time::Duration::from_secs(10));
 }

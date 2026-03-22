@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::Duration;
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
@@ -92,8 +92,6 @@ impl TestEnv {
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn slopd")
     }

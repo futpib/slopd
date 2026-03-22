@@ -141,8 +141,6 @@ impl TestEnv {
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn slopd")
     }

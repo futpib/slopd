@@ -166,6 +166,7 @@ async fn handle_connection(
                             .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                             .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
                             .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)])
+                            .args(["-e", &format!("CLAUDE_SETTINGS={}", settings_path.display())])
                             .arg(config.run.executable.program())
                             .args(config.run.executable.args())
                             .output();
