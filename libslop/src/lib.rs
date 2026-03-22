@@ -242,6 +242,7 @@ pub enum RequestBody {
     Run,
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
+    Send { pane_id: String, prompt: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -257,6 +258,7 @@ pub enum ResponseBody {
     Status { state: DaemonState },
     Run { pane_id: String },
     Kill { pane_id: String },
+    Sent { pane_id: String },
     Hooked,
     Error { message: String },
 }

@@ -65,6 +65,17 @@ async fn main() {
             });
             libslop::RequestBody::Kill { pane_id }
         }
+        "send" => {
+            let pane_id = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: slopctl send <pane_id> <prompt>");
+                std::process::exit(1);
+            });
+            let prompt = args.get(3).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: slopctl send <pane_id> <prompt>");
+                std::process::exit(1);
+            });
+            libslop::RequestBody::Send { pane_id, prompt }
+        }
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);
@@ -84,6 +95,11 @@ async fn main() {
         match response.body {
             libslop::ResponseBody::Run { pane_id } => println!("{}", pane_id),
             libslop::ResponseBody::Kill { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Error { message } => {
+                eprintln!("error: {}", message);
+                std::process::exit(1);
+            }
             other => println!("{:?}", other),
         }
     }

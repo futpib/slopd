@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn kill_slopd(mut child: Child) {
@@ -440,4 +441,87 @@ fn session_start_hook_stores_session_id_on_pane() {
     kill_slopd(slopd);
 
     assert_eq!(session_id, "mock-session-id-1234");
+}
+
+#[test]
+fn send_delivers_prompt_to_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let send_output = env.slopctl(&["send", &pane_id, "hello from test"]);
+
+    kill_slopd(slopd);
+
+    assert!(send_output.status.success(), "slopctl send failed: {:?}", send_output);
+    assert_eq!(send_output.stdout, format!("{}\n", pane_id).as_bytes());
+}
+
+#[test]
+fn send_concurrent_all_delivered() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Launch N concurrent senders.
+    const N: usize = 5;
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let env = env.clone();
+            let pane_id = pane_id.clone();
+            std::thread::spawn(move || {
+                env.slopctl(&["send", &pane_id, &format!("prompt {}", i)])
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    kill_slopd(slopd);
+
+    for (i, output) in results.iter().enumerate() {
+        assert!(output.status.success(), "sender {} failed: {:?}", i, output);
+    }
 }

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
@@ -19,6 +20,32 @@ fn tmux(config: &libslop::SlopdConfig) -> std::process::Command {
         cmd.args(["-S", socket.to_str().unwrap()]);
     }
     cmd
+}
+
+/// Per-pane state shared across connection handlers.
+struct PaneState {
+    /// Serialises the type-then-enter sequence so two concurrent sends don't interleave.
+    type_mutex: Mutex<()>,
+    /// Notified whenever UserPromptSubmit fires for this pane.
+    prompt_submitted: Notify,
+}
+
+impl PaneState {
+    fn new() -> Self {
+        Self {
+            type_mutex: Mutex::new(()),
+            prompt_submitted: Notify::new(),
+        }
+    }
+}
+
+type PaneMap = Arc<dashmap::DashMap<String, Arc<PaneState>>>;
+
+fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
+    panes
+        .entry(pane_id.to_string())
+        .or_insert_with(|| Arc::new(PaneState::new()))
+        .clone()
 }
 
 #[tokio::main]
@@ -79,6 +106,8 @@ async fn main() {
         .unwrap()
         .as_secs();
 
+    let panes: PaneMap = Arc::new(dashmap::DashMap::new());
+
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
@@ -88,7 +117,7 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -102,6 +131,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     start_time: u64,
     config: Arc<libslop::SlopdConfig>,
+    panes: PaneMap,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -110,91 +140,7 @@ async fn handle_connection(
         debug!("received: {}", line);
         let (id, body) = match serde_json::from_str::<libslop::Request>(&line) {
             Ok(req) => {
-                let body = match req.body {
-                    libslop::RequestBody::Ping => libslop::ResponseBody::Pong,
-                    libslop::RequestBody::Status => {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        libslop::ResponseBody::Status {
-                            state: libslop::DaemonState {
-                                uptime_secs: now.saturating_sub(start_time),
-                            },
-                        }
-                    }
-                    libslop::RequestBody::Kill { pane_id } => {
-                        let output = tmux(&config)
-                            .args(["kill-pane", "-t", &pane_id])
-                            .output();
-                        match output {
-                            Ok(out) if out.status.success() => {
-                                libslop::ResponseBody::Kill { pane_id }
-                            }
-                            Ok(out) => {
-                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                                libslop::ResponseBody::Error { message: stderr }
-                            }
-                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
-                        }
-                    }
-                    libslop::RequestBody::Hook { event, payload, pane_id } => {
-                        debug!("hook: {} pane={:?}", event, pane_id);
-                        if event == "SessionStart" {
-                            if let (Some(pane), Some(session_id)) = (
-                                pane_id.as_deref(),
-                                payload.get("session_id").and_then(|v| v.as_str()),
-                            ) {
-                                debug!("SessionStart: pane={} session_id={}", pane, session_id);
-                                let result = tmux(&config)
-                                    .args([
-                                        "set-option",
-                                        "-t",
-                                        pane,
-                                        "-p",
-                                        libslop::TmuxOption::SlopdClaudeSessionId.as_str(),
-                                        session_id,
-                                    ])
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status();
-                                if let Err(e) = result {
-                                    warn!("failed to set @claude_session_id on pane {}: {}", pane, e);
-                                }
-                            }
-                        }
-                        libslop::ResponseBody::Hooked
-                    }
-                    libslop::RequestBody::Run => {
-                        let settings_path = config.claude_settings_path();
-                        if let Err(e) = libslop::inject_hooks_into_file(
-                            &settings_path,
-                            &config.run.slopctl,
-                        ) {
-                            warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
-                        }
-                        let xdg_runtime_dir = libslop::runtime_dir();
-                        let output = tmux(&config)
-                            .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
-                            .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                            .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())])
-                            .arg(config.run.executable.program())
-                            .args(config.run.executable.args())
-                            .output();
-                        match output {
-                            Ok(out) if out.status.success() => {
-                                let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
-                                libslop::ResponseBody::Run { pane_id }
-                            }
-                            Ok(out) => {
-                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                                libslop::ResponseBody::Error { message: stderr }
-                            }
-                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
-                        }
-                    }
-                };
+                let body = handle_request(req.body, start_time, &config, &panes).await;
                 (req.id, body)
             }
             Err(e) => {
@@ -209,6 +155,136 @@ async fn handle_connection(
         debug!("sending: {}", json.trim());
         if writer.write_all(json.as_bytes()).await.is_err() {
             break;
+        }
+    }
+}
+
+async fn handle_request(
+    body: libslop::RequestBody,
+    start_time: u64,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+) -> libslop::ResponseBody {
+    match body {
+        libslop::RequestBody::Ping => libslop::ResponseBody::Pong,
+
+        libslop::RequestBody::Status => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            libslop::ResponseBody::Status {
+                state: libslop::DaemonState {
+                    uptime_secs: now.saturating_sub(start_time),
+                },
+            }
+        }
+
+        libslop::RequestBody::Kill { pane_id } => {
+            let output = tmux(config)
+                .args(["kill-pane", "-t", &pane_id])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => libslop::ResponseBody::Kill { pane_id },
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    libslop::ResponseBody::Error { message: stderr }
+                }
+                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+            }
+        }
+
+        libslop::RequestBody::Hook { event, payload, pane_id } => {
+            debug!("hook: {} pane={:?}", event, pane_id);
+
+            if event == "SessionStart" {
+                if let (Some(pane), Some(session_id)) = (
+                    pane_id.as_deref(),
+                    payload.get("session_id").and_then(|v| v.as_str()),
+                ) {
+                    debug!("SessionStart: pane={} session_id={}", pane, session_id);
+                    let result = tmux(config)
+                        .args([
+                            "set-option", "-t", pane, "-p",
+                            libslop::TmuxOption::SlopdClaudeSessionId.as_str(),
+                            session_id,
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    if let Err(e) = result {
+                        warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
+                    }
+                }
+            }
+
+            if event == "UserPromptSubmit" {
+                if let Some(pane) = pane_id.as_deref() {
+                    debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
+                    pane_state(panes, pane).prompt_submitted.notify_waiters();
+                }
+            }
+
+            libslop::ResponseBody::Hooked
+        }
+
+        libslop::RequestBody::Run => {
+            let settings_path = config.claude_settings_path();
+            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
+                warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+            }
+            let xdg_runtime_dir = libslop::runtime_dir();
+            let output = tmux(config)
+                .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+                .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
+                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())])
+                .arg(config.run.executable.program())
+                .args(config.run.executable.args())
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
+                    libslop::ResponseBody::Run { pane_id }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    libslop::ResponseBody::Error { message: stderr }
+                }
+                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+            }
+        }
+
+        libslop::RequestBody::Send { pane_id, prompt } => {
+            let state = pane_state(panes, &pane_id);
+
+            // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
+            let _guard = state.type_mutex.lock().await;
+
+            // Subscribe to the notify *before* sending keys so we don't miss a fast delivery.
+            let notified = state.prompt_submitted.notified();
+
+            let result = tmux(config)
+                .args(["send-keys", "-t", &pane_id, &prompt, "Enter"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+
+            // Release the type-mutex before awaiting delivery so other senders can type.
+            drop(_guard);
+
+            match result {
+                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                Ok(out) if !out.success() => {
+                    let msg = format!("tmux send-keys failed for pane {}", pane_id);
+                    libslop::ResponseBody::Error { message: msg }
+                }
+                Ok(_) => {
+                    // Wait for UserPromptSubmit from this pane to confirm delivery.
+                    notified.await;
+                    libslop::ResponseBody::Sent { pane_id }
+                }
+            }
         }
     }
 }

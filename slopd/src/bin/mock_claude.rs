@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
@@ -57,6 +57,7 @@ fn main() {
         .unwrap_or_else(|| serde_json::json!({}));
 
     let session_id = "mock-session-id-1234";
+    let cwd = std::env::current_dir().unwrap_or_default();
 
     fire_hooks(
         &settings,
@@ -65,12 +66,30 @@ fn main() {
             "session_id": session_id,
             "hook_event_name": "SessionStart",
             "transcript_path": "/dev/null",
-            "cwd": std::env::current_dir().unwrap_or_default(),
+            "cwd": cwd,
             "source": "startup",
             "model": "mock"
         }),
     );
 
-    // Keep the pane alive so the test can read the tmux pane option before the pane closes.
-    std::thread::sleep(std::time::Duration::from_secs(30));
+    // Read prompts from stdin line by line, firing UserPromptSubmit for each.
+    // This simulates Claude's prompt queue: each line entered into the pane is
+    // a prompt that Claude processes in order.
+    for line in std::io::BufReader::new(std::io::stdin()).lines() {
+        let prompt = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        fire_hooks(
+            &settings,
+            "UserPromptSubmit",
+            &serde_json::json!({
+                "session_id": session_id,
+                "hook_event_name": "UserPromptSubmit",
+                "transcript_path": "/dev/null",
+                "cwd": cwd,
+                "prompt": prompt
+            }),
+        );
+    }
 }
