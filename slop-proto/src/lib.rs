@@ -7,9 +7,6 @@ pub fn socket_path() -> PathBuf {
 }
 
 pub fn runtime_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(val);
-    }
     dirs::runtime_dir().expect("could not determine XDG runtime dir")
 }
 

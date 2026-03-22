@@ -23,15 +23,18 @@ struct TmuxServer {
 }
 
 impl TmuxServer {
-    fn start() -> Self {
+    fn start() -> Option<Self> {
         let tmpdir = tempfile::tempdir().unwrap();
-        let status = Command::new("tmux")
+        let result = Command::new("tmux")
             .args(["-S", "default", "new-session", "-d", "-s", "test"])
             .env("TMUX_TMPDIR", tmpdir.path())
-            .status()
-            .expect("failed to start tmux");
-        assert!(status.success(), "failed to start tmux server");
-        TmuxServer { tmpdir }
+            .status();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("failed to start tmux: {}", e),
+            Ok(status) => assert!(status.success(), "failed to start tmux server"),
+        }
+        Some(TmuxServer { tmpdir })
     }
 
     fn env(&self) -> (&str, &std::path::Path) {
@@ -52,7 +55,10 @@ impl Drop for TmuxServer {
 fn status_with_slopd_running() {
     build_bin("slopd");
 
-    let tmux = TmuxServer::start();
+    let Some(tmux) = TmuxServer::start() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
     let (tmux_env_key, tmux_env_val) = tmux.env();
 
     let runtime_dir = tempfile::tempdir().unwrap();
