@@ -149,12 +149,15 @@ impl TestEnv {
             .env_remove("TMPDIR")
             .spawn()
             .expect("failed to spawn slopd");
-        // Wait for slopd's Unix socket to appear (it prints "listening on ..." only after bind).
+        // Wait for slopd to be ready by polling until a connection to its socket succeeds.
         let socket = self.runtime_dir.path().join("slopd/slopd.sock");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
+        loop {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
             if std::time::Instant::now() > deadline {
-                panic!("timed out waiting for slopd socket at {}", socket.display());
+                panic!("timed out waiting for slopd to accept connections at {}", socket.display());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
