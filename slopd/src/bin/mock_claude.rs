@@ -42,12 +42,14 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
 }
 
 fn main() {
-    // Real Claude reads ~/.claude/settings.json. We support CLAUDE_SETTINGS as a test seam
-    // since there is no reliable official env var to redirect Claude's config directory.
-    let settings_path = std::env::var("CLAUDE_SETTINGS").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.claude/settings.json", home)
-    });
+    // Real Claude reads $CLAUDE_CONFIG_DIR/settings.json (default: ~/.claude/settings.json).
+    let settings_path = {
+        let config_dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.claude", home)
+        });
+        format!("{}/settings.json", config_dir)
+    };
 
     let settings: serde_json::Value = std::fs::read_to_string(&settings_path)
         .ok()
@@ -68,4 +70,7 @@ fn main() {
             "model": "mock"
         }),
     );
+
+    // Keep the pane alive so the test can read the tmux pane option before the pane closes.
+    std::thread::sleep(std::time::Duration::from_secs(30));
 }

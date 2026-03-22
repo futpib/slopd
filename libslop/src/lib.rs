@@ -128,8 +128,8 @@ pub struct SlopdConfig {
     pub tmux: SlopdTmuxConfig,
     #[serde(default)]
     pub run: SlopdRunConfig,
-    /// Override path to Claude's settings.json (default: ~/.claude/settings.json)
-    pub claude_settings: Option<PathBuf>,
+    /// Override Claude's config directory (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude)
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -193,10 +193,14 @@ impl SlopdConfig {
         load_config(path)
     }
 
-    pub fn claude_settings_path(&self) -> PathBuf {
-        self.claude_settings
+    pub fn claude_config_dir(&self) -> PathBuf {
+        self.claude_config_dir
             .clone()
-            .unwrap_or_else(|| home_dir().join(".claude/settings.json"))
+            .unwrap_or_else(|| home_dir().join(".claude"))
+    }
+
+    pub fn claude_settings_path(&self) -> PathBuf {
+        self.claude_config_dir().join("settings.json")
     }
 }
 

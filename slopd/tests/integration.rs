@@ -2,6 +2,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+fn kill_slopd(mut child: Child) {
+    // Use SIGTERM instead of SIGKILL so the process can flush LLVM coverage data on exit.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM); }
+    child.wait().unwrap();
+}
+
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
@@ -55,13 +61,13 @@ impl TmuxServer {
         config_dir: &tempfile::TempDir,
         executable: Option<&[&str]>,
         slopctl: Option<&str>,
-        claude_settings: Option<&PathBuf>,
+        claude_config_dir: Option<&PathBuf>,
     ) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = String::new();
-        if let Some(path) = claude_settings {
-            config.push_str(&format!("claude_settings = {:?}\n\n", path.to_str().unwrap()));
+        if let Some(path) = claude_config_dir {
+            config.push_str(&format!("claude_config_dir = {:?}\n\n", path.to_str().unwrap()));
         }
         config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
         let has_run_section = executable.is_some() || slopctl.is_some();
@@ -125,24 +131,34 @@ impl TestEnv {
     fn new_full(
         executable: Option<&[&str]>,
         slopctl: Option<&str>,
-        claude_settings: Option<&PathBuf>,
+        claude_config_dir: Option<&PathBuf>,
     ) -> Option<Self> {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config_full(&config_dir, executable, slopctl, claude_settings);
+        tmux.write_slopd_config_full(&config_dir, executable, slopctl, claude_config_dir);
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 
     fn spawn_slopd(&self) -> Child {
-        Command::new(cargo_bin("slopd"))
+        let child = Command::new(cargo_bin("slopd"))
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
             .spawn()
-            .expect("failed to spawn slopd")
+            .expect("failed to spawn slopd");
+        // Wait for slopd's Unix socket to appear (it prints "listening on ..." only after bind).
+        let socket = self.runtime_dir.path().join("slopd/slopd.sock");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for slopd socket at {}", socket.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
     }
 
     fn slopctl(&self, args: &[&str]) -> std::process::Output {
@@ -164,11 +180,9 @@ fn slopd_starts_with_tmux_running() {
     };
 
     let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
 
     let still_running = slopd.try_wait().unwrap().is_none();
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(still_running, "slopd exited early");
 }
@@ -208,8 +222,7 @@ fn slopd_creates_marked_tmux_session() {
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let session_exists = env.tmux.tmux()
         .args(["has-session", "-t", "slopd"])
@@ -223,8 +236,7 @@ fn slopd_creates_marked_tmux_session() {
         .expect("failed to run tmux show-options");
     let option_value = String::from_utf8_lossy(&option_output.stdout);
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(session_exists, "slopd tmux session does not exist");
     assert_eq!(option_value.trim(), "true", "{} option not set correctly", libslop::TmuxOption::SlopdManaged.as_str());
@@ -240,13 +252,11 @@ fn run_spawns_executable_in_new_tmux_window() {
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let output = env.slopctl(&["run"]);
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -263,8 +273,7 @@ fn kill_terminates_pane() {
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
@@ -272,8 +281,7 @@ fn kill_terminates_pane() {
 
     let kill_output = env.slopctl(&["kill", &pane_id]);
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(kill_output.status.success(), "slopctl kill failed: {:?}", kill_output);
     let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
@@ -286,29 +294,27 @@ fn run_injects_hooks_into_claude_settings() {
     build_bin("slopctl");
 
     let home_dir = tempfile::tempdir().unwrap();
-    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let claude_config_dir = home_dir.path().join(".claude");
     let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
 
     let Some(env) = TestEnv::new_full(
         Some(&["sleep", "infinity"]),
         Some(&slopctl_path),
-        Some(&claude_settings_path),
+        Some(&claude_config_dir),
     ) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let output = env.slopctl(&["run"]);
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
-    let settings_contents = std::fs::read_to_string(&claude_settings_path)
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
         .expect("settings.json was not created");
     let settings: serde_json::Value =
         serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
@@ -337,13 +343,13 @@ fn run_hook_injection_is_idempotent() {
     build_bin("slopctl");
 
     let home_dir = tempfile::tempdir().unwrap();
-    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let claude_config_dir = home_dir.path().join(".claude");
     let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
 
     let Some(env) = TestEnv::new_full(
         Some(&["sleep", "infinity"]),
         Some(&slopctl_path),
-        Some(&claude_settings_path),
+        Some(&claude_config_dir),
     ) else {
         eprintln!("skipping: tmux not found");
         return;
@@ -351,19 +357,17 @@ fn run_hook_injection_is_idempotent() {
 
     // Run twice to verify idempotency
     for _ in 0..2 {
-        let mut slopd = env.spawn_slopd();
-        std::thread::sleep(Duration::from_millis(100));
+        let slopd = env.spawn_slopd();
 
         let output = env.slopctl(&["run"]);
 
-        slopd.kill().unwrap();
-        slopd.wait().unwrap();
+        kill_slopd(slopd);
 
         assert!(output.status.success(), "slopctl run failed: {:?}", output);
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let settings_contents = std::fs::read_to_string(&claude_settings_path)
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
         .expect("settings.json was not created");
     let settings: serde_json::Value =
         serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
@@ -393,21 +397,20 @@ fn session_start_hook_stores_session_id_on_pane() {
     build_bin("mock_claude");
 
     let home_dir = tempfile::tempdir().unwrap();
-    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let claude_config_dir = home_dir.path().join(".claude");
     let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
     let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
 
     let Some(env) = TestEnv::new_full(
         Some(&[&mock_claude_path]),
         Some(&slopctl_path),
-        Some(&claude_settings_path),
+        Some(&claude_config_dir),
     ) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
-    let mut slopd = env.spawn_slopd();
-    std::thread::sleep(Duration::from_millis(100));
+    let slopd = env.spawn_slopd();
 
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
@@ -425,15 +428,13 @@ fn session_start_hook_stores_session_id_on_pane() {
             break val;
         }
         if Instant::now() > deadline {
-            slopd.kill().unwrap();
-            slopd.wait().unwrap();
+            kill_slopd(slopd);
             panic!("timed out waiting for @claude_session_id on pane {}", pane_id);
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    slopd.kill().unwrap();
-    slopd.wait().unwrap();
+    kill_slopd(slopd);
 
     assert_eq!(session_id, "mock-session-id-1234");
 }
