@@ -81,8 +81,16 @@ fn slopd_fails_without_tmux_running() {
         return;
     }
 
+    // Use a non-existent custom socket path and disable start_server so slopd
+    // must connect to an already-running server (which isn't there).
     let runtime_dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
+    let slopd_config_dir = config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(
+        slopd_config_dir.join("config.toml"),
+        "[tmux]\nsocket = \"/nonexistent/tmux.sock\"\nstart_server = false\n",
+    ).unwrap();
 
     let status = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
@@ -464,25 +472,62 @@ fn ps_lists_panes_with_session_id_and_tags() {
 fn ps_shows_parent_pane() {
     build_bin("slopd");
     build_bin("slopctl");
+    build_bin("mock_claude");
 
-    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
     let slopd = env.spawn_slopd();
 
+    // Launch the parent pane — mock_claude runs inside a real tmux pane, so TMUX_PANE
+    // is set automatically by tmux in the child process environment.
     let parent_out = env.slopctl(&["run"]);
     assert!(parent_out.status.success());
     let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
 
-    let child_out = Command::new(cargo_bin("slopctl"))
-        .args(["run"])
-        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
-        .env("TMUX_PANE", &parent_pane)
-        .output().unwrap();
-    assert!(child_out.status.success());
-    let child_pane = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+    // Wait for SessionStart so mock_claude is ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &parent_pane, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart on parent pane");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Ask mock_claude to spawn a child pane. Because it runs inside a tmux pane,
+    // TMUX_PANE is set by tmux automatically — no manual env var wiring needed.
+    let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
+    assert!(send_out.status.success(), "slopctl send /run failed: {:?}", send_out);
+
+    // mock_claude prints "/run:<child_pane_id>" to the pane; capture it.
+    let child_pane = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = env.tmux.tmux()
+                .args(["capture-pane", "-t", &parent_pane, "-p"])
+                .output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().find(|l| l.starts_with("/run:")) {
+                break line.trim_start_matches("/run:").trim().to_string();
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for /run output in pane");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
 
     let ps_out = env.slopctl(&["ps"]);
 
@@ -490,13 +535,11 @@ fn ps_shows_parent_pane() {
 
     assert!(ps_out.status.success(), "ps failed: {:?}", ps_out);
     let stdout = String::from_utf8_lossy(&ps_out.stdout);
-    // The child row should contain the parent pane ID in the PARENT column.
     let child_line = stdout.lines()
         .find(|l| l.contains(&child_pane))
         .unwrap_or_else(|| panic!("child pane {} not found in ps output:\n{}", child_pane, stdout));
     assert!(child_line.contains(&parent_pane),
         "child row missing parent pane ID {}:\n{}", parent_pane, child_line);
-    // The parent row should show "-" in the PARENT column.
     let parent_line = stdout.lines()
         .find(|l| l.starts_with(&parent_pane))
         .unwrap_or_else(|| panic!("parent pane {} not found in ps output:\n{}", parent_pane, stdout));
@@ -1224,29 +1267,61 @@ fn help_send_filtered_unknown_filter_key() {
 fn run_from_pane_sets_parent_pane_attribute() {
     build_bin("slopd");
     build_bin("slopctl");
+    build_bin("mock_claude");
 
-    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
     let slopd = env.spawn_slopd();
 
-    // Spawn a "parent" pane first.
+    // Spawn the parent pane — mock_claude runs inside a real tmux pane.
     let parent_out = env.slopctl(&["run"]);
     assert!(parent_out.status.success(), "first run failed: {:?}", parent_out);
     let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
 
-    // Spawn a "child" pane as if it was launched from within the parent pane
-    // by passing TMUX_PANE as the parent pane ID.
-    let child_out = Command::new(cargo_bin("slopctl"))
-        .args(["run"])
-        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
-        .env("TMUX_PANE", &parent_pane)
-        .output()
-        .expect("failed to spawn slopctl run");
-    assert!(child_out.status.success(), "child run failed: {:?}", child_out);
-    let child_pane = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+    // Wait for SessionStart so mock_claude is ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &parent_pane, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart on parent pane");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Ask mock_claude to spawn a child. TMUX_PANE is set by tmux in mock_claude's
+    // environment, so the child gets @slopd_parent_pane set automatically.
+    let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
+    assert!(send_out.status.success(), "slopctl send /run failed: {:?}", send_out);
+
+    // mock_claude prints "/run:<child_pane_id>" to the pane; capture it.
+    let child_pane = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = env.tmux.tmux()
+                .args(["capture-pane", "-t", &parent_pane, "-p"])
+                .output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().find(|l| l.starts_with("/run:")) {
+                break line.trim_start_matches("/run:").trim().to_string();
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for /run output in pane");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
 
     // Verify the child pane has @slopd_parent_pane set to the parent.
     let opt_out = env.tmux.tmux()

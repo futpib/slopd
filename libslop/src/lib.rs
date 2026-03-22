@@ -235,9 +235,24 @@ pub struct SlopdConfig {
     pub claude_config_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdTmuxConfig {
     pub socket: Option<PathBuf>,
+    /// Run `tmux start-server` on startup (default: true when socket is not set).
+    pub start_server: Option<bool>,
+}
+
+impl Default for SlopdTmuxConfig {
+    fn default() -> Self {
+        Self { socket: None, start_server: None }
+    }
+}
+
+impl SlopdTmuxConfig {
+    /// Whether slopd should run `tmux start-server` on startup.
+    pub fn should_start_server(&self) -> bool {
+        self.start_server.unwrap_or(self.socket.is_none())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

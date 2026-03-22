@@ -110,15 +110,24 @@ async fn main() {
 
     let config = Arc::new(libslop::SlopdConfig::load());
 
-    let status = tmux(&config)
-        .arg("list-sessions")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("failed to run tmux");
-    if !status.success() {
-        error!("tmux is not running");
-        std::process::exit(1);
+    if config.tmux.should_start_server() {
+        tmux(&config)
+            .arg("start-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run tmux start-server");
+    } else {
+        let status = tmux(&config)
+            .arg("list-sessions")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run tmux");
+        if !status.success() {
+            error!("tmux is not running");
+            std::process::exit(1);
+        }
     }
 
     // Create the slopd session if it doesn't exist (-A: attach if exists, -d: keep detached)
@@ -382,7 +391,8 @@ async fn handle_request(
             let mut cmd = tmux(config);
             cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                 .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())]);
+                .args(["-e", &format!("CLAUDE_CONFIG_DIR={}", config.claude_config_dir().display())])
+                .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)]);
             // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
             // write their coverage data even when launched inside a tmux window.
             if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {

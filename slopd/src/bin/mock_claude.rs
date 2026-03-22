@@ -137,6 +137,31 @@ fn main() {
                     while stdin.read(&mut buf).unwrap_or(0) > 0 {}
                     break;
                 }
+                if prompt == "/run" {
+                    // Spawn a child pane via slopctl run. TMUX_PANE is set automatically
+                    // by tmux in our environment, so the child will have @slopd_parent_pane
+                    // pointing at us without any manual wiring.
+                    let slopctl = std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
+                    let output = Command::new(&slopctl)
+                        .arg("run")
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .and_then(|c| c.wait_with_output());
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            let child_pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            // Print child pane ID so the test can read it from tmux pane content.
+                            println!("/run:{}", child_pane);
+                        }
+                        Ok(out) => {
+                            eprintln!("mock_claude: slopctl run failed: {:?}", out.status);
+                        }
+                        Err(e) => {
+                            eprintln!("mock_claude: failed to spawn slopctl run: {}", e);
+                        }
+                    }
+                    // Fall through to fire UserPromptSubmit so slopctl send unblocks.
+                }
 
                 fire_hooks(
                     &settings,
