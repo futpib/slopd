@@ -10,12 +10,56 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     path.join(name)
 }
 
+fn build_bin(name: &str) {
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", name, "--bin", name])
+        .status()
+        .expect("failed to run cargo build");
+    assert!(status.success(), "cargo build --bin {} failed", name);
+}
+
+struct TmuxServer {
+    tmpdir: tempfile::TempDir,
+}
+
+impl TmuxServer {
+    fn start() -> Self {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let status = Command::new("tmux")
+            .args(["-S", "default", "new-session", "-d", "-s", "test"])
+            .env("TMUX_TMPDIR", tmpdir.path())
+            .status()
+            .expect("failed to start tmux");
+        assert!(status.success(), "failed to start tmux server");
+        TmuxServer { tmpdir }
+    }
+
+    fn env(&self) -> (&str, &std::path::Path) {
+        ("TMUX_TMPDIR", self.tmpdir.path())
+    }
+}
+
+impl Drop for TmuxServer {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-S", "default", "kill-server"])
+            .env("TMUX_TMPDIR", self.tmpdir.path())
+            .status();
+    }
+}
+
 #[test]
 fn status_with_slopd_running() {
+    build_bin("slopd");
+
+    let tmux = TmuxServer::start();
+    let (tmux_env_key, tmux_env_val) = tmux.env();
+
     let runtime_dir = tempfile::tempdir().unwrap();
 
     let mut slopd = Command::new(cargo_bin("slopd"))
         .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env(tmux_env_key, tmux_env_val)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

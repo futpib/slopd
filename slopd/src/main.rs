@@ -4,6 +4,17 @@ use tokio::net::UnixListener;
 
 #[tokio::main]
 async fn main() {
+    let tmux_status = std::process::Command::new("tmux")
+        .arg("list-sessions")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run tmux");
+    if !tmux_status.success() {
+        eprintln!("slopd: tmux is not running");
+        std::process::exit(1);
+    }
+
     let socket_path = slop_proto::socket_path();
     let socket_dir = socket_path.parent().unwrap();
 
