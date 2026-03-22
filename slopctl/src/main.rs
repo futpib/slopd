@@ -453,7 +453,9 @@ async fn main() {
             print_ps(panes);
             return;
         }
-        Command::Run => libslop::RequestBody::Run,
+        Command::Run => libslop::RequestBody::Run {
+            parent_pane_id: std::env::var("TMUX_PANE").ok(),
+        },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
         Command::Send { pane_id, prompt, timeout } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },

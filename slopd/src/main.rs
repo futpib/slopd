@@ -370,7 +370,7 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run => {
+        libslop::RequestBody::Run { parent_pane_id } => {
             let settings_path = config.claude_settings_path();
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
@@ -393,6 +393,20 @@ async fn handle_request(
                 Ok(out) if out.status.success() => {
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
+                    if let Some(ref parent) = parent_pane_id {
+                        let result = tmux(config)
+                            .args([
+                                "set-option", "-t", &pane_id, "-p",
+                                libslop::TmuxOption::SlopdParentPane.as_str(),
+                                parent,
+                            ])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                        if let Err(e) = result {
+                            warn!("failed to set @slopd_parent_pane on pane {}: {}", pane_id, e);
+                        }
+                    }
                     libslop::ResponseBody::Run { pane_id }
                 }
                 Ok(out) => {

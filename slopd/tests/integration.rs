@@ -1175,3 +1175,72 @@ fn help_send_filtered_unknown_filter_key() {
     assert_eq!(out.status.code(), Some(1), "expected exit 1\nstderr: {}", stderr);
     assert!(stderr.contains("foo"), "expected filter key in error\nstderr: {}", stderr);
 }
+
+#[test]
+fn run_from_pane_sets_parent_pane_attribute() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a "parent" pane first.
+    let parent_out = env.slopctl(&["run"]);
+    assert!(parent_out.status.success(), "first run failed: {:?}", parent_out);
+    let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
+
+    // Spawn a "child" pane as if it was launched from within the parent pane
+    // by passing TMUX_PANE as the parent pane ID.
+    let child_out = Command::new(cargo_bin("slopctl"))
+        .args(["run"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("TMUX_PANE", &parent_pane)
+        .output()
+        .expect("failed to spawn slopctl run");
+    assert!(child_out.status.success(), "child run failed: {:?}", child_out);
+    let child_pane = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+
+    // Verify the child pane has @slopd_parent_pane set to the parent.
+    let opt_out = env.tmux.tmux()
+        .args(["show-options", "-t", &child_pane, "-p", "-v",
+               libslop::TmuxOption::SlopdParentPane.as_str()])
+        .output().unwrap();
+    let value = String::from_utf8_lossy(&opt_out.stdout).trim().to_string();
+
+    kill_slopd(slopd);
+
+    assert_eq!(value, parent_pane,
+        "@slopd_parent_pane on child pane should equal parent pane ID");
+}
+
+#[test]
+fn run_without_tmux_pane_has_no_parent_attribute() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // env.slopctl does not set TMUX_PANE, simulating a user-initiated run.
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let opt_out = env.tmux.tmux()
+        .args(["show-options", "-t", &pane_id, "-p", "-v",
+               libslop::TmuxOption::SlopdParentPane.as_str()])
+        .output().unwrap();
+    let value = String::from_utf8_lossy(&opt_out.stdout).trim().to_string();
+
+    kill_slopd(slopd);
+
+    assert!(value.is_empty(), "@slopd_parent_pane should not be set for user-initiated run, got {:?}", value);
+}

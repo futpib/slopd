@@ -23,6 +23,8 @@ pub enum TmuxOption {
     SlopdManaged,
     /// Stores the Claude session ID on a pane
     SlopdClaudeSessionId,
+    /// Stores the parent pane ID when a pane was spawned by another pane via slopctl run
+    SlopdParentPane,
 }
 
 impl TmuxOption {
@@ -30,6 +32,7 @@ impl TmuxOption {
         match self {
             TmuxOption::SlopdManaged => "@slopd_managed",
             TmuxOption::SlopdClaudeSessionId => "@slopd_claude_session_id",
+            TmuxOption::SlopdParentPane => "@slopd_parent_pane",
         }
     }
 }
@@ -358,7 +361,7 @@ pub struct EventFilter {
 #[serde(tag = "type")]
 pub enum RequestBody {
     Status,
-    Run,
+    Run { parent_pane_id: Option<String> },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64 },
