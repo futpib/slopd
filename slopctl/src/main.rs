@@ -4,9 +4,9 @@ use tokio::net::UnixStream;
 use tracing::debug;
 
 #[derive(Parser)]
-#[command(name = "slopctl")]
+#[command(name = "slopctl", about = "Control a running slopd daemon")]
 struct Cli {
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity (-v INFO, -vv DEBUG, -vvv TRACE)")]
     verbose: u8,
 
     #[command(subcommand)]
@@ -15,6 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show slopd uptime and state.
     Status,
     /// List panes in the slopd session.
     Ps {
@@ -22,22 +23,31 @@ enum Command {
         #[arg(long = "filter", value_name = "KEY=VALUE")]
         filters: Vec<String>,
     },
+    /// Open a new Claude pane in the slopd tmux session.
     Run,
+    /// Terminate a Claude pane.
     Kill {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
     },
+    /// Forward a Claude lifecycle hook event to slopd (called by Claude hooks).
     Hook {
+        /// Hook event name (e.g. UserPromptSubmit).
         event: String,
     },
+    /// Type a prompt into a pane and wait for UserPromptSubmit confirmation.
     Send {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
+        /// Prompt text to send.
         prompt: String,
-        /// Seconds to wait for UserPromptSubmit confirmation (default: 60).
+        /// Seconds to wait for UserPromptSubmit confirmation.
         #[arg(long, default_value = "60")]
         timeout: u64,
     },
     /// Send Ctrl+C, Ctrl+D, and Escape to interrupt a running agent.
     Interrupt {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
     },
     /// Subscribe to a stream of events and print each as a JSON line.
@@ -46,36 +56,42 @@ enum Command {
         #[arg(long = "hook", value_name = "EVENT")]
         hooks: Vec<String>,
         /// Only receive events from this tmux pane.
-        #[arg(long)]
+        #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
         /// Only receive events from this Claude session.
-        #[arg(long)]
+        #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
     },
     /// Add a tag to a pane.
     Tag {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
+        /// Tag name (ASCII letters, digits, _, -).
         tag: String,
     },
     /// Remove a tag from a pane.
     Untag {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
+        /// Tag name to remove.
         tag: String,
     },
     /// List all tags on a pane.
     Tags {
+        /// Tmux pane ID (e.g. %42).
         pane_id: String,
     },
-    /// Send a prompt to panes selected by filters.
+    /// Type a prompt into all panes matching a filter.
     SendFiltered {
+        /// Prompt text to send.
         prompt: String,
         /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
         #[arg(long = "filter", value_name = "KEY=VALUE")]
         filters: Vec<String>,
-        /// How to select among matching panes: one (default), any, all.
+        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
         #[arg(long, default_value = "one")]
         select: SelectMode,
-        /// Seconds to wait for UserPromptSubmit confirmation per pane (default: 60).
+        /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
     },
@@ -181,6 +197,11 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Validate filter arguments eagerly before touching the socket.
+    if let Command::Ps { ref filters } | Command::SendFiltered { ref filters, .. } = cli.command {
+        parse_filters(filters.clone());
+    }
 
     let _config = libslop::SlopctlConfig::load();
 

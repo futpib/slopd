@@ -1076,3 +1076,102 @@ fn send_filtered_all_is_concurrent() {
         N, all_elapsed, limit, baseline,
     );
 }
+
+/// Run slopctl with the given args (no daemon needed), assert exit code 2, and
+/// assert that stderr contains `expected_hint` so the user knows what went wrong.
+fn assert_invalid_usage(args: &[&str], expected_hint: &str) {
+    build_bin("slopctl");
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(args)
+        .output()
+        .expect("failed to run slopctl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "slopctl {:?}: expected exit 2, got {:?}\nstderr: {}",
+        args, out.status.code(), stderr,
+    );
+    assert!(
+        stderr.contains(expected_hint),
+        "slopctl {:?}: stderr missing {:?}\nstderr: {}",
+        args, expected_hint, stderr,
+    );
+}
+
+#[test]
+fn help_no_subcommand() {
+    assert_invalid_usage(&[], "Usage:");
+}
+
+#[test]
+fn help_unknown_subcommand() {
+    assert_invalid_usage(&["frobnicate"], "Usage:");
+}
+
+#[test]
+fn help_kill_missing_pane_id() {
+    assert_invalid_usage(&["kill"], "<PANE_ID>");
+}
+
+#[test]
+fn help_hook_missing_event() {
+    assert_invalid_usage(&["hook"], "<EVENT>");
+}
+
+#[test]
+fn help_send_missing_args() {
+    assert_invalid_usage(&["send"], "<PANE_ID>");
+}
+
+#[test]
+fn help_send_missing_prompt() {
+    assert_invalid_usage(&["send", "%1"], "<PROMPT>");
+}
+
+#[test]
+fn help_interrupt_missing_pane_id() {
+    assert_invalid_usage(&["interrupt"], "<PANE_ID>");
+}
+
+#[test]
+fn help_tag_missing_args() {
+    assert_invalid_usage(&["tag"], "<PANE_ID>");
+}
+
+#[test]
+fn help_tag_missing_tag() {
+    assert_invalid_usage(&["tag", "%1"], "<TAG>");
+}
+
+#[test]
+fn help_untag_missing_args() {
+    assert_invalid_usage(&["untag"], "<PANE_ID>");
+}
+
+#[test]
+fn help_untag_missing_tag() {
+    assert_invalid_usage(&["untag", "%1"], "<TAG>");
+}
+
+#[test]
+fn help_tags_missing_pane_id() {
+    assert_invalid_usage(&["tags"], "<PANE_ID>");
+}
+
+#[test]
+fn help_send_filtered_missing_prompt() {
+    assert_invalid_usage(&["send-filtered"], "<PROMPT>");
+}
+
+#[test]
+fn help_send_filtered_unknown_filter_key() {
+    build_bin("slopctl");
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["send-filtered", "--filter", "foo=bar", "hello"])
+        .output()
+        .expect("failed to run slopctl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "expected exit 1\nstderr: {}", stderr);
+    assert!(stderr.contains("foo"), "expected filter key in error\nstderr: {}", stderr);
+}
