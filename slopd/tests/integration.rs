@@ -530,6 +530,8 @@ fn ps_shows_parent_pane() {
     };
 
     let ps_out = env.slopctl(&["ps"]);
+    // Verify no stray quote characters in parent_pane_id via JSON output (issue #5).
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
 
     kill_slopd(slopd);
 
@@ -545,6 +547,18 @@ fn ps_shows_parent_pane() {
         .unwrap_or_else(|| panic!("parent pane {} not found in ps output:\n{}", parent_pane, stdout));
     assert!(parent_line.contains('-'),
         "parent row should have '-' for PARENT:\n{}", parent_line);
+
+    assert!(ps_json_out.status.success(), "ps --json failed: {:?}", ps_json_out);
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json output is not valid JSON");
+    let child_entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == child_pane)
+        .unwrap_or_else(|| panic!("child pane {} not in ps --json output", child_pane));
+    assert_eq!(
+        child_entry["parent_pane_id"],
+        serde_json::Value::String(parent_pane.clone()),
+        "parent_pane_id contains stray quotes or wrong value",
+    );
 }
 
 #[test]
