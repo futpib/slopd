@@ -103,26 +103,24 @@ Verbosity can be increased with `-v` / `-vv` / `-vvv` (maps to INFO / DEBUG / TR
 
 File: `~/.config/slopd/config.toml`
 
+All defaults are fine for most setups. The only key you are likely to want to set is `claude_config_dir` if Claude's config lives somewhere other than `~/.claude`.
+
 ```toml
-# Optional: override the directory Claude uses for its config.
-# Mirrors the CLAUDE_CONFIG_DIR environment variable.
-claude_config_dir = "~/.claude"
+# Override the directory Claude uses for its config (mirrors CLAUDE_CONFIG_DIR).
+# Uncomment if Claude is configured somewhere other than ~/.claude.
+# claude_config_dir = "~/.claude"
 
-[tmux]
-# Optional: path to a custom tmux socket.
-# When omitted, slopd manages its own tmux server.
-socket = "/run/user/1000/tmux-slopd.sock"
+# [tmux]
+# Path to a custom tmux socket. When omitted slopd uses its default server.
+# socket = "/run/user/1000/tmux-slopd.sock"
 
-# Whether to start a new tmux server when socket is not set (default: true).
-start_server = true
+# [run]
+# Command used to launch Claude. Can be a string or an array.
+# executable = "claude"
+# executable = ["claude", "--dangerously-skip-permissions"]
 
-[run]
-# The command used to launch Claude. Can be a string or a list.
-executable = "claude"
-# executable = ["claude", "--some-flag"]
-
-# Path to the slopctl binary used for hook injection.
-slopctl = "slopctl"
+# Path to the slopctl binary injected into Claude hooks.
+# slopctl = "slopctl"
 ```
 
 ### slopctl config
@@ -161,7 +159,7 @@ Filter by tag:
 slopctl ps --filter tag=prod
 ```
 
-### `slopctl run [--parent-pane-id PANE_ID]`
+### `slopctl run`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
@@ -169,11 +167,7 @@ Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on st
 PANE=$(slopctl run)
 ```
 
-To record that a pane was spawned by another pane:
-
-```bash
-slopctl run --parent-pane-id %1
-```
+If called from within a tmux pane (i.e. `$TMUX_PANE` is set), the new pane automatically records that pane as its parent.
 
 ### `slopctl kill <PANE_ID>`
 
@@ -263,9 +257,9 @@ slopctl send-filtered "Start task X" --filter tag=idle --select one
 
 | Value | Behaviour |
 |-------|-----------|
-| `one` | Exactly one matching pane must exist; error otherwise |
+| `one` (default) | Exactly one matching pane must exist; error otherwise |
 | `any` | Send to one arbitrarily chosen matching pane |
-| `all` | Send to all matching panes (default) |
+| `all` | Send to all matching panes |
 
 ---
 
