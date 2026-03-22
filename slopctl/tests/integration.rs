@@ -12,6 +12,9 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
 }
 
 fn build_bin(name: &str) {
+    if cfg!(coverage) {
+        return;
+    }
     let status = Command::new(env!("CARGO"))
         .args(["build", "-p", name, "--bin", name])
         .status()

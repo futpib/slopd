@@ -5,3 +5,6 @@ members = [
     "libslop",
 ]
 resolver = "2"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
