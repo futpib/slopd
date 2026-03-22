@@ -221,7 +221,7 @@ pub enum RequestBody {
     Status,
     Run,
     Kill { pane_id: String },
-    Hook { event: String, payload: serde_json::Value },
+    Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

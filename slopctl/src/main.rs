@@ -55,7 +55,8 @@ async fn main() {
                 eprintln!("Failed to parse hook payload: {}", e);
                 std::process::exit(1);
             });
-            libslop::RequestBody::Hook { event, payload }
+            let pane_id = std::env::var("TMUX_PANE").ok();
+            libslop::RequestBody::Hook { event, payload, pane_id }
         }
         "kill" => {
             let pane_id = args.get(2).cloned().unwrap_or_else(|| {

@@ -126,8 +126,31 @@ async fn handle_connection(
                             Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
                         }
                     }
-                    libslop::RequestBody::Hook { event, payload: _ } => {
-                        debug!("hook: {}", event);
+                    libslop::RequestBody::Hook { event, payload, pane_id } => {
+                        debug!("hook: {} pane={:?}", event, pane_id);
+                        if event == "SessionStart" {
+                            if let (Some(pane), Some(session_id)) = (
+                                pane_id.as_deref(),
+                                payload.get("session_id").and_then(|v| v.as_str()),
+                            ) {
+                                debug!("SessionStart: pane={} session_id={}", pane, session_id);
+                                let result = tmux(&config)
+                                    .args([
+                                        "set-option",
+                                        "-t",
+                                        pane,
+                                        "-p",
+                                        "@claude_session_id",
+                                        session_id,
+                                    ])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status();
+                                if let Err(e) = result {
+                                    warn!("failed to set @claude_session_id on pane {}: {}", pane, e);
+                                }
+                            }
+                        }
                         libslop::ResponseBody::Hooked
                     }
                     libslop::RequestBody::Run => {
@@ -138,8 +161,11 @@ async fn handle_connection(
                         ) {
                             warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
                         }
+                        let xdg_runtime_dir = libslop::runtime_dir();
                         let output = tmux(&config)
                             .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+                            .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
+                            .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)])
                             .arg(config.run.executable.program())
                             .args(config.run.executable.args())
                             .output();

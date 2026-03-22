@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
@@ -16,7 +16,7 @@ fn build_bin(name: &str) {
         return;
     }
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", name, "--bin", name])
+        .args(["build", "--workspace", "--bin", name])
         .status()
         .expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);
@@ -60,6 +60,9 @@ impl TmuxServer {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap());
+        if let Some(path) = claude_settings {
+            config.push_str(&format!("\nclaude_settings = {:?}\n", path.to_str().unwrap()));
+        }
         let has_run_section = executable.is_some() || slopctl.is_some();
         if has_run_section {
             config.push_str("\n[run]\n");
@@ -70,9 +73,6 @@ impl TmuxServer {
             if let Some(s) = slopctl {
                 config.push_str(&format!("slopctl = {:?}\n", s));
             }
-        }
-        if let Some(path) = claude_settings {
-            config.push_str(&format!("\nclaude_settings = {:?}\n", path.to_str().unwrap()));
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
@@ -385,4 +385,56 @@ fn run_hook_injection_is_idempotent() {
         }).count();
         assert_eq!(our_hook_count, 1, "expected exactly one slopctl hook for event {}, got {}", event, our_hook_count);
     }
+}
+
+#[test]
+fn session_start_hook_stores_session_id_on_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_settings_path = home_dir.path().join(".claude/settings.json");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_settings_path),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let mut slopd = env.spawn_slopd();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Poll until @claude_session_id is set on the pane (mock_claude fires the hook then exits)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let session_id = loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v", "@claude_session_id"])
+            .output()
+            .expect("failed to run tmux show-options");
+        let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !val.is_empty() {
+            break val;
+        }
+        if Instant::now() > deadline {
+            slopd.kill().unwrap();
+            slopd.wait().unwrap();
+            panic!("timed out waiting for @claude_session_id on pane {}", pane_id);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    slopd.kill().unwrap();
+    slopd.wait().unwrap();
+
+    assert_eq!(session_id, "mock-session-id-1234");
 }
