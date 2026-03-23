@@ -182,6 +182,32 @@ fn kill_terminates_pane() {
 }
 
 #[test]
+fn run_does_not_inject_hooks_into_host_claude_settings() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let host_settings = libslop::home_dir().join(".claude/settings.json");
+    let mtime_before = host_settings.metadata().ok().map(|m| m.modified().unwrap());
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+
+    let mtime_after = host_settings.metadata().ok().map(|m| m.modified().unwrap());
+    assert_eq!(
+        mtime_before, mtime_after,
+        "~/.claude/settings.json was modified by the test"
+    );
+}
+
+#[test]
 fn run_injects_hooks_into_claude_settings() {
     build_bin("slopd");
     build_bin("slopctl");

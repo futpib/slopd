@@ -124,7 +124,8 @@ impl TestEnv {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config(&config_dir, executable);
+        let claude_config_dir = config_dir.path().join(".claude");
+        tmux.write_slopd_config_full(&config_dir, executable, None, Some(&claude_config_dir));
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 
