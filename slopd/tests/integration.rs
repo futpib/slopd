@@ -73,6 +73,48 @@ fn slopd_starts_with_tmux_running() {
 }
 
 #[test]
+fn slopd_second_instance_fails_when_first_is_running() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+
+    let mut slopd2 = Command::new(cargo_bin("slopd"))
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("XDG_CONFIG_HOME", env.config_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn second slopd");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        if let Some(status) = slopd2.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    if exited.is_none() {
+        kill_child(slopd2);
+    }
+    kill_slopd(slopd1);
+
+    let status2 = exited.expect("second slopd instance should have exited, but it kept running");
+    assert!(!status2.success(), "second slopd instance should have failed");
+}
+
+#[test]
 fn slopd_fails_without_tmux_running() {
     build_bin("slopd");
 

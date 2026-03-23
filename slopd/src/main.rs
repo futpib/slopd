@@ -177,6 +177,23 @@ async fn main() {
     let socket_dir = socket_path.parent().unwrap();
 
     tokio::fs::create_dir_all(&socket_dir).await.unwrap();
+
+    let lock_path = socket_path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap_or_else(|e| panic!("failed to open lock file {}: {}", lock_path.display(), e));
+    let lock_result = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&lock_file), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            error!("slopd is already running (lock file held: {})", lock_path.display());
+            std::process::exit(1);
+        }
+        panic!("flock failed: {}", err);
+    }
+
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     let listener = UnixListener::bind(&socket_path).unwrap();
