@@ -49,7 +49,29 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
     }
 }
 
+fn handle_prompt(prompt: &str) {
+    if let Some(text) = prompt.strip_prefix("/echo ") {
+        println!("{}", text.trim());
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let print_mode = args.iter().any(|a| a == "--print" || a == "-p");
+
+    if print_mode {
+        // In --print mode, treat the last non-flag argument as the prompt,
+        // process it, and exit immediately (no interactive loop).
+        let prompt = args.iter()
+            .skip(1)
+            .filter(|a| *a != "--print" && *a != "-p")
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        handle_prompt(&prompt);
+        return;
+    }
+
     // Real Claude reads $CLAUDE_CONFIG_DIR/settings.json (default: ~/.claude/settings.json).
     let settings_path = {
         let config_dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| {
@@ -156,6 +178,11 @@ fn main() {
                         }
                         other => eprintln!("mock_claude: unknown newline mode {:?}", other),
                     }
+                    continue;
+                }
+
+                if let Some(text) = prompt.strip_prefix("/echo ") {
+                    println!("{}", text.trim());
                     continue;
                 }
 

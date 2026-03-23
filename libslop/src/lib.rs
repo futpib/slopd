@@ -376,7 +376,7 @@ pub struct EventFilter {
 #[serde(tag = "type")]
 pub enum RequestBody {
     Status,
-    Run { parent_pane_id: Option<String> },
+    Run { parent_pane_id: Option<String>, extra_args: Vec<String> },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64 },

@@ -390,7 +390,7 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id } => {
+        libslop::RequestBody::Run { parent_pane_id, extra_args } => {
             let settings_path = config.claude_settings_path();
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
@@ -411,6 +411,7 @@ async fn handle_request(
             let output = cmd
                 .arg(config.run.executable.program())
                 .args(config.run.executable.args())
+                .args(&extra_args)
                 .output()
                 .await;
             match output {

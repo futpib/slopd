@@ -27,7 +27,11 @@ enum Command {
         json: bool,
     },
     /// Open a new Claude pane in the slopd tmux session.
-    Run,
+    Run {
+        /// Extra arguments passed to the Claude executable (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
     /// Terminate a Claude pane.
     Kill {
         /// Tmux pane ID (e.g. %42).
@@ -480,8 +484,9 @@ async fn main() {
             }
             return;
         }
-        Command::Run => libslop::RequestBody::Run {
+        Command::Run { extra_args } => libslop::RequestBody::Run {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
+            extra_args,
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
         Command::Send { pane_id, prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },

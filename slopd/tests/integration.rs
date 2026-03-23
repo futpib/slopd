@@ -1617,3 +1617,116 @@ fn run_without_tmux_pane_has_no_parent_attribute() {
 
     assert!(value.is_empty(), "@slopd_parent_pane should not be set for user-initiated run, got {:?}", value);
 }
+
+/// Verify that extra args passed via `slopctl run -- <args>` are forwarded to the executable.
+/// mock_claude --print exits immediately without entering the interactive loop.
+#[test]
+fn run_extra_args_print_exits_immediately() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Set remain-on-exit so we can inspect the pane after mock_claude exits.
+    env.tmux.tmux()
+        .args(["set-option", "-t", "slopd", "-g", "remain-on-exit", "on"])
+        .status().unwrap();
+
+    let run_out = env.slopctl(&["run", "--", "--print", "hello"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // mock_claude --print should exit quickly. Poll until the pane is dead.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", &pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("Pane is dead") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for pane to exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    kill_slopd(slopd);
+}
+
+/// Verify that /echo command in mock_claude prints the argument back.
+#[test]
+fn echo_command_prints_output() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Wait for SessionStart so mock_claude is ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let send_out = env.slopctl(&["send", &pane_id, "/echo hello-from-echo"]);
+    assert!(send_out.status.success(), "slopctl send failed: {:?}", send_out);
+
+    // Poll pane output for the echo response.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let found = loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", &pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.lines().any(|l| l.contains("hello-from-echo")) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    kill_slopd(slopd);
+
+    assert!(found, "expected 'hello-from-echo' in pane output");
+}
