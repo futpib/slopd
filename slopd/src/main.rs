@@ -1,9 +1,17 @@
+use clap::Parser;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
+
+#[derive(Parser)]
+#[command(name = "slopd", about = "Claude session manager daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
+struct Cli {
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
 
 fn verbosity_to_level(verbosity: u8) -> tracing::Level {
     match verbosity {
@@ -118,10 +126,9 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &BroadcastEvent) -> bool 
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let verbosity = args.iter().filter(|a| *a == "-v").count() as u8;
+    let cli = Cli::parse();
 
-    let level = verbosity_to_level(verbosity);
+    let level = verbosity_to_level(cli.verbose);
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_env_filter(

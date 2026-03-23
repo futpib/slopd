@@ -724,6 +724,7 @@ dependencies = [
 name = "slopd"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "dashmap",
  "libc",
  "libslop",

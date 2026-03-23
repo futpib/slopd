@@ -2,6 +2,36 @@ use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
 use std::process::Command;
 
 #[test]
+fn slopctl_version_contains_commit_hash() {
+    build_bin("slopctl");
+
+    let output = Command::new(cargo_bin("slopctl"))
+        .arg("--version")
+        .output()
+        .expect("failed to run slopctl --version");
+
+    assert!(output.status.success(), "slopctl --version failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let has_hash = stdout.split(|c: char| !c.is_ascii_hexdigit()).any(|tok| tok.len() >= 7);
+    assert!(has_hash, "no commit hash found in slopctl --version output: {:?}", stdout.trim());
+}
+
+#[test]
+fn slopd_version_contains_commit_hash() {
+    build_bin("slopd");
+
+    let output = Command::new(cargo_bin("slopd"))
+        .arg("--version")
+        .output()
+        .expect("failed to run slopd --version");
+
+    assert!(output.status.success(), "slopd --version failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let has_hash = stdout.split(|c: char| !c.is_ascii_hexdigit()).any(|tok| tok.len() >= 7);
+    assert!(has_hash, "no commit hash found in slopd --version output: {:?}", stdout.trim());
+}
+
+#[test]
 fn ps_json_returns_valid_json_array() {
     build_bin("slopd");
     build_bin("slopctl");

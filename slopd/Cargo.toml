@@ -11,6 +11,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 dashmap = "6.1.0"
 libc = "0.2.183"
+clap = { version = "4.6.0", features = ["derive"] }
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }

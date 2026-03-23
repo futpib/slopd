@@ -4,7 +4,7 @@ use tokio::net::UnixStream;
 use tracing::debug;
 
 #[derive(Parser)]
-#[command(name = "slopctl", about = "Control a running slopd daemon")]
+#[command(name = "slopctl", about = "Control a running slopd daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
 struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity (-v INFO, -vv DEBUG, -vvv TRACE)")]
     verbose: u8,
