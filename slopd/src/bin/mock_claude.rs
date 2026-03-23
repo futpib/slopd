@@ -1,6 +1,14 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
+#[derive(Clone, Copy)]
+enum NewlineMode {
+    /// Every newline submits the line (original behaviour).
+    AlwaysSubmit,
+    /// Alternating: even-numbered newlines (0, 2, …) are literal, odd (1, 3, …) submit.
+    Alternating,
+}
+
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
 /// Mirrors real Claude's hook execution: each command is run via `sh -c` in a non-interactive
 /// shell with the JSON payload on stdin.
@@ -94,6 +102,8 @@ fn main() {
     let mut last_interrupt: Option<u8> = None;
     let mut stdin = std::io::stdin();
     let mut byte = [0u8; 1];
+    let mut newline_mode = NewlineMode::Alternating;
+    let mut newline_count: u64 = 0;
 
     loop {
         match stdin.read(&mut byte) {
@@ -114,10 +124,40 @@ fn main() {
                 last_interrupt = Some(b);
             }
             0x0d | 0x0a => {
-                // Carriage return or newline: complete the line.
                 last_interrupt = None;
-                let prompt = String::from_utf8_lossy(&line_buf).into_owned();
+
+                // In Alternating mode, even-numbered newlines are literal (appended
+                // to the buffer like Ctrl+J) and odd-numbered newlines submit.
+                let is_submit = match newline_mode {
+                    NewlineMode::AlwaysSubmit => true,
+                    NewlineMode::Alternating => {
+                        let n = newline_count;
+                        newline_count += 1;
+                        n % 2 == 1
+                    }
+                };
+
+                if !is_submit {
+                    line_buf.push(b'\n');
+                    continue;
+                }
+
+                let raw_prompt = String::from_utf8_lossy(&line_buf).into_owned();
                 line_buf.clear();
+                // Trim leading newlines that were inserted as literals by alternating mode.
+                let prompt = raw_prompt.trim_start_matches('\n').to_string();
+
+                if let Some(mode) = prompt.strip_prefix("/newline-mode ") {
+                    match mode.trim() {
+                        "always-submit" => newline_mode = NewlineMode::AlwaysSubmit,
+                        "alternating" => {
+                            newline_mode = NewlineMode::Alternating;
+                            newline_count = 0;
+                        }
+                        other => eprintln!("mock_claude: unknown newline mode {:?}", other),
+                    }
+                    continue;
+                }
 
                 if let Some(secs) = prompt.strip_prefix("/sleep ") {
                     let secs: u64 = secs.trim().parse().unwrap_or(0);

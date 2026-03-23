@@ -448,11 +448,9 @@ async fn handle_request(
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
             let _guard = state.type_mutex.lock().await;
 
-            // Subscribe to the notify *before* sending keys so we don't miss a fast delivery.
-            let notified = state.prompt_submitted.notified();
-
+            // Type the prompt text (without Enter) first.
             let result = tmux(config)
-                .args(["send-keys", "-t", &pane_id, &prompt, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &prompt])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -468,13 +466,43 @@ async fn handle_request(
                     libslop::ResponseBody::Error { message: msg }
                 }
                 Ok(_) => {
-                    // Wait for UserPromptSubmit from this pane to confirm delivery.
-                    let timeout = std::time::Duration::from_secs(timeout_secs);
-                    match tokio::time::timeout(timeout, notified).await {
-                        Ok(()) => libslop::ResponseBody::Sent { pane_id },
-                        Err(_) => libslop::ResponseBody::Error {
-                            message: format!("timed out after {}s waiting for UserPromptSubmit on pane {}", timeout_secs, pane_id),
-                        },
+                    // Send Enter repeatedly with exponential backoff until
+                    // UserPromptSubmit fires, confirming the prompt was submitted.
+                    // Real Claude may treat some newlines as literal (Ctrl+J) rather
+                    // than submit, so we retry.
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(timeout_secs);
+                    let mut backoff = std::time::Duration::from_millis(100);
+                    let max_backoff = std::time::Duration::from_secs(2);
+
+                    loop {
+                        let notified = state.prompt_submitted.notified();
+
+                        let enter_result = tmux(config)
+                            .args(["send-keys", "-t", &pane_id, "Enter"])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+
+                        if let Err(e) = enter_result {
+                            break libslop::ResponseBody::Error { message: e.to_string() };
+                        }
+
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            break libslop::ResponseBody::Error {
+                                message: format!("timed out after {}s waiting for UserPromptSubmit on pane {}", timeout_secs, pane_id),
+                            };
+                        }
+
+                        let wait = backoff.min(remaining);
+                        match tokio::time::timeout(wait, notified).await {
+                            Ok(()) => break libslop::ResponseBody::Sent { pane_id },
+                            Err(_) => {
+                                backoff = (backoff * 2).min(max_backoff);
+                            }
+                        }
                     }
                 }
             }

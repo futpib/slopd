@@ -524,6 +524,10 @@ fn ps_shows_parent_pane() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Switch mock_claude to always-submit mode so single Enters work reliably.
+    let mode_out = env.slopctl(&["send", &parent_pane, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success(), "slopctl send /newline-mode failed: {:?}", mode_out);
+
     // Ask mock_claude to spawn a child pane. Because it runs inside a tmux pane,
     // TMUX_PANE is set by tmux automatically — no manual env var wiring needed.
     let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
@@ -637,6 +641,14 @@ fn send_to_pane_with_broken_hooks_times_out() {
         assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // Switch mock_claude to always-submit mode. Two Enters needed: the first is
+    // literal (alternating mode default), the second submits.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status()
+        .expect("failed to send /newline-mode");
+    std::thread::sleep(Duration::from_millis(100));
 
     // Put mock_claude into break-hooks mode: it drains stdin but fires no hooks.
     // Sent directly via tmux (not slopctl) to avoid going through the Send machinery.
@@ -1477,6 +1489,10 @@ fn run_from_pane_sets_parent_pane_attribute() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Switch mock_claude to always-submit mode so single Enters work reliably.
+    let mode_out = env.slopctl(&["send", &parent_pane, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success(), "slopctl send /newline-mode failed: {:?}", mode_out);
+
     // Ask mock_claude to spawn a child. TMUX_PANE is set by tmux in mock_claude's
     // environment, so the child gets @slopd_parent_pane set automatically.
     let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
@@ -1539,6 +1555,13 @@ fn run_does_not_set_claude_config_dir_when_not_configured() {
     // mock_claude starts immediately (no hook injection needed — we bypass slopctl send).
     // Give it a moment to enter raw mode before sending keys.
     std::thread::sleep(Duration::from_millis(200));
+
+    // Switch mock_claude to always-submit mode. Two Enters needed: the first is
+    // literal (alternating mode default), the second submits.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
 
     // Send keys directly via tmux (bypasses slopctl send / UserPromptSubmit hook).
     env.tmux.tmux()
