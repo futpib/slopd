@@ -48,6 +48,29 @@ fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
         .clone()
 }
 
+/// Set of pane IDs in the `slopd` tmux session.
+/// Populated from tmux on startup (so it survives slopd restarts) and kept
+/// in sync as panes are created/killed.
+type ManagedPanes = Arc<dashmap::DashSet<String>>;
+
+/// Populate the managed-pane set from the `slopd` tmux session.
+async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes) {
+    let output = tmux(config)
+        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+        .output()
+        .await;
+    if let Ok(out) = output {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let pane_id = line.trim();
+                if !pane_id.is_empty() {
+                    managed.insert(pane_id.to_string());
+                }
+            }
+        }
+    }
+}
+
 /// An event broadcast to all active subscribers.
 #[derive(Debug, Clone)]
 struct BroadcastEvent {
@@ -165,6 +188,11 @@ async fn main() {
         .as_secs();
 
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
+    let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
+
+    // Recover managed pane IDs from the tmux session so panes that existed
+    // before a slopd restart are still recognized.
+    load_managed_panes(&config, &managed_panes).await;
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
     let event_tx: EventTx = Arc::new(event_tx);
@@ -178,7 +206,7 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), event_tx.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -205,6 +233,7 @@ async fn handle_connection(
     start_time: u64,
     config: Arc<libslop::SlopdConfig>,
     panes: PaneMap,
+    managed_panes: ManagedPanes,
     event_tx: EventTx,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -251,7 +280,7 @@ async fn handle_connection(
             }
         }
 
-        let body = handle_request(req.body, start_time, &config, &panes, &event_tx).await;
+        let body = handle_request(req.body, start_time, &config, &panes, &managed_panes, &event_tx).await;
         if write_response(&mut writer, req.id, body).await.is_err() {
             break;
         }
@@ -314,6 +343,7 @@ async fn handle_request(
     start_time: u64,
     config: &Arc<libslop::SlopdConfig>,
     panes: &PaneMap,
+    managed_panes: &ManagedPanes,
     event_tx: &EventTx,
 ) -> libslop::ResponseBody {
     match body {
@@ -338,6 +368,7 @@ async fn handle_request(
             match output {
                 Ok(out) if out.status.success() => {
                     panes.remove(&pane_id);
+                    managed_panes.remove(&pane_id);
                     libslop::ResponseBody::Kill { pane_id }
                 }
                 Ok(out) => {
@@ -350,6 +381,16 @@ async fn handle_request(
 
         libslop::RequestBody::Hook { event, payload, pane_id } => {
             debug!("hook: {} pane={:?}", event, pane_id);
+
+            // Ignore hooks from panes that were not spawned by slopd. This can happen
+            // when an external Claude instance shares the same settings.json with
+            // injected hooks.
+            if let Some(pane) = pane_id.as_deref() {
+                if !managed_panes.contains(pane) {
+                    debug!("ignoring hook from unmanaged pane {}", pane);
+                    return libslop::ResponseBody::Hooked;
+                }
+            }
 
             if event == "SessionStart" {
                 if let (Some(pane), Some(session_id)) = (
@@ -418,6 +459,7 @@ async fn handle_request(
                 Ok(out) if out.status.success() => {
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
+                    managed_panes.insert(pane_id.clone());
                     if let Some(ref parent) = parent_pane_id {
                         let result = tmux(config)
                             .args([

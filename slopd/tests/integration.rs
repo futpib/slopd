@@ -836,18 +836,24 @@ fn listen_by_pane_id() {
     build_bin("slopd");
     build_bin("slopctl");
 
-    let Some(env) = TestEnv::new(None) else {
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
         eprintln!("skipping: tmux not found");
         return;
     };
 
     let slopd = env.spawn_slopd();
 
-    let target_pane = "%42";
-    let other_pane = "%99";
+    // Spawn two managed panes so their IDs are known to slopd.
+    let out1 = env.slopctl(&["run"]);
+    assert!(out1.status.success(), "first run failed");
+    let target_pane = String::from_utf8_lossy(&out1.stdout).trim().to_string();
+
+    let out2 = env.slopctl(&["run"]);
+    assert!(out2.status.success(), "second run failed");
+    let other_pane = String::from_utf8_lossy(&out2.stdout).trim().to_string();
 
     let mut listen = Command::new(cargo_bin("slopctl"))
-        .args(["listen", "--pane-id", target_pane])
+        .args(["listen", "--pane-id", &target_pane])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -858,12 +864,12 @@ fn listen_by_pane_id() {
 
     // Fire from the wrong pane first.
     let other_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"wrong pane"}"#;
-    let out = fire_hook(&env, "UserPromptSubmit", other_payload, Some(other_pane));
+    let out = fire_hook(&env, "UserPromptSubmit", other_payload, Some(&other_pane));
     assert!(out.status.success());
 
     // Then fire from the target pane.
     let target_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"right pane"}"#;
-    let out = fire_hook(&env, "UserPromptSubmit", target_payload, Some(target_pane));
+    let out = fire_hook(&env, "UserPromptSubmit", target_payload, Some(&target_pane));
     assert!(out.status.success());
 
     let stdout = listen.stdout.take().unwrap();
@@ -875,7 +881,7 @@ fn listen_by_pane_id() {
     kill_slopd(slopd);
 
     let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
-    assert_eq!(event["pane_id"], target_pane);
+    assert_eq!(event["pane_id"], target_pane.as_str());
     assert_eq!(event["payload"]["prompt"], "right pane");
 }
 
@@ -1729,4 +1735,159 @@ fn echo_command_prints_output() {
     kill_slopd(slopd);
 
     assert!(found, "expected 'hello-from-echo' in pane output");
+}
+
+/// When a Claude instance outside of slopd's managed session has `slopctl hook` configured
+/// (e.g. because it shares the same settings.json), its hook events should NOT be dispatched
+/// to subscribers as if they came from a managed pane.
+#[test]
+fn hook_from_unmanaged_pane_is_not_dispatched() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a managed pane so that hooks get injected into settings.json.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let managed_pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for the managed pane's SessionStart to fire (proves hooks are injected).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &managed_pane_id, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output().unwrap();
+        let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !val.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for managed pane SessionStart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Now spawn an *unmanaged* mock_claude in the "test" session (not the "slopd" session).
+    // It will read the same settings.json with the injected hooks and fire SessionStart
+    // on startup, sending hook events to slopd even though it is not managed.
+    let unmanaged_out = env.tmux.tmux()
+        .args([
+            "new-window", "-t", "test", "-P", "-F", "#{pane_id}",
+            &mock_claude_path,
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("CLAUDE_CONFIG_DIR", &claude_config_dir)
+        .output()
+        .expect("failed to spawn unmanaged mock_claude pane");
+    assert!(unmanaged_out.status.success(), "failed to create unmanaged pane: {:?}", unmanaged_out);
+    let unmanaged_pane_id = String::from_utf8_lossy(&unmanaged_out.stdout).trim().to_string();
+
+    // Start a listener that receives all events (no filters).
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Fire a hook event pretending to come from the unmanaged pane.
+    let payload = format!(
+        r#"{{"session_id":"unmanaged-session","hook_event_name":"UserPromptSubmit","prompt":"from outside"}}"#
+    );
+    let hook_out = fire_hook(&env, "UserPromptSubmit", &payload, Some(&unmanaged_pane_id));
+    assert!(hook_out.status.success(), "hook from unmanaged pane failed: {:?}", hook_out);
+
+    // Also fire from the managed pane so the listener has something to read
+    // (if the unmanaged event is correctly suppressed).
+    let managed_payload = r#"{"session_id":"mock-session-id-1234","hook_event_name":"UserPromptSubmit","prompt":"from managed"}"#;
+    let hook_out = fire_hook(&env, "UserPromptSubmit", managed_payload, Some(&managed_pane_id));
+    assert!(hook_out.status.success(), "hook from managed pane failed: {:?}", hook_out);
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read event line");
+
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+
+    // The event from the unmanaged pane should have been silently dropped.
+    // The first event we receive must be from the managed pane.
+    assert_eq!(
+        event["pane_id"].as_str().unwrap(), managed_pane_id,
+        "Expected slopd to ignore the unmanaged pane's event, but got pane_id={:?}",
+        event["pane_id"],
+    );
+    assert_eq!(event["payload"]["prompt"], "from managed");
+}
+
+/// Panes created before a slopd restart must still be recognized as managed.
+/// Hooks fired from those panes should still be dispatched to subscribers.
+#[test]
+fn hooks_from_managed_pane_work_after_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Restart slopd — the tmux session and pane survive.
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    // Start a listener.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Fire a hook from the pre-existing managed pane.
+    let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"after restart"}"#;
+    let hook_out = fire_hook(&env, "UserPromptSubmit", payload, Some(&pane_id));
+    assert!(hook_out.status.success(), "hook failed: {:?}", hook_out);
+
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("failed to read event line");
+
+    kill_child(listen);
+    kill_slopd(slopd2);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    assert_eq!(event["pane_id"], pane_id.as_str());
+    assert_eq!(event["payload"]["prompt"], "after restart");
 }
