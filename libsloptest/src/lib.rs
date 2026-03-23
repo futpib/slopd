@@ -124,8 +124,7 @@ impl TestEnv {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let claude_config_dir = config_dir.path().join(".claude");
-        tmux.write_slopd_config_full(&config_dir, executable, None, Some(&claude_config_dir));
+        tmux.write_slopd_config(&config_dir, executable);
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 
@@ -145,6 +144,7 @@ impl TestEnv {
         let child = Command::new(cargo_bin("slopd"))
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env("HOME", self.config_dir.path())
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")

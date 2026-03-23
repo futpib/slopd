@@ -250,6 +250,40 @@ fn run_does_not_inject_hooks_into_host_claude_settings() {
 }
 
 #[test]
+fn run_without_claude_config_dir_does_not_inject_hooks_into_host_claude_settings() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let host_settings = libslop::home_dir().join(".claude/settings.json");
+    let mtime_before = host_settings.metadata().ok().map(|m| m.modified().unwrap());
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    // new_full with claude_config_dir=None: slopd has no configured claude_config_dir,
+    // so it would fall back to ~/.claude if HOME is not isolated.
+    let Some(env) = TestEnv::new_full(
+        Some(&["sleep", "infinity"]),
+        Some(&slopctl_path),
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+
+    let mtime_after = host_settings.metadata().ok().map(|m| m.modified().unwrap());
+    assert_eq!(
+        mtime_before, mtime_after,
+        "~/.claude/settings.json was modified by the test"
+    );
+}
+
+#[test]
 fn run_injects_hooks_into_claude_settings() {
     build_bin("slopd");
     build_bin("slopctl");
