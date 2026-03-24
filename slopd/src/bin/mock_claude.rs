@@ -12,7 +12,7 @@ enum NewlineMode {
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
 /// Mirrors real Claude's hook execution: each command is run via `sh -c` in a non-interactive
 /// shell with the JSON payload on stdin.
-fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::Value) {
+fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::Value, wait: bool) {
     let Some(entries) = settings["hooks"][event].as_array() else {
         return;
     };
@@ -45,6 +45,9 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
                 .unwrap()
                 .write_all(payload.to_string().as_bytes())
                 .expect("failed to write hook payload to stdin");
+            if !wait {
+                continue;
+            }
             let output = child.wait_with_output().expect("failed to wait for hook");
             if !output.status.success() {
                 let msg = format!(
@@ -125,6 +128,7 @@ fn main() {
             "source": "startup",
             "model": "mock"
         }),
+        false,
     );
 
     // Read raw bytes from stdin, accumulating lines.
@@ -258,6 +262,7 @@ fn main() {
                         "cwd": cwd,
                         "prompt": prompt
                     }),
+                    true,
                 );
             }
             _ => {
