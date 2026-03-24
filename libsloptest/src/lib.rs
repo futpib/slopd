@@ -194,45 +194,75 @@ impl TestEnv {
 
     /// Read from a listener spawned by `spawn_session_start_listener` until a
     /// SessionStart event for `pane_id` arrives. Returns the `session_id` from
-    /// the event payload and kills the listener.
+    /// the event payload and kills the listener. Panics if no event arrives
+    /// within 10 seconds.
     pub fn wait_for_session_start(&self, mut listener: Child, pane_id: &str) -> String {
         use std::io::BufRead;
         let stdout = listener.stdout.take().expect("listener has no stdout");
-        let mut reader = std::io::BufReader::new(stdout);
-        let session_id = loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).expect("failed to read from slopctl listen");
-            assert!(n > 0, "slopctl listen closed before SessionStart for {}", pane_id);
-            let v: serde_json::Value = serde_json::from_str(line.trim())
-                .expect("slopctl listen emitted invalid JSON");
-            if v["pane_id"] == pane_id {
-                break v["payload"]["session_id"]
-                    .as_str()
-                    .expect("SessionStart payload missing session_id")
-                    .to_string();
+        let pane_id = pane_id.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => { let _ = tx.send(Err(())); return; }
+                    Ok(_) => {}
+                }
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v["pane_id"] == pane_id {
+                    let session_id = v["payload"]["session_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = tx.send(Ok(session_id));
+                    return;
+                }
             }
-        };
+        });
+        let session_id = rx.recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for SessionStart")
+            .expect("slopctl listen closed before SessionStart");
         kill_child(listener);
         session_id
     }
 
     /// Like `wait_for_session_start` but waits for SessionStart on all `pane_ids`.
     /// Uses a single listener, so spawn it before issuing any `slopctl run` calls.
+    /// Panics if not all events arrive within 10 seconds.
     pub fn wait_for_session_starts(&self, mut listener: Child, pane_ids: &[&str]) {
         use std::io::BufRead;
         let stdout = listener.stdout.take().expect("listener has no stdout");
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut remaining: std::collections::HashSet<&str> = pane_ids.iter().copied().collect();
-        while !remaining.is_empty() {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).expect("failed to read from slopctl listen");
-            assert!(n > 0, "slopctl listen closed before SessionStart for {:?}", remaining);
-            let v: serde_json::Value = serde_json::from_str(line.trim())
-                .expect("slopctl listen emitted invalid JSON");
-            if let Some(pane_id) = v["pane_id"].as_str() {
-                remaining.remove(pane_id);
+        let pane_ids_owned: Vec<String> = pane_ids.iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut remaining: std::collections::HashSet<String> = pane_ids_owned.into_iter().collect();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => { let _ = tx.send(Err(remaining)); return; }
+                    Ok(_) => {}
+                }
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(pane_id) = v["pane_id"].as_str() {
+                    remaining.remove(pane_id);
+                }
+                if remaining.is_empty() {
+                    let _ = tx.send(Ok(()));
+                    return;
+                }
             }
-        }
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for SessionStart on all panes")
+            .expect("slopctl listen closed before all SessionStart events");
         kill_child(listener);
     }
 }
