@@ -203,6 +203,49 @@ mod tests {
             assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
         }
     }
+
+    #[test]
+    fn inject_hooks_removes_stale_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        // Inject with an old absolute path (simulates previous slopd config).
+        inject_hooks_into_file(&path, "/home/claude/.local/bin/slopctl").unwrap();
+
+        // Then inject with the new plain command.
+        inject_hooks_into_file(&path, "slopctl").unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+
+            // Old path entry must be gone.
+            let old_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c.contains("/home/claude/.local/bin/slopctl"))
+                    })
+                })
+            }).count();
+            assert_eq!(old_count, 0, "event {} still has stale absolute-path entry", event);
+
+            // New entry must be present exactly once.
+            let new_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c == &format!("slopctl hook {}", event))
+                    })
+                })
+            }).count();
+            assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
+        }
+    }
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
