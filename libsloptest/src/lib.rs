@@ -179,17 +179,33 @@ impl TestEnv {
         self.runtime_dir.path().join("slopd/slopd.sock")
     }
 
-    /// Spawn a `slopctl listen --hook SessionStart` subscriber. Call this before
-    /// `slopctl run` to avoid any race where the event fires before we subscribe.
+    /// Spawn a `slopctl listen --hook SessionStart` subscriber and wait until
+    /// the subscription is confirmed. Call this before `slopctl run` to
+    /// guarantee no race where the event fires before we subscribe.
     /// Pass the returned child to `wait_for_session_start`.
     pub fn spawn_session_start_listener(&self) -> Child {
-        Command::new(cargo_bin("slopctl"))
+        let mut child = Command::new(cargo_bin("slopctl"))
             .args(["listen", "--hook", "SessionStart"])
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to spawn slopctl listen")
+            .expect("failed to spawn slopctl listen");
+        // Read the {"subscribed":true} confirmation before returning so the
+        // caller knows the subscription is active and no events will be missed.
+        // Read byte-by-byte to avoid buffering bytes that wait_for_session_start needs.
+        let stdout = child.stdout.as_mut().expect("listener has no stdout");
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            use std::io::Read;
+            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        let line = String::from_utf8_lossy(&line);
+        assert!(line.contains("subscribed"), "unexpected first line from slopctl listen: {:?}", line);
+        child
     }
 
     /// Read from a listener spawned by `spawn_session_start_listener` until a

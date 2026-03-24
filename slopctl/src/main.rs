@@ -322,7 +322,9 @@ async fn main() {
                         std::process::exit(1);
                     });
                     match response.body {
-                        libslop::ResponseBody::Subscribed => {}
+                        libslop::ResponseBody::Subscribed => {
+                            println!("{{\"subscribed\":true}}");
+                        }
                         libslop::ResponseBody::Event { source, event_type, pane_id, payload } => {
                             let out = serde_json::json!({
                                 "source": source,

@@ -772,7 +772,13 @@ fn listen_no_filters_receives_all_events() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    std::thread::sleep(Duration::from_millis(100));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire two different event types.
     let stop_payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
@@ -782,9 +788,6 @@ fn listen_no_filters_receives_all_events() {
     let prompt_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
     let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, None);
     assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
-
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
 
     let mut line1 = String::new();
     reader.read_line(&mut line1).expect("failed to read first event");
@@ -820,15 +823,18 @@ fn listen_receives_hook_event() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    // Give the subscription time to be established.
-    std::thread::sleep(Duration::from_millis(100));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}"#;
     let out = fire_hook(&env, "UserPromptSubmit", payload, None);
     assert!(out.status.success(), "slopctl hook failed: {:?}", out);
 
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
@@ -861,7 +867,13 @@ fn listen_filters_out_non_matching_events() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    std::thread::sleep(Duration::from_millis(100));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire a non-matching event first.
     let stop_payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
@@ -873,8 +885,6 @@ fn listen_filters_out_non_matching_events() {
     let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, None);
     assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
 
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
@@ -916,7 +926,13 @@ fn listen_by_pane_id() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    std::thread::sleep(Duration::from_millis(100));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire from the wrong pane first.
     let other_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"wrong pane"}"#;
@@ -928,8 +944,6 @@ fn listen_by_pane_id() {
     let out = fire_hook(&env, "UserPromptSubmit", target_payload, Some(&target_pane));
     assert!(out.status.success());
 
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
@@ -1775,7 +1789,13 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    std::thread::sleep(Duration::from_millis(200));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire a hook event pretending to come from the unmanaged pane.
     let payload = format!(
@@ -1790,8 +1810,6 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
     let hook_out = fire_hook(&env, "UserPromptSubmit", managed_payload, Some(&managed_pane_id));
     assert!(hook_out.status.success(), "hook from managed pane failed: {:?}", hook_out);
 
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
@@ -1841,15 +1859,19 @@ fn hooks_from_managed_pane_work_after_slopd_restart() {
         .spawn()
         .expect("failed to spawn slopctl listen");
 
-    std::thread::sleep(Duration::from_millis(200));
+    let stdout = listen.stdout.take().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Read and discard the subscription confirmation line.
+    let mut subscribed_line = String::new();
+    reader.read_line(&mut subscribed_line).expect("failed to read subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire a hook from the pre-existing managed pane.
     let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"after restart"}"#;
     let hook_out = fire_hook(&env, "UserPromptSubmit", payload, Some(&pane_id));
     assert!(hook_out.status.success(), "hook failed: {:?}", hook_out);
 
-    let stdout = listen.stdout.take().unwrap();
-    let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("failed to read event line");
 
