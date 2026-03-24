@@ -108,6 +108,23 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
             .as_array_mut()
             .expect("hook event entry must be an array");
 
+        // Remove stale entries from a previous slopctl path (e.g. hardcoded absolute path
+        // after switching to a plain "slopctl" command).  A stale entry is one whose sole
+        // hook command ends with " hook {event}" but is not our current command.
+        let stale_suffix = format!(" hook {}", event);
+        entries.retain(|entry| {
+            let is_stale = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+                hooks_arr.iter().any(|h| {
+                    if h.get("type").and_then(|t| t.as_str()) != Some("command") {
+                        return false;
+                    }
+                    let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    cmd.ends_with(&stale_suffix) && cmd != command
+                })
+            });
+            !is_stale
+        });
+
         let already_present = entries.iter().any(|entry| {
             entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
                 hooks_arr.iter().any(|h| {
