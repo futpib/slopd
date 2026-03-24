@@ -1083,6 +1083,62 @@ fn tags_survive_slopd_restart() {
 }
 
 #[test]
+fn tags_without_pane_id_uses_tmux_pane_env() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let tag_out = env.slopctl(&["tag", &pane_id, "current-pane-tag"]);
+    assert!(tag_out.status.success(), "slopctl tag failed: {:?}", tag_out);
+
+    // Run `slopctl tags` without an explicit pane ID but with TMUX_PANE set.
+    let tags_out = Command::new(cargo_bin("slopctl"))
+        .args(["tags"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("TMUX_PANE", &pane_id)
+        .output()
+        .expect("failed to run slopctl tags");
+    assert!(tags_out.status.success(), "slopctl tags failed: {:?}", tags_out);
+    let stdout = String::from_utf8_lossy(&tags_out.stdout);
+    assert!(
+        stdout.lines().any(|l| l == "current-pane-tag"),
+        "expected tag in output: {:?}",
+        stdout,
+    );
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn tags_without_pane_id_and_without_tmux_pane_errors() {
+    build_bin("slopctl");
+
+    // Run `slopctl tags` with no pane ID and no TMUX_PANE — should fail.
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["tags"])
+        .env_remove("TMUX_PANE")
+        // XDG_RUNTIME_DIR does not need to point at a live daemon; clap should
+        // reject the invocation before any socket connection is attempted.
+        .env("XDG_RUNTIME_DIR", "/tmp")
+        .output()
+        .expect("failed to run slopctl tags");
+    assert!(
+        !out.status.success(),
+        "slopctl tags should fail when PANE_ID is omitted and TMUX_PANE is unset",
+    );
+}
+
+#[test]
 fn tag_invalid_name_returns_error() {
     build_bin("slopd");
     build_bin("slopctl");

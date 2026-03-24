@@ -91,8 +91,8 @@ enum Command {
     },
     /// List all tags on a pane.
     Tags {
-        /// Tmux pane ID (e.g. %42).
-        pane_id: String,
+        /// Tmux pane ID (e.g. %42). Defaults to $TMUX_PANE if omitted.
+        pane_id: Option<String>,
     },
 }
 
@@ -495,7 +495,16 @@ async fn main() {
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
-        Command::Tags { pane_id } => libslop::RequestBody::Tags { pane_id },
+        Command::Tags { pane_id } => {
+            let pane_id = match pane_id.or_else(|| std::env::var("TMUX_PANE").ok()) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: PANE_ID is required when $TMUX_PANE is not set");
+                    std::process::exit(1);
+                }
+            };
+            libslop::RequestBody::Tags { pane_id }
+        }
         Command::Hook { .. } | Command::Listen { .. } => unreachable!(),
     };
 
