@@ -2,6 +2,7 @@
 name = "libslop"
 version = "0.1.0"
 edition = "2024"
+description = "Shared library for slopd/slopctl — protocol types, config, hook injection, path helpers"
 
 [dependencies]
 atomic-write-file = "0.3.0"

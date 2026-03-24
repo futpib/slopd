@@ -2,6 +2,7 @@
 name = "libsloptest"
 version = "0.1.0"
 edition = "2024"
+description = "Test helpers for slopd/slopctl — isolated tmux environments for integration tests"
 
 [dependencies]
 tempfile = "3.27.0"
