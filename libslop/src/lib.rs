@@ -110,7 +110,9 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
 
         // Remove stale entries from a previous slopctl path (e.g. hardcoded absolute path
         // after switching to a plain "slopctl" command).  A stale entry is one whose sole
-        // hook command ends with " hook {event}" but is not our current command.
+        // hook command is "slopctl hook {event}" (or an absolute path ending in "/slopctl
+        // hook {event}") but is not our current command.  Commands from other tools
+        // (e.g. "foobar hook {event}") are never considered stale.
         let stale_suffix = format!(" hook {}", event);
         entries.retain(|entry| {
             let is_stale = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
@@ -119,7 +121,12 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
                         return false;
                     }
                     let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    cmd.ends_with(&stale_suffix) && cmd != command
+                    if !cmd.ends_with(&stale_suffix) || cmd == command {
+                        return false;
+                    }
+                    // Only remove entries whose executable is slopctl (plain or absolute path).
+                    let prefix = &cmd[..cmd.len() - stale_suffix.len()];
+                    prefix == "slopctl" || prefix.ends_with("/slopctl")
                 })
             });
             !is_stale
@@ -202,6 +209,42 @@ mod tests {
             }).count();
             assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
         }
+    }
+
+    #[test]
+    fn inject_hooks_preserves_other_tool_entries() {
+        // Build a settings.json that already contains hook entries from a different tool
+        // (e.g. "foobar hook Stop").  inject_hooks must leave those entries alone.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "foobar hook Stop"}]
+                    }
+                ]
+            }
+        });
+
+        inject_hooks(&mut settings, "slopctl");
+
+        let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
+
+        // The foobar entry must still be present.
+        let foobar_count = stop_entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+            })
+        }).count();
+        assert_eq!(foobar_count, 1, "foobar hook Stop entry was incorrectly removed");
+
+        // The slopctl entry must also be present.
+        let slopctl_count = stop_entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| h["command"].as_str() == Some("slopctl hook Stop"))
+            })
+        }).count();
+        assert_eq!(slopctl_count, 1, "slopctl hook Stop entry is missing");
     }
 
     #[test]
