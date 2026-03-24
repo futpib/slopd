@@ -30,9 +30,13 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
             let mut child = Command::new("sh")
                 .args(["-c", command])
                 .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap_or_else(|e| {
-                    eprintln!("mock_claude: failed to spawn hook {:?}: {}", command, e);
+                    let msg = format!("mock_claude: failed to spawn hook {:?}: {}", command, e);
+                    eprintln!("{}", msg);
+                    println!("{}", msg);
                     std::process::exit(1);
                 });
             child
@@ -41,9 +45,17 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
                 .unwrap()
                 .write_all(payload.to_string().as_bytes())
                 .expect("failed to write hook payload to stdin");
-            let status = child.wait().expect("failed to wait for hook");
-            if !status.success() {
-                eprintln!("mock_claude: hook {:?} exited with {:?}", command, status);
+            let output = child.wait_with_output().expect("failed to wait for hook");
+            if !output.status.success() {
+                let msg = format!(
+                    "mock_claude: hook {:?} exited with {:?}\nstdout: {}\nstderr: {}",
+                    command,
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                eprintln!("{}", msg);
+                println!("{}", msg);
             }
         }
     }
