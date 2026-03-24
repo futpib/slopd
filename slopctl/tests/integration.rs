@@ -36,7 +36,7 @@ fn ps_json_returns_valid_json_array() {
     build_bin("slopd");
     build_bin("slopctl");
 
-    let Some(env) = TestEnv::new(None) else {
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
         eprintln!("skipping: tmux not found");
         return;
     };
@@ -70,7 +70,7 @@ fn ps_json_filter_by_tag() {
     build_bin("slopd");
     build_bin("slopctl");
 
-    let Some(env) = TestEnv::new(None) else {
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
         eprintln!("skipping: tmux not found");
         return;
     };
