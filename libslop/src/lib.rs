@@ -108,6 +108,30 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
             .as_array_mut()
             .expect("hook event entry must be an array");
 
+        // Remove stale entries from a previous slopctl path (e.g. hardcoded absolute path
+        // after switching to a plain "slopctl" command).  A stale entry is one whose sole
+        // hook command is "slopctl hook {event}" (or an absolute path ending in "/slopctl
+        // hook {event}") but is not our current command.  Commands from other tools
+        // (e.g. "foobar hook {event}") are never considered stale.
+        let stale_suffix = format!(" hook {}", event);
+        entries.retain(|entry| {
+            let is_stale = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+                hooks_arr.iter().any(|h| {
+                    if h.get("type").and_then(|t| t.as_str()) != Some("command") {
+                        return false;
+                    }
+                    let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    if !cmd.ends_with(&stale_suffix) || cmd == command {
+                        return false;
+                    }
+                    // Only remove entries whose executable is slopctl (plain or absolute path).
+                    let prefix = &cmd[..cmd.len() - stale_suffix.len()];
+                    prefix == "slopctl" || prefix.ends_with("/slopctl")
+                })
+            });
+            !is_stale
+        });
+
         let already_present = entries.iter().any(|entry| {
             entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
                 hooks_arr.iter().any(|h| {
@@ -184,6 +208,85 @@ mod tests {
                 })
             }).count();
             assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
+        }
+    }
+
+    #[test]
+    fn inject_hooks_preserves_other_tool_entries() {
+        // Build a settings.json that already contains hook entries from a different tool
+        // (e.g. "foobar hook Stop").  inject_hooks must leave those entries alone.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "foobar hook Stop"}]
+                    }
+                ]
+            }
+        });
+
+        inject_hooks(&mut settings, "slopctl");
+
+        let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
+
+        // The foobar entry must still be present.
+        let foobar_count = stop_entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+            })
+        }).count();
+        assert_eq!(foobar_count, 1, "foobar hook Stop entry was incorrectly removed");
+
+        // The slopctl entry must also be present.
+        let slopctl_count = stop_entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| h["command"].as_str() == Some("slopctl hook Stop"))
+            })
+        }).count();
+        assert_eq!(slopctl_count, 1, "slopctl hook Stop entry is missing");
+    }
+
+    #[test]
+    fn inject_hooks_removes_stale_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        // Inject with an old absolute path (simulates previous slopd config).
+        inject_hooks_into_file(&path, "/home/claude/.local/bin/slopctl").unwrap();
+
+        // Then inject with the new plain command.
+        inject_hooks_into_file(&path, "slopctl").unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+
+            // Old path entry must be gone.
+            let old_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c.contains("/home/claude/.local/bin/slopctl"))
+                    })
+                })
+            }).count();
+            assert_eq!(old_count, 0, "event {} still has stale absolute-path entry", event);
+
+            // New entry must be present exactly once.
+            let new_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c == &format!("slopctl hook {}", event))
+                    })
+                })
+            }).count();
+            assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
         }
     }
 }
