@@ -406,26 +406,11 @@ fn session_start_hook_stores_session_id_on_pane() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let session_id = loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output()
-            .expect("failed to run tmux show-options");
-        let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !val.is_empty() {
-            break val;
-        }
-        if Instant::now() > deadline {
-            kill_slopd(slopd);
-            panic!("timed out waiting for @claude_session_id on pane {}", pane_id);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let session_id = env.wait_for_session_start(listener, &pane_id);
 
     kill_slopd(slopd);
 
@@ -539,20 +524,11 @@ fn ps_lists_panes_with_session_id_and_tags() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    // Wait for SessionStart so session_id is set on the pane.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &pane_id);
 
     // Add a tag so we can verify it appears in ps output.
     let tag_out = env.slopctl(&["tag", &pane_id, "mytest"]);
@@ -610,21 +586,11 @@ fn ps_shows_parent_pane() {
 
     // Launch the parent pane — mock_claude runs inside a real tmux pane, so TMUX_PANE
     // is set automatically by tmux in the child process environment.
+    let listener = env.spawn_session_start_listener();
     let parent_out = env.slopctl(&["run"]);
     assert!(parent_out.status.success());
     let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
-
-    // Wait for SessionStart so mock_claude is ready.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &parent_pane, "-p", "-v",
-                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart on parent pane");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &parent_pane);
 
     // Switch mock_claude to always-submit mode so single Enters work reliably.
     let mode_out = env.slopctl(&["send", &parent_pane, "/newline-mode always-submit"]);
@@ -726,23 +692,11 @@ fn send_to_pane_with_broken_hooks_times_out() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    // Wait for SessionStart so mock_claude is in its prompt-reading loop.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output()
-            .expect("failed to run tmux show-options");
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &pane_id);
 
     // Switch mock_claude to always-submit mode. Two Enters needed: the first is
     // literal (alternating mode default), the second submits.
@@ -1009,26 +963,11 @@ fn interrupt_exits_mock_claude() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    // Wait for mock_claude to start (SessionStart hook fires).
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v",
-                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-            break;
-        }
-        if Instant::now() > deadline {
-            kill_slopd(slopd);
-            panic!("timed out waiting for mock_claude to start");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &pane_id);
 
     // Interrupt: sends C-c, C-d, Escape — enough to drop whatever Claude is doing.
     let int_out = env.slopctl(&["interrupt", &pane_id]);
@@ -1189,20 +1128,11 @@ fn send_filtered_one_match() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success());
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    // Wait for SessionStart.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &pane_id);
 
     let tag_out = env.slopctl(&["tag", &pane_id, "mytarget"]);
     assert!(tag_out.status.success());
@@ -1281,21 +1211,10 @@ fn send_filtered_all_sends_to_all_matching() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
     let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
-
-    // Wait for both panes to be ready.
-    for pane_id in &[&pane1, &pane2] {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let out = env.tmux.tmux()
-                .args(["show-options", "-t", pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-                .output().unwrap();
-            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+    env.wait_for_session_starts(listener, &[&pane1, &pane2]);
 
     env.slopctl(&["tag", &pane1, "broadcast"]);
     env.slopctl(&["tag", &pane2, "broadcast"]);
@@ -1332,20 +1251,10 @@ fn send_filtered_any_sends_to_exactly_one_pane() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let pane1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
     let pane2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
-
-    for pane_id in &[&pane1, &pane2] {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let out = env.tmux.tmux()
-                .args(["show-options", "-t", pane_id, "-p", "-v", libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-                .output().unwrap();
-            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+    env.wait_for_session_starts(listener, &[&pane1, &pane2]);
 
     env.slopctl(&["tag", &pane1, "anytarget"]);
     env.slopctl(&["tag", &pane2, "anytarget"]);
@@ -1415,25 +1324,16 @@ fn send_filtered_all_is_concurrent() {
     let slopd = env.spawn_slopd();
 
     const N: usize = 4;
+    let listener = env.spawn_session_start_listener();
     let mut pane_ids = Vec::new();
     for _ in 0..N {
         let out = env.slopctl(&["run"]);
         assert!(out.status.success());
         pane_ids.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
+    env.wait_for_session_starts(listener, &pane_ids.iter().map(String::as_str).collect::<Vec<_>>());
 
-    // Wait for all panes to be ready.
     for pane_id in &pane_ids {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let out = env.tmux.tmux()
-                .args(["show-options", "-t", pane_id, "-p", "-v",
-                       libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-                .output().unwrap();
-            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-            assert!(Instant::now() < deadline, "timed out waiting for SessionStart on {}", pane_id);
-            std::thread::sleep(Duration::from_millis(50));
-        }
         env.slopctl(&["tag", pane_id, "concurrent"]);
     }
 
@@ -1581,21 +1481,11 @@ fn run_from_pane_sets_parent_pane_attribute() {
     let slopd = env.spawn_slopd();
 
     // Spawn the parent pane — mock_claude runs inside a real tmux pane.
+    let listener = env.spawn_session_start_listener();
     let parent_out = env.slopctl(&["run"]);
     assert!(parent_out.status.success(), "first run failed: {:?}", parent_out);
     let parent_pane = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
-
-    // Wait for SessionStart so mock_claude is ready.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &parent_pane, "-p", "-v",
-                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart on parent pane");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &parent_pane);
 
     // Switch mock_claude to always-submit mode so single Enters work reliably.
     let mode_out = env.slopctl(&["send", &parent_pane, "/newline-mode always-submit"]);
@@ -1799,21 +1689,11 @@ fn echo_command_prints_output() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_out = env.slopctl(&["run"]);
     assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
     let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
-
-    // Wait for SessionStart so mock_claude is ready.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &pane_id, "-p", "-v",
-                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() { break; }
-        assert!(Instant::now() < deadline, "timed out waiting for SessionStart");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &pane_id);
 
     let send_out = env.slopctl(&["send", &pane_id, "/echo hello-from-echo"]);
     assert!(send_out.status.success(), "slopctl send failed: {:?}", send_out);
@@ -1865,24 +1745,11 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
     let slopd = env.spawn_slopd();
 
     // Spawn a managed pane so that hooks get injected into settings.json.
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let managed_pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-
-    // Wait for the managed pane's SessionStart to fire (proves hooks are injected).
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["show-options", "-t", &managed_pane_id, "-p", "-v",
-                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
-            .output().unwrap();
-        let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !val.is_empty() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for managed pane SessionStart");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    env.wait_for_session_start(listener, &managed_pane_id);
 
     // Now spawn an *unmanaged* mock_claude in the "test" session (not the "slopd" session).
     // It will read the same settings.json with the injected hooks and fire SessionStart

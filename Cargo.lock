@@ -365,6 +365,7 @@ name = "libsloptest"
 version = "0.1.0"
 dependencies = [
  "nix 0.31.2",
+ "serde_json",
  "tempfile",
 ]
 

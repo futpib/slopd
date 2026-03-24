@@ -178,4 +178,61 @@ impl TestEnv {
     pub fn socket_path(&self) -> PathBuf {
         self.runtime_dir.path().join("slopd/slopd.sock")
     }
+
+    /// Spawn a `slopctl listen --hook SessionStart` subscriber. Call this before
+    /// `slopctl run` to avoid any race where the event fires before we subscribe.
+    /// Pass the returned child to `wait_for_session_start`.
+    pub fn spawn_session_start_listener(&self) -> Child {
+        Command::new(cargo_bin("slopctl"))
+            .args(["listen", "--hook", "SessionStart"])
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn slopctl listen")
+    }
+
+    /// Read from a listener spawned by `spawn_session_start_listener` until a
+    /// SessionStart event for `pane_id` arrives. Returns the `session_id` from
+    /// the event payload and kills the listener.
+    pub fn wait_for_session_start(&self, mut listener: Child, pane_id: &str) -> String {
+        use std::io::BufRead;
+        let stdout = listener.stdout.take().expect("listener has no stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let session_id = loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("failed to read from slopctl listen");
+            assert!(n > 0, "slopctl listen closed before SessionStart for {}", pane_id);
+            let v: serde_json::Value = serde_json::from_str(line.trim())
+                .expect("slopctl listen emitted invalid JSON");
+            if v["pane_id"] == pane_id {
+                break v["payload"]["session_id"]
+                    .as_str()
+                    .expect("SessionStart payload missing session_id")
+                    .to_string();
+            }
+        };
+        kill_child(listener);
+        session_id
+    }
+
+    /// Like `wait_for_session_start` but waits for SessionStart on all `pane_ids`.
+    /// Uses a single listener, so spawn it before issuing any `slopctl run` calls.
+    pub fn wait_for_session_starts(&self, mut listener: Child, pane_ids: &[&str]) {
+        use std::io::BufRead;
+        let stdout = listener.stdout.take().expect("listener has no stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut remaining: std::collections::HashSet<&str> = pane_ids.iter().copied().collect();
+        while !remaining.is_empty() {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("failed to read from slopctl listen");
+            assert!(n > 0, "slopctl listen closed before SessionStart for {:?}", remaining);
+            let v: serde_json::Value = serde_json::from_str(line.trim())
+                .expect("slopctl listen emitted invalid JSON");
+            if let Some(pane_id) = v["pane_id"].as_str() {
+                remaining.remove(pane_id);
+            }
+        }
+        kill_child(listener);
+    }
 }
