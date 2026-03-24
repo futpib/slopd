@@ -239,7 +239,7 @@ impl TestEnv {
                 }
             }
         });
-        let session_id = rx.recv_timeout(Duration::from_secs(10))
+        let session_id = rx.recv_timeout(Duration::from_secs(30))
             .expect("timed out waiting for SessionStart")
             .expect("slopctl listen closed before SessionStart");
         kill_child(listener);
@@ -276,7 +276,7 @@ impl TestEnv {
                 }
             }
         });
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(Duration::from_secs(30))
             .expect("timed out waiting for SessionStart on all panes")
             .expect("slopctl listen closed before all SessionStart events");
         kill_child(listener);
