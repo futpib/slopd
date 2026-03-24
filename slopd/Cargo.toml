@@ -2,6 +2,7 @@
 name = "slopd"
 version = "0.1.0"
 edition = "2024"
+description = "Claude agent session manager daemon — tmux management, RPC server, event broadcasting"
 
 [dependencies]
 libslop = { path = "../libslop" }
