@@ -1051,6 +1051,48 @@ fn tag_and_untag_pane() {
 }
 
 #[test]
+fn created_at_survives_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_out.status.success(), "slopctl ps --json failed: {:?}", ps_out);
+    let panes: serde_json::Value = serde_json::from_slice(&ps_out.stdout).expect("ps --json is not valid JSON");
+    let created_at_before = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("pane {} not in ps --json output", pane_id))["created_at"]
+        .as_u64()
+        .expect("created_at is not a u64");
+
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    let ps_out2 = env.slopctl(&["ps", "--json"]);
+    assert!(ps_out2.status.success(), "slopctl ps --json failed after restart: {:?}", ps_out2);
+    let panes2: serde_json::Value = serde_json::from_slice(&ps_out2.stdout).expect("ps --json is not valid JSON after restart");
+    let created_at_after = panes2.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("pane {} not in ps --json output after restart", pane_id))["created_at"]
+        .as_u64()
+        .expect("created_at is not a u64 after restart");
+
+    assert_eq!(created_at_before, created_at_after, "created_at changed after slopd restart");
+
+    kill_slopd(slopd2);
+}
+
+#[test]
 fn tags_survive_slopd_restart() {
     build_bin("slopd");
     build_bin("slopctl");
