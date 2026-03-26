@@ -325,10 +325,10 @@ async fn handle_connection(
         };
 
         if let libslop::RequestBody::Subscribe { filters } = req.body {
+            let mut rx = event_tx.subscribe();
             if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
                 return;
             }
-            let mut rx = event_tx.subscribe();
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
