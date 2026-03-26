@@ -65,9 +65,12 @@ enum Command {
     },
     /// Subscribe to a stream of events and print each as a JSON line.
     Listen {
-        /// Filter by hook event name (repeatable; omit for all events).
+        /// Filter by hook event name (repeatable; omit for all events). Matches source:hook events.
         #[arg(long = "hook", value_name = "EVENT")]
         hooks: Vec<String>,
+        /// Filter by slopd event name (repeatable). Matches source:slopd events (e.g. StateChange, DetailedStateChange).
+        #[arg(long = "event", value_name = "EVENT")]
+        events: Vec<String>,
         /// Only receive events from this tmux pane.
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
@@ -210,6 +213,12 @@ async fn main() {
             parse_filters(filters.clone());
         }
     }
+    if let Command::Tags { pane_id: None } = cli.command {
+        if std::env::var("TMUX_PANE").is_err() {
+            eprintln!("error: <PANE_ID> is required when $TMUX_PANE is not set");
+            std::process::exit(2);
+        }
+    }
 
     let _config = libslop::SlopctlConfig::load();
 
@@ -274,10 +283,10 @@ async fn main() {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    if let Command::Listen { hooks, pane_id, session_id } = cli.command {
-        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && pane_id.is_none() && session_id.is_none() {
+    if let Command::Listen { hooks, events, pane_id, session_id } = cli.command {
+        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && pane_id.is_none() && session_id.is_none() {
             vec![]
-        } else if hooks.is_empty() {
+        } else if hooks.is_empty() && events.is_empty() {
             vec![libslop::EventFilter {
                 source: None,
                 event_type: None,
@@ -286,13 +295,21 @@ async fn main() {
                 payload_match: serde_json::Map::new(),
             }]
         } else {
-            hooks.into_iter().map(|h| libslop::EventFilter {
+            let hook_filters = hooks.into_iter().map(|h| libslop::EventFilter {
                 source: Some("hook".to_string()),
                 event_type: Some(h),
                 pane_id: pane_id.clone(),
                 session_id: session_id.clone(),
                 payload_match: serde_json::Map::new(),
-            }).collect()
+            });
+            let event_filters = events.into_iter().map(|e| libslop::EventFilter {
+                source: Some("slopd".to_string()),
+                event_type: Some(e),
+                pane_id: pane_id.clone(),
+                session_id: None,
+                payload_match: serde_json::Map::new(),
+            });
+            hook_filters.chain(event_filters).collect()
         };
 
         let request = libslop::Request {
@@ -496,13 +513,7 @@ async fn main() {
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
         Command::Tags { pane_id } => {
-            let pane_id = match pane_id.or_else(|| std::env::var("TMUX_PANE").ok()) {
-                Some(id) => id,
-                None => {
-                    eprintln!("error: PANE_ID is required when $TMUX_PANE is not set");
-                    std::process::exit(1);
-                }
-            };
+            let pane_id = pane_id.or_else(|| std::env::var("TMUX_PANE").ok()).unwrap();
             libslop::RequestBody::Tags { pane_id }
         }
         Command::Hook { .. } | Command::Listen { .. } => unreachable!(),

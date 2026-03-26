@@ -17,11 +17,20 @@ pub fn build_bin(name: &str) {
     if cfg!(coverage) {
         return;
     }
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static BUILT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut guard = BUILT.lock().unwrap();
+    let built = guard.get_or_insert_with(HashSet::new);
+    if built.contains(name) {
+        return;
+    }
     let status = Command::new(env!("CARGO"))
         .args(["build", "--workspace", "--bin", name])
         .status()
         .expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);
+    built.insert(name.to_string());
 }
 
 /// Send SIGTERM and wait. Use instead of Child::kill() so instrumented binaries

@@ -944,13 +944,11 @@ fn listen_by_pane_id() {
     let out = fire_hook(&env, "UserPromptSubmit", target_payload, Some(&target_pane));
     assert!(out.status.success());
 
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("failed to read event line");
+    let event = read_next_hook_event(&mut reader);
 
     kill_child(listen);
     kill_slopd(slopd);
 
-    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
     assert_eq!(event["pane_id"], target_pane.as_str());
     assert_eq!(event["payload"]["prompt"], "right pane");
 }
@@ -1866,16 +1864,13 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
     let hook_out = fire_hook(&env, "UserPromptSubmit", managed_payload, Some(&managed_pane_id));
     assert!(hook_out.status.success(), "hook from managed pane failed: {:?}", hook_out);
 
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("failed to read event line");
+    let event = read_next_hook_event(&mut reader);
 
     kill_child(listen);
     kill_slopd(slopd);
 
-    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
-
     // The event from the unmanaged pane should have been silently dropped.
-    // The first event we receive must be from the managed pane.
+    // The first hook event we receive must be from the managed pane.
     assert_eq!(
         event["pane_id"].as_str().unwrap(), managed_pane_id,
         "Expected slopd to ignore the unmanaged pane's event, but got pane_id={:?}",
@@ -1928,15 +1923,26 @@ fn hooks_from_managed_pane_work_after_slopd_restart() {
     let hook_out = fire_hook(&env, "UserPromptSubmit", payload, Some(&pane_id));
     assert!(hook_out.status.success(), "hook failed: {:?}", hook_out);
 
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("failed to read event line");
+    let event = read_next_hook_event(&mut reader);
 
     kill_child(listen);
     kill_slopd(slopd2);
 
-    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
     assert_eq!(event["pane_id"], pane_id.as_str());
     assert_eq!(event["payload"]["prompt"], "after restart");
+}
+
+/// Read lines from a BufReader until a hook event (source == "hook") is found and return it.
+/// Skips slopd-internal events (StateChange, DetailedStateChange) which may arrive interleaved.
+fn read_next_hook_event(reader: &mut std::io::BufReader<impl std::io::Read>) -> serde_json::Value {
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("failed to read event line");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+        if v["source"] == "hook" {
+            return v;
+        }
+    }
 }
 
 /// Helper: fire a hook for a pane and assert the resulting (state, detailed_state).
@@ -1968,8 +1974,10 @@ fn pane_state_booting_up_on_run_then_transitions_on_hooks() {
     let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
     let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
 
+    // --no-session-start prevents mock_claude from firing SessionStart on startup,
+    // so we can assert booting_up before any hook fires.
     let Some(env) = TestEnv::new_full(
-        Some(&[&mock_claude_path]),
+        Some(&[&mock_claude_path, "--no-session-start"]),
         Some(&slopctl_path),
         Some(&claude_config_dir),
     ) else {
@@ -1979,22 +1987,27 @@ fn pane_state_booting_up_on_run_then_transitions_on_hooks() {
 
     let slopd = env.spawn_slopd();
 
-    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
-    // Immediately after run: booting_up
+    // mock_claude is running but has not fired SessionStart: state must be booting_up
     let (state, detailed) = env.pane_state(&pane_id);
     assert_eq!(state, libslop::PaneState::BootingUp);
     assert_eq!(detailed, libslop::PaneDetailedState::BootingUp);
 
-    // Wait for SessionStart (fired by mock_claude), then state should be ready
-    env.wait_for_session_start(listener, &pane_id);
-    std::thread::sleep(Duration::from_millis(100));
+    // Ask mock_claude to fire SessionStart via its /hook command.
+    // mock_claude fires SessionStart (synchronously, wait=true) then falls through to
+    // UserPromptSubmit. slopctl send blocks until UserPromptSubmit is confirmed, so
+    // when it returns slopd has processed both hooks.
+    let send_out = env.slopctl(&["send", &pane_id, "/hook SessionStart"]);
+    assert!(send_out.status.success(), "slopctl send /hook SessionStart failed: {:?}", send_out);
+
+    // SessionStart → Ready, then UserPromptSubmit → BusyProcessing.
+    // BusyProcessing confirms SessionStart was processed (state passed through Ready).
     let (state, detailed) = env.pane_state(&pane_id);
-    assert_eq!(state, libslop::PaneState::Ready);
-    assert_eq!(detailed, libslop::PaneDetailedState::Ready);
+    assert_eq!(state, libslop::PaneState::Busy);
+    assert_eq!(detailed, libslop::PaneDetailedState::BusyProcessing);
 
     kill_slopd(slopd);
 }
@@ -2111,4 +2124,183 @@ fn pane_state_resets_to_booting_up_on_slopd_restart() {
         libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
 
     kill_slopd(slopd2);
+}
+
+/// Spawn `slopctl listen --event <event_type>` and wait for the subscription confirmation.
+/// Returns the child process with stdout piped.
+fn spawn_event_listener(env: &TestEnv, event_type: &str) -> std::process::Child {
+    let mut child = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--event", event_type])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen --event");
+    let stdout = child.stdout.as_mut().expect("listener has no stdout");
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        use std::io::Read;
+        stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+        if buf[0] == b'\n' { break; }
+        line.push(buf[0]);
+    }
+    let line = String::from_utf8_lossy(&line);
+    assert!(line.contains("subscribed"), "unexpected first line from slopctl listen: {:?}", line);
+    child
+}
+
+/// Read lines from a listener child until a line whose parsed JSON satisfies `pred`, or panic after 10s.
+fn wait_for_event<F>(mut listener: std::process::Child, pred: F) -> serde_json::Value
+where
+    F: Fn(&serde_json::Value) -> bool + Send + 'static,
+{
+    use std::io::BufRead;
+    let stdout = listener.stdout.take().expect("listener has no stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => { let _ = tx.send(None); return; }
+                Ok(_) => {}
+            }
+            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if pred(&v) {
+                let _ = tx.send(Some(v));
+                return;
+            }
+        }
+    });
+    let event = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out waiting for event")
+        .expect("listener closed before matching event");
+    kill_child(listener);
+    event
+}
+
+#[test]
+fn listen_event_state_change_fires_on_hook() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let listener = spawn_event_listener(&env, "StateChange");
+
+    let payload = r#"{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    let out = fire_hook(&env, "SessionStart", payload, Some(&pane_id));
+    assert!(out.status.success(), "hook failed: {:?}", out);
+
+    let event = wait_for_event(listener, move |v| {
+        v["event_type"] == "StateChange" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["event_type"], "StateChange");
+    assert_eq!(event["payload"]["state"], "ready");
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn listen_event_detailed_state_change_fires_on_hook() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
+
+    let payload = r#"{"session_id":"s1","hook_event_name":"PreToolUse","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    let out = fire_hook(&env, "PreToolUse", payload, Some(&pane_id));
+    assert!(out.status.success(), "hook failed: {:?}", out);
+
+    let event = wait_for_event(listener, move |v| {
+        v["event_type"] == "DetailedStateChange" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["event_type"], "DetailedStateChange");
+    assert_eq!(event["payload"]["detailed_state"], "busy_tool_use");
+
+    kill_slopd(slopd);
+}
+
+/// Spawn `slopctl listen --hook <event_type>` and wait for the subscription confirmation.
+fn spawn_hook_listener(env: &TestEnv, event_type: &str) -> std::process::Child {
+    let mut child = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", event_type])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen --hook");
+    let stdout = child.stdout.as_mut().expect("listener has no stdout");
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        use std::io::Read;
+        stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+        if buf[0] == b'\n' { break; }
+        line.push(buf[0]);
+    }
+    let line = String::from_utf8_lossy(&line);
+    assert!(line.contains("subscribed"), "unexpected first line from slopctl listen: {:?}", line);
+    child
+}
+
+#[test]
+fn listen_hook_delivers_hook_event() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let listener = spawn_hook_listener(&env, "UserPromptSubmit");
+
+    let payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","transcript_path":"/dev/null","cwd":"/tmp","prompt":"hello"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", payload, Some(&pane_id));
+    assert!(out.status.success(), "hook failed: {:?}", out);
+
+    let event = wait_for_event(listener, move |v| {
+        v["event_type"] == "UserPromptSubmit" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "hook");
+    assert_eq!(event["event_type"], "UserPromptSubmit");
+    assert_eq!(event["payload"]["prompt"], "hello");
+
+    kill_slopd(slopd);
 }

@@ -73,6 +73,7 @@ fn handle_prompt(prompt: &str) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let print_mode = args.iter().any(|a| a == "--print" || a == "-p");
+    let no_session_start = args.iter().any(|a| a == "--no-session-start");
 
     if print_mode {
         // In --print mode, treat the last non-flag argument as the prompt,
@@ -117,19 +118,21 @@ fn main() {
         orig
     };
 
-    fire_hooks(
-        &settings,
-        "SessionStart",
-        &serde_json::json!({
-            "session_id": session_id,
-            "hook_event_name": "SessionStart",
-            "transcript_path": "/dev/null",
-            "cwd": cwd,
-            "source": "startup",
-            "model": "mock"
-        }),
-        false,
-    );
+    if !no_session_start {
+        fire_hooks(
+            &settings,
+            "SessionStart",
+            &serde_json::json!({
+                "session_id": session_id,
+                "hook_event_name": "SessionStart",
+                "transcript_path": "/dev/null",
+                "cwd": cwd,
+                "source": "startup",
+                "model": "mock"
+            }),
+            false,
+        );
+    }
 
     // Read raw bytes from stdin, accumulating lines.
     // Mirrors real Claude terminal behaviour:

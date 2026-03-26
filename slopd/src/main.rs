@@ -34,6 +34,8 @@ async fn set_pane_detailed_state(
     config: &libslop::SlopdConfig,
     pane_id: &str,
     detailed: &libslop::PaneDetailedState,
+    previous: Option<&libslop::PaneDetailedState>,
+    event_tx: &EventTx,
 ) {
     let simple = detailed.to_simple();
     for (opt, val) in [
@@ -50,6 +52,29 @@ async fn set_pane_detailed_state(
             warn!("failed to set {} on pane {}: {}", opt.as_str(), pane_id, e);
         }
     }
+
+    let previous_simple = previous.map(|p| p.to_simple());
+    if previous_simple.as_ref() != Some(&simple) {
+        let _ = event_tx.send(BroadcastEvent {
+            source: "slopd".to_string(),
+            event_type: "StateChange".to_string(),
+            pane_id: Some(pane_id.to_string()),
+            payload: serde_json::json!({
+                "state": simple.as_str(),
+                "previous_state": previous_simple.as_ref().map(|s| s.as_str()),
+            }),
+        });
+    }
+
+    let _ = event_tx.send(BroadcastEvent {
+        source: "slopd".to_string(),
+        event_type: "DetailedStateChange".to_string(),
+        pane_id: Some(pane_id.to_string()),
+        payload: serde_json::json!({
+            "detailed_state": detailed.as_str(),
+            "previous_detailed_state": previous.map(|p| p.as_str()),
+        }),
+    });
 }
 
 /// Per-pane state shared across connection handlers.
@@ -86,7 +111,7 @@ type ManagedPanes = Arc<dashmap::DashSet<String>>;
 /// Populate the managed-pane set from the `slopd` tmux session.
 /// Resets state to booting_up for all recovered panes since we don't know
 /// where Claude actually is after a slopd restart.
-async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes) {
+async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx) {
     let output = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
         .output()
@@ -97,7 +122,7 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
                 let pane_id = line.trim();
                 if !pane_id.is_empty() {
                     managed.insert(pane_id.to_string());
-                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp).await;
+                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
                 }
             }
         }
@@ -239,12 +264,12 @@ async fn main() {
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
     let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
 
-    // Recover managed pane IDs from the tmux session so panes that existed
-    // before a slopd restart are still recognized.
-    load_managed_panes(&config, &managed_panes).await;
-
     let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
     let event_tx: EventTx = Arc::new(event_tx);
+
+    // Recover managed pane IDs from the tmux session so panes that existed
+    // before a slopd restart are still recognized.
+    load_managed_panes(&config, &managed_panes, &event_tx).await;
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
@@ -465,7 +490,7 @@ async fn handle_request(
                     if let Err(e) = result {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready).await;
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx).await;
                 }
             }
 
@@ -473,7 +498,7 @@ async fn handle_request(
                 if let Some(pane) = pane_id.as_deref() {
                     debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                     pane_state(panes, pane).prompt_submitted.notify_waiters();
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing).await;
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing, None, event_tx).await;
                 }
             }
 
@@ -490,7 +515,7 @@ async fn handle_request(
                 _ => None,
             };
             if let (Some(pane), Some(state)) = (pane_id.as_deref(), detailed_state) {
-                set_pane_detailed_state(config, pane, &state).await;
+                set_pane_detailed_state(config, pane, &state, None, event_tx).await;
             }
 
             let _ = event_tx.send(BroadcastEvent {
@@ -532,7 +557,7 @@ async fn handle_request(
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
-                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp).await;
+                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
                     if let Some(ref parent) = parent_pane_id {
                         let result = tmux(config)
                             .args([
