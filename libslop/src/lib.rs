@@ -29,6 +29,8 @@ pub enum TmuxOption {
     SlopdState,
     /// Stores the detailed pane state
     SlopdDetailedState,
+    /// Stores the pane creation unix timestamp
+    SlopdCreatedAt,
 }
 
 impl TmuxOption {
@@ -39,6 +41,7 @@ impl TmuxOption {
             TmuxOption::SlopdParentPane => "@slopd_parent_pane",
             TmuxOption::SlopdState => "@slopd_state",
             TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
+            TmuxOption::SlopdCreatedAt => "@slopd_created_at",
         }
     }
 }
@@ -620,8 +623,10 @@ impl PaneDetailedState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
-    /// Unix timestamp of pane creation.
+    /// Unix timestamp when slopd spawned this pane (from @slopd_created_at).
     pub created_at: u64,
+    /// Unix timestamp of last tmux window activity (#{window_activity}).
+    pub last_active: u64,
     /// Claude session ID stored by the SessionStart hook, if set.
     pub session_id: Option<String>,
     /// Parent pane ID if this pane was spawned by another pane via slopctl run.

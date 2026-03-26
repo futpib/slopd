@@ -544,22 +544,27 @@ fn ps_lists_panes_with_session_id_and_tags() {
     assert!(stdout.contains(&pane_id), "ps output missing pane_id {}: {}", pane_id, stdout);
     assert!(stdout.contains("mock-session-id-1234"), "ps output missing session_id: {}", stdout);
     assert!(stdout.contains("mytest"), "ps output missing tag: {}", stdout);
-    assert!(stdout.contains("ago") || stdout.contains("now"), "ps output missing created time: {}", stdout);
-    assert!(!stdout.contains("56 years ago"), "created_at is 0 (issue #7): {}", stdout);
+    assert!(stdout.contains("LAST_ACTIVE"), "ps output missing LAST_ACTIVE column header: {}", stdout);
+    assert!(stdout.contains("ago") || stdout.contains("now"), "ps output missing time: {}", stdout);
+    assert!(!stdout.contains("56 years ago"), "created_at is 0: {}", stdout);
 
-    // Verify created_at is a plausible recent Unix timestamp (issue #7).
+    // Verify created_at and last_active are plausible recent Unix timestamps.
     assert!(ps_json_out.status.success(), "ps --json failed: {:?}", ps_json_out);
     let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
         .expect("ps --json is not valid JSON");
     let pane_entry = panes.as_array().unwrap().iter()
         .find(|p| p["pane_id"] == pane_id)
         .unwrap_or_else(|| panic!("pane {} not in ps --json output", pane_id));
-    let created_at = pane_entry["created_at"].as_u64().expect("created_at is not a u64");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    assert!(created_at > 0, "created_at is 0 (issue #7)");
+    let created_at = pane_entry["created_at"].as_u64().expect("created_at is not a u64");
+    assert!(created_at > 0, "created_at is 0");
     assert!(created_at <= now, "created_at is in the future: {}", created_at);
     assert!(now - created_at < 60, "created_at is more than 60s ago: {}", created_at);
+    let last_active = pane_entry["last_active"].as_u64().expect("last_active is not a u64");
+    assert!(last_active > 0, "last_active is 0");
+    assert!(last_active <= now, "last_active is in the future: {}", last_active);
+    assert!(created_at <= last_active, "created_at ({}) is after last_active ({})", created_at, last_active);
 }
 
 #[test]

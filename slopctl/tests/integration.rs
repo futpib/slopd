@@ -62,7 +62,39 @@ fn ps_json_returns_valid_json_array() {
 
     assert!(pane["pane_id"].is_string(), "pane_id must be a string");
     assert!(pane["created_at"].is_number(), "created_at must be a number");
+    assert!(pane["last_active"].is_number(), "last_active must be a number");
     assert!(pane["tags"].is_array(), "tags must be an array");
+}
+
+#[test]
+fn ps_table_contains_expected_columns() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let output = env.slopctl(&["ps"]);
+
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl ps failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PANE"), "missing PANE column: {}", stdout);
+    assert!(stdout.contains("CREATED"), "missing CREATED column: {}", stdout);
+    assert!(stdout.contains("LAST_ACTIVE"), "missing LAST_ACTIVE column: {}", stdout);
+    assert!(stdout.contains("SESSION"), "missing SESSION column: {}", stdout);
+    assert!(stdout.contains("STATE"), "missing STATE column: {}", stdout);
+    assert!(stdout.contains(&pane_id), "missing pane_id in output: {}", stdout);
+    assert!(stdout.contains("ago") || stdout.contains("now"), "missing time in output: {}", stdout);
 }
 
 #[test]

@@ -378,19 +378,20 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
             Some(p) if !p.is_empty() => p.to_string(),
             _ => continue,
         };
-        let created_at: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        let last_active: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
 
         let opts_out = tmux(config)
             .args(["show-options", "-t", &pane_id, "-p"])
             .output()
             .await;
-        let (session_id, parent_pane_id, tags, state, detailed_state) = match opts_out {
+        let (session_id, parent_pane_id, tags, state, detailed_state, created_at) = match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let mut session_id = None;
                 let mut parent_pane_id = None;
                 let mut tags = Vec::new();
                 let mut detailed_state = None;
+                let mut created_at = None;
                 for opt_line in stdout.lines() {
                     let mut words = opt_line.splitn(2, ' ');
                     let key = words.next().unwrap_or("").trim();
@@ -401,18 +402,21 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
                         parent_pane_id = Some(val.to_string());
                     } else if key == libslop::TmuxOption::SlopdDetailedState.as_str() {
                         detailed_state = libslop::PaneDetailedState::from_str(val);
+                    } else if key == libslop::TmuxOption::SlopdCreatedAt.as_str() {
+                        created_at = val.parse::<u64>().ok();
                     } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
                         tags.push(tag.to_string());
                     }
                 }
                 let detailed_state = detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
                 let state = detailed_state.to_simple();
-                (session_id, parent_pane_id, tags, state, detailed_state)
+                let created_at = created_at.unwrap_or(last_active);
+                (session_id, parent_pane_id, tags, state, detailed_state, created_at)
             }
-            _ => (None, None, Vec::new(), libslop::PaneState::BootingUp, libslop::PaneDetailedState::BootingUp),
+            _ => (None, None, Vec::new(), libslop::PaneState::BootingUp, libslop::PaneDetailedState::BootingUp, last_active),
         };
 
-        panes.push(libslop::PaneInfo { pane_id, created_at, session_id, parent_pane_id, tags, state, detailed_state });
+        panes.push(libslop::PaneInfo { pane_id, created_at, last_active, session_id, parent_pane_id, tags, state, detailed_state });
     }
     Ok(panes)
 }
@@ -557,6 +561,15 @@ async fn handle_request(
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let _ = tmux(config)
+                        .args(["set-option", "-t", &pane_id, "-p",
+                            libslop::TmuxOption::SlopdCreatedAt.as_str(),
+                            &now.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
                     set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
                     if let Some(ref parent) = parent_pane_id {
                         let result = tmux(config)
