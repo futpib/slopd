@@ -364,6 +364,7 @@ dependencies = [
 name = "libsloptest"
 version = "0.1.0"
 dependencies = [
+ "libslop",
  "nix 0.31.2",
  "serde_json",
  "tempfile",

@@ -30,6 +30,28 @@ fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
     cmd
 }
 
+async fn set_pane_detailed_state(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    detailed: &libslop::PaneDetailedState,
+) {
+    let simple = detailed.to_simple();
+    for (opt, val) in [
+        (libslop::TmuxOption::SlopdState, simple.as_str()),
+        (libslop::TmuxOption::SlopdDetailedState, detailed.as_str()),
+    ] {
+        let result = tmux(config)
+            .args(["set-option", "-t", pane_id, "-p", opt.as_str(), val])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if let Err(e) = result {
+            warn!("failed to set {} on pane {}: {}", opt.as_str(), pane_id, e);
+        }
+    }
+}
+
 /// Per-pane state shared across connection handlers.
 struct PaneState {
     /// Serialises the type-then-enter sequence so two concurrent sends don't interleave.
@@ -62,6 +84,8 @@ fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
 type ManagedPanes = Arc<dashmap::DashSet<String>>;
 
 /// Populate the managed-pane set from the `slopd` tmux session.
+/// Resets state to booting_up for all recovered panes since we don't know
+/// where Claude actually is after a slopd restart.
 async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes) {
     let output = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
@@ -73,6 +97,7 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
                 let pane_id = line.trim();
                 if !pane_id.is_empty() {
                     managed.insert(pane_id.to_string());
+                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp).await;
                 }
             }
         }
@@ -334,12 +359,13 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
             .args(["show-options", "-t", &pane_id, "-p"])
             .output()
             .await;
-        let (session_id, parent_pane_id, tags) = match opts_out {
+        let (session_id, parent_pane_id, tags, state, detailed_state) = match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let mut session_id = None;
                 let mut parent_pane_id = None;
                 let mut tags = Vec::new();
+                let mut detailed_state = None;
                 for opt_line in stdout.lines() {
                     let mut words = opt_line.splitn(2, ' ');
                     let key = words.next().unwrap_or("").trim();
@@ -348,16 +374,20 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
                         session_id = Some(val.to_string());
                     } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
                         parent_pane_id = Some(val.to_string());
+                    } else if key == libslop::TmuxOption::SlopdDetailedState.as_str() {
+                        detailed_state = libslop::PaneDetailedState::from_str(val);
                     } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
                         tags.push(tag.to_string());
                     }
                 }
-                (session_id, parent_pane_id, tags)
+                let detailed_state = detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
+                let state = detailed_state.to_simple();
+                (session_id, parent_pane_id, tags, state, detailed_state)
             }
-            _ => (None, None, Vec::new()),
+            _ => (None, None, Vec::new(), libslop::PaneState::BootingUp, libslop::PaneDetailedState::BootingUp),
         };
 
-        panes.push(libslop::PaneInfo { pane_id, created_at, session_id, parent_pane_id, tags });
+        panes.push(libslop::PaneInfo { pane_id, created_at, session_id, parent_pane_id, tags, state, detailed_state });
     }
     Ok(panes)
 }
@@ -435,6 +465,7 @@ async fn handle_request(
                     if let Err(e) = result {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready).await;
                 }
             }
 
@@ -442,7 +473,24 @@ async fn handle_request(
                 if let Some(pane) = pane_id.as_deref() {
                     debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                     pane_state(panes, pane).prompt_submitted.notify_waiters();
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing).await;
                 }
+            }
+
+            let detailed_state = match event.as_str() {
+                "Stop" | "StopFailure" => Some(libslop::PaneDetailedState::Ready),
+                "PreToolUse" => Some(libslop::PaneDetailedState::BusyToolUse),
+                "PostToolUse" | "PostToolUseFailure" => Some(libslop::PaneDetailedState::BusyProcessing),
+                "PermissionRequest" => Some(libslop::PaneDetailedState::AwaitingInputPermission),
+                "SubagentStart" => Some(libslop::PaneDetailedState::BusySubagent),
+                "SubagentStop" | "ElicitationResult" => Some(libslop::PaneDetailedState::BusyProcessing),
+                "PreCompact" => Some(libslop::PaneDetailedState::BusyCompacting),
+                "PostCompact" => Some(libslop::PaneDetailedState::BusyProcessing),
+                "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
+                _ => None,
+            };
+            if let (Some(pane), Some(state)) = (pane_id.as_deref(), detailed_state) {
+                set_pane_detailed_state(config, pane, &state).await;
             }
 
             let _ = event_tx.send(BroadcastEvent {
@@ -484,6 +532,7 @@ async fn handle_request(
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
+                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp).await;
                     if let Some(ref parent) = parent_pane_id {
                         let result = tmux(config)
                             .args([

@@ -218,6 +218,21 @@ fn main() {
                     println!("/env:{}={}", key.trim(), val);
                     continue;
                 }
+                if let Some(event) = prompt.strip_prefix("/hook ") {
+                    fire_hooks(
+                        &settings,
+                        event.trim(),
+                        &serde_json::json!({
+                            "session_id": session_id,
+                            "hook_event_name": event.trim(),
+                            "transcript_path": "/dev/null",
+                            "cwd": cwd,
+                        }),
+                        true,
+                    );
+                    // Fall through to fire UserPromptSubmit so slopctl send unblocks.
+                }
+
                 if prompt == "/break-stdin" {
                     break;
                 }

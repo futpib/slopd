@@ -246,6 +246,18 @@ impl TestEnv {
         session_id
     }
 
+    /// Query `slopctl ps --json` and return the `(state, detailed_state)` for `pane_id`.
+    /// Panics if the pane is not found.
+    pub fn pane_state(&self, pane_id: &str) -> (libslop::PaneState, libslop::PaneDetailedState) {
+        let output = self.slopctl(&["ps", "--json"]);
+        assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+        let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&output.stdout)
+            .expect("failed to parse slopctl ps --json output");
+        let pane = panes.into_iter().find(|p| p.pane_id == pane_id)
+            .unwrap_or_else(|| panic!("pane {} not found in slopctl ps output", pane_id));
+        (pane.state, pane.detailed_state)
+    }
+
     /// Like `wait_for_session_start` but waits for SessionStart on all `pane_ids`.
     /// Uses a single listener, so spawn it before issuing any `slopctl run` calls.
     /// Panics if not all events arrive within 10 seconds.

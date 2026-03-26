@@ -1938,3 +1938,177 @@ fn hooks_from_managed_pane_work_after_slopd_restart() {
     assert_eq!(event["pane_id"], pane_id.as_str());
     assert_eq!(event["payload"]["prompt"], "after restart");
 }
+
+/// Helper: fire a hook for a pane and assert the resulting (state, detailed_state).
+fn assert_state_after_hook(
+    env: &libsloptest::TestEnv,
+    pane_id: &str,
+    event: &str,
+    payload: &str,
+    expected_state: libslop::PaneState,
+    expected_detailed: libslop::PaneDetailedState,
+) {
+    let out = fire_hook(env, event, payload, Some(pane_id));
+    assert!(out.status.success(), "hook {} failed: {:?}", event, out);
+    // Give slopd a moment to write the tmux option.
+    std::thread::sleep(Duration::from_millis(100));
+    let (state, detailed) = env.pane_state(pane_id);
+    assert_eq!(state, expected_state, "state mismatch after {} hook", event);
+    assert_eq!(detailed, expected_detailed, "detailed_state mismatch after {} hook", event);
+}
+
+#[test]
+fn pane_state_booting_up_on_run_then_transitions_on_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Immediately after run: booting_up
+    let (state, detailed) = env.pane_state(&pane_id);
+    assert_eq!(state, libslop::PaneState::BootingUp);
+    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp);
+
+    // Wait for SessionStart (fired by mock_claude), then state should be ready
+    env.wait_for_session_start(listener, &pane_id);
+    std::thread::sleep(Duration::from_millis(100));
+    let (state, detailed) = env.pane_state(&pane_id);
+    assert_eq!(state, libslop::PaneState::Ready);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn pane_state_transitions_through_all_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let base = |hook: &str| format!(
+        r#"{{"session_id":"s1","hook_event_name":"{}","transcript_path":"/dev/null","cwd":"/tmp"}}"#,
+        hook
+    );
+
+    // SessionStart → ready
+    assert_state_after_hook(&env, &pane_id, "SessionStart", &base("SessionStart"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // UserPromptSubmit → busy / busy_processing
+    assert_state_after_hook(&env, &pane_id, "UserPromptSubmit", &base("UserPromptSubmit"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // PreToolUse → busy / busy_tool_use
+    assert_state_after_hook(&env, &pane_id, "PreToolUse", &base("PreToolUse"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyToolUse);
+
+    // PermissionRequest → awaiting_input / awaiting_input_permission
+    assert_state_after_hook(&env, &pane_id, "PermissionRequest", &base("PermissionRequest"),
+        libslop::PaneState::AwaitingInput, libslop::PaneDetailedState::AwaitingInputPermission);
+
+    // PostToolUse → busy / busy_processing
+    assert_state_after_hook(&env, &pane_id, "PostToolUse", &base("PostToolUse"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // Elicitation → awaiting_input / awaiting_input_elicitation
+    assert_state_after_hook(&env, &pane_id, "Elicitation", &base("Elicitation"),
+        libslop::PaneState::AwaitingInput, libslop::PaneDetailedState::AwaitingInputElicitation);
+
+    // ElicitationResult → busy / busy_processing
+    assert_state_after_hook(&env, &pane_id, "ElicitationResult", &base("ElicitationResult"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // SubagentStart → busy / busy_subagent
+    assert_state_after_hook(&env, &pane_id, "SubagentStart", &base("SubagentStart"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusySubagent);
+
+    // SubagentStop → busy / busy_processing
+    assert_state_after_hook(&env, &pane_id, "SubagentStop", &base("SubagentStop"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // PreCompact → busy / busy_compacting
+    assert_state_after_hook(&env, &pane_id, "PreCompact", &base("PreCompact"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyCompacting);
+
+    // PostCompact → busy / busy_processing
+    assert_state_after_hook(&env, &pane_id, "PostCompact", &base("PostCompact"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // Stop → ready
+    assert_state_after_hook(&env, &pane_id, "Stop", &base("Stop"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // StopFailure → ready
+    assert_state_after_hook(&env, &pane_id, "StopFailure", &base("StopFailure"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn pane_state_resets_to_booting_up_on_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Advance to ready via SessionStart
+    let payload = r#"{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    assert_state_after_hook(&env, &pane_id, "SessionStart", payload,
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // Restart slopd
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    // State must be reset to booting_up
+    std::thread::sleep(Duration::from_millis(100));
+    let (state, detailed) = env.pane_state(&pane_id);
+    assert_eq!(state, libslop::PaneState::BootingUp, "expected booting_up after restart");
+    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp, "expected booting_up after restart");
+
+    // Fire SessionStart again to confirm normal transitions still work after restart
+    assert_state_after_hook(&env, &pane_id, "SessionStart", payload,
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    kill_slopd(slopd2);
+}

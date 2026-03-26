@@ -25,6 +25,10 @@ pub enum TmuxOption {
     SlopdClaudeSessionId,
     /// Stores the parent pane ID when a pane was spawned by another pane via slopctl run
     SlopdParentPane,
+    /// Stores the simplified pane state
+    SlopdState,
+    /// Stores the detailed pane state
+    SlopdDetailedState,
 }
 
 impl TmuxOption {
@@ -33,6 +37,8 @@ impl TmuxOption {
             TmuxOption::SlopdManaged => "@slopd_managed",
             TmuxOption::SlopdClaudeSessionId => "@slopd_claude_session_id",
             TmuxOption::SlopdParentPane => "@slopd_parent_pane",
+            TmuxOption::SlopdState => "@slopd_state",
+            TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
         }
     }
 }
@@ -526,6 +532,91 @@ pub enum ResponseBody {
     Error { message: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneState {
+    BootingUp,
+    Ready,
+    Busy,
+    AwaitingInput,
+}
+
+impl PaneState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PaneState::BootingUp => "booting_up",
+            PaneState::Ready => "ready",
+            PaneState::Busy => "busy",
+            PaneState::AwaitingInput => "awaiting_input",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "booting_up" => Some(PaneState::BootingUp),
+            "ready" => Some(PaneState::Ready),
+            "busy" => Some(PaneState::Busy),
+            "awaiting_input" => Some(PaneState::AwaitingInput),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneDetailedState {
+    BootingUp,
+    Ready,
+    BusyProcessing,
+    BusyToolUse,
+    BusySubagent,
+    BusyCompacting,
+    AwaitingInputPermission,
+    AwaitingInputElicitation,
+}
+
+impl PaneDetailedState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PaneDetailedState::BootingUp => "booting_up",
+            PaneDetailedState::Ready => "ready",
+            PaneDetailedState::BusyProcessing => "busy_processing",
+            PaneDetailedState::BusyToolUse => "busy_tool_use",
+            PaneDetailedState::BusySubagent => "busy_subagent",
+            PaneDetailedState::BusyCompacting => "busy_compacting",
+            PaneDetailedState::AwaitingInputPermission => "awaiting_input_permission",
+            PaneDetailedState::AwaitingInputElicitation => "awaiting_input_elicitation",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "booting_up" => Some(PaneDetailedState::BootingUp),
+            "ready" => Some(PaneDetailedState::Ready),
+            "busy_processing" => Some(PaneDetailedState::BusyProcessing),
+            "busy_tool_use" => Some(PaneDetailedState::BusyToolUse),
+            "busy_subagent" => Some(PaneDetailedState::BusySubagent),
+            "busy_compacting" => Some(PaneDetailedState::BusyCompacting),
+            "awaiting_input_permission" => Some(PaneDetailedState::AwaitingInputPermission),
+            "awaiting_input_elicitation" => Some(PaneDetailedState::AwaitingInputElicitation),
+            _ => None,
+        }
+    }
+
+    pub fn to_simple(&self) -> PaneState {
+        match self {
+            PaneDetailedState::BootingUp => PaneState::BootingUp,
+            PaneDetailedState::Ready => PaneState::Ready,
+            PaneDetailedState::BusyProcessing
+            | PaneDetailedState::BusyToolUse
+            | PaneDetailedState::BusySubagent
+            | PaneDetailedState::BusyCompacting => PaneState::Busy,
+            PaneDetailedState::AwaitingInputPermission
+            | PaneDetailedState::AwaitingInputElicitation => PaneState::AwaitingInput,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
@@ -537,6 +628,10 @@ pub struct PaneInfo {
     pub parent_pane_id: Option<String>,
     /// User-defined tags on this pane.
     pub tags: Vec<String>,
+    /// Simplified pane state.
+    pub state: PaneState,
+    /// Detailed pane state.
+    pub detailed_state: PaneDetailedState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
