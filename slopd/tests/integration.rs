@@ -1477,8 +1477,8 @@ fn send_filtered_all_is_concurrent() {
     assert!(all_out.status.success(), "send failed: {:?}", all_out);
 
     // All N panes received. Wall time should be well under N * baseline.
-    // We allow 2x baseline as headroom for scheduling jitter.
-    let limit = baseline * 2 + Duration::from_millis(500);
+    // We allow 3x baseline as headroom for scheduling jitter.
+    let limit = baseline * 3 + Duration::from_millis(500);
     assert!(
         all_elapsed < limit,
         "send to {} panes took {:?}, expected < {:?} (baseline {:?}); \

@@ -291,11 +291,6 @@ async fn main() {
         panic!("flock failed: {}", err);
     }
 
-    let _ = tokio::fs::remove_file(&socket_path).await;
-
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    info!("listening on {}", socket_path.display());
-
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -308,8 +303,15 @@ async fn main() {
     let event_tx: EventTx = Arc::new(event_tx);
 
     // Recover managed pane IDs from the tmux session so panes that existed
-    // before a slopd restart are still recognized.
+    // before a slopd restart are still recognized. This must happen before
+    // binding the socket so that clients cannot create panes in the slopd
+    // session while the scan is in progress.
     load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
+
+    let _ = tokio::fs::remove_file(&socket_path).await;
+
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    info!("listening on {}", socket_path.display());
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
