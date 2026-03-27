@@ -439,9 +439,11 @@ fn send_delivers_prompt_to_pane() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
 
     let send_output = env.slopctl(&["send", &pane_id, "hello from test"]);
 
@@ -475,9 +477,11 @@ fn send_concurrent_all_delivered() {
 
     let slopd = env.spawn_slopd();
 
+    let listener = env.spawn_session_start_listener();
     let run_output = env.slopctl(&["run"]);
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
 
     const N: usize = 5;
     let handles: Vec<_> = (0..N)
@@ -2047,18 +2051,18 @@ fn pane_state_booting_up_on_run_then_transitions_on_hooks() {
     assert_eq!(state, libslop::PaneState::BootingUp);
     assert_eq!(detailed, libslop::PaneDetailedState::BootingUp);
 
-    // Ask mock_claude to fire SessionStart via its /hook command.
-    // mock_claude fires SessionStart (synchronously, wait=true) then falls through to
-    // UserPromptSubmit. slopctl send blocks until UserPromptSubmit is confirmed, so
-    // when it returns slopd has processed both hooks.
-    let send_out = env.slopctl(&["send", &pane_id, "/hook SessionStart"]);
-    assert!(send_out.status.success(), "slopctl send /hook SessionStart failed: {:?}", send_out);
+    // Fire SessionStart directly via slopctl hook (bypasses Send machinery, so the
+    // BootingUp state guard does not block it). SessionStart → Ready.
+    let payload = format!(
+        r#"{{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}}"#
+    );
+    let hook_out = fire_hook(&env, "SessionStart", &payload, Some(&pane_id));
+    assert!(hook_out.status.success(), "fire SessionStart hook failed: {:?}", hook_out);
+    std::thread::sleep(Duration::from_millis(100));
 
-    // SessionStart → Ready, then UserPromptSubmit → BusyProcessing.
-    // BusyProcessing confirms SessionStart was processed (state passed through Ready).
     let (state, detailed) = env.pane_state(&pane_id);
-    assert_eq!(state, libslop::PaneState::Busy);
-    assert_eq!(detailed, libslop::PaneDetailedState::BusyProcessing);
+    assert_eq!(state, libslop::PaneState::Ready);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready);
 
     kill_slopd(slopd);
 }
@@ -2590,4 +2594,253 @@ fn send_with_interrupt_preempts_busy_pane() {
     assert!(send_out.status.success(), "send --interrupt failed: {:?}", send_out);
     // Should complete quickly (interrupt fires immediately), not wait the full 30s.
     assert!(elapsed < Duration::from_secs(8), "send --interrupt took {:?}", elapsed);
+}
+
+/// Helper: create a raw tmux pane in the "test" session that slopd has never seen.
+fn spawn_unmanaged_pane(env: &TestEnv) -> String {
+    let out = env.tmux.tmux()
+        .args(["new-window", "-t", "test", "-P", "-F", "#{pane_id}", "sleep", "infinity"])
+        .output()
+        .expect("failed to create unmanaged pane");
+    assert!(out.status.success(), "failed to create unmanaged tmux pane: {:?}", out);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Helper: create a raw tmux pane directly inside the slopd session, bypassing slopctl run.
+/// slopd was already running when the pane was created, so it is not in managed_panes.
+fn spawn_unmanaged_pane_in_slopd_session(env: &TestEnv) -> String {
+    let out = env.tmux.tmux()
+        .args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}", "sleep", "infinity"])
+        .output()
+        .expect("failed to create pane in slopd session");
+    assert!(out.status.success(), "failed to create tmux pane in slopd session: {:?}", out);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn kill_unmanaged_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let unmanaged = spawn_unmanaged_pane(&env);
+
+    let out = env.slopctl(&["kill", &unmanaged]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "kill on unmanaged pane should have failed: {:?}", out);
+}
+
+#[test]
+fn send_unmanaged_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let unmanaged = spawn_unmanaged_pane(&env);
+
+    let out = env.slopctl(&["send", &unmanaged, "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "send to unmanaged pane should have failed: {:?}", out);
+}
+
+#[test]
+fn interrupt_unmanaged_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let unmanaged = spawn_unmanaged_pane(&env);
+
+    let out = env.slopctl(&["interrupt", &unmanaged]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "interrupt on unmanaged pane should have failed: {:?}", out);
+}
+
+#[test]
+fn tag_unmanaged_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let unmanaged = spawn_unmanaged_pane(&env);
+
+    let out = env.slopctl(&["tag", &unmanaged, "mylabel"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "tag on unmanaged pane should have failed: {:?}", out);
+}
+
+#[test]
+fn untag_unmanaged_pane_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let unmanaged = spawn_unmanaged_pane(&env);
+
+    let out = env.slopctl(&["untag", &unmanaged, "mylabel"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "untag on unmanaged pane should have failed: {:?}", out);
+}
+
+#[test]
+fn kill_pane_in_slopd_session_not_via_run_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let out = env.slopctl(&["kill", &pane]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "kill on slopd-session pane not registered via run should fail: {:?}", out);
+}
+
+#[test]
+fn send_pane_in_slopd_session_not_via_run_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let out = env.slopctl(&["send", &pane, "hello"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "send to slopd-session pane not registered via run should fail: {:?}", out);
+}
+
+#[test]
+fn interrupt_pane_in_slopd_session_not_via_run_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let out = env.slopctl(&["interrupt", &pane]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "interrupt on slopd-session pane not registered via run should fail: {:?}", out);
+}
+
+#[test]
+fn tag_pane_in_slopd_session_not_via_run_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let out = env.slopctl(&["tag", &pane, "mylabel"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "tag on slopd-session pane not registered via run should fail: {:?}", out);
+}
+
+#[test]
+fn untag_pane_in_slopd_session_not_via_run_returns_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let out = env.slopctl(&["untag", &pane, "mylabel"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "untag on slopd-session pane not registered via run should fail: {:?}", out);
+}
+
+#[test]
+fn ps_does_not_show_pane_not_created_via_run() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Create a managed pane via slopctl run.
+    let managed = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    // Create a pane directly in the slopd session, bypassing slopctl run.
+    let unmanaged = spawn_unmanaged_pane_in_slopd_session(&env);
+
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    kill_slopd(slopd);
+
+    assert!(ps_out.status.success(), "slopctl ps --json failed: {:?}", ps_out);
+    let panes: Vec<serde_json::Value> = serde_json::from_slice(&ps_out.stdout)
+        .unwrap_or_else(|e| panic!("ps --json output is not valid JSON: {}", e));
+    let ids: Vec<&str> = panes.iter().filter_map(|p| p["pane_id"].as_str()).collect();
+    assert!(ids.contains(&managed.as_str()), "managed pane {} missing from ps output", managed);
+    assert!(!ids.contains(&unmanaged.as_str()), "unmanaged pane {} should not appear in ps output", unmanaged);
 }
