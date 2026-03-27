@@ -57,6 +57,9 @@ enum Command {
         /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
+        /// Interrupt the pane(s) before sending the prompt.
+        #[arg(short = 'i', long)]
+        interrupt: bool,
     },
     /// Send Ctrl+C, Ctrl+D, and Escape to interrupt a running agent.
     Interrupt {
@@ -366,7 +369,7 @@ async fn main() {
     // Client-side filter resolution for Send with filter target: query Ps first, then Send per pane.
     if let Command::Send { ref pane_id, .. } = cli.command {
         if pane_id.contains('=') {
-            if let Command::Send { pane_id, prompt, filters, select, timeout } = cli.command {
+            if let Command::Send { pane_id, prompt, filters, select, timeout, interrupt } = cli.command {
                 let mut all_filters = vec![pane_id];
                 all_filters.extend(filters);
                 let parsed = parse_filters(all_filters);
@@ -417,6 +420,13 @@ async fn main() {
                         matched.into_iter().map(|p| p.pane_id).collect()
                     }
                 };
+
+                // If --interrupt, interrupt each pane sequentially before sending.
+                if interrupt {
+                    for pane_id in &target_pane_ids {
+                        send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Interrupt { pane_id: pane_id.clone() }).await;
+                    }
+                }
 
                 // Send all requests on the same connection, each with a unique ID,
                 // then read responses correlating by ID.
@@ -479,6 +489,21 @@ async fn main() {
         }
     }
 
+    // Handle direct-pane Send with --interrupt: interrupt first, then send.
+    if let Command::Send { ref pane_id, interrupt: true, ref prompt, timeout, .. } = cli.command {
+        send_request(&mut writer, &mut lines, 1, libslop::RequestBody::Interrupt { pane_id: pane_id.clone() }).await;
+        let body = libslop::RequestBody::Send { pane_id: pane_id.clone(), prompt: prompt.clone(), timeout_secs: timeout };
+        match send_request(&mut writer, &mut lines, 2, body).await {
+            libslop::ResponseBody::Sent { pane_id } => println!("{}", pane_id),
+            libslop::ResponseBody::Error { message } => {
+                eprintln!("error: {}", message);
+                std::process::exit(1);
+            }
+            other => println!("{:?}", other),
+        }
+        return;
+    }
+
     let body = match cli.command {
         Command::Status => libslop::RequestBody::Status,
         Command::Ps { filters, json } => {
@@ -508,7 +533,7 @@ async fn main() {
             extra_args,
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
-        Command::Send { pane_id, prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
+        Command::Send { pane_id, prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout }, // interrupt:false handled above
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
