@@ -426,6 +426,21 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
     Ok(panes)
 }
 
+async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Result<(), libslop::ResponseBody> {
+    for key in &["C-c", "C-d", "Escape"] {
+        let result = tmux(config)
+            .args(["send-keys", "-t", pane_id, key])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if let Err(e) = result {
+            return Err(libslop::ResponseBody::Error { message: e.to_string() });
+        }
+    }
+    Ok(())
+}
+
 async fn handle_request(
     body: libslop::RequestBody,
     start_time: u64,
@@ -610,16 +625,8 @@ async fn handle_request(
             // whatever Claude is currently doing.
             if interrupt {
                 let _guard = state.type_mutex.lock().await;
-                for key in &["C-c", "C-d", "Escape"] {
-                    let result = tmux(config)
-                        .args(["send-keys", "-t", &pane_id, key])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                    if let Err(e) = result {
-                        return libslop::ResponseBody::Error { message: e.to_string() };
-                    }
+                if let Err(e) = send_interrupt_keys(config, &pane_id).await {
+                    return e;
                 }
             }
 
@@ -751,16 +758,8 @@ async fn handle_request(
             // Acquire the type-mutex so we don't interleave with concurrent sends.
             let _guard = state.type_mutex.lock().await;
 
-            for key in &["C-c", "C-d", "Escape"] {
-                let result = tmux(config)
-                    .args(["send-keys", "-t", &pane_id, key])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                if let Err(e) = result {
-                    return libslop::ResponseBody::Error { message: e.to_string() };
-                }
+            if let Err(e) = send_interrupt_keys(config, &pane_id).await {
+                return e;
             }
 
             libslop::ResponseBody::Interrupted { pane_id }
