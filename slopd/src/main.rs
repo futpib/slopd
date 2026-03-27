@@ -13,21 +13,54 @@ struct Cli {
     verbose: u8,
 }
 
-fn verbosity_to_level(verbosity: u8) -> tracing::Level {
-    match verbosity {
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        2 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
-    }
-}
-
 fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("tmux");
     if let Some(socket) = &config.tmux.socket {
         cmd.args(["-S", socket.to_str().unwrap()]);
     }
     cmd
+}
+
+async fn tmux_set_pane_option(config: &libslop::SlopdConfig, pane_id: &str, option: &str, value: &str) -> std::io::Result<std::process::ExitStatus> {
+    tmux(config)
+        .args(["set-option", "-t", pane_id, "-p", option, value])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+}
+
+async fn tmux_unset_pane_option(config: &libslop::SlopdConfig, pane_id: &str, option: &str) -> std::io::Result<std::process::ExitStatus> {
+    tmux(config)
+        .args(["set-option", "-t", pane_id, "-p", "-u", option])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+}
+
+async fn tmux_send_keys(config: &libslop::SlopdConfig, pane_id: &str, keys: &str) -> std::io::Result<std::process::ExitStatus> {
+    tmux(config)
+        .args(["send-keys", "-t", pane_id, keys])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+}
+
+fn hook_event_to_detailed_state(event: &str) -> Option<libslop::PaneDetailedState> {
+    match event {
+        "Stop" | "StopFailure" => Some(libslop::PaneDetailedState::Ready),
+        "PreToolUse" => Some(libslop::PaneDetailedState::BusyToolUse),
+        "PostToolUse" | "PostToolUseFailure" => Some(libslop::PaneDetailedState::BusyProcessing),
+        "PermissionRequest" => Some(libslop::PaneDetailedState::AwaitingInputPermission),
+        "SubagentStart" => Some(libslop::PaneDetailedState::BusySubagent),
+        "SubagentStop" | "ElicitationResult" => Some(libslop::PaneDetailedState::BusyProcessing),
+        "PreCompact" => Some(libslop::PaneDetailedState::BusyCompacting),
+        "PostCompact" => Some(libslop::PaneDetailedState::BusyProcessing),
+        "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
+        _ => None,
+    }
 }
 
 async fn set_pane_detailed_state(
@@ -44,13 +77,7 @@ async fn set_pane_detailed_state(
         (libslop::TmuxOption::SlopdState, simple.as_str()),
         (libslop::TmuxOption::SlopdDetailedState, detailed.as_str()),
     ] {
-        let result = tmux(config)
-            .args(["set-option", "-t", pane_id, "-p", opt.as_str(), val])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if let Err(e) = result {
+        if let Err(e) = tmux_set_pane_option(config, pane_id, opt.as_str(), val).await {
             warn!("failed to set {} on pane {}: {}", opt.as_str(), pane_id, e);
         }
     }
@@ -183,7 +210,7 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &BroadcastEvent) -> bool 
 async fn main() {
     let cli = Cli::parse();
 
-    let level = verbosity_to_level(cli.verbose);
+    let level = libslop::verbosity_to_level(cli.verbose);
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_env_filter(
@@ -366,6 +393,31 @@ async fn handle_connection(
     }
 }
 
+fn parse_pane_options(stdout: &str) -> (Option<String>, Option<String>, Vec<String>, Option<libslop::PaneDetailedState>, Option<u64>) {
+    let mut session_id = None;
+    let mut parent_pane_id = None;
+    let mut tags = Vec::new();
+    let mut detailed_state = None;
+    let mut created_at = None;
+    for opt_line in stdout.lines() {
+        let mut words = opt_line.splitn(2, ' ');
+        let key = words.next().unwrap_or("").trim();
+        let val = words.next().unwrap_or("").trim().trim_matches('"');
+        if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
+            session_id = Some(val.to_string());
+        } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
+            parent_pane_id = Some(val.to_string());
+        } else if key == libslop::TmuxOption::SlopdDetailedState.as_str() {
+            detailed_state = libslop::PaneDetailedState::from_str(val);
+        } else if key == libslop::TmuxOption::SlopdCreatedAt.as_str() {
+            created_at = val.parse::<u64>().ok();
+        } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
+            tags.push(tag.to_string());
+        }
+    }
+    (session_id, parent_pane_id, tags, detailed_state, created_at)
+}
+
 async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
     let list_out = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity}"])
@@ -392,27 +444,7 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
         let (session_id, parent_pane_id, tags, state, detailed_state, created_at) = match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut session_id = None;
-                let mut parent_pane_id = None;
-                let mut tags = Vec::new();
-                let mut detailed_state = None;
-                let mut created_at = None;
-                for opt_line in stdout.lines() {
-                    let mut words = opt_line.splitn(2, ' ');
-                    let key = words.next().unwrap_or("").trim();
-                    let val = words.next().unwrap_or("").trim().trim_matches('"');
-                    if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
-                        session_id = Some(val.to_string());
-                    } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
-                        parent_pane_id = Some(val.to_string());
-                    } else if key == libslop::TmuxOption::SlopdDetailedState.as_str() {
-                        detailed_state = libslop::PaneDetailedState::from_str(val);
-                    } else if key == libslop::TmuxOption::SlopdCreatedAt.as_str() {
-                        created_at = val.parse::<u64>().ok();
-                    } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
-                        tags.push(tag.to_string());
-                    }
-                }
+                let (session_id, parent_pane_id, tags, detailed_state, created_at) = parse_pane_options(&stdout);
                 let detailed_state = detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
                 let state = detailed_state.to_simple();
                 let created_at = created_at.unwrap_or(last_active);
@@ -428,13 +460,7 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
 
 async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Result<(), libslop::ResponseBody> {
     for key in &["C-c", "C-d", "Escape"] {
-        let result = tmux(config)
-            .args(["send-keys", "-t", pane_id, key])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if let Err(e) = result {
+        if let Err(e) = tmux_send_keys(config, pane_id, key).await {
             return Err(libslop::ResponseBody::Error { message: e.to_string() });
         }
     }
@@ -501,17 +527,7 @@ async fn handle_request(
                     payload.get("session_id").and_then(|v| v.as_str()),
                 ) {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
-                    let result = tmux(config)
-                        .args([
-                            "set-option", "-t", pane, "-p",
-                            libslop::TmuxOption::SlopdClaudeSessionId.as_str(),
-                            session_id,
-                        ])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                    if let Err(e) = result {
+                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
                     set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx, panes).await;
@@ -526,18 +542,7 @@ async fn handle_request(
                 }
             }
 
-            let detailed_state = match event.as_str() {
-                "Stop" | "StopFailure" => Some(libslop::PaneDetailedState::Ready),
-                "PreToolUse" => Some(libslop::PaneDetailedState::BusyToolUse),
-                "PostToolUse" | "PostToolUseFailure" => Some(libslop::PaneDetailedState::BusyProcessing),
-                "PermissionRequest" => Some(libslop::PaneDetailedState::AwaitingInputPermission),
-                "SubagentStart" => Some(libslop::PaneDetailedState::BusySubagent),
-                "SubagentStop" | "ElicitationResult" => Some(libslop::PaneDetailedState::BusyProcessing),
-                "PreCompact" => Some(libslop::PaneDetailedState::BusyCompacting),
-                "PostCompact" => Some(libslop::PaneDetailedState::BusyProcessing),
-                "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
-                _ => None,
-            };
+            let detailed_state = hook_event_to_detailed_state(event.as_str());
             if let (Some(pane), Some(state)) = (pane_id.as_deref(), detailed_state) {
                 set_pane_detailed_state(config, pane, &state, None, event_tx, panes).await;
             }
@@ -582,27 +587,10 @@ async fn handle_request(
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                    let _ = tmux(config)
-                        .args(["set-option", "-t", &pane_id, "-p",
-                            libslop::TmuxOption::SlopdCreatedAt.as_str(),
-                            &now.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
+                    let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
                     set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
                     if let Some(ref parent) = parent_pane_id {
-                        let result = tmux(config)
-                            .args([
-                                "set-option", "-t", &pane_id, "-p",
-                                libslop::TmuxOption::SlopdParentPane.as_str(),
-                                parent,
-                            ])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .await;
-                        if let Err(e) = result {
+                        if let Err(e) = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdParentPane.as_str(), parent).await {
                             warn!("failed to set @slopd_parent_pane on pane {}: {}", pane_id, e);
                         }
                     }
@@ -693,12 +681,7 @@ async fn handle_request(
             let _guard = state.type_mutex.lock().await;
 
             // Type the prompt text (without Enter) first.
-            let result = tmux(config)
-                .args(["send-keys", "-t", &pane_id, &prompt])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            let result = tmux_send_keys(config, &pane_id, &prompt).await;
 
             // Release the type-mutex before awaiting delivery so other senders can type.
             drop(_guard);
@@ -722,12 +705,7 @@ async fn handle_request(
                     loop {
                         let notified = state.prompt_submitted.notified();
 
-                        let enter_result = tmux(config)
-                            .args(["send-keys", "-t", &pane_id, "Enter"])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .await;
+                        let enter_result = tmux_send_keys(config, &pane_id, "Enter").await;
 
                         if let Err(e) = enter_result {
                             break libslop::ResponseBody::Error { message: e.to_string() };
@@ -771,25 +749,13 @@ async fn handle_request(
                 Err(e) => return libslop::ResponseBody::Error { message: e },
             };
             if remove {
-                let result = tmux(config)
-                    .args(["set-option", "-t", &pane_id, "-p", "-u", &option_name])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                match result {
+                match tmux_unset_pane_option(config, &pane_id, &option_name).await {
                     Ok(s) if s.success() => libslop::ResponseBody::Untagged { pane_id, tag },
                     Ok(s) => libslop::ResponseBody::Error { message: format!("tmux exited with {}", s) },
                     Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
                 }
             } else {
-                let result = tmux(config)
-                    .args(["set-option", "-t", &pane_id, "-p", &option_name, "1"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-                match result {
+                match tmux_set_pane_option(config, &pane_id, &option_name, "1").await {
                     Ok(s) if s.success() => libslop::ResponseBody::Tagged { pane_id, tag },
                     Ok(s) => libslop::ResponseBody::Error { message: format!("tmux exited with {}", s) },
                     Err(e) => libslop::ResponseBody::Error { message: e.to_string() },

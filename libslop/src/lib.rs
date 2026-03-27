@@ -2,6 +2,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub fn verbosity_to_level(verbosity: u8) -> tracing::Level {
+    match verbosity {
+        0 => tracing::Level::WARN,
+        1 => tracing::Level::INFO,
+        2 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
+    }
+}
+
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("slopd/slopd.sock")
 }

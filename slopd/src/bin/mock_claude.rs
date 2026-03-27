@@ -108,6 +108,15 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
     }
 }
 
+fn hook_payload(event: &str, session_id: &str, cwd: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": event,
+        "transcript_path": "/dev/null",
+        "cwd": cwd,
+    })
+}
+
 fn handle_prompt(prompt: &str) {
     if let Some(text) = prompt.strip_prefix("/echo ") {
         println!("{}", text.trim());
@@ -163,19 +172,10 @@ fn main() {
     };
 
     if !no_session_start {
-        fire_hooks(
-            &settings,
-            "SessionStart",
-            &serde_json::json!({
-                "session_id": session_id,
-                "hook_event_name": "SessionStart",
-                "transcript_path": "/dev/null",
-                "cwd": cwd,
-                "source": "startup",
-                "model": "mock"
-            }),
-            false,
-        );
+        let mut payload = hook_payload("SessionStart", session_id, &cwd);
+        payload["source"] = serde_json::json!("startup");
+        payload["model"] = serde_json::json!("mock");
+        fire_hooks(&settings, "SessionStart", &payload, false);
     }
 
     // Read raw bytes from stdin, accumulating lines.
@@ -259,47 +259,18 @@ fn main() {
                     // During this time the real Claude still accepts terminal input and
                     // queues it; once the tool finishes, the queued prompt is submitted.
                     let secs: u64 = secs.trim().parse().unwrap_or(0);
-                    fire_hooks(
-                        &settings,
-                        "PreToolUse",
-                        &serde_json::json!({
-                            "session_id": session_id,
-                            "hook_event_name": "PreToolUse",
-                            "transcript_path": "/dev/null",
-                            "cwd": cwd,
-                        }),
-                        true,
-                    );
+                    fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd), true);
                     // Read the next submitted prompt while "busy" (queued input).
                     // If interrupted (None), cancel the tool use immediately.
                     let queued = read_next_prompt(&mut stdin, &mut newline_mode, &mut newline_count);
                     if queued.is_some() {
                         std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
-                    fire_hooks(
-                        &settings,
-                        "PostToolUse",
-                        &serde_json::json!({
-                            "session_id": session_id,
-                            "hook_event_name": "PostToolUse",
-                            "transcript_path": "/dev/null",
-                            "cwd": cwd,
-                        }),
-                        true,
-                    );
+                    fire_hooks(&settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd), true);
                     if let Some(queued_prompt) = queued {
-                        fire_hooks(
-                            &settings,
-                            "UserPromptSubmit",
-                            &serde_json::json!({
-                                "session_id": session_id,
-                                "hook_event_name": "UserPromptSubmit",
-                                "transcript_path": "/dev/null",
-                                "cwd": cwd,
-                                "prompt": queued_prompt,
-                            }),
-                            true,
-                        );
+                        let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd);
+                        payload["prompt"] = serde_json::json!(queued_prompt);
+                        fire_hooks(&settings, "UserPromptSubmit", &payload, true);
                     }
                     continue;
                 }
@@ -315,17 +286,7 @@ fn main() {
                     continue;
                 }
                 if let Some(event) = prompt.strip_prefix("/hook ") {
-                    fire_hooks(
-                        &settings,
-                        event.trim(),
-                        &serde_json::json!({
-                            "session_id": session_id,
-                            "hook_event_name": event.trim(),
-                            "transcript_path": "/dev/null",
-                            "cwd": cwd,
-                        }),
-                        true,
-                    );
+                    fire_hooks(&settings, event.trim(), &hook_payload(event.trim(), session_id, &cwd), true);
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
                 }
 
@@ -363,18 +324,9 @@ fn main() {
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
                 }
 
-                fire_hooks(
-                    &settings,
-                    "UserPromptSubmit",
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "hook_event_name": "UserPromptSubmit",
-                        "transcript_path": "/dev/null",
-                        "cwd": cwd,
-                        "prompt": prompt
-                    }),
-                    true,
-                );
+                let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd);
+                payload["prompt"] = serde_json::json!(prompt);
+                fire_hooks(&settings, "UserPromptSubmit", &payload, true);
             }
             _ => {
                 last_interrupt = None;
