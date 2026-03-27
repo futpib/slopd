@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
@@ -83,13 +84,26 @@ struct PaneState {
     type_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
+    /// Set to true once SessionStart has fired for this pane (Claude is ready to accept prompts).
+    session_ready: watch::Sender<bool>,
 }
 
 impl PaneState {
     fn new() -> Self {
+        let (session_ready, _) = watch::channel(false);
         Self {
             type_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
+            session_ready,
+        }
+    }
+
+    fn new_ready() -> Self {
+        let (session_ready, _) = watch::channel(true);
+        Self {
+            type_mutex: Mutex::new(()),
+            prompt_submitted: Notify::new(),
+            session_ready,
         }
     }
 }
@@ -109,9 +123,8 @@ fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
 type ManagedPanes = Arc<dashmap::DashSet<String>>;
 
 /// Populate the managed-pane set from the `slopd` tmux session.
-/// Resets state to booting_up for all recovered panes since we don't know
-/// where Claude actually is after a slopd restart.
-async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx) {
+/// Also pre-marks recovered panes as session-ready since their SessionStart already fired.
+async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, panes: &PaneMap) {
     let output = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
         .output()
@@ -122,7 +135,9 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
                 let pane_id = line.trim();
                 if !pane_id.is_empty() {
                     managed.insert(pane_id.to_string());
-                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
+                    // Pre-populate state so recovered panes are immediately ready for sends.
+                    panes.entry(pane_id.to_string())
+                        .or_insert_with(|| Arc::new(PaneState::new_ready()));
                 }
             }
         }
@@ -264,12 +279,12 @@ async fn main() {
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
     let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
 
-    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
-    let event_tx: EventTx = Arc::new(event_tx);
-
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized.
-    load_managed_panes(&config, &managed_panes, &event_tx).await;
+    load_managed_panes(&config, &managed_panes, &panes).await;
+
+    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
+    let event_tx: EventTx = Arc::new(event_tx);
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
@@ -495,6 +510,10 @@ async fn handle_request(
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
                     set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx).await;
+                    // Signal that this pane is ready to accept prompts.
+                    // Use send_replace so the value is updated even if no receivers
+                    // have subscribed yet (SessionStart can fire before any Send request).
+                    pane_state(panes, pane).session_ready.send_replace(true);
                 }
             }
 
@@ -597,7 +616,33 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Send { pane_id, prompt, timeout_secs } => {
+            // Reject sends to panes not managed by slopd (avoids waiting forever on
+            // panes that will never fire SessionStart).
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
+
             let state = pane_state(panes, &pane_id);
+
+            // Wait for SessionStart before typing — Claude must be ready to accept prompts.
+            // Newly-spawned panes start with session_ready=false; recovered panes start true.
+            let mut session_rx = state.session_ready.subscribe();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                session_rx.wait_for(|&v| v),
+            ).await {
+                Ok(_) => {}
+                Err(_) => {
+                    return libslop::ResponseBody::Error {
+                        message: format!(
+                            "timed out after {}s waiting for SessionStart on pane {}",
+                            timeout_secs, pane_id
+                        ),
+                    };
+                }
+            }
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
             let _guard = state.type_mutex.lock().await;

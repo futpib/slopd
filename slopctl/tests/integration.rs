@@ -1,5 +1,6 @@
 use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[test]
 fn slopctl_version_contains_commit_hash() {
@@ -172,4 +173,66 @@ fn status_without_slopd_running() {
         .expect("failed to run slopctl");
 
     assert!(!output.status.success(), "slopctl should have failed but succeeded");
+}
+
+/// Test that `slopctl send --interrupt` interrupts a pane and then delivers the prompt.
+/// The --interrupt flag sends Ctrl+C/D/Esc before typing the prompt; this verifies the
+/// combined flow succeeds and returns the pane ID.
+#[test]
+fn send_interrupt_delivers_prompt_after_interrupt() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
+
+    // Wait for SessionStart so mock_claude is in its prompt-reading loop and
+    // slopd has marked the pane as session-ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["show-options", "-t", &pane_id, "-p", "-v",
+                   libslop::TmuxOption::SlopdClaudeSessionId.as_str()])
+            .output()
+            .expect("failed to run tmux show-options");
+        if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("timed out waiting for SessionStart on pane {}", pane_id);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // send --interrupt should: send Ctrl+C/D/Esc to interrupt, then deliver the prompt.
+    let send_output = env.slopctl(&["send", "--interrupt", &pane_id, "hello with interrupt"]);
+
+    kill_slopd(slopd);
+
+    assert!(send_output.status.success(), "slopctl send --interrupt failed: {:?}", send_output);
+    assert_eq!(
+        send_output.stdout,
+        format!("{}\n", pane_id).as_bytes(),
+        "expected pane_id in stdout"
+    );
 }

@@ -15,6 +15,7 @@ timeago = { version = "0.6.0", default-features = false }
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }
+libslop = { path = "../libslop" }
 
 [lints]
 workspace = true
