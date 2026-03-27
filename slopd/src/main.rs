@@ -141,21 +141,29 @@ fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
 type ManagedPanes = Arc<dashmap::DashSet<String>>;
 
 /// Populate the managed-pane set from the `slopd` tmux session.
+/// Only panes that have the `@slopd_managed` pane option set are considered managed
+/// (i.e. were registered via `slopctl run`). This filters out panes that were
+/// created directly in the slopd session without going through slopd.
 /// Resets state to booting_up for all recovered panes since we don't know
 /// where Claude actually is after a slopd restart.
 async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) {
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+        .args(["list-panes", "-s", "-t", "slopd", "-F",
+               &format!("#{{pane_id}} #{{{}}}",
+                        libslop::TmuxOption::SlopdManaged.as_str())])
         .output()
         .await;
     if let Ok(out) = output {
         if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let pane_id = line.trim();
-                if !pane_id.is_empty() {
-                    managed.insert(pane_id.to_string());
-                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+                let mut parts = line.splitn(2, ' ');
+                let pane_id = parts.next().unwrap_or("").trim();
+                let slopd_managed = parts.next().unwrap_or("").trim();
+                if pane_id.is_empty() || slopd_managed != "true" {
+                    continue;
                 }
+                managed.insert(pane_id.to_string());
+                set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
             }
         }
     }
@@ -393,7 +401,8 @@ async fn handle_connection(
     }
 }
 
-fn parse_pane_options(stdout: &str) -> (Option<String>, Option<String>, Vec<String>, Option<libslop::PaneDetailedState>, Option<u64>) {
+fn parse_pane_options(stdout: &str) -> (bool, Option<String>, Option<String>, Vec<String>, Option<libslop::PaneDetailedState>, Option<u64>) {
+    let mut slopd_managed = false;
     let mut session_id = None;
     let mut parent_pane_id = None;
     let mut tags = Vec::new();
@@ -403,7 +412,9 @@ fn parse_pane_options(stdout: &str) -> (Option<String>, Option<String>, Vec<Stri
         let mut words = opt_line.splitn(2, ' ');
         let key = words.next().unwrap_or("").trim();
         let val = words.next().unwrap_or("").trim().trim_matches('"');
-        if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
+        if key == libslop::TmuxOption::SlopdManaged.as_str() {
+            slopd_managed = val == "true";
+        } else if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
             session_id = Some(val.to_string());
         } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
             parent_pane_id = Some(val.to_string());
@@ -415,7 +426,7 @@ fn parse_pane_options(stdout: &str) -> (Option<String>, Option<String>, Vec<Stri
             tags.push(tag.to_string());
         }
     }
-    (session_id, parent_pane_id, tags, detailed_state, created_at)
+    (slopd_managed, session_id, parent_pane_id, tags, detailed_state, created_at)
 }
 
 async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
@@ -444,13 +455,16 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
         let (session_id, parent_pane_id, tags, state, detailed_state, created_at) = match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                let (session_id, parent_pane_id, tags, detailed_state, created_at) = parse_pane_options(&stdout);
+                let (slopd_managed, session_id, parent_pane_id, tags, detailed_state, created_at) = parse_pane_options(&stdout);
+                if !slopd_managed {
+                    continue;
+                }
                 let detailed_state = detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
                 let state = detailed_state.to_simple();
                 let created_at = created_at.unwrap_or(last_active);
                 (session_id, parent_pane_id, tags, state, detailed_state, created_at)
             }
-            _ => (None, None, Vec::new(), libslop::PaneState::BootingUp, libslop::PaneDetailedState::BootingUp, last_active),
+            _ => continue,
         };
 
         panes.push(libslop::PaneInfo { pane_id, created_at, last_active, session_id, parent_pane_id, tags, state, detailed_state });
@@ -490,6 +504,11 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Kill { pane_id } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
             let output = tmux(config)
                 .args(["kill-pane", "-t", &pane_id])
                 .output()
@@ -586,6 +605,7 @@ async fn handle_request(
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
+                    let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
                     set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
@@ -605,6 +625,11 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Send { pane_id, prompt, timeout_secs, interrupt } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
             let state = pane_state(panes, &pane_id);
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(timeout_secs);
@@ -731,6 +756,11 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Interrupt { pane_id } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
             let state = pane_state(panes, &pane_id);
 
             // Acquire the type-mutex so we don't interleave with concurrent sends.
@@ -744,6 +774,11 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Tag { pane_id, tag, remove } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
             let option_name = match libslop::tag_option_name(&tag) {
                 Ok(name) => name,
                 Err(e) => return libslop::ResponseBody::Error { message: e },
