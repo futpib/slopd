@@ -2140,7 +2140,7 @@ fn pane_state_transitions_through_all_hooks() {
 }
 
 #[test]
-fn pane_state_resets_to_booting_up_on_slopd_restart() {
+fn pane_state_preserved_across_slopd_restart() {
     build_bin("slopd");
     build_bin("slopctl");
 
@@ -2164,14 +2164,15 @@ fn pane_state_resets_to_booting_up_on_slopd_restart() {
     kill_slopd(slopd);
     let slopd2 = env.spawn_slopd();
 
-    // State must be reset to booting_up
+    // DetailedState is persisted in tmux pane options and survives slopd restart.
+    // A pane that was Ready before restart remains Ready — no SessionStart needed.
     std::thread::sleep(Duration::from_millis(100));
     let (state, detailed) = env.pane_state(&pane_id);
-    assert_eq!(state, libslop::PaneState::BootingUp, "expected booting_up after restart");
-    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp, "expected booting_up after restart");
+    assert_eq!(state, libslop::PaneState::Ready, "expected ready state to be preserved after restart");
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready, "expected ready detailed state to be preserved after restart");
 
-    // Fire SessionStart again to confirm normal transitions still work after restart
-    assert_state_after_hook(&env, &pane_id, "SessionStart", payload,
+    // Confirm normal hook transitions still work after restart
+    assert_state_after_hook(&env, &pane_id, "Stop", r#"{"hook_event_name":"Stop","transcript_path":"/dev/null","cwd":"/tmp"}"#,
         libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
 
     kill_slopd(slopd2);
