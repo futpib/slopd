@@ -2470,3 +2470,124 @@ fn send_fails_fast_when_pane_awaiting_permission() {
         "send to pane awaiting permission took {:?}, expected fast failure (issue #15)", elapsed,
     );
 }
+
+/// Issue #17 part 2: send to a BootingUp pane should wait for Ready rather than
+/// failing immediately. Once SessionStart fires and the pane becomes Ready, the
+/// send should complete successfully.
+#[test]
+fn send_waits_for_ready_when_pane_is_booting_up() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // --no-session-start keeps mock_claude in BootingUp until we explicitly trigger it.
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path, "--no-session-start"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Confirm pane is BootingUp before proceeding.
+    let (_, detailed) = env.pane_state(&pane_id);
+    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp, "expected BootingUp before SessionStart");
+
+    // Start send in a background thread — it should block waiting for Ready.
+    let env2 = env.clone();
+    let pane_id2 = pane_id.clone();
+    let send_thread = std::thread::spawn(move || {
+        env2.slopctl(&["send", &pane_id2, "hello after boot", "--timeout", "10"])
+    });
+
+    // Give send a moment to start blocking, then trigger SessionStart directly
+    // via slopctl hook (bypasses send machinery, works regardless of pane state).
+    std::thread::sleep(Duration::from_millis(200));
+
+    let payload = format!(
+        r#"{{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}}"#
+    );
+    let hook_out = fire_hook(&env, "SessionStart", &payload, Some(&pane_id));
+    assert!(hook_out.status.success(), "fire SessionStart hook failed: {:?}", hook_out);
+
+    let send_out = send_thread.join().unwrap();
+
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send should have succeeded after pane became ready: {:?}", send_out);
+}
+
+/// Issue #17 part 1: send --interrupt should interrupt a busy pane then deliver
+/// the prompt, succeeding where a plain send would be stuck waiting.
+#[test]
+fn send_with_interrupt_preempts_busy_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Put mock_claude into a long busy state (30s) in the background.
+    let env2 = env.clone();
+    let pane_id2 = pane_id.clone();
+    let busy_thread = std::thread::spawn(move || {
+        env2.slopctl(&["send", &pane_id2, "/busy 30"])
+    });
+
+    // Wait until pane is BusyToolUse.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::BusyToolUse {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for BusyToolUse state");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // send --interrupt should interrupt the busy pane and deliver the prompt.
+    let start = Instant::now();
+    let send_out = env.slopctl(&["send", "--interrupt", &pane_id, "hello after interrupt", "--timeout", "10"]);
+    let elapsed = start.elapsed();
+
+    let _ = busy_thread.join();
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send --interrupt failed: {:?}", send_out);
+    // Should complete quickly (interrupt fires immediately), not wait the full 30s.
+    assert!(elapsed < Duration::from_secs(8), "send --interrupt took {:?}", elapsed);
+}

@@ -271,8 +271,11 @@ fn main() {
                         true,
                     );
                     // Read the next submitted prompt while "busy" (queued input).
+                    // If interrupted (None), cancel the tool use immediately.
                     let queued = read_next_prompt(&mut stdin, &mut newline_mode, &mut newline_count);
-                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    if queued.is_some() {
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                    }
                     fire_hooks(
                         &settings,
                         "PostToolUse",

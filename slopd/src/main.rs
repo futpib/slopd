@@ -601,27 +601,85 @@ async fn handle_request(
             }
         }
 
-        libslop::RequestBody::Send { pane_id, prompt, timeout_secs } => {
+        libslop::RequestBody::Send { pane_id, prompt, timeout_secs, interrupt } => {
             let state = pane_state(panes, &pane_id);
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(timeout_secs);
 
-            // Reject immediately for states where UserPromptSubmit can never fire:
-            // BootingUp — Claude hasn't drawn its UI yet, keystrokes go to the shell.
-            // AwaitingInput* — pane is at a dialog (permission/elicitation), not the chat prompt.
-            // Busy* states are allowed: Claude queues input during tool use and fires
-            // UserPromptSubmit once it returns to the prompt.
-            let current_state = state.detailed_state.lock().unwrap().clone();
-            match current_state {
-                libslop::PaneDetailedState::BootingUp
-                | libslop::PaneDetailedState::AwaitingInputPermission
-                | libslop::PaneDetailedState::AwaitingInputElicitation => {
-                    return libslop::ResponseBody::Error {
-                        message: format!(
-                            "pane {} cannot accept a prompt (state: {}); send rejected",
-                            pane_id, current_state.as_str()
-                        ),
-                    };
+            // If --interrupt was requested, send C-c/C-d/Escape first to preempt
+            // whatever Claude is currently doing.
+            if interrupt {
+                let _guard = state.type_mutex.lock().await;
+                for key in &["C-c", "C-d", "Escape"] {
+                    let result = tmux(config)
+                        .args(["send-keys", "-t", &pane_id, key])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                    if let Err(e) = result {
+                        return libslop::ResponseBody::Error { message: e.to_string() };
+                    }
                 }
-                _ => {}
+            }
+
+            // Subscribe to DetailedStateChange events before reading current state
+            // to avoid a race between the check and the subscription.
+            let mut state_rx = event_tx.subscribe();
+
+            // Wait for the pane to reach a sendable state if it isn't already.
+            // BootingUp: Claude hasn't drawn its UI yet — wait for Ready.
+            // AwaitingInput*: pane is at a dialog — reject immediately (interrupt
+            //   should be used first if the caller wants to preempt).
+            loop {
+                let current_state = state.detailed_state.lock().unwrap().clone();
+                match current_state {
+                    libslop::PaneDetailedState::BootingUp => {
+                        // Wait for DetailedStateChange → ready for this pane.
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            return libslop::ResponseBody::Error {
+                                message: format!(
+                                    "timed out after {}s waiting for pane {} to become ready (still booting_up)",
+                                    timeout_secs, pane_id
+                                ),
+                            };
+                        }
+                        match tokio::time::timeout(remaining, async {
+                            loop {
+                                match state_rx.recv().await {
+                                    Ok(ev) if ev.event_type == "DetailedStateChange" && ev.pane_id.as_deref() == Some(&pane_id) => {
+                                        if ev.payload.get("detailed_state").and_then(|v| v.as_str()) == Some("ready") {
+                                            return;
+                                        }
+                                    }
+                                    Ok(_) => continue,
+                                    Err(_) => return,
+                                }
+                            }
+                        }).await {
+                            Ok(()) => continue,
+                            Err(_) => {
+                                return libslop::ResponseBody::Error {
+                                    message: format!(
+                                        "timed out after {}s waiting for pane {} to become ready (still booting_up)",
+                                        timeout_secs, pane_id
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                    libslop::PaneDetailedState::AwaitingInputPermission
+                    | libslop::PaneDetailedState::AwaitingInputElicitation => {
+                        return libslop::ResponseBody::Error {
+                            message: format!(
+                                "pane {} cannot accept a prompt (state: {}); use --interrupt to preempt",
+                                pane_id, current_state.as_str()
+                            ),
+                        };
+                    }
+                    _ => break,
+                }
             }
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.

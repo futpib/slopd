@@ -57,6 +57,9 @@ enum Command {
         /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
+        /// Interrupt the pane before sending (equivalent to slopctl interrupt then send).
+        #[arg(long, short = 'i')]
+        interrupt: bool,
     },
     /// Send Ctrl+C, Ctrl+D, and Escape to interrupt a running agent.
     Interrupt {
@@ -366,7 +369,7 @@ async fn main() {
     // Client-side filter resolution for Send with filter target: query Ps first, then Send per pane.
     if let Command::Send { ref pane_id, .. } = cli.command {
         if pane_id.contains('=') {
-            if let Command::Send { pane_id, prompt, filters, select, timeout } = cli.command {
+            if let Command::Send { pane_id, prompt, filters, select, timeout, interrupt } = cli.command {
                 let mut all_filters = vec![pane_id];
                 all_filters.extend(filters);
                 let parsed = parse_filters(all_filters);
@@ -427,6 +430,7 @@ async fn main() {
                         pane_id: pane_id.clone(),
                         prompt: prompt.clone(),
                         timeout_secs: timeout,
+                        interrupt,
                     };
                     let request = libslop::Request { id, body };
                     let mut json = serde_json::to_string(&request).unwrap();
@@ -508,7 +512,7 @@ async fn main() {
             extra_args,
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
-        Command::Send { pane_id, prompt, timeout, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout },
+        Command::Send { pane_id, prompt, timeout, interrupt, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout, interrupt },
         Command::Interrupt { pane_id } => libslop::RequestBody::Interrupt { pane_id },
         Command::Tag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: false },
         Command::Untag { pane_id, tag } => libslop::RequestBody::Tag { pane_id, tag, remove: true },
