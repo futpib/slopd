@@ -725,6 +725,8 @@ fn send_to_pane_with_broken_hooks_times_out() {
     kill_slopd(slopd);
 
     assert!(!output.status.success(), "slopctl send should have timed out: {:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "expected timeout message in stderr: {:?}", stderr);
 }
 
 /// Regression test for issue #9: send timeout must fire even against a pane that
@@ -753,6 +755,8 @@ fn send_timeout_fires_on_non_hook_pane() {
     kill_slopd(slopd);
 
     assert!(!output.status.success(), "send should have timed out");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"), "expected timeout message in stderr: {:?}", stderr);
     assert!(elapsed < Duration::from_secs(10),
         "send took {:?}, timer appears to have hung (issue #9)", elapsed);
 }
