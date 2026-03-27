@@ -2355,3 +2355,118 @@ fn listen_hook_delivers_hook_event() {
 
     kill_slopd(slopd);
 }
+
+/// Verify that slopctl send succeeds when the pane is busy (BusyToolUse).
+/// Real Claude queues input during tool use and fires UserPromptSubmit once it
+/// returns to the prompt — mock_claude's /busy N command simulates this.
+#[test]
+fn send_succeeds_when_pane_is_busy() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Send /busy 2 in a background thread — this fires PreToolUse, then blocks
+    // waiting for the queued prompt, sleeps 2s, then fires UserPromptSubmit.
+    let env2 = env.clone();
+    let pane_id2 = pane_id.clone();
+    let busy_thread = std::thread::spawn(move || {
+        env2.slopctl(&["send", &pane_id2, "/busy 2"])
+    });
+
+    // Wait until the pane enters BusyToolUse state.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::BusyToolUse {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for BusyToolUse state");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Now send a prompt while the pane is busy. The prompt is queued by mock_claude
+    // and UserPromptSubmit fires ~2s later when the tool use finishes.
+    let start = Instant::now();
+    let send_out = env.slopctl(&["send", &pane_id, "hello while busy", "--timeout", "10"]);
+    let elapsed = start.elapsed();
+
+    let _ = busy_thread.join();
+    kill_slopd(slopd);
+
+    assert!(send_out.status.success(), "send while busy failed: {:?}", send_out);
+    // Should have taken roughly 2s (the busy duration), not 10s (the timeout).
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "send while busy took {:?}, should have completed within the busy period", elapsed,
+    );
+}
+
+/// Regression test for issue #15: send to a pane in AwaitingInputPermission state must fail
+/// fast rather than waiting the full timeout. Keystrokes go to the permission dialog, not
+/// the chat prompt, so UserPromptSubmit will never fire.
+#[test]
+fn send_fails_fast_when_pane_awaiting_permission() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Advance pane to AwaitingInputPermission via PermissionRequest hook.
+    let base = |hook: &str| format!(
+        r#"{{"session_id":"s1","hook_event_name":"{}","transcript_path":"/dev/null","cwd":"/tmp"}}"#,
+        hook
+    );
+    assert_state_after_hook(&env, &pane_id, "SessionStart", &base("SessionStart"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+    assert_state_after_hook(&env, &pane_id, "PermissionRequest", &base("PermissionRequest"),
+        libslop::PaneState::AwaitingInput, libslop::PaneDetailedState::AwaitingInputPermission);
+
+    // With the pane at a permission dialog, send should fail immediately rather than
+    // waiting the full timeout. Keystrokes go to the dialog, not the chat prompt.
+    let timeout_secs = 5u64;
+    let start = Instant::now();
+    let output = env.slopctl(&["send", &pane_id, "hello", "--timeout", &timeout_secs.to_string()]);
+    let elapsed = start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(!output.status.success(), "send to pane awaiting permission should have failed: {:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("timed out"), "send should have failed fast (state check), not timed out: {:?}", stderr);
+    assert!(
+        elapsed < Duration::from_secs(timeout_secs - 1),
+        "send to pane awaiting permission took {:?}, expected fast failure (issue #15)", elapsed,
+    );
+}

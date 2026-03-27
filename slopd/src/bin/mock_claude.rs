@@ -9,6 +9,50 @@ enum NewlineMode {
     Alternating,
 }
 
+/// Accumulate the next submitted line from `stdin` (raw bytes), respecting
+/// `newline_mode` and `newline_count`. Returns the trimmed prompt string or
+/// `None` on EOF/error.
+fn read_next_prompt(
+    stdin: &mut std::io::Stdin,
+    newline_mode: &mut NewlineMode,
+    newline_count: &mut u64,
+) -> Option<String> {
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let b = byte[0];
+        match b {
+            0x03 | 0x04 | 0x1b => {
+                // Interrupt — discard accumulated buffer and signal caller.
+                return None;
+            }
+            0x0d | 0x0a => {
+                let is_submit = match newline_mode {
+                    NewlineMode::AlwaysSubmit => true,
+                    NewlineMode::Alternating => {
+                        let n = *newline_count;
+                        *newline_count += 1;
+                        n % 2 == 1
+                    }
+                };
+                if !is_submit {
+                    line_buf.push(b'\n');
+                    continue;
+                }
+                let raw = String::from_utf8_lossy(&line_buf).into_owned();
+                return Some(raw.trim_start_matches('\n').to_string());
+            }
+            _ => {
+                line_buf.push(b);
+            }
+        }
+    }
+}
+
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
 /// Mirrors real Claude's hook execution: each command is run via `sh -c` in a non-interactive
 /// shell with the JSON payload on stdin.
@@ -139,7 +183,7 @@ fn main() {
     //   - Single Esc, C-c, or C-d: interrupt (drop current work, back to prompt)
     //   - Two consecutive C-c or two consecutive C-d: exit
     //   - Two consecutive Esc: rewind mode (ignored here, not an exit)
-    let mut line_buf = Vec::new();
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut last_interrupt: Option<u8> = None;
     let mut stdin = std::io::stdin();
     let mut byte = [0u8; 1];
@@ -208,6 +252,52 @@ fn main() {
                 if let Some(secs) = prompt.strip_prefix("/sleep ") {
                     let secs: u64 = secs.trim().parse().unwrap_or(0);
                     std::thread::sleep(std::time::Duration::from_secs(secs));
+                    continue;
+                }
+                if let Some(secs) = prompt.strip_prefix("/busy ") {
+                    // Simulate Claude running a tool use for `secs` seconds.
+                    // During this time the real Claude still accepts terminal input and
+                    // queues it; once the tool finishes, the queued prompt is submitted.
+                    let secs: u64 = secs.trim().parse().unwrap_or(0);
+                    fire_hooks(
+                        &settings,
+                        "PreToolUse",
+                        &serde_json::json!({
+                            "session_id": session_id,
+                            "hook_event_name": "PreToolUse",
+                            "transcript_path": "/dev/null",
+                            "cwd": cwd,
+                        }),
+                        true,
+                    );
+                    // Read the next submitted prompt while "busy" (queued input).
+                    let queued = read_next_prompt(&mut stdin, &mut newline_mode, &mut newline_count);
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    fire_hooks(
+                        &settings,
+                        "PostToolUse",
+                        &serde_json::json!({
+                            "session_id": session_id,
+                            "hook_event_name": "PostToolUse",
+                            "transcript_path": "/dev/null",
+                            "cwd": cwd,
+                        }),
+                        true,
+                    );
+                    if let Some(queued_prompt) = queued {
+                        fire_hooks(
+                            &settings,
+                            "UserPromptSubmit",
+                            &serde_json::json!({
+                                "session_id": session_id,
+                                "hook_event_name": "UserPromptSubmit",
+                                "transcript_path": "/dev/null",
+                                "cwd": cwd,
+                                "prompt": queued_prompt,
+                            }),
+                            true,
+                        );
+                    }
                     continue;
                 }
                 if let Some(code) = prompt.strip_prefix("/exit ") {

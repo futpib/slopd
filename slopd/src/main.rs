@@ -36,7 +36,9 @@ async fn set_pane_detailed_state(
     detailed: &libslop::PaneDetailedState,
     previous: Option<&libslop::PaneDetailedState>,
     event_tx: &EventTx,
+    panes: &PaneMap,
 ) {
+    *pane_state(panes, pane_id).detailed_state.lock().unwrap() = detailed.clone();
     let simple = detailed.to_simple();
     for (opt, val) in [
         (libslop::TmuxOption::SlopdState, simple.as_str()),
@@ -83,6 +85,8 @@ struct PaneState {
     type_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
+    /// Cached detailed state, kept in sync by set_pane_detailed_state.
+    detailed_state: std::sync::Mutex<libslop::PaneDetailedState>,
 }
 
 impl PaneState {
@@ -90,6 +94,7 @@ impl PaneState {
         Self {
             type_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
+            detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
         }
     }
 }
@@ -111,7 +116,7 @@ type ManagedPanes = Arc<dashmap::DashSet<String>>;
 /// Populate the managed-pane set from the `slopd` tmux session.
 /// Resets state to booting_up for all recovered panes since we don't know
 /// where Claude actually is after a slopd restart.
-async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx) {
+async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) {
     let output = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
         .output()
@@ -122,7 +127,7 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
                 let pane_id = line.trim();
                 if !pane_id.is_empty() {
                     managed.insert(pane_id.to_string());
-                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
+                    set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
                 }
             }
         }
@@ -269,7 +274,7 @@ async fn main() {
 
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized.
-    load_managed_panes(&config, &managed_panes, &event_tx).await;
+    load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
@@ -494,7 +499,7 @@ async fn handle_request(
                     if let Err(e) = result {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx).await;
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx, panes).await;
                 }
             }
 
@@ -502,7 +507,7 @@ async fn handle_request(
                 if let Some(pane) = pane_id.as_deref() {
                     debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                     pane_state(panes, pane).prompt_submitted.notify_waiters();
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing, None, event_tx).await;
+                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing, None, event_tx, panes).await;
                 }
             }
 
@@ -519,7 +524,7 @@ async fn handle_request(
                 _ => None,
             };
             if let (Some(pane), Some(state)) = (pane_id.as_deref(), detailed_state) {
-                set_pane_detailed_state(config, pane, &state, None, event_tx).await;
+                set_pane_detailed_state(config, pane, &state, None, event_tx, panes).await;
             }
 
             let _ = event_tx.send(BroadcastEvent {
@@ -570,7 +575,7 @@ async fn handle_request(
                         .stderr(std::process::Stdio::null())
                         .status()
                         .await;
-                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx).await;
+                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
                     if let Some(ref parent) = parent_pane_id {
                         let result = tmux(config)
                             .args([
@@ -598,6 +603,26 @@ async fn handle_request(
 
         libslop::RequestBody::Send { pane_id, prompt, timeout_secs } => {
             let state = pane_state(panes, &pane_id);
+
+            // Reject immediately for states where UserPromptSubmit can never fire:
+            // BootingUp — Claude hasn't drawn its UI yet, keystrokes go to the shell.
+            // AwaitingInput* — pane is at a dialog (permission/elicitation), not the chat prompt.
+            // Busy* states are allowed: Claude queues input during tool use and fires
+            // UserPromptSubmit once it returns to the prompt.
+            let current_state = state.detailed_state.lock().unwrap().clone();
+            match current_state {
+                libslop::PaneDetailedState::BootingUp
+                | libslop::PaneDetailedState::AwaitingInputPermission
+                | libslop::PaneDetailedState::AwaitingInputElicitation => {
+                    return libslop::ResponseBody::Error {
+                        message: format!(
+                            "pane {} cannot accept a prompt (state: {}); send rejected",
+                            pane_id, current_state.as_str()
+                        ),
+                    };
+                }
+                _ => {}
+            }
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
             let _guard = state.type_mutex.lock().await;
