@@ -114,8 +114,10 @@ struct PaneState {
     prompt_submitted: Notify,
     /// Cached detailed state, kept in sync by set_pane_detailed_state.
     detailed_state: std::sync::Mutex<libslop::PaneDetailedState>,
-    /// Cancels the transcript tail task when the pane is killed.
-    transcript_cancel: tokio_util::sync::CancellationToken,
+    /// Cancels the transcript tail task when the pane is killed or the tailer is restarted.
+    transcript_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    /// The transcript path currently being tailed (if any).
+    transcript_path: std::sync::Mutex<Option<String>>,
 }
 
 impl PaneState {
@@ -124,7 +126,8 @@ impl PaneState {
             type_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
-            transcript_cancel: tokio_util::sync::CancellationToken::new(),
+            transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            transcript_path: std::sync::Mutex::new(None),
         }
     }
 }
@@ -602,7 +605,7 @@ async fn handle_request(
             match output {
                 Ok(out) if out.status.success() => {
                     if let Some((_, state)) = panes.remove(&pane_id) {
-                        state.transcript_cancel.cancel();
+                        state.transcript_cancel.lock().unwrap().cancel();
                     }
                     managed_panes.remove(&pane_id);
                     libslop::ResponseBody::Kill { pane_id }
@@ -628,6 +631,39 @@ async fn handle_request(
                 }
             }
 
+            // Start (or re-start) tailing the transcript file whenever a hook
+            // includes a transcript_path we haven't seen yet for this pane.
+            // This covers both SessionStart and any hook fired after a slopd
+            // restart where the tailer is no longer running.
+            if let (Some(pane), Some(transcript_path)) = (
+                pane_id.as_deref(),
+                payload.get("transcript_path").and_then(|v| v.as_str()),
+            ) {
+                let state = pane_state(panes, pane);
+                let already_tailing = state.transcript_path.lock().unwrap().as_deref() == Some(transcript_path);
+                if !already_tailing {
+                    debug!("hook {}: starting transcript tail for pane {} path={}", event, pane, transcript_path);
+                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdTranscriptPath.as_str(), transcript_path).await {
+                        warn!("failed to set @slopd_transcript_path on pane {}: {}", pane, e);
+                    }
+                    // Cancel any previous tailer and swap in a fresh token.
+                    let new_cancel = tokio_util::sync::CancellationToken::new();
+                    {
+                        let mut cancel_guard = state.transcript_cancel.lock().unwrap();
+                        cancel_guard.cancel();
+                        *cancel_guard = new_cancel.clone();
+                    }
+                    *state.transcript_path.lock().unwrap() = Some(transcript_path.to_string());
+                    tokio::spawn(tail_transcript(
+                        std::path::PathBuf::from(transcript_path),
+                        pane.to_string(),
+                        state.clone(),
+                        event_tx.clone(),
+                        new_cancel,
+                    ));
+                }
+            }
+
             if event == "SessionStart" {
                 if let (Some(pane), Some(session_id)) = (
                     pane_id.as_deref(),
@@ -636,23 +672,6 @@ async fn handle_request(
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
-                    }
-
-                    // Start tailing the transcript file if provided.
-                    if let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
-                        debug!("SessionStart: transcript_path={}", transcript_path);
-                        if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdTranscriptPath.as_str(), transcript_path).await {
-                            warn!("failed to set @slopd_transcript_path on pane {}: {}", pane, e);
-                        }
-                        let state = pane_state(panes, pane);
-                        let cancel = state.transcript_cancel.clone();
-                        tokio::spawn(tail_transcript(
-                            std::path::PathBuf::from(transcript_path),
-                            pane.to_string(),
-                            state,
-                            event_tx.clone(),
-                            cancel,
-                        ));
                     }
 
                     set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx, panes).await;
