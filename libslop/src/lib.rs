@@ -40,6 +40,8 @@ pub enum TmuxOption {
     SlopdDetailedState,
     /// Stores the pane creation unix timestamp
     SlopdCreatedAt,
+    /// Stores the transcript file path reported by SessionStart
+    SlopdTranscriptPath,
 }
 
 impl TmuxOption {
@@ -51,6 +53,7 @@ impl TmuxOption {
             TmuxOption::SlopdState => "@slopd_state",
             TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
             TmuxOption::SlopdCreatedAt => "@slopd_created_at",
+            TmuxOption::SlopdTranscriptPath => "@slopd_transcript_path",
         }
     }
 }

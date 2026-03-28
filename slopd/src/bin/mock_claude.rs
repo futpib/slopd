@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy)]
@@ -108,11 +109,52 @@ fn fire_hooks(settings: &serde_json::Value, event: &str, payload: &serde_json::V
     }
 }
 
-fn hook_payload(event: &str, session_id: &str, cwd: &std::path::Path) -> serde_json::Value {
+/// Append a JSON record to the transcript file.
+fn write_transcript_record(transcript_path: &PathBuf, record: &serde_json::Value) {
+    use std::fs::OpenOptions;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
+        .expect("failed to open transcript file");
+    let mut line = serde_json::to_string(record).expect("failed to serialize transcript record");
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .expect("failed to write transcript record");
+}
+
+fn transcript_record(record_type: &str, session_id: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "type": record_type,
+        "uuid": format!("mock-uuid-{}", uuid_counter()),
+        "timestamp": chrono_now(),
+        "sessionId": session_id,
+    });
+    if let (Some(base), Some(extra_obj)) = (record.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    record
+}
+
+fn uuid_counter() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("1970-01-01T00:00:{:02}.000Z", d.as_secs() % 60)
+}
+
+fn hook_payload(event: &str, session_id: &str, cwd: &std::path::Path, transcript_path: &PathBuf) -> serde_json::Value {
     serde_json::json!({
         "session_id": session_id,
         "hook_event_name": event,
-        "transcript_path": "/dev/null",
+        "transcript_path": transcript_path,
         "cwd": cwd,
     })
 }
@@ -158,6 +200,18 @@ fn main() {
     let session_id = "mock-session-id-1234";
     let cwd = std::env::current_dir().unwrap_or_default();
 
+    // Create a transcript .jsonl file, mirroring real Claude behaviour.
+    // Use CLAUDE_CONFIG_DIR-relative path like real Claude does.
+    let transcript_dir = {
+        let config_dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.claude", home)
+        });
+        PathBuf::from(config_dir).join("projects").join("mock")
+    };
+    std::fs::create_dir_all(&transcript_dir).unwrap_or_default();
+    let transcript_path = transcript_dir.join(format!("{}.jsonl", session_id));
+
     // Put the terminal in raw mode so we receive key bytes directly (Ctrl+C = 0x03,
     // Ctrl+D = 0x04, Escape = 0x1b) rather than having the terminal driver intercept them.
     // This mirrors real Claude's interactive terminal behaviour.
@@ -172,7 +226,7 @@ fn main() {
     };
 
     if !no_session_start {
-        let mut payload = hook_payload("SessionStart", session_id, &cwd);
+        let mut payload = hook_payload("SessionStart", session_id, &cwd, &transcript_path);
         payload["source"] = serde_json::json!("startup");
         payload["model"] = serde_json::json!("mock");
         fire_hooks(&settings, "SessionStart", &payload, false);
@@ -259,16 +313,16 @@ fn main() {
                     // During this time the real Claude still accepts terminal input and
                     // queues it; once the tool finishes, the queued prompt is submitted.
                     let secs: u64 = secs.trim().parse().unwrap_or(0);
-                    fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd), true);
+                    fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path), true);
                     // Read the next submitted prompt while "busy" (queued input).
                     // If interrupted (None), cancel the tool use immediately.
                     let queued = read_next_prompt(&mut stdin, &mut newline_mode, &mut newline_count);
                     if queued.is_some() {
                         std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
-                    fire_hooks(&settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd), true);
+                    fire_hooks(&settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd, &transcript_path), true);
                     if let Some(queued_prompt) = queued {
-                        let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd);
+                        let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                         payload["prompt"] = serde_json::json!(queued_prompt);
                         fire_hooks(&settings, "UserPromptSubmit", &payload, true);
                     }
@@ -286,7 +340,7 @@ fn main() {
                     continue;
                 }
                 if let Some(event) = prompt.strip_prefix("/hook ") {
-                    fire_hooks(&settings, event.trim(), &hook_payload(event.trim(), session_id, &cwd), true);
+                    fire_hooks(&settings, event.trim(), &hook_payload(event.trim(), session_id, &cwd, &transcript_path), true);
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
                 }
 
@@ -324,7 +378,15 @@ fn main() {
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
                 }
 
-                let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd);
+                // Write transcript records like real Claude does.
+                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                    "message": { "role": "user", "content": &prompt },
+                })));
+                write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                    "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                })));
+
+                let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                 payload["prompt"] = serde_json::json!(prompt);
                 fire_hooks(&settings, "UserPromptSubmit", &payload, true);
             }

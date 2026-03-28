@@ -2817,6 +2817,119 @@ fn untag_pane_in_slopd_session_not_via_run_returns_error() {
     assert!(!out.status.success(), "untag on slopd-session pane not registered via run should fail: {:?}", out);
 }
 
+/// Verify that slopd tails transcript files and broadcasts records via the event system.
+#[test]
+fn transcript_events_received_via_listen() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Subscribe to transcript user+assistant events.
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--transcript", "user", "--transcript", "assistant"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn transcript listener");
+
+    // Wait for subscription confirmation.
+    {
+        let stdout = listener.stdout.as_mut().unwrap();
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            use std::io::Read;
+            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        let line = String::from_utf8_lossy(&line);
+        assert!(line.contains("subscribed"), "unexpected first line: {:?}", line);
+    }
+
+    // Spawn the pane and wait for SessionStart.
+    let session_listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &pane_id);
+
+    // Send a prompt — mock_claude writes user + assistant transcript records.
+    let send_output = env.slopctl(&["send", &pane_id, "hello transcript"]);
+    assert!(send_output.status.success(), "slopctl send failed: {:?}", send_output);
+
+    // Read transcript events from the listener in a background thread with timeout.
+    let stdout = listener.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<serde_json::Value>>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if v.get("source").and_then(|s| s.as_str()) == Some("transcript") {
+                    events.push(v);
+                    if events.len() >= 2 {
+                        let _ = tx.send(events);
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(events);
+    });
+
+    let events = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out waiting for transcript events");
+
+    kill_child(listener);
+    kill_slopd(slopd);
+
+    assert!(events.len() >= 2, "expected at least 2 transcript events, got {}: {:?}", events.len(), events);
+
+    // Check we got a user and an assistant event.
+    let types: Vec<&str> = events.iter()
+        .filter_map(|e| e.get("event_type").and_then(|t| t.as_str()))
+        .collect();
+    assert!(types.contains(&"user"), "missing 'user' transcript event, got: {:?}", types);
+    assert!(types.contains(&"assistant"), "missing 'assistant' transcript event, got: {:?}", types);
+
+    // Verify pane_id is set on the events.
+    for ev in &events {
+        assert_eq!(
+            ev.get("pane_id").and_then(|p| p.as_str()),
+            Some(pane_id.as_str()),
+            "transcript event should have pane_id"
+        );
+    }
+
+    // Verify the payload contains the original record content.
+    let user_event = events.iter().find(|e| e["event_type"] == "user").unwrap();
+    let user_content = user_event["payload"]["message"]["content"].as_str().unwrap_or("");
+    assert!(user_content.contains("hello transcript"),
+        "user transcript record should contain the prompt, got: {:?}", user_content);
+}
+
 #[test]
 fn ps_does_not_show_pane_not_created_via_run() {
     build_bin("slopd");

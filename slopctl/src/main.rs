@@ -74,6 +74,9 @@ enum Command {
         /// Filter by slopd event name (repeatable). Matches source:slopd events (e.g. StateChange, DetailedStateChange).
         #[arg(long = "event", value_name = "EVENT")]
         events: Vec<String>,
+        /// Filter by transcript record type (repeatable). Matches source:transcript events (e.g. user, assistant, progress).
+        #[arg(long = "transcript", value_name = "TYPE")]
+        transcripts: Vec<String>,
         /// Only receive events from this tmux pane.
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
@@ -277,10 +280,10 @@ async fn main() {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    if let Command::Listen { hooks, events, pane_id, session_id } = cli.command {
-        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && pane_id.is_none() && session_id.is_none() {
+    if let Command::Listen { hooks, events, transcripts, pane_id, session_id } = cli.command {
+        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() {
             vec![]
-        } else if hooks.is_empty() && events.is_empty() {
+        } else if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
             vec![libslop::EventFilter {
                 source: None,
                 event_type: None,
@@ -303,7 +306,14 @@ async fn main() {
                 session_id: None,
                 payload_match: serde_json::Map::new(),
             });
-            hook_filters.chain(event_filters).collect()
+            let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
+                source: Some("transcript".to_string()),
+                event_type: Some(t),
+                pane_id: pane_id.clone(),
+                session_id: session_id.clone(),
+                payload_match: serde_json::Map::new(),
+            });
+            hook_filters.chain(event_filters).chain(transcript_filters).collect()
         };
 
         let request = libslop::Request {

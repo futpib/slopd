@@ -114,6 +114,8 @@ struct PaneState {
     prompt_submitted: Notify,
     /// Cached detailed state, kept in sync by set_pane_detailed_state.
     detailed_state: std::sync::Mutex<libslop::PaneDetailedState>,
+    /// Cancels the transcript tail task when the pane is killed.
+    transcript_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl PaneState {
@@ -122,6 +124,76 @@ impl PaneState {
             type_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
+            transcript_cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+}
+
+/// Tail a transcript .jsonl file, broadcasting each new JSON record as an event.
+/// Reads from `offset` (the byte position after any content that existed before
+/// we started watching) and polls for new data until cancelled.
+async fn tail_transcript(
+    path: std::path::PathBuf,
+    pane_id: String,
+    event_tx: EventTx,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use tokio::io::AsyncBufReadExt;
+
+    // Open the file; if it doesn't exist yet, wait until it appears.
+    let file = loop {
+        match tokio::fs::File::open(&path).await {
+            Ok(f) => break f,
+            Err(_) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+        }
+    };
+
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF — wait for more data or cancellation.
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(record) => {
+                        let record_type = record
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let _ = event_tx.send(BroadcastEvent {
+                            source: "transcript".to_string(),
+                            event_type: record_type,
+                            pane_id: Some(pane_id.clone()),
+                            payload: record,
+                        });
+                    }
+                    Err(e) => {
+                        debug!("failed to parse transcript line: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("error reading transcript {}: {}", path.display(), e);
+                return;
+            }
         }
     }
 }
@@ -517,7 +589,9 @@ async fn handle_request(
                 .await;
             match output {
                 Ok(out) if out.status.success() => {
-                    panes.remove(&pane_id);
+                    if let Some((_, state)) = panes.remove(&pane_id) {
+                        state.transcript_cancel.cancel();
+                    }
                     managed_panes.remove(&pane_id);
                     libslop::ResponseBody::Kill { pane_id }
                 }
@@ -551,6 +625,23 @@ async fn handle_request(
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
+
+                    // Start tailing the transcript file if provided.
+                    if let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
+                        debug!("SessionStart: transcript_path={}", transcript_path);
+                        if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdTranscriptPath.as_str(), transcript_path).await {
+                            warn!("failed to set @slopd_transcript_path on pane {}: {}", pane, e);
+                        }
+                        let state = pane_state(panes, pane);
+                        let cancel = state.transcript_cancel.clone();
+                        tokio::spawn(tail_transcript(
+                            std::path::PathBuf::from(transcript_path),
+                            pane.to_string(),
+                            event_tx.clone(),
+                            cancel,
+                        ));
+                    }
+
                     set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx, panes).await;
                 }
             }
