@@ -10,26 +10,66 @@ enum NewlineMode {
     Alternating,
 }
 
-/// Accumulate the next submitted line from `stdin` (raw bytes), respecting
-/// `newline_mode` and `newline_count`. Returns the trimmed prompt string or
-/// `None` on EOF/error.
-fn read_next_prompt(
+/// Result of reading input during a busy period.
+enum BusyInput {
+    /// One or more prompts were queued, then the busy period ended normally.
+    Queued(Vec<String>),
+    /// One or more prompts were queued, then the user interrupted.
+    Interrupted(Vec<String>),
+    /// The user interrupted before typing any prompt.
+    Empty,
+}
+
+/// Read queued prompts during a busy period. Collects submitted lines until
+/// either `busy_duration` elapses (returning Queued) or an interrupt byte
+/// arrives (returning Interrupted with whatever was collected so far, or Empty
+/// if nothing was queued yet).
+///
+/// Writes `queue-operation enqueue` transcript records immediately as each
+/// prompt arrives, so external observers (slopd) see them in real time.
+fn read_busy_input(
+    stdin_fd: i32,
     stdin: &mut std::io::Stdin,
     newline_mode: &mut NewlineMode,
     newline_count: &mut u64,
-) -> Option<String> {
+    busy_duration: std::time::Duration,
+    transcript_path: &PathBuf,
+    session_id: &str,
+) -> BusyInput {
+    let deadline = std::time::Instant::now() + busy_duration;
+    let mut queued: Vec<String> = Vec::new();
     let mut line_buf: Vec<u8> = Vec::new();
-    let mut byte = [0u8; 1];
+
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Queued(queued) };
+        }
+
+        // Poll stdin with timeout.
+        let mut pfd = libc::pollfd {
+            fd: stdin_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret <= 0 {
+            return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Queued(queued) };
+        }
+
+        // Data available — read one byte.
+        let mut byte = [0u8; 1];
         match stdin.read(&mut byte) {
-            Ok(0) | Err(_) => return None,
+            Ok(0) | Err(_) => {
+                return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Interrupted(queued) };
+            }
             Ok(_) => {}
         }
         let b = byte[0];
         match b {
             0x03 | 0x04 | 0x1b => {
-                // Interrupt — discard accumulated buffer and signal caller.
-                return None;
+                return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Interrupted(queued) };
             }
             0x0d | 0x0a => {
                 let is_submit = match newline_mode {
@@ -45,7 +85,16 @@ fn read_next_prompt(
                     continue;
                 }
                 let raw = String::from_utf8_lossy(&line_buf).into_owned();
-                return Some(raw.trim_start_matches('\n').to_string());
+                line_buf.clear();
+                let prompt = raw.trim_start_matches('\n').to_string();
+                // Write enqueue immediately so slopd sees it in real time.
+                write_transcript_record(transcript_path, &transcript_record(
+                    "queue-operation", session_id, serde_json::json!({
+                        "operation": "enqueue",
+                        "content": &prompt,
+                    }),
+                ));
+                queued.push(prompt);
             }
             _ => {
                 line_buf.push(b);
@@ -312,19 +361,73 @@ fn main() {
                     // Simulate Claude running a tool use for `secs` seconds.
                     // During this time the real Claude still accepts terminal input and
                     // queues it; once the tool finishes, the queued prompt is submitted.
+                    // Supports multiple queued prompts, interrupts (cancel), and the
+                    // corresponding queue-operation transcript records.
                     let secs: u64 = secs.trim().parse().unwrap_or(0);
+
+                    // Fire UserPromptSubmit for the /busy command itself (the user submitted it).
+                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                        "message": { "role": "user", "content": &prompt },
+                    })));
+                    let mut busy_payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    busy_payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(&settings, "UserPromptSubmit", &busy_payload, true);
+
                     fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path), true);
-                    // Read the next submitted prompt while "busy" (queued input).
-                    // If interrupted (None), cancel the tool use immediately.
-                    let queued = read_next_prompt(&mut stdin, &mut newline_mode, &mut newline_count);
-                    if queued.is_some() {
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
-                    }
+
+                    let busy_input = read_busy_input(
+                        stdin_fd,
+                        &mut stdin,
+                        &mut newline_mode,
+                        &mut newline_count,
+                        std::time::Duration::from_secs(secs),
+                        &transcript_path,
+                        session_id,
+                    );
+
                     fire_hooks(&settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd, &transcript_path), true);
-                    if let Some(queued_prompt) = queued {
-                        let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
-                        payload["prompt"] = serde_json::json!(queued_prompt);
-                        fire_hooks(&settings, "UserPromptSubmit", &payload, true);
+
+                    match busy_input {
+                        BusyInput::Empty => {
+                            // Interrupted before any prompt was queued — tool finished, back to ready.
+                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path), true);
+                        }
+                        BusyInput::Interrupted(prompts) => {
+                            // Prompts were queued then user interrupted — enqueue
+                            // records were already written in read_busy_input;
+                            // write remove for each (cancelled).
+                            for _ in &prompts {
+                                write_transcript_record(&transcript_path, &transcript_record(
+                                    "queue-operation", session_id, serde_json::json!({
+                                        "operation": "remove",
+                                    }),
+                                ));
+                            }
+                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path), true);
+                        }
+                        BusyInput::Queued(prompts) => {
+                            // Enqueue records were already written in read_busy_input.
+                            // Write dequeue for each (consumed).
+                            for _ in &prompts {
+                                write_transcript_record(&transcript_path, &transcript_record(
+                                    "queue-operation", session_id, serde_json::json!({
+                                        "operation": "dequeue",
+                                    }),
+                                ));
+                            }
+                            // Process the last queued prompt (like real Claude — last wins).
+                            let last = prompts.last().unwrap();
+                            write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                                "message": { "role": "user", "content": last },
+                            })));
+                            write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                                "message": { "role": "assistant", "content": format!("mock response to: {}", last) },
+                            })));
+                            let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                            payload["prompt"] = serde_json::json!(last);
+                            fire_hooks(&settings, "UserPromptSubmit", &payload, true);
+                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path), true);
+                        }
                     }
                     continue;
                 }
@@ -389,6 +492,7 @@ fn main() {
                 let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                 payload["prompt"] = serde_json::json!(prompt);
                 fire_hooks(&settings, "UserPromptSubmit", &payload, true);
+                fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path), true);
             }
             _ => {
                 last_interrupt = None;

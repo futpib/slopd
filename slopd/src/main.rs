@@ -135,6 +135,7 @@ impl PaneState {
 async fn tail_transcript(
     path: std::path::PathBuf,
     pane_id: String,
+    pane_state: Arc<PaneState>,
     event_tx: EventTx,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -178,6 +179,17 @@ async fn tail_transcript(
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
+
+                        // A queue-operation enqueue means a prompt was accepted
+                        // while Claude was busy. Notify pending senders so
+                        // slopctl send unblocks immediately.
+                        if record_type == "queue-operation" {
+                            if record.get("operation").and_then(|v| v.as_str()) == Some("enqueue") {
+                                debug!("transcript enqueue: notifying pending senders for pane {}", pane_id);
+                                pane_state.prompt_submitted.notify_waiters();
+                            }
+                        }
+
                         let _ = event_tx.send(BroadcastEvent {
                             source: "transcript".to_string(),
                             event_type: record_type,
@@ -637,6 +649,7 @@ async fn handle_request(
                         tokio::spawn(tail_transcript(
                             std::path::PathBuf::from(transcript_path),
                             pane.to_string(),
+                            state,
                             event_tx.clone(),
                             cancel,
                         ));

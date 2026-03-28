@@ -2957,3 +2957,195 @@ fn ps_does_not_show_pane_not_created_via_run() {
     assert!(ids.contains(&managed.as_str()), "managed pane {} missing from ps output", managed);
     assert!(!ids.contains(&unmanaged.as_str()), "unmanaged pane {} should not appear in ps output", unmanaged);
 }
+
+/// Helper: read the mock_claude transcript file from a test's claude_config_dir.
+/// mock_claude writes to <claude_config_dir>/projects/mock/mock-session-id-1234.jsonl.
+fn read_transcript(claude_config_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let path = claude_config_dir
+        .join("projects/mock/mock-session-id-1234.jsonl");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read transcript at {}: {}", path.display(), e));
+    contents.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+            .unwrap_or_else(|e| panic!("bad JSON in transcript: {}: {}", e, l)))
+        .collect()
+}
+
+/// Helper: filter transcript records by type.
+fn transcript_records_of_type<'a>(records: &'a [serde_json::Value], record_type: &str) -> Vec<&'a serde_json::Value> {
+    records.iter()
+        .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some(record_type))
+        .collect()
+}
+
+/// Verify that mock_claude writes user and assistant transcript records for a normal prompt.
+#[test]
+fn mock_claude_transcript_normal_prompt() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    let send_output = env.slopctl(&["send", &pane_id, "hello world"]);
+    assert!(send_output.status.success());
+
+    // Give transcript a moment to be flushed.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let records = read_transcript(&claude_config_dir);
+
+    kill_slopd(slopd);
+
+    let user_records = transcript_records_of_type(&records, "user");
+    let assistant_records = transcript_records_of_type(&records, "assistant");
+    let queue_records = transcript_records_of_type(&records, "queue-operation");
+
+    assert_eq!(user_records.len(), 1, "expected 1 user record, got {}", user_records.len());
+    assert_eq!(assistant_records.len(), 1, "expected 1 assistant record, got {}", assistant_records.len());
+    assert!(queue_records.is_empty(), "normal prompt should not produce queue-operation records");
+
+    let content = user_records[0]["message"]["content"].as_str().unwrap();
+    assert!(content.trim() == "hello world",
+        "expected 'hello world', got {:?}", content);
+}
+
+/// Verify that mock_claude writes queue-operation enqueue/remove records when a
+/// prompt is queued during /busy and processed afterwards.
+#[test]
+fn mock_claude_transcript_busy_queue_records() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Send /busy 3 in a background thread — fires PreToolUse, then collects queued
+    // input for up to 3 seconds before processing. slopctl send for the queued prompt
+    // unblocks immediately when the enqueue transcript record appears.
+    let env2 = env.clone();
+    let pane_id2 = pane_id.clone();
+    let busy_thread = std::thread::spawn(move || {
+        env2.slopctl(&["send", &pane_id2, "/busy 3"])
+    });
+
+    // Wait until BusyToolUse.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::BusyToolUse {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for BusyToolUse");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Send a prompt while busy — it gets queued.
+    let send_output = env.slopctl(&["send", &pane_id, "queued prompt", "--timeout", "10"]);
+    assert!(send_output.status.success(), "send while busy failed: {:?}", send_output);
+
+    let _ = busy_thread.join();
+
+    // Wait for the pane to return to Ready (Stop fires after the busy turn completes).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for pane to return to Ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Give transcript a moment to be flushed.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let records = read_transcript(&claude_config_dir);
+
+    kill_slopd(slopd);
+
+    let queue_records = transcript_records_of_type(&records, "queue-operation");
+    assert!(queue_records.len() >= 2, "expected at least 2 queue-operation records, got {}: {:?}", queue_records.len(), queue_records);
+
+    // First queue-operation should be enqueue with the queued prompt content.
+    let enqueue = queue_records.iter().find(|r| r["operation"] == "enqueue")
+        .expect("missing enqueue queue-operation");
+    assert!(enqueue["content"].as_str().unwrap().trim() == "queued prompt",
+        "enqueue content mismatch: {:?}", enqueue["content"]);
+
+    // Second should be dequeue (queued item consumed and processed).
+    let dequeue = queue_records.iter().find(|r| r["operation"] == "dequeue")
+        .expect("missing dequeue queue-operation");
+    assert!(dequeue.get("content").is_none() || dequeue["content"].is_null(),
+        "dequeue should not have content");
+
+    // The queued prompt should also produce user + assistant records.
+    let user_records = transcript_records_of_type(&records, "user");
+    let queued_user = user_records.iter()
+        .find(|r| r["message"]["content"].as_str().map_or(false, |c| c.trim() == "queued prompt"))
+        .expect("missing user record for the queued prompt");
+    assert!(queued_user["sessionId"].as_str().is_some());
+
+    let assistant_records = transcript_records_of_type(&records, "assistant");
+    let queued_assistant = assistant_records.iter()
+        .find(|r| {
+            r["message"]["content"].as_str()
+                .map_or(false, |c| c.contains("queued prompt"))
+        })
+        .expect("missing assistant record for the queued prompt");
+    assert!(queued_assistant["sessionId"].as_str().is_some());
+
+    // Verify ordering: enqueue comes before dequeue.
+    let enqueue_idx = records.iter().position(|r| r.get("operation").and_then(|o| o.as_str()) == Some("enqueue")).unwrap();
+    let dequeue_idx = records.iter().position(|r| r.get("operation").and_then(|o| o.as_str()) == Some("dequeue")).unwrap();
+    assert!(enqueue_idx < dequeue_idx, "enqueue (idx {}) should come before dequeue (idx {})", enqueue_idx, dequeue_idx);
+
+    // Verify ordering: dequeue comes before the user record for the queued prompt.
+    let user_idx = records.iter().position(|r| {
+        r.get("type").and_then(|t| t.as_str()) == Some("user")
+            && r["message"]["content"].as_str().map_or(false, |c| c.trim() == "queued prompt")
+    }).unwrap();
+    assert!(dequeue_idx < user_idx, "dequeue (idx {}) should come before user record (idx {})", dequeue_idx, user_idx);
+}
