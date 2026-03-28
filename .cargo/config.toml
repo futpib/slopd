@@ -1,0 +1,5 @@
+[env]
+# Limit integration test parallelism — each test spawns a tmux server,
+# slopd daemon, and mock_claude processes, so running too many in parallel
+# starves the system and causes timeouts on CI / low-core machines.
+RUST_TEST_THREADS = "2"
