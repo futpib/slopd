@@ -148,9 +148,9 @@ uptime: 1h 23m 45s
 List all panes managed by slopd.
 
 ```
-PANE_ID  CREATED           SESSION_ID        PARENT  TAGS
-%1       2 minutes ago     session-abc123    -       []
-%2       5 seconds ago     -                 %1      [web, prod]
+PANE  CREATED        LAST_ACTIVE    SESSION         PARENT  TAGS      STATE  DETAILED_STATE
+%1    2 minutes ago  2 minutes ago  session-abc123  -       -         ready  ready
+%2    5 seconds ago  5 seconds ago  -               %1      web,prod  busy   busy_tool_use
 ```
 
 Filter by tag:
@@ -290,7 +290,6 @@ Clients can subscribe to the live event stream with `slopctl listen`. Events are
   "source": "hook",
   "event_type": "UserPromptSubmit",
   "pane_id": "%1",
-  "session_id": "session-abc123",
   "payload": { ... }
 }
 ```
