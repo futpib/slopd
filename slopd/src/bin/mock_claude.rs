@@ -365,13 +365,17 @@ fn main() {
                     // corresponding queue-operation transcript records.
                     let secs: u64 = secs.trim().parse().unwrap_or(0);
 
-                    // Fire UserPromptSubmit for the /busy command itself (the user submitted it).
+                    // Fire UserPromptSubmit for the /busy command itself (the user submitted it),
+                    // and write user + assistant transcript records like real Claude does.
                     write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
                         "message": { "role": "user", "content": &prompt },
                     })));
                     let mut busy_payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     busy_payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(&settings, "UserPromptSubmit", &busy_payload, true);
+                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                    })));
 
                     fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path), true);
 
