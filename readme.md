@@ -143,7 +143,7 @@ Print daemon uptime.
 uptime: 1h 23m 45s
 ```
 
-### `slopctl ps [--filter KEY=VALUE]`
+### `slopctl ps [--filter KEY=VALUE] [--json]`
 
 List all panes managed by slopd.
 
@@ -157,6 +157,12 @@ Filter by tag:
 
 ```bash
 slopctl ps --filter tag=prod
+```
+
+Output as a JSON array (one object per pane) instead of the default table:
+
+```bash
+slopctl ps --json
 ```
 
 ### `slopctl run`
@@ -177,8 +183,8 @@ Terminate a Claude pane.
 slopctl kill %2
 ```
 
-### `slopctl send <PANE_ID> <PROMPT> [--timeout SECS]`
-### `slopctl send <KEY=VALUE> <PROMPT> [--select one|any|all] [--timeout SECS]`
+### `slopctl send <PANE_ID> <PROMPT> [--interrupt] [--timeout SECS]`
+### `slopctl send <KEY=VALUE> <PROMPT> [--select one|any|all] [--interrupt] [--timeout SECS]`
 
 Type `PROMPT` into a pane (or panes matching a filter) and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout.
 
@@ -188,6 +194,9 @@ When the first positional argument contains `=`, it is treated as a filter inste
 # Send to a specific pane
 slopctl send %1 "Summarize this file: README.md"
 slopctl send %1 "Run the tests" --timeout 10
+
+# Interrupt a busy pane first, then send a new prompt
+slopctl send %1 "Cancel that — do this instead" --interrupt
 
 # Send to all panes tagged "worker"
 slopctl send tag=worker "Report your status" --select all
@@ -203,6 +212,8 @@ slopctl send tag=idle "Start task X" --select one
 | `one` (default) | Exactly one matching pane must exist; error otherwise |
 | `any` | Send to one arbitrarily chosen matching pane |
 | `all` | Send to all matching panes |
+
+`--interrupt` / `-i`: Send Ctrl+C, Ctrl+D, and Escape to the pane(s) before typing the prompt. Equivalent to running `slopctl interrupt` first.
 
 ### `slopctl interrupt <PANE_ID>`
 
@@ -220,7 +231,7 @@ Forward a Claude lifecycle hook event to slopd. Reads the JSON payload from stdi
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
 ```
 
-### `slopctl listen [--hook EVENT] [--pane-id ID] [--session-id ID]`
+### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID]`
 
 Subscribe to the event stream and print events as JSON lines.
 
@@ -228,9 +239,26 @@ Subscribe to the event stream and print events as JSON lines.
 # All events
 slopctl listen
 
-# Only Stop events on a specific pane
+# Only Stop hook events on a specific pane
 slopctl listen --hook Stop --pane-id %1
+
+# slopd state-change events only
+slopctl listen --event StateChange
+
+# Transcript records only (Claude conversation content)
+slopctl listen --transcript user --transcript assistant
+
+# Mix sources: hook Stop events and state changes for a pane
+slopctl listen --hook Stop --event DetailedStateChange --pane-id %1
 ```
+
+Flag summary:
+
+| Flag | Source matched | Example values |
+|------|---------------|----------------|
+| `--hook EVENT` | `source:hook` | `Stop`, `UserPromptSubmit`, … |
+| `--event EVENT` | `source:slopd` | `StateChange`, `DetailedStateChange` |
+| `--transcript TYPE` | `source:transcript` | `user`, `assistant`, `progress` |
 
 ### `slopctl tag <PANE_ID> <TAG>`
 
@@ -283,7 +311,9 @@ Hook injection is **idempotent** and **concurrency-safe**: an exclusive advisory
 
 ## Event system
 
-Clients can subscribe to the live event stream with `slopctl listen`. Events are delivered as newline-delimited JSON objects, each with the shape:
+Clients can subscribe to the live event stream with `slopctl listen`. Events are delivered as newline-delimited JSON objects. There are three event sources:
+
+### `source:hook` — Claude lifecycle hook events
 
 ```json
 {
@@ -293,6 +323,57 @@ Clients can subscribe to the live event stream with `slopctl listen`. Events are
   "payload": { ... }
 }
 ```
+
+`event_type` is the Claude hook name (e.g. `SessionStart`, `Stop`, `PreToolUse`). `payload` is the raw JSON object Claude passed to the hook.
+
+### `source:slopd` — daemon state events
+
+Emitted by slopd itself whenever a pane's state changes.
+
+```json
+{
+  "source": "slopd",
+  "event_type": "StateChange",
+  "pane_id": "%1",
+  "payload": {
+    "state": "busy",
+    "previous_state": "ready"
+  }
+}
+```
+
+```json
+{
+  "source": "slopd",
+  "event_type": "DetailedStateChange",
+  "pane_id": "%1",
+  "payload": {
+    "detailed_state": "busy_tool_use",
+    "previous_detailed_state": "ready"
+  }
+}
+```
+
+`StateChange` fires when the coarse `state` transitions (`booting_up` → `ready` → `busy` → `awaiting_input`). `DetailedStateChange` fires on every hook event that updates the fine-grained state.
+
+Detailed state values: `booting_up`, `ready`, `busy_processing`, `busy_tool_use`, `busy_subagent`, `busy_compacting`, `awaiting_input_permission`, `awaiting_input_elicitation`.
+
+### `source:transcript` — Claude conversation transcript
+
+slopd tails each pane's Claude transcript `.jsonl` file and re-broadcasts every record as an event. This lets subscribers read Claude's conversation in real time without polling the file system.
+
+```json
+{
+  "source": "transcript",
+  "event_type": "assistant",
+  "pane_id": "%1",
+  "payload": { ... }
+}
+```
+
+`event_type` is the `type` field from the transcript record (e.g. `user`, `assistant`, `progress`, `queue-operation`).
+
+### Filtering
 
 Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and `session_id`. Multiple filter objects are OR-ed; fields within a single filter object are AND-ed.
 
