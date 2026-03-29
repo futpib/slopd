@@ -84,7 +84,7 @@ async fn set_pane_detailed_state(
 
     let previous_simple = previous.map(|p| p.to_simple());
     if previous_simple.as_ref() != Some(&simple) {
-        let _ = event_tx.send(BroadcastEvent {
+        let _ = event_tx.send(libslop::Record {
             source: "slopd".to_string(),
             event_type: "StateChange".to_string(),
             pane_id: Some(pane_id.to_string()),
@@ -92,10 +92,11 @@ async fn set_pane_detailed_state(
                 "state": simple.as_str(),
                 "previous_state": previous_simple.as_ref().map(|s| s.as_str()),
             }),
+            cursor: None,
         });
     }
 
-    let _ = event_tx.send(BroadcastEvent {
+    let _ = event_tx.send(libslop::Record {
         source: "slopd".to_string(),
         event_type: "DetailedStateChange".to_string(),
         pane_id: Some(pane_id.to_string()),
@@ -103,6 +104,7 @@ async fn set_pane_detailed_state(
             "detailed_state": detailed.as_str(),
             "previous_detailed_state": previous.map(|p| p.as_str()),
         }),
+        cursor: None,
     });
 }
 
@@ -159,6 +161,7 @@ async fn tail_transcript(
 
     let mut reader = tokio::io::BufReader::new(file);
     let mut line = String::new();
+    let mut byte_pos: u64 = 0;
 
     loop {
         line.clear();
@@ -170,7 +173,10 @@ async fn tail_transcript(
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                 }
             }
-            Ok(_) => {
+            Ok(n) => {
+                let line_start = byte_pos;
+                byte_pos += n as u64;
+
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -193,11 +199,12 @@ async fn tail_transcript(
                             }
                         }
 
-                        let _ = event_tx.send(BroadcastEvent {
+                        let _ = event_tx.send(libslop::Record {
                             source: "transcript".to_string(),
                             event_type: record_type,
                             pane_id: Some(pane_id.clone()),
                             payload: record,
+                            cursor: Some(line_start),
                         });
                     }
                     Err(e) => {
@@ -211,6 +218,98 @@ async fn tail_transcript(
             }
         }
     }
+}
+
+/// Read the last `n` JSON records from a transcript JSONL file.
+/// Returns `(records, file_len)` where each record is `(byte_offset, parsed_json)`,
+/// ordered oldest-first, and `file_len` is the file size at read time.
+async fn read_transcript_tail(
+    path: &std::path::Path,
+    n: u64,
+) -> std::io::Result<(Vec<(u64, serde_json::Value)>, u64)> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    let file_len = file.metadata().await?.len();
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut byte_pos: u64 = 0;
+    let n = n as usize;
+
+    // Sliding window: keep only the last N valid records.
+    let mut window = std::collections::VecDeque::with_capacity(n + 1);
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await? {
+            0 => break,
+            bytes_read => {
+                let line_start = byte_pos;
+                byte_pos += bytes_read as u64;
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if window.len() == n {
+                        window.pop_front();
+                    }
+                    window.push_back((line_start, record));
+                }
+            }
+        }
+    }
+
+    Ok((window.into(), file_len))
+}
+
+/// Read up to `limit` JSON records from a transcript JSONL file that start
+/// strictly before `before_offset` bytes. Returns `(records, at_beginning)`
+/// where records are ordered oldest-first.
+async fn read_transcript_before(
+    path: &std::path::Path,
+    before_offset: u64,
+    limit: u64,
+) -> std::io::Result<(Vec<(u64, serde_json::Value)>, bool)> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut byte_pos: u64 = 0;
+    let limit = limit as usize;
+
+    let mut window = std::collections::VecDeque::with_capacity(limit + 1);
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await? {
+            0 => break,
+            bytes_read => {
+                let line_start = byte_pos;
+                byte_pos += bytes_read as u64;
+
+                if line_start >= before_offset {
+                    break;
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if window.len() == limit {
+                        window.pop_front();
+                    }
+                    window.push_back((line_start, record));
+                }
+            }
+        }
+    }
+
+    let at_beginning = window.front().map_or(true, |(offset, _)| *offset == 0);
+    Ok((window.into(), at_beginning))
 }
 
 type PaneMap = Arc<dashmap::DashMap<String, Arc<PaneState>>>;
@@ -256,18 +355,9 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
     }
 }
 
-/// An event broadcast to all active subscribers.
-#[derive(Debug, Clone)]
-struct BroadcastEvent {
-    source: String,
-    event_type: String,
-    pane_id: Option<String>,
-    payload: serde_json::Value,
-}
+type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
 
-type EventTx = Arc<tokio::sync::broadcast::Sender<BroadcastEvent>>;
-
-fn filters_match(filters: &[libslop::EventFilter], ev: &BroadcastEvent) -> bool {
+fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool {
     if filters.is_empty() {
         return true;
     }
@@ -386,7 +476,7 @@ async fn main() {
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
     let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
 
-    let (event_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(256);
+    let (event_tx, _) = tokio::sync::broadcast::channel::<libslop::Record>(256);
     let event_tx: EventTx = Arc::new(event_tx);
 
     // Recover managed pane IDs from the tmux session so panes that existed
@@ -431,6 +521,47 @@ async fn write_response(
     writer.write_all(json.as_bytes()).await
 }
 
+/// Deduplication state for SubscribeTranscript: skip transcript records for the
+/// given pane whose byte offset is below the file-end position at replay time.
+struct Dedup {
+    pane_id: String,
+    file_end_offset: u64,
+}
+
+/// Stream broadcast records to a subscriber, applying filters and optional dedup.
+async fn stream_events(
+    rx: &mut tokio::sync::broadcast::Receiver<libslop::Record>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    filters: &[libslop::EventFilter],
+    dedup: Option<&Dedup>,
+) -> std::io::Result<()> {
+    loop {
+        match rx.recv().await {
+            Ok(record) => {
+                // Skip transcript records that were already replayed from disk.
+                if let Some(dedup) = dedup {
+                    if record.source == "transcript"
+                        && record.pane_id.as_deref() == Some(&dedup.pane_id)
+                        && record.cursor.map_or(false, |o| o < dedup.file_end_offset)
+                    {
+                        continue;
+                    }
+                }
+                if filters_match(filters, &record) {
+                    write_response(writer, id, libslop::ResponseBody::Record(record)).await?;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!("subscriber lagged, dropped {} events", n);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Ok(());
+            }
+        }
+    }
+}
+
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     start_time: u64,
@@ -453,39 +584,99 @@ async fn handle_connection(
             }
         };
 
-        if let libslop::RequestBody::Subscribe { filters } = req.body {
-            let mut rx = event_tx.subscribe();
-            if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
-                return;
+        match req.body {
+            libslop::RequestBody::Subscribe { filters } => {
+                let mut rx = event_tx.subscribe();
+                if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
+                    return;
+                }
+                if stream_events(&mut rx, &mut writer, req.id, &filters, None).await.is_err() {
+                    return;
+                }
+                continue;
             }
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        if filters_match(&filters, &ev) {
-                            let body = libslop::ResponseBody::Event {
-                                source: ev.source,
-                                event_type: ev.event_type,
-                                pane_id: ev.pane_id,
-                                payload: ev.payload,
-                            };
-                            if write_response(&mut writer, req.id, body).await.is_err() {
-                                return;
+
+            libslop::RequestBody::SubscribeTranscript { pane_id, last_n } => {
+                // Step 1: Subscribe to broadcast FIRST to avoid gaps.
+                let mut rx = event_tx.subscribe();
+
+                // Step 2: Read last N records from the transcript file on disk.
+                let transcript_path = panes
+                    .get(&pane_id)
+                    .and_then(|state| state.transcript_path.lock().unwrap().clone());
+
+                let (records, file_end_offset) = match transcript_path {
+                    Some(ref path) => {
+                        let path = std::path::PathBuf::from(path);
+                        match read_transcript_tail(&path, last_n).await {
+                            Ok((records, file_len)) => (records, file_len),
+                            Err(e) => {
+                                warn!("failed to read transcript for replay: {}", e);
+                                (vec![], 0)
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("subscriber lagged, dropped {} events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    None => (vec![], 0),
+                };
+
+                // Step 3: Send Subscribed confirmation.
+                if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
+                    return;
+                }
+
+                // Step 4: Send replayed records.
+                for (cursor, payload) in &records {
+                    let record_type = payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let record = libslop::Record {
+                        cursor: Some(*cursor),
+                        source: "transcript".to_string(),
+                        event_type: record_type,
+                        pane_id: Some(pane_id.clone()),
+                        payload: payload.clone(),
+                    };
+                    if write_response(&mut writer, req.id, libslop::ResponseBody::Record(record)).await.is_err() {
                         return;
                     }
                 }
-            }
-        }
 
-        let body = handle_request(req.body, start_time, &config, &panes, &managed_panes, &event_tx).await;
-        if write_response(&mut writer, req.id, body).await.is_err() {
-            break;
+                // Step 5: Send ReplayEnd as a Record.
+                let replay_end = libslop::Record {
+                    cursor: None,
+                    source: "slopd".to_string(),
+                    event_type: "ReplayEnd".to_string(),
+                    pane_id: Some(pane_id.clone()),
+                    payload: serde_json::Value::Null,
+                };
+                if write_response(&mut writer, req.id, libslop::ResponseBody::Record(replay_end)).await.is_err() {
+                    return;
+                }
+
+                // Step 6: Enter live event loop, skipping transcript records already replayed.
+                // Only forward transcript records for this pane.
+                let transcript_filter = vec![libslop::EventFilter {
+                    source: Some("transcript".to_string()),
+                    event_type: None,
+                    pane_id: Some(pane_id.clone()),
+                    session_id: None,
+                    payload_match: serde_json::Map::new(),
+                }];
+                let dedup = Some(Dedup { pane_id, file_end_offset });
+                if stream_events(&mut rx, &mut writer, req.id, &transcript_filter, dedup.as_ref()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+
+            body => {
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx).await;
+                if write_response(&mut writer, req.id, body).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -691,11 +882,12 @@ async fn handle_request(
                 set_pane_detailed_state(config, pane, &state, None, event_tx, panes).await;
             }
 
-            let _ = event_tx.send(BroadcastEvent {
+            let _ = event_tx.send(libslop::Record {
                 source: "hook".to_string(),
                 event_type: event,
                 pane_id,
                 payload,
+                cursor: None,
             });
 
             libslop::ResponseBody::Hooked
@@ -988,9 +1180,49 @@ async fn handle_request(
             }
         }
 
-        libslop::RequestBody::Subscribe { .. } => {
+        libslop::RequestBody::ReadTranscript { pane_id, before_cursor, limit } => {
+            let transcript_path = panes
+                .get(&pane_id)
+                .and_then(|state| state.transcript_path.lock().unwrap().clone());
+
+            match transcript_path {
+                None => libslop::ResponseBody::TranscriptPage {
+                    records: vec![],
+                },
+                Some(path) => {
+                    let path = std::path::PathBuf::from(&path);
+                    let effective_before = match before_cursor {
+                        Some(c) => c,
+                        None => tokio::fs::metadata(&path).await
+                            .map(|m| m.len()).unwrap_or(0),
+                    };
+                    match read_transcript_before(&path, effective_before, limit).await {
+                        Ok((records, _at_beginning)) => {
+                            let records = records.into_iter().map(|(cursor, payload)| {
+                                let event_type = payload
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                libslop::Record {
+                                    cursor: Some(cursor),
+                                    source: "transcript".to_string(),
+                                    event_type,
+                                    pane_id: Some(pane_id.clone()),
+                                    payload,
+                                }
+                            }).collect();
+                            libslop::ResponseBody::TranscriptPage { records }
+                        }
+                        Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                    }
+                }
+            }
+        }
+
+        libslop::RequestBody::Subscribe { .. } | libslop::RequestBody::SubscribeTranscript { .. } => {
             // Handled in handle_connection before reaching here.
-            unreachable!("Subscribe should be handled before handle_request")
+            unreachable!("Subscribe/SubscribeTranscript should be handled before handle_request")
         }
     }
 }

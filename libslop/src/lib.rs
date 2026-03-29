@@ -539,6 +539,21 @@ fn load_config<T: Default + for<'de> Deserialize<'de>>(path: PathBuf) -> T {
     }
 }
 
+/// Unified envelope for all events and transcript records across all endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Record {
+    /// Byte offset in the JSONL file. Set for transcript records, None for lifecycle events.
+    pub cursor: Option<u64>,
+    /// Origin: "transcript", "hook", or "slopd".
+    pub source: String,
+    /// Record/event type: "user", "assistant", "StateChange", "ReplayEnd", etc.
+    pub event_type: String,
+    /// Tmux pane this record belongs to, if applicable.
+    pub pane_id: Option<String>,
+    /// The full payload (parsed JSON for transcript, structured data for events).
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
@@ -573,8 +588,13 @@ pub enum RequestBody {
     Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },
     /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
     Interrupt { pane_id: String },
-    /// Subscribe to a stream of events. An empty filters vec matches all events.
+    /// Subscribe to a stream of lifecycle events (hook + slopd). An empty filters vec matches all.
     Subscribe { filters: Vec<EventFilter> },
+    /// Subscribe to a pane's transcript: replay the last `last_n` records from
+    /// disk, then stream new records live. All delivered as `Record`s.
+    SubscribeTranscript { pane_id: String, last_n: u64 },
+    /// Read a page of historical transcript records before a given cursor.
+    ReadTranscript { pane_id: String, before_cursor: Option<u64>, limit: u64 },
     /// Set or remove a user-defined tag on a pane.
     Tag { pane_id: String, tag: String, remove: bool },
     /// List all user-defined tags on a pane.
@@ -598,15 +618,12 @@ pub enum ResponseBody {
     Sent { pane_id: String },
     Interrupted { pane_id: String },
     Hooked,
-    /// Sent once to confirm a Subscribe request was accepted.
+    /// Sent once to confirm a Subscribe or SubscribeTranscript request was accepted.
     Subscribed,
-    /// Streamed to subscribers as events occur.
-    Event {
-        source: String,
-        event_type: String,
-        pane_id: Option<String>,
-        payload: serde_json::Value,
-    },
+    /// Streamed to subscribers (both Subscribe and SubscribeTranscript).
+    Record(Record),
+    /// Response to ReadTranscript.
+    TranscriptPage { records: Vec<Record> },
     Tagged { pane_id: String, tag: String },
     Untagged { pane_id: String, tag: String },
     Tags { pane_id: String, tags: Vec<String> },

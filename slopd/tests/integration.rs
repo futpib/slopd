@@ -3288,6 +3288,264 @@ fn mock_claude_transcript_busy_queue_records() {
     assert!(dequeue_idx < user_idx, "dequeue (idx {}) should come before user record (idx {})", dequeue_idx, user_idx);
 }
 
+/// Verify that SubscribeTranscript replays the last N records then streams live records.
+#[test]
+fn subscribe_transcript_replays_then_streams_live() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn pane and wait for SessionStart.
+    let session_listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &pane_id);
+
+    // Send two prompts so there is transcript history.
+    let send1 = env.slopctl(&["send", &pane_id, "first prompt"]);
+    assert!(send1.status.success());
+    let send2 = env.slopctl(&["send", &pane_id, "second prompt"]);
+    assert!(send2.status.success());
+
+    // Give transcript time to flush.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Subscribe with --replay 100 to get all history plus live.
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", &pane_id, "--replay", "100"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn replay listener");
+
+    // Wait for subscription confirmation.
+    {
+        let stdout = listener.stdout.as_mut().unwrap();
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            use std::io::Read;
+            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        let line = String::from_utf8_lossy(&line);
+        assert!(line.contains("subscribed"), "unexpected first line: {:?}", line);
+    }
+
+    // Send a third prompt (this should arrive as a live record after replay).
+    let send3 = env.slopctl(&["send", &pane_id, "third prompt"]);
+    assert!(send3.status.success());
+
+    // Read records from the listener.
+    let stdout = listener.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<serde_json::Value>>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        let mut records = Vec::new();
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                records.push(v);
+                // We expect: system+user+assistant for "first prompt",
+                // user+assistant for "second prompt", ReplayEnd,
+                // user+assistant for "third prompt" (live).
+                // Wait for at least a user record containing "third prompt".
+                let has_third = records.iter().any(|r| {
+                    r["event_type"] == "user"
+                        && r["payload"]["message"]["content"].as_str()
+                            .map_or(false, |c| c.contains("third prompt"))
+                });
+                if has_third {
+                    let _ = tx.send(records);
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(records);
+    });
+
+    let records = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out waiting for replay + live records");
+
+    kill_child(listener);
+    kill_slopd(slopd);
+
+    // Verify we got replayed records for "first prompt" and "second prompt".
+    let first_user = records.iter().any(|r| {
+        r["event_type"] == "user"
+            && r["payload"]["message"]["content"].as_str()
+                .map_or(false, |c| c.contains("first prompt"))
+    });
+    assert!(first_user, "missing replayed 'first prompt' record");
+
+    let second_user = records.iter().any(|r| {
+        r["event_type"] == "user"
+            && r["payload"]["message"]["content"].as_str()
+                .map_or(false, |c| c.contains("second prompt"))
+    });
+    assert!(second_user, "missing replayed 'second prompt' record");
+
+    // Verify ReplayEnd marker exists.
+    let replay_end = records.iter().any(|r| r["event_type"] == "ReplayEnd");
+    assert!(replay_end, "missing ReplayEnd marker in stream");
+
+    // Verify live "third prompt" exists.
+    let third_user = records.iter().any(|r| {
+        r["event_type"] == "user"
+            && r["payload"]["message"]["content"].as_str()
+                .map_or(false, |c| c.contains("third prompt"))
+    });
+    assert!(third_user, "missing live 'third prompt' record");
+
+    // Verify ReplayEnd comes before the third prompt.
+    let replay_end_idx = records.iter().position(|r| r["event_type"] == "ReplayEnd").unwrap();
+    let third_idx = records.iter().position(|r| {
+        r["event_type"] == "user"
+            && r["payload"]["message"]["content"].as_str()
+                .map_or(false, |c| c.contains("third prompt"))
+    }).unwrap();
+    assert!(replay_end_idx < third_idx,
+        "ReplayEnd (idx {}) should come before live third prompt (idx {})", replay_end_idx, third_idx);
+
+    // Verify all transcript records have cursor set.
+    for r in &records {
+        if r["source"] == "transcript" {
+            assert!(r["cursor"].is_number(),
+                "transcript record should have numeric cursor, got: {:?}", r);
+        }
+    }
+}
+
+/// Verify that ReadTranscript returns paginated history with cursors.
+#[test]
+fn read_transcript_returns_paginated_records() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn pane and send prompts to create transcript history.
+    let session_listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &pane_id);
+
+    let send1 = env.slopctl(&["send", &pane_id, "alpha"]);
+    assert!(send1.status.success());
+    let send2 = env.slopctl(&["send", &pane_id, "beta"]);
+    assert!(send2.status.success());
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Read all transcript records (no --before cursor).
+    let out = env.slopctl(&["transcript", &pane_id, "--limit", "100"]);
+    assert!(out.status.success(), "slopctl transcript failed: {:?}", out);
+    let page: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("transcript output not valid JSON");
+    let records = page["records"].as_array().expect("records should be array");
+
+    // Should have records (system + user + assistant for each prompt).
+    assert!(records.len() >= 4, "expected at least 4 records, got {}", records.len());
+
+    // Every record should have a cursor.
+    for r in records {
+        assert!(r["cursor"].is_number(), "record should have numeric cursor: {:?}", r);
+    }
+
+    // Cursors should be monotonically increasing.
+    let cursors: Vec<u64> = records.iter()
+        .map(|r| r["cursor"].as_u64().unwrap())
+        .collect();
+    for i in 1..cursors.len() {
+        assert!(cursors[i] > cursors[i - 1],
+            "cursors should be monotonically increasing: {:?}", cursors);
+    }
+
+    // Now paginate: read records before the cursor of the last record.
+    let mid_cursor = cursors[cursors.len() / 2];
+    let out2 = env.slopctl(&["transcript", &pane_id, "--before", &mid_cursor.to_string(), "--limit", "100"]);
+    assert!(out2.status.success());
+    let page2: serde_json::Value = serde_json::from_slice(&out2.stdout)
+        .expect("transcript page 2 not valid JSON");
+    let records2 = page2["records"].as_array().expect("records should be array");
+
+    // All records in page 2 should have cursors strictly less than mid_cursor.
+    for r in records2 {
+        let c = r["cursor"].as_u64().unwrap();
+        assert!(c < mid_cursor,
+            "paginated record cursor {} should be < before_cursor {}", c, mid_cursor);
+    }
+
+    kill_slopd(slopd);
+}
+
+/// Verify that ReadTranscript returns empty page for pane without transcript.
+#[test]
+fn read_transcript_empty_for_pane_without_transcript() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a pane (sleep infinity — no mock_claude, no transcript).
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success());
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // ReadTranscript should return empty page.
+    let out = env.slopctl(&["transcript", &pane_id]);
+    assert!(out.status.success(), "slopctl transcript failed: {:?}", out);
+    let page: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("transcript output not valid JSON");
+    let records = page["records"].as_array().expect("records should be array");
+    assert!(records.is_empty(), "expected empty records for pane without transcript, got {}", records.len());
+
+    kill_slopd(slopd);
+}
+
 /// Verify that slopd resumes tailing transcript files for preexisting panes after a restart.
 #[test]
 fn transcript_tailing_resumes_after_slopd_restart() {

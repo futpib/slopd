@@ -88,6 +88,20 @@ enum Command {
         /// Only receive events from this Claude session.
         #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
+        /// Replay the last N transcript records before switching to live events (requires --pane-id).
+        #[arg(long, value_name = "N")]
+        replay: Option<u64>,
+    },
+    /// Read historical transcript records from a pane.
+    Transcript {
+        /// Tmux pane ID (e.g. %42).
+        pane_id: String,
+        /// Byte-offset cursor; return records strictly before this offset.
+        #[arg(long)]
+        before: Option<u64>,
+        /// Maximum number of records to return.
+        #[arg(long, default_value = "50")]
+        limit: u64,
     },
     /// Add a tag to a pane.
     Tag {
@@ -285,45 +299,58 @@ async fn main() {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    if let Command::Listen { hooks, events, transcripts, pane_id, session_id } = cli.command {
-        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() {
-            vec![]
-        } else if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
-            vec![libslop::EventFilter {
-                source: None,
-                event_type: None,
-                pane_id,
-                session_id,
-                payload_match: serde_json::Map::new(),
-            }]
+    if let Command::Listen { hooks, events, transcripts, pane_id, session_id, replay } = cli.command {
+        let request = if let Some(last_n) = replay {
+            let replay_pane_id = match pane_id {
+                Some(ref id) => id.clone(),
+                None => {
+                    eprintln!("error: --replay requires --pane-id");
+                    std::process::exit(2);
+                }
+            };
+            libslop::Request {
+                id: 1,
+                body: libslop::RequestBody::SubscribeTranscript { pane_id: replay_pane_id, last_n },
+            }
         } else {
-            let hook_filters = hooks.into_iter().map(|h| libslop::EventFilter {
-                source: Some("hook".to_string()),
-                event_type: Some(h),
-                pane_id: pane_id.clone(),
-                session_id: session_id.clone(),
-                payload_match: serde_json::Map::new(),
-            });
-            let event_filters = events.into_iter().map(|e| libslop::EventFilter {
-                source: Some("slopd".to_string()),
-                event_type: Some(e),
-                pane_id: pane_id.clone(),
-                session_id: None,
-                payload_match: serde_json::Map::new(),
-            });
-            let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
-                source: Some("transcript".to_string()),
-                event_type: Some(t),
-                pane_id: pane_id.clone(),
-                session_id: session_id.clone(),
-                payload_match: serde_json::Map::new(),
-            });
-            hook_filters.chain(event_filters).chain(transcript_filters).collect()
-        };
-
-        let request = libslop::Request {
-            id: 1,
-            body: libslop::RequestBody::Subscribe { filters },
+            let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() {
+                vec![]
+            } else if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
+                vec![libslop::EventFilter {
+                    source: None,
+                    event_type: None,
+                    pane_id,
+                    session_id,
+                    payload_match: serde_json::Map::new(),
+                }]
+            } else {
+                let hook_filters = hooks.into_iter().map(|h| libslop::EventFilter {
+                    source: Some("hook".to_string()),
+                    event_type: Some(h),
+                    pane_id: pane_id.clone(),
+                    session_id: session_id.clone(),
+                    payload_match: serde_json::Map::new(),
+                });
+                let event_filters = events.into_iter().map(|e| libslop::EventFilter {
+                    source: Some("slopd".to_string()),
+                    event_type: Some(e),
+                    pane_id: pane_id.clone(),
+                    session_id: None,
+                    payload_match: serde_json::Map::new(),
+                });
+                let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
+                    source: Some("transcript".to_string()),
+                    event_type: Some(t),
+                    pane_id: pane_id.clone(),
+                    session_id: session_id.clone(),
+                    payload_match: serde_json::Map::new(),
+                });
+                hook_filters.chain(event_filters).chain(transcript_filters).collect()
+            };
+            libslop::Request {
+                id: 1,
+                body: libslop::RequestBody::Subscribe { filters },
+            }
         };
         let mut json = serde_json::to_string(&request).unwrap();
         debug!("sending: {}", json);
@@ -351,14 +378,8 @@ async fn main() {
                         libslop::ResponseBody::Subscribed => {
                             println!("{{\"subscribed\":true}}");
                         }
-                        libslop::ResponseBody::Event { source, event_type, pane_id, payload } => {
-                            let out = serde_json::json!({
-                                "source": source,
-                                "event_type": event_type,
-                                "pane_id": pane_id,
-                                "payload": payload,
-                            });
-                            println!("{}", out);
+                        libslop::ResponseBody::Record(record) => {
+                            println!("{}", serde_json::to_string(&record).unwrap());
                         }
                         libslop::ResponseBody::Error { message } => {
                             eprintln!("error: {}", message);
@@ -526,6 +547,24 @@ async fn main() {
         Command::Tags { pane_id } => {
             let pane_id = pane_id.or_else(|| std::env::var("TMUX_PANE").ok()).unwrap();
             libslop::RequestBody::Tags { pane_id }
+        }
+        Command::Transcript { pane_id, before, limit } => {
+            let body = libslop::RequestBody::ReadTranscript { pane_id, before_cursor: before, limit };
+            match send_request(&mut writer, &mut lines, 1, body).await {
+                libslop::ResponseBody::TranscriptPage { records } => {
+                    let out = serde_json::json!({ "records": records });
+                    println!("{}", out);
+                }
+                libslop::ResponseBody::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("unexpected response: {:?}", other);
+                    std::process::exit(1);
+                }
+            }
+            return;
         }
         Command::Hook { .. } | Command::Listen { .. } => unreachable!(),
     };
