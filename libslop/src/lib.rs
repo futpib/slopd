@@ -733,6 +733,9 @@ pub struct PaneInfo {
     pub state: PaneState,
     /// Detailed pane state.
     pub detailed_state: PaneDetailedState,
+    /// Current working directory of the pane (#{pane_current_path}).
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

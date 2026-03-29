@@ -593,7 +593,7 @@ async fn main() {
 fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let now = std::time::SystemTime::now();
     let fmt = timeago::Formatter::new();
-    let rows: Vec<(String, String, String, String, String, String, String, String)> = panes.iter().map(|p| {
+    let rows: Vec<(String, String, String, String, String, String, String, String, String)> = panes.iter().map(|p| {
         let epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let created = fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at)));
         let last_active = fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active)));
@@ -602,7 +602,8 @@ fn print_ps(panes: Vec<libslop::PaneInfo>) {
         let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
         let state = p.state.as_str().to_string();
         let detailed_state = p.detailed_state.as_str().to_string();
-        (p.pane_id.clone(), created, last_active, session, parent, tags, state, detailed_state)
+        let working_dir = p.working_dir.as_deref().unwrap_or("-").to_string();
+        (p.pane_id.clone(), created, last_active, session, parent, tags, state, detailed_state, working_dir)
     }).collect();
 
     let pane_w          = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
@@ -613,16 +614,17 @@ fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let tags_w          = rows.iter().map(|r| r.5.len()).max().unwrap_or(0).max(4);
     let state_w         = rows.iter().map(|r| r.6.len()).max().unwrap_or(0).max(5);
     let detailed_w      = rows.iter().map(|r| r.7.len()).max().unwrap_or(0).max(14);
+    let working_dir_w   = rows.iter().map(|r| r.8.len()).max().unwrap_or(0).max(11);
 
-    println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}",
-        "PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "TAGS", "STATE", "DETAILED_STATE",
+    println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
+        "PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR",
         pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-        parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w);
+        parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
 
-    for (pane_id, created, last_active, session, parent, tags, state, detailed_state) in &rows {
-        println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}",
-            pane_id, created, last_active, session, parent, tags, state, detailed_state,
+    for (pane_id, created, last_active, session, parent, tags, state, detailed_state, working_dir) in &rows {
+        println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
+            pane_id, created, last_active, session, parent, tags, state, detailed_state, working_dir,
             pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-            parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w);
+            parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
     }
 }

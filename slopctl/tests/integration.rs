@@ -64,6 +64,7 @@ fn ps_json_returns_valid_json_array() {
     assert!(pane["created_at"].is_number(), "created_at must be a number");
     assert!(pane["last_active"].is_number(), "last_active must be a number");
     assert!(pane["tags"].is_array(), "tags must be an array");
+    assert!(pane["working_dir"].is_string() || pane["working_dir"].is_null(), "working_dir must be a string or null: {:?}", pane);
 }
 
 #[test]
@@ -93,6 +94,7 @@ fn ps_table_contains_expected_columns() {
     assert!(stdout.contains("LAST_ACTIVE"), "missing LAST_ACTIVE column: {}", stdout);
     assert!(stdout.contains("SESSION"), "missing SESSION column: {}", stdout);
     assert!(stdout.contains("STATE"), "missing STATE column: {}", stdout);
+    assert!(stdout.contains("WORKING_DIR"), "missing WORKING_DIR column: {}", stdout);
     assert!(stdout.contains(&pane_id), "missing pane_id in output: {}", stdout);
     assert!(stdout.contains("ago") || stdout.contains("now"), "missing time in output: {}", stdout);
 }
@@ -139,6 +141,97 @@ fn ps_json_filter_by_tag() {
     assert!(panes2.is_empty(), "expected empty array for unmatched filter");
 
     kill_slopd(slopd);
+}
+
+#[test]
+fn ps_working_dir_reflects_start_directory() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let work_dir = tempfile::tempdir().unwrap();
+
+    let Some(env) = TestEnv::new_with_start_directory(
+        Some(&["sleep", "infinity"]),
+        work_dir.path().to_str().unwrap(),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
+
+    // Give the pane a moment to start so pane_current_path is populated.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let output = env.slopctl(&["ps", "--json"]);
+
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("output is not valid JSON: {}\noutput was: {}", e, stdout));
+
+    let pane = panes.iter().find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("spawned pane {} not found in ps --json output: {}", pane_id, stdout));
+
+    let working_dir = pane["working_dir"].as_str()
+        .unwrap_or_else(|| panic!("working_dir must be a string, got: {:?}", pane["working_dir"]));
+
+    assert_eq!(
+        std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.into()),
+        std::fs::canonicalize(work_dir.path()).unwrap(),
+        "working_dir in ps --json should match the configured start_directory"
+    );
+}
+
+#[test]
+fn ps_working_dir_reflects_per_run_start_directory() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let work_dir = tempfile::tempdir().unwrap();
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run", "-c", work_dir.path().to_str().unwrap()]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
+
+    // Give the pane a moment to start so pane_current_path is populated.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let output = env.slopctl(&["ps", "--json"]);
+
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("output is not valid JSON: {}\noutput was: {}", e, stdout));
+
+    let pane = panes.iter().find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("spawned pane {} not found in ps --json output: {}", pane_id, stdout));
+
+    let working_dir = pane["working_dir"].as_str()
+        .unwrap_or_else(|| panic!("working_dir must be a string, got: {:?}", pane["working_dir"]));
+
+    assert_eq!(
+        std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.into()),
+        std::fs::canonicalize(work_dir.path()).unwrap(),
+        "working_dir in ps --json should match the --start-directory flag"
+    );
 }
 
 #[test]
