@@ -165,17 +165,34 @@ impl TestEnv {
     }
 
     pub fn spawn_slopd(&self) -> Child {
-        let child = Command::new(cargo_bin("slopd"))
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+        self.spawn_slopd_inner(None)
+    }
+
+    /// Like `spawn_slopd` but sets `SLOPD_TEST_RUN_YIELD_MS` to the given value.
+    /// This causes slopd to sleep for `delay_ms` milliseconds inside the Run handler
+    /// after inserting the pane into managed_panes, making it certain that any
+    /// concurrent hook (e.g. SessionStart fired by mock_claude at startup) is
+    /// processed before the Run handler's pane-state guard runs.  Used to write
+    /// deterministic regression tests for the race described in:
+    ///   fix: guard Run handler from resetting pane state that a concurrent hook already advanced
+    pub fn spawn_slopd_with_run_yield(&self, delay_ms: u64) -> Child {
+        self.spawn_slopd_inner(Some(delay_ms))
+    }
+
+    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>) -> Child {
+        let mut cmd = Command::new(cargo_bin("slopd"));
+        cmd.env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env("HOME", self.config_dir.path())
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn slopd");
+            .stderr(Stdio::null());
+        if let Some(ms) = run_yield_ms {
+            cmd.env("SLOPD_TEST_RUN_YIELD_MS", ms.to_string());
+        }
+        let child = cmd.spawn().expect("failed to spawn slopd");
         // Wait for slopd to be ready by polling until a connection to its socket succeeds.
         let socket = self.runtime_dir.path().join("slopd/slopd.sock");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
