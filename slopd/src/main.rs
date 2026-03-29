@@ -701,7 +701,7 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id, extra_args } => {
+        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory } => {
             let settings_path = config.claude_settings_path();
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
@@ -711,6 +711,17 @@ async fn handle_request(
             cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                 .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
                 .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)]);
+            // Resolve start directory: per-session flag takes precedence over config default.
+            // Config value is expanded (~ and $VAR); the CLI value is already shell-expanded.
+            let effective_start_dir = start_directory.or_else(|| {
+                config.run.start_directory.as_ref().map(|p| libslop::expand_path(p))
+            });
+            if let Some(ref dir) = effective_start_dir {
+                match dir.to_str() {
+                    Some(dir_str) => { cmd.args(["-c", dir_str]); }
+                    None => warn!("start_directory contains non-UTF-8 characters, ignoring: {}", dir.display()),
+                }
+            }
             if let Some(ref custom_dir) = config.claude_config_dir {
                 cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
             }

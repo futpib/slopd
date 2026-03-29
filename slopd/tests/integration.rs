@@ -199,6 +199,79 @@ fn run_spawns_executable_in_new_tmux_window() {
 }
 
 #[test]
+fn run_uses_start_directory_from_config() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let work_dir = tempfile::tempdir().unwrap();
+
+    let Some(env) = TestEnv::new_with_start_directory(
+        Some(&["sleep", "infinity"]),
+        work_dir.path().to_str().unwrap(),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Give the window a moment to start
+    std::thread::sleep(Duration::from_millis(200));
+
+    let cwd_output = env.tmux.tmux()
+        .args(["display-message", "-p", "-t", &pane_id, "#{pane_current_path}"])
+        .output()
+        .expect("failed to run tmux display-message");
+
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    let cwd = String::from_utf8_lossy(&cwd_output.stdout).trim().to_string();
+    assert_eq!(
+        std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone().into()),
+        std::fs::canonicalize(work_dir.path()).unwrap(),
+        "pane working directory should match config start_directory"
+    );
+}
+
+#[test]
+fn run_uses_start_directory_from_flag() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let work_dir = tempfile::tempdir().unwrap();
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run", "-c", work_dir.path().to_str().unwrap()]);
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Give the window a moment to start
+    std::thread::sleep(Duration::from_millis(200));
+
+    let cwd_output = env.tmux.tmux()
+        .args(["display-message", "-p", "-t", &pane_id, "#{pane_current_path}"])
+        .output()
+        .expect("failed to run tmux display-message");
+
+    kill_slopd(slopd);
+
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    let cwd = String::from_utf8_lossy(&cwd_output.stdout).trim().to_string();
+    assert_eq!(
+        std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone().into()),
+        std::fs::canonicalize(work_dir.path()).unwrap(),
+        "pane working directory should match --start-directory flag"
+    );
+}
+
+#[test]
 fn kill_terminates_pane() {
     build_bin("slopd");
     build_bin("slopctl");

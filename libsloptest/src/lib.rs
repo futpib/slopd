@@ -79,7 +79,7 @@ impl TmuxServer {
     }
 
     pub fn write_slopd_config(&self, config_dir: &tempfile::TempDir, executable: Option<&[&str]>) {
-        self.write_slopd_config_full(config_dir, executable, None, None);
+        self.write_slopd_config_full(config_dir, executable, None, None, None);
     }
 
     pub fn write_slopd_config_full(
@@ -88,6 +88,7 @@ impl TmuxServer {
         executable: Option<&[&str]>,
         slopctl: Option<&str>,
         claude_config_dir: Option<&PathBuf>,
+        start_directory: Option<&str>,
     ) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
@@ -96,7 +97,7 @@ impl TmuxServer {
             config.push_str(&format!("claude_config_dir = {:?}\n\n", path.to_str().unwrap()));
         }
         config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
-        let has_run_section = executable.is_some() || slopctl.is_some();
+        let has_run_section = executable.is_some() || slopctl.is_some() || start_directory.is_some();
         if has_run_section {
             config.push_str("\n[run]\n");
             if let Some(exe) = executable {
@@ -105,6 +106,9 @@ impl TmuxServer {
             }
             if let Some(s) = slopctl {
                 config.push_str(&format!("slopctl = {:?}\n", s));
+            }
+            if let Some(dir) = start_directory {
+                config.push_str(&format!("start_directory = {:?}\n", dir));
             }
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
@@ -145,7 +149,18 @@ impl TestEnv {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config_full(&config_dir, executable, slopctl, claude_config_dir);
+        tmux.write_slopd_config_full(&config_dir, executable, slopctl, claude_config_dir, None);
+        Some(TestEnv { tmux, runtime_dir, config_dir })
+    }
+
+    pub fn new_with_start_directory(
+        executable: Option<&[&str]>,
+        start_directory: &str,
+    ) -> Option<Self> {
+        let tmux = TmuxServer::start()?;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        tmux.write_slopd_config_full(&config_dir, executable, None, None, Some(start_directory));
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 

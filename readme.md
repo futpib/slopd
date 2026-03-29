@@ -121,6 +121,11 @@ All defaults are fine for most setups. The only key you are likely to want to se
 
 # Path to the slopctl binary injected into Claude hooks.
 # slopctl = "slopctl"
+
+# Default working directory for every new Claude pane.
+# Supports ~ and $VAR / ${VAR} expansion.
+# Overridden per-session by `slopctl run --start-directory`.
+# start_directory = "~/code/my-project"
 ```
 
 ### slopctl config
@@ -165,7 +170,7 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run`
+### `slopctl run [-c DIR] [-- EXTRA_ARGS...]`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
@@ -174,6 +179,13 @@ PANE=$(slopctl run)
 ```
 
 If called from within a tmux pane (i.e. `$TMUX_PANE` is set), the new pane automatically records that pane as its parent.
+
+Use `-c` / `--start-directory` to set the working directory for this session, overriding the global `[run] start_directory` from config:
+
+```bash
+PANE=$(slopctl run -c ~/code/other-project)
+PANE=$(slopctl run --start-directory ~/code/other-project)
+```
 
 ### `slopctl kill <PANE_ID>`
 
