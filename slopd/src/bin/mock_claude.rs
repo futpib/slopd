@@ -458,7 +458,7 @@ fn main() {
                 }
                 if prompt == "/run" {
                     // Spawn a child pane via slopctl run. TMUX_PANE is set automatically
-                    // by tmux in our environment, so the child will have @slopd_parent_pane
+                    // by tmux in our environment, so the child will have @slopd_ancestor_panes
                     // pointing at us without any manual wiring.
                     let slopctl = std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
                     let output = Command::new(&slopctl)

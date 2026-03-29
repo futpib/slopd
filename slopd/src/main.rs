@@ -681,10 +681,28 @@ async fn handle_connection(
     }
 }
 
-fn parse_pane_options(stdout: &str) -> (bool, Option<String>, Option<String>, Vec<String>, Option<libslop::PaneDetailedState>, Option<u64>) {
+/// Parsed pane options from tmux `show-options -p` output.
+struct ParsedPaneOptions {
+    slopd_managed: bool,
+    session_id: Option<String>,
+    /// Full ancestor chain (immediate parent first). Stored as @slopd_ancestor_panes.
+    ancestor_panes: Vec<String>,
+    tags: Vec<String>,
+    detailed_state: Option<libslop::PaneDetailedState>,
+    created_at: Option<u64>,
+}
+
+impl ParsedPaneOptions {
+    /// Derive parent_pane_id from the first ancestor.
+    fn parent_pane_id(&self) -> Option<String> {
+        self.ancestor_panes.first().cloned()
+    }
+}
+
+fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
     let mut slopd_managed = false;
     let mut session_id = None;
-    let mut parent_pane_id = None;
+    let mut ancestor_panes = Vec::new();
     let mut tags = Vec::new();
     let mut detailed_state = None;
     let mut created_at = None;
@@ -696,8 +714,11 @@ fn parse_pane_options(stdout: &str) -> (bool, Option<String>, Option<String>, Ve
             slopd_managed = val == "true";
         } else if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
             session_id = Some(val.to_string());
-        } else if key == libslop::TmuxOption::SlopdParentPane.as_str() {
-            parent_pane_id = Some(val.to_string());
+        } else if key == libslop::TmuxOption::SlopdAncestorPanes.as_str() {
+            ancestor_panes = val.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         } else if key == libslop::TmuxOption::SlopdDetailedState.as_str() {
             detailed_state = libslop::PaneDetailedState::from_str(val);
         } else if key == libslop::TmuxOption::SlopdCreatedAt.as_str() {
@@ -706,7 +727,60 @@ fn parse_pane_options(stdout: &str) -> (bool, Option<String>, Option<String>, Ve
             tags.push(tag.to_string());
         }
     }
-    (slopd_managed, session_id, parent_pane_id, tags, detailed_state, created_at)
+    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at }
+}
+
+/// Encode an ancestor list as a comma-separated string for tmux storage.
+fn encode_ancestors(ancestors: &[String]) -> String {
+    ancestors.join(",")
+}
+
+/// Remove `dead_pane_id` from the ancestor chain of every managed pane that
+/// references it.  Called from the Kill handler before the pane is destroyed,
+/// and also usable for batch cleanup.
+async fn reparent_children_of(
+    config: &libslop::SlopdConfig,
+    managed_panes: &ManagedPanes,
+    dead_pane_id: &str,
+) {
+    for entry in managed_panes.iter() {
+        let child_id = entry.key().clone();
+        if child_id == dead_pane_id {
+            continue;
+        }
+        // Read this pane's current ancestor chain.
+        let Ok(out) = tmux(config)
+            .args(["show-options", "-t", &child_id, "-p", "-v",
+                   libslop::TmuxOption::SlopdAncestorPanes.as_str()])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let ancestors: Vec<String> = raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !ancestors.contains(&dead_pane_id.to_string()) {
+            continue;
+        }
+        // Remove the dead pane from the ancestor chain.
+        let new_ancestors: Vec<String> = ancestors.into_iter()
+            .filter(|a| a != dead_pane_id)
+            .collect();
+        if new_ancestors.is_empty() {
+            let _ = tmux(config)
+                .args(["set-option", "-t", &child_id, "-p", "-u",
+                       libslop::TmuxOption::SlopdAncestorPanes.as_str()])
+                .output()
+                .await;
+        } else {
+            let encoded = encode_ancestors(&new_ancestors);
+            let _ = tmux_set_pane_option(config, &child_id,
+                libslop::TmuxOption::SlopdAncestorPanes.as_str(), &encoded).await;
+        }
+    }
 }
 
 async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
@@ -719,7 +793,13 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
         return Err(String::from_utf8_lossy(&list_out.stderr).trim().to_string());
     }
 
-    let mut panes = Vec::new();
+    // First pass: collect all managed panes with their parsed options.
+    struct RawPane {
+        pane_id: String,
+        last_active: u64,
+        opts: ParsedPaneOptions,
+    }
+    let mut raw_panes = Vec::new();
     for line in String::from_utf8_lossy(&list_out.stdout).lines() {
         let mut parts = line.splitn(2, ' ');
         let pane_id = match parts.next() {
@@ -732,22 +812,61 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
             .args(["show-options", "-t", &pane_id, "-p"])
             .output()
             .await;
-        let (session_id, parent_pane_id, tags, state, detailed_state, created_at) = match opts_out {
+        match opts_out {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                let (slopd_managed, session_id, parent_pane_id, tags, detailed_state, created_at) = parse_pane_options(&stdout);
-                if !slopd_managed {
+                let opts = parse_pane_options(&stdout);
+                if !opts.slopd_managed {
                     continue;
                 }
-                let detailed_state = detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
-                let state = detailed_state.to_simple();
-                let created_at = created_at.unwrap_or(last_active);
-                (session_id, parent_pane_id, tags, state, detailed_state, created_at)
+                raw_panes.push(RawPane { pane_id, last_active, opts });
             }
             _ => continue,
         };
+    }
 
-        panes.push(libslop::PaneInfo { pane_id, created_at, last_active, session_id, parent_pane_id, tags, state, detailed_state });
+    // Build set of live managed pane IDs.
+    let live_ids: std::collections::HashSet<String> = raw_panes.iter().map(|p| p.pane_id.clone()).collect();
+
+    // Second pass: reparent any pane whose parent is dead by walking the ancestor chain.
+    let mut panes = Vec::new();
+    for mut raw in raw_panes {
+        let parent_pane_id = raw.opts.parent_pane_id();
+        let needs_reparent = parent_pane_id.as_ref().is_some_and(|p| !live_ids.contains(p.as_str()));
+
+        if needs_reparent {
+            // Walk ancestors to find the first one that is still alive.
+            let new_ancestors: Vec<String> = raw.opts.ancestor_panes.iter()
+                .skip_while(|a| !live_ids.contains(a.as_str()))
+                .cloned()
+                .collect();
+            raw.opts.ancestor_panes = new_ancestors;
+            // Persist the updated ancestor chain to tmux so it survives slopd restarts.
+            let encoded = encode_ancestors(&raw.opts.ancestor_panes);
+            if raw.opts.ancestor_panes.is_empty() {
+                let _ = tmux(config)
+                    .args(["set-option", "-t", &raw.pane_id, "-p", "-u", libslop::TmuxOption::SlopdAncestorPanes.as_str()])
+                    .output()
+                    .await;
+            } else {
+                let _ = tmux_set_pane_option(config, &raw.pane_id, libslop::TmuxOption::SlopdAncestorPanes.as_str(), &encoded).await;
+            }
+        }
+
+        let parent_pane_id = raw.opts.parent_pane_id();
+        let detailed_state = raw.opts.detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
+        let state = detailed_state.to_simple();
+        let created_at = raw.opts.created_at.unwrap_or(raw.last_active);
+        panes.push(libslop::PaneInfo {
+            pane_id: raw.pane_id,
+            created_at,
+            last_active: raw.last_active,
+            session_id: raw.opts.session_id,
+            parent_pane_id,
+            tags: raw.opts.tags,
+            state,
+            detailed_state,
+        });
     }
     Ok(panes)
 }
@@ -789,6 +908,9 @@ async fn handle_request(
                     message: format!("pane {} is not managed by slopd", pane_id),
                 };
             }
+            // Reparent children before killing: for every managed pane whose ancestor
+            // list contains the dying pane, remove it from their ancestor chain.
+            reparent_children_of(config, managed_panes, &pane_id).await;
             let output = tmux(config)
                 .args(["kill-pane", "-t", &pane_id])
                 .output()
@@ -961,8 +1083,26 @@ async fn handle_request(
                         set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
                     }
                     if let Some(ref parent) = parent_pane_id {
-                        if let Err(e) = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdParentPane.as_str(), parent).await {
-                            warn!("failed to set @slopd_parent_pane on pane {}: {}", pane_id, e);
+                        // Build the ancestor chain: [parent, parent's ancestors...].
+                        let mut ancestors = vec![parent.clone()];
+                        // Read the parent's ancestor chain from tmux.
+                        if let Ok(out) = tmux(config)
+                            .args(["show-options", "-t", parent, "-p", "-v",
+                                   libslop::TmuxOption::SlopdAncestorPanes.as_str()])
+                            .output()
+                            .await
+                        {
+                            let parent_ancestors = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            for a in parent_ancestors.split(',') {
+                                let a = a.trim();
+                                if !a.is_empty() {
+                                    ancestors.push(a.to_string());
+                                }
+                            }
+                        }
+                        let encoded = encode_ancestors(&ancestors);
+                        if let Err(e) = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdAncestorPanes.as_str(), &encoded).await {
+                            warn!("failed to set @slopd_ancestor_panes on pane {}: {}", pane_id, e);
                         }
                     }
                     libslop::ResponseBody::Run { pane_id }

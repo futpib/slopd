@@ -1688,7 +1688,7 @@ fn run_from_pane_sets_parent_pane_attribute() {
     assert!(mode_out.status.success(), "slopctl send /newline-mode failed: {:?}", mode_out);
 
     // Ask mock_claude to spawn a child. TMUX_PANE is set by tmux in mock_claude's
-    // environment, so the child gets @slopd_parent_pane set automatically.
+    // environment, so the child gets @slopd_ancestor_panes set automatically.
     let send_out = env.slopctl(&["send", &parent_pane, "/run"]);
     assert!(send_out.status.success(), "slopctl send /run failed: {:?}", send_out);
 
@@ -1708,17 +1708,19 @@ fn run_from_pane_sets_parent_pane_attribute() {
         }
     };
 
-    // Verify the child pane has @slopd_parent_pane set to the parent.
+    // Verify the child pane has @slopd_ancestor_panes with parent as first entry.
     let opt_out = env.tmux.tmux()
         .args(["show-options", "-t", &child_pane, "-p", "-v",
-               libslop::TmuxOption::SlopdParentPane.as_str()])
+               libslop::TmuxOption::SlopdAncestorPanes.as_str()])
         .output().unwrap();
     let value = String::from_utf8_lossy(&opt_out.stdout).trim().to_string();
+    // The ancestor list should start with the parent pane ID.
+    let first_ancestor = value.split(',').next().unwrap_or("").trim();
 
     kill_slopd(slopd);
 
-    assert_eq!(value, parent_pane,
-        "@slopd_parent_pane on child pane should equal parent pane ID");
+    assert_eq!(first_ancestor, parent_pane,
+        "@slopd_ancestor_panes first entry should equal parent pane ID");
 }
 
 #[test]
@@ -1803,13 +1805,13 @@ fn run_without_tmux_pane_has_no_parent_attribute() {
 
     let opt_out = env.tmux.tmux()
         .args(["show-options", "-t", &pane_id, "-p", "-v",
-               libslop::TmuxOption::SlopdParentPane.as_str()])
+               libslop::TmuxOption::SlopdAncestorPanes.as_str()])
         .output().unwrap();
     let value = String::from_utf8_lossy(&opt_out.stdout).trim().to_string();
 
     kill_slopd(slopd);
 
-    assert!(value.is_empty(), "@slopd_parent_pane should not be set for user-initiated run, got {:?}", value);
+    assert!(value.is_empty(), "@slopd_ancestor_panes should not be set for user-initiated run, got {:?}", value);
 }
 
 /// Verify that extra args passed via `slopctl run -- <args>` are forwarded to the executable.
@@ -3682,4 +3684,446 @@ fn transcript_tailing_resumes_after_slopd_restart() {
             "transcript event should have pane_id after restart"
         );
     }
+}
+
+/// Helper: send `/run` to a pane via mock_claude and capture the child pane ID
+/// from the `/run:<child_pane_id>` line printed to the pane.
+fn spawn_child_via_mock_claude(env: &TestEnv, parent_pane: &str) -> String {
+    // Count existing /run: lines so we can detect the new one.
+    let before_count = {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", parent_pane, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().filter(|l| l.starts_with("/run:")).count()
+    };
+
+    let send_out = env.slopctl(&["send", parent_pane, "/run"]);
+    assert!(send_out.status.success(), "slopctl send /run failed: {:?}", send_out);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", parent_pane, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let run_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("/run:")).collect();
+        if run_lines.len() > before_count {
+            return run_lines.last().unwrap().trim_start_matches("/run:").trim().to_string();
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for /run output in pane {}", parent_pane);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Helper: set up a 3-pane A→B→C hierarchy. Returns (slopd child, pane_a, pane_b, pane_c).
+fn setup_abc_hierarchy(env: &TestEnv) -> (String, String, String) {
+    // Spawn pane A (grandparent).
+    let listener = env.spawn_session_start_listener();
+    let a_out = env.slopctl(&["run"]);
+    assert!(a_out.status.success());
+    let pane_a = String::from_utf8_lossy(&a_out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_a);
+
+    let mode_out = env.slopctl(&["send", &pane_a, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success());
+
+    // A spawns B.
+    let pane_b = spawn_child_via_mock_claude(env, &pane_a);
+
+    // Wait for B to be ready.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (state, _) = env.pane_state(&pane_b);
+        if state == libslop::PaneState::Ready { break; }
+        assert!(Instant::now() < deadline, "timed out waiting for pane B to become Ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mode_out = env.slopctl(&["send", &pane_b, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success());
+
+    // B spawns C.
+    let pane_c = spawn_child_via_mock_claude(env, &pane_b);
+
+    // Verify initial hierarchy: C→B→A.
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_json_out.status.success());
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json output is not valid JSON");
+    let c_entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_c.as_str())
+        .expect("pane C not found in ps output");
+    assert_eq!(c_entry["parent_pane_id"], pane_b.as_str(),
+        "setup: C's parent should be B");
+    let b_entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_b.as_str())
+        .expect("pane B not found in ps output");
+    assert_eq!(b_entry["parent_pane_id"], pane_a.as_str(),
+        "setup: B's parent should be A");
+
+    (pane_a, pane_b, pane_c)
+}
+
+/// Helper: set up a 2-pane A→B hierarchy. Returns (pane_a, pane_b).
+fn setup_ab_hierarchy(env: &TestEnv) -> (String, String) {
+    let listener = env.spawn_session_start_listener();
+    let a_out = env.slopctl(&["run"]);
+    assert!(a_out.status.success());
+    let pane_a = String::from_utf8_lossy(&a_out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_a);
+
+    let mode_out = env.slopctl(&["send", &pane_a, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success());
+
+    // A spawns B.
+    let pane_b = spawn_child_via_mock_claude(env, &pane_a);
+
+    // Verify initial hierarchy: B→A.
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_json_out.status.success());
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json output is not valid JSON");
+    let b_entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_b.as_str())
+        .expect("pane B not found in ps output");
+    assert_eq!(b_entry["parent_pane_id"], pane_a.as_str(),
+        "setup: B's parent should be A");
+
+    (pane_a, pane_b)
+}
+
+fn new_reparent_test_env() -> Option<(TestEnv, tempfile::TempDir)> {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let env = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    )?;
+
+    Some((env, home_dir))
+}
+
+/// Assert that pane `pane_id` has `expected_parent` in `slopctl ps --json` output.
+/// Pass `None` to assert parent_pane_id is null.
+fn assert_parent_pane(env: &TestEnv, pane_id: &str, expected_parent: Option<&str>) {
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_json_out.status.success());
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json output is not valid JSON");
+    let entry = panes.as_array().unwrap().iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| panic!("pane {} not found in ps output", pane_id));
+    let expected = match expected_parent {
+        Some(id) => serde_json::Value::String(id.to_string()),
+        None => serde_json::Value::Null,
+    };
+    assert_eq!(
+        entry["parent_pane_id"], expected,
+        "pane {} parent_pane_id: expected {:?}, got {:?}",
+        pane_id, expected, entry["parent_pane_id"],
+    );
+}
+
+/// Assert that pane `pane_id` does not appear in `slopctl ps --json` output.
+fn assert_pane_gone(env: &TestEnv, pane_id: &str) {
+    let ps_json_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_json_out.status.success());
+    let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+        .expect("ps --json output is not valid JSON");
+    assert!(
+        panes.as_array().unwrap().iter().all(|p| p["pane_id"] != pane_id),
+        "pane {} should not appear in ps output after being killed", pane_id,
+    );
+}
+
+/// Wait for a pane to disappear from `slopctl ps --json` output.
+fn wait_for_pane_gone(env: &TestEnv, pane_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ps_json_out = env.slopctl(&["ps", "--json"]);
+        assert!(ps_json_out.status.success());
+        let panes: serde_json::Value = serde_json::from_slice(&ps_json_out.stdout)
+            .expect("ps --json output is not valid JSON");
+        if panes.as_array().unwrap().iter().all(|p| p["pane_id"] != pane_id) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for pane {} to disappear", pane_id);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ── A→B→C: kill middle pane B, C should be reparented to A ──
+
+#[test]
+fn reparent_middle_via_slopctl_kill() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b, pane_c) = setup_abc_hierarchy(&env);
+
+    // Kill B via slopctl.
+    let kill_out = env.slopctl(&["kill", &pane_b]);
+    assert!(kill_out.status.success(), "slopctl kill failed: {:?}", kill_out);
+
+    assert_parent_pane(&env, &pane_c, Some(&pane_a));
+    assert_pane_gone(&env, &pane_b);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn reparent_middle_via_tmux_kill() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b, pane_c) = setup_abc_hierarchy(&env);
+
+    // Kill B directly via tmux (bypassing slopd).
+    let out = env.tmux.tmux()
+        .args(["kill-pane", "-t", &pane_b])
+        .output().unwrap();
+    assert!(out.status.success(), "tmux kill-pane failed: {:?}", out);
+
+    // slopd doesn't know about the kill until list_panes is called.
+    wait_for_pane_gone(&env, &pane_b);
+    assert_parent_pane(&env, &pane_c, Some(&pane_a));
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn reparent_middle_via_process_exit() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b, pane_c) = setup_abc_hierarchy(&env);
+
+    // Make B's mock_claude exit by sending two C-c in a row (mock_claude exits on
+    // consecutive C-c). We use tmux send-keys directly because slopctl send would
+    // wait for a UserPromptSubmit hook that never fires when the process exits.
+    env.tmux.tmux().args(["send-keys", "-t", &pane_b, "C-c"]).status().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    env.tmux.tmux().args(["send-keys", "-t", &pane_b, "C-c"]).status().unwrap();
+
+    wait_for_pane_gone(&env, &pane_b);
+    assert_parent_pane(&env, &pane_c, Some(&pane_a));
+
+    kill_slopd(slopd);
+}
+
+// ── A→B: kill root pane A, B's parent should become null ──
+
+#[test]
+fn reparent_root_via_slopctl_kill() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b) = setup_ab_hierarchy(&env);
+
+    // Kill A via slopctl.
+    let kill_out = env.slopctl(&["kill", &pane_a]);
+    assert!(kill_out.status.success(), "slopctl kill failed: {:?}", kill_out);
+
+    assert_parent_pane(&env, &pane_b, None);
+    assert_pane_gone(&env, &pane_a);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn reparent_root_via_tmux_kill() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b) = setup_ab_hierarchy(&env);
+
+    // Kill A directly via tmux.
+    let out = env.tmux.tmux()
+        .args(["kill-pane", "-t", &pane_a])
+        .output().unwrap();
+    assert!(out.status.success(), "tmux kill-pane failed: {:?}", out);
+
+    wait_for_pane_gone(&env, &pane_a);
+    assert_parent_pane(&env, &pane_b, None);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn reparent_root_via_process_exit() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b) = setup_ab_hierarchy(&env);
+
+    // Make A's mock_claude exit by sending two C-c in a row (mock_claude exits on
+    // consecutive C-c). We use tmux send-keys directly because slopctl send would
+    // wait for a UserPromptSubmit hook that never fires when the process exits.
+    env.tmux.tmux().args(["send-keys", "-t", &pane_a, "C-c"]).status().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    env.tmux.tmux().args(["send-keys", "-t", &pane_a, "C-c"]).status().unwrap();
+
+    wait_for_pane_gone(&env, &pane_a);
+    assert_parent_pane(&env, &pane_b, None);
+
+    kill_slopd(slopd);
+}
+
+// ── Pane killed while slopd is offline, then slopd restarts ──
+
+#[test]
+fn reparent_middle_during_slopd_restart() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b, pane_c) = setup_abc_hierarchy(&env);
+
+    // Stop slopd.
+    kill_slopd(slopd);
+
+    // Kill B via tmux while slopd is offline (slopctl kill won't work without slopd).
+    let out = env.tmux.tmux()
+        .args(["kill-pane", "-t", &pane_b])
+        .output().unwrap();
+    assert!(out.status.success(), "tmux kill-pane failed: {:?}", out);
+
+    // Restart slopd — it should detect B is gone and reparent C to A.
+    let slopd = env.spawn_slopd();
+
+    assert_pane_gone(&env, &pane_b);
+    assert_parent_pane(&env, &pane_c, Some(&pane_a));
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn reparent_root_during_slopd_restart() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let (pane_a, pane_b) = setup_ab_hierarchy(&env);
+
+    // Stop slopd.
+    kill_slopd(slopd);
+
+    // Kill A via tmux while slopd is offline.
+    let out = env.tmux.tmux()
+        .args(["kill-pane", "-t", &pane_a])
+        .output().unwrap();
+    assert!(out.status.success(), "tmux kill-pane failed: {:?}", out);
+
+    // Restart slopd — it should detect A is gone and clear B's parent.
+    let slopd = env.spawn_slopd();
+
+    assert_pane_gone(&env, &pane_a);
+    assert_parent_pane(&env, &pane_b, None);
+
+    kill_slopd(slopd);
+}
+
+/// Helper: spawn a chain of `depth` panes where each spawns the next via `/run`.
+/// Returns the pane IDs in order from root to leaf: [P0, P1, ..., P(depth-1)].
+fn setup_pane_chain(env: &TestEnv, depth: usize) -> Vec<String> {
+    assert!(depth >= 1);
+
+    let listener = env.spawn_session_start_listener();
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success());
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &root);
+
+    let mode_out = env.slopctl(&["send", &root, "/newline-mode always-submit"]);
+    assert!(mode_out.status.success());
+
+    let mut chain = vec![root];
+
+    for _ in 1..depth {
+        let parent = chain.last().unwrap();
+        let child = spawn_child_via_mock_claude(env, parent);
+
+        // Wait for child to be ready.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (state, _) = env.pane_state(&child);
+            if state == libslop::PaneState::Ready { break; }
+            assert!(Instant::now() < deadline, "timed out waiting for pane to become Ready");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mode_out = env.slopctl(&["send", &child, "/newline-mode always-submit"]);
+        assert!(mode_out.status.success());
+
+        chain.push(child);
+    }
+
+    chain
+}
+
+/// 6-level chain: P0→P1→P2→P3→P4→P5. Kill P1,P2,P3,P4 while slopd is offline.
+/// After restart, P5's parent should be P0 (the only surviving ancestor).
+#[test]
+fn reparent_deep_chain_during_slopd_restart() {
+    let Some((env, _home)) = new_reparent_test_env() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let chain = setup_pane_chain(&env, 6);
+
+    // Verify initial parent chain.
+    for i in 1..6 {
+        assert_parent_pane(&env, &chain[i], Some(&chain[i - 1]));
+    }
+
+    // Stop slopd.
+    kill_slopd(slopd);
+
+    // Kill P1, P2, P3, P4 via tmux while slopd is offline.
+    for i in 1..5 {
+        let out = env.tmux.tmux()
+            .args(["kill-pane", "-t", &chain[i]])
+            .output().unwrap();
+        assert!(out.status.success(), "tmux kill-pane {} failed", chain[i]);
+    }
+
+    // Restart slopd.
+    let slopd = env.spawn_slopd();
+
+    // P1-P4 should be gone.
+    for i in 1..5 {
+        assert_pane_gone(&env, &chain[i]);
+    }
+
+    // P5's parent should be P0 (skipping all dead intermediaries).
+    assert_parent_pane(&env, &chain[5], Some(&chain[0]));
+
+    // P0 should still have no parent.
+    assert_parent_pane(&env, &chain[0], None);
+
+    kill_slopd(slopd);
 }

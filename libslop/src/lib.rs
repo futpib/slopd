@@ -53,8 +53,8 @@ pub enum TmuxOption {
     SlopdManaged,
     /// Stores the Claude session ID on a pane
     SlopdClaudeSessionId,
-    /// Stores the parent pane ID when a pane was spawned by another pane via slopctl run
-    SlopdParentPane,
+    /// Comma-separated ancestor pane IDs (immediate parent first, then grandparent, etc.)
+    SlopdAncestorPanes,
     /// Stores the simplified pane state
     SlopdState,
     /// Stores the detailed pane state
@@ -70,7 +70,7 @@ impl TmuxOption {
         match self {
             TmuxOption::SlopdManaged => "@slopd_managed",
             TmuxOption::SlopdClaudeSessionId => "@slopd_claude_session_id",
-            TmuxOption::SlopdParentPane => "@slopd_parent_pane",
+            TmuxOption::SlopdAncestorPanes => "@slopd_ancestor_panes",
             TmuxOption::SlopdState => "@slopd_state",
             TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
             TmuxOption::SlopdCreatedAt => "@slopd_created_at",
