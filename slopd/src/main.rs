@@ -785,7 +785,7 @@ async fn reparent_children_of(
 
 async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
     let list_out = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity}"])
+        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity} #{pane_current_path}"])
         .output()
         .await
         .map_err(|e| e.to_string())?;
@@ -797,16 +797,18 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
     struct RawPane {
         pane_id: String,
         last_active: u64,
+        working_dir: Option<String>,
         opts: ParsedPaneOptions,
     }
     let mut raw_panes = Vec::new();
     for line in String::from_utf8_lossy(&list_out.stdout).lines() {
-        let mut parts = line.splitn(2, ' ');
+        let mut parts = line.splitn(3, ' ');
         let pane_id = match parts.next() {
             Some(p) if !p.is_empty() => p.to_string(),
             _ => continue,
         };
         let last_active: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        let working_dir = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
         let opts_out = tmux(config)
             .args(["show-options", "-t", &pane_id, "-p"])
@@ -819,7 +821,7 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
                 if !opts.slopd_managed {
                     continue;
                 }
-                raw_panes.push(RawPane { pane_id, last_active, opts });
+                raw_panes.push(RawPane { pane_id, last_active, working_dir, opts });
             }
             _ => continue,
         };
@@ -866,6 +868,7 @@ async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneIn
             tags: raw.opts.tags,
             state,
             detailed_state,
+            working_dir: raw.working_dir,
         });
     }
     Ok(panes)
