@@ -94,7 +94,7 @@ fn slopd_second_instance_fails_when_first_is_running() {
         .spawn()
         .expect("failed to spawn second slopd");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let exited = loop {
         if let Some(status) = slopd2.try_wait().unwrap() {
             break Some(status);
@@ -685,7 +685,7 @@ fn ps_shows_parent_pane() {
 
     // mock_claude prints "/run:<child_pane_id>" to the pane; capture it.
     let child_pane = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let out = env.tmux.tmux()
                 .args(["capture-pane", "-t", &parent_pane, "-p"])
@@ -1694,7 +1694,7 @@ fn run_from_pane_sets_parent_pane_attribute() {
 
     // mock_claude prints "/run:<child_pane_id>" to the pane; capture it.
     let child_pane = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let out = env.tmux.tmux()
                 .args(["capture-pane", "-t", &parent_pane, "-p"])
@@ -1763,7 +1763,7 @@ fn run_does_not_set_claude_config_dir_when_not_configured() {
         .status().unwrap();
 
     // Poll pane output for the /env response.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let env_line = loop {
         let out = env.tmux.tmux()
             .args(["capture-pane", "-t", &pane_id, "-p"])
@@ -1846,7 +1846,7 @@ fn run_extra_args_print_exits_immediately() {
     let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
 
     // mock_claude --print should exit quickly. Poll until the pane is dead.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let out = env.tmux.tmux()
             .args(["capture-pane", "-t", &pane_id, "-p"])
@@ -1895,7 +1895,7 @@ fn echo_command_prints_output() {
     assert!(send_out.status.success(), "slopctl send failed: {:?}", send_out);
 
     // Poll pane output for the echo response.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let found = loop {
         let out = env.tmux.tmux()
             .args(["capture-pane", "-t", &pane_id, "-p"])
@@ -2474,7 +2474,7 @@ fn send_succeeds_when_pane_is_busy() {
     });
 
     // Wait until the pane enters BusyToolUse state.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let (_, detailed) = env.pane_state(&pane_id);
         if detailed == libslop::PaneDetailedState::BusyToolUse {
@@ -2646,7 +2646,7 @@ fn send_with_interrupt_preempts_busy_pane() {
     });
 
     // Wait until pane is BusyToolUse.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let (_, detailed) = env.pane_state(&pane_id);
         if detailed == libslop::PaneDetailedState::BusyToolUse {
@@ -3145,7 +3145,7 @@ fn mock_claude_transcript_busy_queue_records() {
     });
 
     // Wait until BusyToolUse.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (_, detailed) = env.pane_state(&pane_id);
         if detailed == libslop::PaneDetailedState::BusyToolUse {

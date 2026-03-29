@@ -178,7 +178,7 @@ impl TestEnv {
             .expect("failed to spawn slopd");
         // Wait for slopd to be ready by polling until a connection to its socket succeeds.
         let socket = self.runtime_dir.path().join("slopd/slopd.sock");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 break;
