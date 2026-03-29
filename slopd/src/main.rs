@@ -356,6 +356,12 @@ async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPane
 }
 
 type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
+type PaneRegistered = Arc<tokio::sync::Notify>;
+
+/// How long to wait for a pane to be registered before concluding that a hook
+/// came from a genuinely unmanaged (external) pane.  The race window is
+/// typically sub-millisecond; 2 s is generous headroom for a loaded system.
+const PANE_REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool {
     if filters.is_empty() {
@@ -475,6 +481,7 @@ async fn main() {
 
     let panes: PaneMap = Arc::new(dashmap::DashMap::new());
     let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
+    let pane_registered: PaneRegistered = Arc::new(tokio::sync::Notify::new());
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<libslop::Record>(256);
     let event_tx: EventTx = Arc::new(event_tx);
@@ -499,7 +506,7 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -569,6 +576,7 @@ async fn handle_connection(
     panes: PaneMap,
     managed_panes: ManagedPanes,
     event_tx: EventTx,
+    pane_registered: PaneRegistered,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -672,7 +680,7 @@ async fn handle_connection(
             }
 
             body => {
-                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx).await;
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered).await;
                 if write_response(&mut writer, req.id, body).await.is_err() {
                     break;
                 }
@@ -890,6 +898,7 @@ async fn handle_request(
     panes: &PaneMap,
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
+    pane_registered: &PaneRegistered,
 ) -> libslop::ResponseBody {
     match body {
 
@@ -942,8 +951,25 @@ async fn handle_request(
             // injected hooks.
             if let Some(pane) = pane_id.as_deref() {
                 if !managed_panes.contains(pane) {
-                    debug!("ignoring hook from unmanaged pane {}", pane);
-                    return libslop::ResponseBody::Hooked;
+                    // The hook might have arrived before the Run handler's
+                    // managed_panes.insert() ran (race between tmux creating the pane
+                    // and the async task resuming).  Wait briefly for registration.
+                    let _ = tokio::time::timeout(PANE_REGISTRATION_WAIT, async {
+                        loop {
+                            // Create the notified future before re-checking so we don't
+                            // miss a notification that fires between the check and the await.
+                            let notified = pane_registered.notified();
+                            if managed_panes.contains(pane) {
+                                return;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await;
+                    if !managed_panes.contains(pane) {
+                        debug!("ignoring hook from unmanaged pane {}", pane);
+                        return libslop::ResponseBody::Hooked;
+                    }
                 }
             }
 
@@ -1058,6 +1084,9 @@ async fn handle_request(
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
+                    // Wake any hook handlers that arrived before managed_panes.insert()
+                    // (race between tmux creating the pane and this task resuming).
+                    pane_registered.notify_waiters();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
