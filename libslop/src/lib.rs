@@ -32,47 +32,20 @@ pub fn home_dir() -> PathBuf {
 /// - A leading `~` (alone or followed by `/`) is replaced with the current
 ///   user's home directory.
 /// - `$NAME` and `${NAME}` are replaced with the value of the environment
-///   variable `NAME`; unknown variables expand to an empty string.
+///   variable `NAME`; unknown variables are left as-is.
 ///
 /// This is intended for paths read from config files, where the shell does
 /// not perform expansion automatically.
 pub fn expand_path(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
-    // Expand leading ~
-    let s: std::borrow::Cow<str> = if s == "~" {
-        home_dir().to_string_lossy().into_owned().into()
-    } else if s.starts_with("~/") {
-        format!("{}/{}", home_dir().display(), &s[2..]).into()
-    } else {
-        s
-    };
-    // Expand $VAR and ${VAR}
-    let mut result = String::with_capacity(s.len());
-    let mut rest: &str = &s;
-    while !rest.is_empty() {
-        if let Some(idx) = rest.find('$') {
-            result.push_str(&rest[..idx]);
-            rest = &rest[idx + 1..];
-            if rest.starts_with('{') {
-                rest = &rest[1..];
-                let end = rest.find('}').unwrap_or(rest.len());
-                let var_name = &rest[..end];
-                result.push_str(&std::env::var(var_name).unwrap_or_default());
-                rest = if end < rest.len() { &rest[end + 1..] } else { "" };
-            } else {
-                let end = rest
-                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    .unwrap_or(rest.len());
-                let var_name = &rest[..end];
-                result.push_str(&std::env::var(var_name).unwrap_or_default());
-                rest = &rest[end..];
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    PathBuf::from(result)
+    let expanded = shellexpand::full_with_context_no_errors(
+        s.as_ref(),
+        // Use dirs::home_dir() directly (returns Option) rather than the local
+        // home_dir() wrapper (which panics) — shellexpand needs an Option.
+        || dirs::home_dir().and_then(|p| p.into_os_string().into_string().ok()),
+        |var| std::env::var(var).ok(),
+    );
+    PathBuf::from(expanded.as_ref())
 }
 
 pub enum TmuxOption {
@@ -395,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_path_unknown_var_expands_to_empty() {
+    fn expand_path_unknown_var_left_as_is() {
         let result = expand_path(std::path::Path::new("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
-        assert_eq!(result, std::path::PathBuf::from("/base//end"));
+        assert_eq!(result, std::path::PathBuf::from("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
     }
 }
 
