@@ -26,7 +26,7 @@ pub fn build_bin(name: &str) {
         return;
     }
     let status = Command::new(env!("CARGO"))
-        .args(["build", "--workspace", "--bin", name])
+        .args(["build", "--workspace", "--bin", name, "--all-features"])
         .status()
         .expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);

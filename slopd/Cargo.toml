@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Claude agent session manager daemon — tmux management, RPC server, event broadcasting"
 
+[features]
+# Enables test-only knobs (e.g. SLOPD_TEST_RUN_YIELD_MS) used by integration
+# tests to make timing-sensitive races deterministic.  Must never be enabled
+# in production builds.
+testing = []
+
 [dependencies]
 libslop = { path = "../libslop" }
 tokio = { version = "1", features = ["full"] }

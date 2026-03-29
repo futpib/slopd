@@ -749,6 +749,8 @@ async fn handle_request(
                     // soon as the tmux window opens) are guaranteed to be processed before we
                     // reach the guard below. This makes the race condition deterministic in
                     // the run_handler_does_not_reset_pane_state_on_concurrent_hook test.
+                    // Only compiled when the "testing" feature is enabled — never in production.
+                    #[cfg(feature = "testing")]
                     if let Some(ms) = std::env::var("SLOPD_TEST_RUN_YIELD_MS")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
