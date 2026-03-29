@@ -27,6 +27,54 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().expect("could not determine home dir")
 }
 
+/// Expand `~` and `$VAR` / `${VAR}` references in a path.
+///
+/// - A leading `~` (alone or followed by `/`) is replaced with the current
+///   user's home directory.
+/// - `$NAME` and `${NAME}` are replaced with the value of the environment
+///   variable `NAME`; unknown variables expand to an empty string.
+///
+/// This is intended for paths read from config files, where the shell does
+/// not perform expansion automatically.
+pub fn expand_path(path: &std::path::Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    // Expand leading ~
+    let s: std::borrow::Cow<str> = if s == "~" {
+        home_dir().to_string_lossy().into_owned().into()
+    } else if s.starts_with("~/") {
+        format!("{}/{}", home_dir().display(), &s[2..]).into()
+    } else {
+        s
+    };
+    // Expand $VAR and ${VAR}
+    let mut result = String::with_capacity(s.len());
+    let mut rest: &str = &s;
+    while !rest.is_empty() {
+        if let Some(idx) = rest.find('$') {
+            result.push_str(&rest[..idx]);
+            rest = &rest[idx + 1..];
+            if rest.starts_with('{') {
+                rest = &rest[1..];
+                let end = rest.find('}').unwrap_or(rest.len());
+                let var_name = &rest[..end];
+                result.push_str(&std::env::var(var_name).unwrap_or_default());
+                rest = if end < rest.len() { &rest[end + 1..] } else { "" };
+            } else {
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                let var_name = &rest[..end];
+                result.push_str(&std::env::var(var_name).unwrap_or_default());
+                rest = &rest[end..];
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    PathBuf::from(result)
+}
+
 pub enum TmuxOption {
     /// Marks the slopd-managed tmux session; value is "true"
     SlopdManaged,
@@ -310,6 +358,47 @@ mod tests {
             assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
         }
     }
+
+    #[test]
+    fn expand_path_tilde_alone() {
+        let home = home_dir();
+        assert_eq!(expand_path(std::path::Path::new("~")), home);
+    }
+
+    #[test]
+    fn expand_path_tilde_slash() {
+        let home = home_dir();
+        let result = expand_path(std::path::Path::new("~/code/project"));
+        assert_eq!(result, home.join("code/project"));
+    }
+
+    #[test]
+    fn expand_path_dollar_var() {
+        // SAFETY: single-threaded test; no other thread reads this variable concurrently.
+        unsafe { std::env::set_var("SLOPD_TEST_DIR", "/tmp/test-project") };
+        let result = expand_path(std::path::Path::new("$SLOPD_TEST_DIR/sub"));
+        assert_eq!(result, std::path::PathBuf::from("/tmp/test-project/sub"));
+    }
+
+    #[test]
+    fn expand_path_dollar_brace_var() {
+        // SAFETY: single-threaded test; no other thread reads this variable concurrently.
+        unsafe { std::env::set_var("SLOPD_TEST_DIR2", "/tmp/braced") };
+        let result = expand_path(std::path::Path::new("${SLOPD_TEST_DIR2}/sub"));
+        assert_eq!(result, std::path::PathBuf::from("/tmp/braced/sub"));
+    }
+
+    #[test]
+    fn expand_path_no_expansion_needed() {
+        let result = expand_path(std::path::Path::new("/absolute/path"));
+        assert_eq!(result, std::path::PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_path_unknown_var_expands_to_empty() {
+        let result = expand_path(std::path::Path::new("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
+        assert_eq!(result, std::path::PathBuf::from("/base//end"));
+    }
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
@@ -416,6 +505,10 @@ pub struct SlopdRunConfig {
     /// Path to slopctl binary used for hook injection (default: "slopctl")
     #[serde(default = "default_slopctl")]
     pub slopctl: String,
+    /// Default working directory for new Claude panes. Supports `~` and
+    /// `$VAR` / `${VAR}` expansion. Overridden per-session by
+    /// `slopctl run --start-directory`.
+    pub start_directory: Option<PathBuf>,
 }
 
 fn default_slopctl() -> String {
@@ -427,6 +520,7 @@ impl Default for SlopdRunConfig {
         Self {
             executable: Executable::default(),
             slopctl: default_slopctl(),
+            start_directory: None,
         }
     }
 }
@@ -500,7 +594,7 @@ pub struct EventFilter {
 #[serde(tag = "type")]
 pub enum RequestBody {
     Status,
-    Run { parent_pane_id: Option<String>, extra_args: Vec<String> },
+    Run { parent_pane_id: Option<String>, extra_args: Vec<String>, start_directory: Option<PathBuf> },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },

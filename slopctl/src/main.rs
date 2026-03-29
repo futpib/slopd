@@ -28,6 +28,11 @@ enum Command {
     },
     /// Open a new Claude pane in the slopd tmux session.
     Run {
+        /// Working directory for the new pane. The shell expands ~ and
+        /// environment variables before this value reaches slopctl.
+        /// Overrides [run] start_directory from config.toml for this session.
+        #[arg(short = 'c', long, value_name = "DIR")]
+        start_directory: Option<std::path::PathBuf>,
         /// Extra arguments passed to the Claude executable (after --).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
@@ -508,9 +513,10 @@ async fn main() {
             }
             return;
         }
-        Command::Run { extra_args } => libslop::RequestBody::Run {
+        Command::Run { extra_args, start_directory } => libslop::RequestBody::Run {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
             extra_args,
+            start_directory,
         },
         Command::Kill { pane_id } => libslop::RequestBody::Kill { pane_id },
         Command::Send { pane_id, prompt, timeout, interrupt, .. } => libslop::RequestBody::Send { pane_id, prompt, timeout_secs: timeout, interrupt },
