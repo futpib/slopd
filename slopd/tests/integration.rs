@@ -2254,7 +2254,72 @@ fn pane_state_resets_to_booting_up_on_slopd_restart() {
     kill_slopd(slopd2);
 }
 
-/// Spawn `slopctl listen --event <event_type>` and wait for the subscription confirmation.
+/// Regression test for the race between the Run handler and a concurrently-firing
+/// SessionStart hook that caused the pane to stay stuck in booting_up.
+///
+/// The bug: after `tmux new-window` the Run handler inserts the pane into
+/// managed_panes (making hooks eligible) and then awaits two tmux set-option
+/// calls.  A fast-starting child (mock_claude) can fire its SessionStart hook
+/// during those awaits; the hook handler sets state → Ready and broadcasts the
+/// event.  When the Run handler resumed it called set_pane_detailed_state(BootingUp)
+/// unconditionally, resetting Ready back to BootingUp.  Any subsequent
+/// slopctl send then timed out waiting for the pane to become ready.
+///
+/// The fix guards the set_pane_detailed_state(BootingUp) call so it is skipped
+/// when the state has already been advanced by a concurrent hook.
+///
+/// This test makes the race deterministic by setting SLOPD_TEST_RUN_YIELD_MS,
+/// which adds a 2-second async sleep inside the Run handler right before the
+/// guard.  mock_claude always fires SessionStart within that window, so the
+/// hook is guaranteed to run (and set state → Ready) before the guard runs.
+#[test]
+fn run_handler_does_not_reset_pane_state_on_concurrent_hook() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // 2 000 ms is ample time for mock_claude to start and fire SessionStart.
+    let slopd = env.spawn_slopd_with_run_yield(2000);
+
+    // Subscribe before running so no SessionStart event is missed.
+    let listener = env.spawn_session_start_listener();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Blocks until the SessionStart broadcast is received.  By the time slopctl
+    // run returned, the Run handler (including its guard) has already completed,
+    // so both sides of the race have settled.
+    env.wait_for_session_start(listener, &pane_id);
+
+    // State must be Ready.  Without the guard the Run handler would have reset
+    // it back to BootingUp after the hook set it to Ready.
+    let (state, detailed) = env.pane_state(&pane_id);
+    assert_eq!(state, libslop::PaneState::Ready,
+        "pane should be Ready after SessionStart but got {:?} / {:?}", state, detailed);
+
+    // Confirm that slopctl send completes without waiting for a ready transition.
+    let send_out = env.slopctl(&["send", &pane_id, "hello", "--timeout", "5"]);
+    assert!(send_out.status.success(),
+        "slopctl send should succeed immediately when pane is Ready: {:?}", send_out);
+
+    kill_slopd(slopd);
+}
 /// Returns the child process with stdout piped.
 fn spawn_event_listener(env: &TestEnv, event_type: &str) -> std::process::Child {
     let mut child = Command::new(cargo_bin("slopctl"))

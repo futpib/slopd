@@ -15,7 +15,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y tmux
       - run: cargo install cargo-llvm-cov --locked
-      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --test-threads=1
+      - run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info -- --test-threads=1
       - uses: coverallsapp/github-action@v2
         with:
           file: lcov.info

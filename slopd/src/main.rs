@@ -744,7 +744,30 @@ async fn handle_request(
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
-                    set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+                    // Test hook: SLOPD_TEST_RUN_YIELD_MS adds an extra async sleep here so
+                    // that concurrent hook tasks (e.g. SessionStart fired by mock_claude as
+                    // soon as the tmux window opens) are guaranteed to be processed before we
+                    // reach the guard below. This makes the race condition deterministic in
+                    // the run_handler_does_not_reset_pane_state_on_concurrent_hook test.
+                    // Only compiled when the "testing" feature is enabled — never in production.
+                    #[cfg(feature = "testing")]
+                    if let Some(ms) = std::env::var("SLOPD_TEST_RUN_YIELD_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    // Guard: only set BootingUp state if no concurrent hook has already
+                    // advanced it. PaneState::new() already initialises detailed_state to
+                    // BootingUp; a fast-starting process (e.g. mock_claude under coverage)
+                    // can fire its SessionStart hook during the await points above, setting
+                    // the pane to Ready before we reach this point. Without this guard we
+                    // would reset a Ready pane back to BootingUp, causing slopctl send to
+                    // wait indefinitely for the pane to become ready again.
+                    let current_state = pane_state(panes, &pane_id).detailed_state.lock().unwrap().clone();
+                    if current_state == libslop::PaneDetailedState::BootingUp {
+                        set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+                    }
                     if let Some(ref parent) = parent_pane_id {
                         if let Err(e) = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdParentPane.as_str(), parent).await {
                             warn!("failed to set @slopd_parent_pane on pane {}: {}", pane_id, e);
