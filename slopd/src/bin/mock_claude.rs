@@ -205,6 +205,21 @@ fn hook_payload(event: &str, session_id: &str, cwd: &std::path::Path, transcript
     })
 }
 
+/// Fire the Stop hook and write a `system/turn_duration` transcript record,
+/// matching real Claude's end-of-turn behaviour.
+fn fire_stop(
+    settings: &serde_json::Value,
+    session_id: &str,
+    cwd: &std::path::Path,
+    transcript_path: &PathBuf,
+) {
+    fire_hooks(settings, "Stop", &hook_payload("Stop", session_id, cwd, transcript_path));
+    write_transcript_record(transcript_path, &transcript_record("system", session_id, serde_json::json!({
+        "subtype": "turn_duration",
+        "durationMs": 0,
+    })));
+}
+
 fn handle_prompt(prompt: &str) {
     if let Some(text) = prompt.strip_prefix("/echo ") {
         println!("{}", text.trim());
@@ -462,7 +477,7 @@ fn main() {
                     match busy_input {
                         BusyInput::Empty => {
                             // Interrupted before any prompt was queued — tool finished, back to ready.
-                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path));
+                            fire_stop(&settings, session_id, &cwd, &transcript_path);
                         }
                         BusyInput::Interrupted(prompts) => {
                             // Prompts were queued then user interrupted — enqueue
@@ -475,7 +490,7 @@ fn main() {
                                     }),
                                 ));
                             }
-                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path));
+                            fire_stop(&settings, session_id, &cwd, &transcript_path);
                         }
                         BusyInput::Queued(prompts) => {
                             // Enqueue records were already written in read_busy_input.
@@ -498,7 +513,7 @@ fn main() {
                             let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                             payload["prompt"] = serde_json::json!(last);
                             fire_hooks(&settings, "UserPromptSubmit", &payload);
-                            fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path));
+                            fire_stop(&settings, session_id, &cwd, &transcript_path);
                         }
                     }
                     continue;
@@ -564,7 +579,7 @@ fn main() {
                 let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                 payload["prompt"] = serde_json::json!(prompt);
                 fire_hooks(&settings, "UserPromptSubmit", &payload);
-                fire_hooks(&settings, "Stop", &hook_payload("Stop", session_id, &cwd, &transcript_path));
+                fire_stop(&settings, session_id, &cwd, &transcript_path);
             }
             _ => {
                 last_interrupt = None;

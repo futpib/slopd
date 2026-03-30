@@ -48,8 +48,69 @@ async fn tmux_send_keys(config: &libslop::SlopdConfig, pane_id: &str, keys: &str
         .await
 }
 
-fn hook_event_to_detailed_state(event: &str) -> Option<libslop::PaneDetailedState> {
+/// Events that can cause a pane state transition.
+enum PaneStateEvent<'a> {
+    /// slopd startup recovery or new pane creation.
+    Init,
+    /// A hook fired by Claude (received via the hook socket).
+    Hook { event: &'a str },
+    /// A transcript record was observed.
+    TranscriptRecord { record_type: &'a str, record: &'a serde_json::Value },
+}
+
+/// Pure reducer: given the current state and an event, returns the new state
+/// (or None if the event doesn't cause a transition).
+fn reduce_pane_state(
+    current: &libslop::PaneDetailedState,
+    event: &PaneStateEvent,
+) -> Option<libslop::PaneDetailedState> {
     match event {
+        PaneStateEvent::Init => Some(libslop::PaneDetailedState::BootingUp),
+
+        PaneStateEvent::Hook { event } => reduce_hook_event(event),
+
+        PaneStateEvent::TranscriptRecord { record_type, record } => {
+            match *record_type {
+                // `progress` records with `data.type: "hook_progress"` carry the
+                // hook event name in `data.hookEvent`. Replay them like hooks.
+                "progress" => {
+                    let hook_event = record
+                        .get("data")
+                        .and_then(|d| {
+                            if d.get("type").and_then(|t| t.as_str()) == Some("hook_progress") {
+                                d.get("hookEvent").and_then(|e| e.as_str())
+                            } else {
+                                None
+                            }
+                        });
+                    hook_event.and_then(reduce_hook_event)
+                }
+
+                // `system` with `subtype: "turn_duration"` marks the end of a turn —
+                // Claude is idle and ready for input.
+                "system" if record.get("subtype").and_then(|s| s.as_str()) == Some("turn_duration") => {
+                    Some(libslop::PaneDetailedState::Ready)
+                }
+
+                // When Claude is interrupted while awaiting permission or elicitation
+                // input, it writes transcript `user` events (tool rejection + interrupt
+                // message) but does NOT fire any hooks.
+                "user" if matches!(current,
+                    libslop::PaneDetailedState::AwaitingInputPermission
+                    | libslop::PaneDetailedState::AwaitingInputElicitation
+                ) => Some(libslop::PaneDetailedState::Ready),
+
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Map a hook event name to the resulting detailed state.
+fn reduce_hook_event(event: &str) -> Option<libslop::PaneDetailedState> {
+    match event {
+        "SessionStart" => Some(libslop::PaneDetailedState::Ready),
+        "UserPromptSubmit" => Some(libslop::PaneDetailedState::BusyProcessing),
         "Stop" | "StopFailure" => Some(libslop::PaneDetailedState::Ready),
         "PreToolUse" => Some(libslop::PaneDetailedState::BusyToolUse),
         "PostToolUse" | "PostToolUseFailure" => Some(libslop::PaneDetailedState::BusyProcessing),
@@ -201,20 +262,14 @@ async fn tail_transcript(
                             }
                         }
 
-                        // When Claude is interrupted while awaiting permission or
-                        // elicitation input, it writes transcript `user` events
-                        // (tool rejection + interrupt message) but does NOT fire
-                        // any hooks. Detect this and transition to Ready so the
-                        // state doesn't stay stuck.
-                        if record_type == "user" {
+                        // Check if this transcript record triggers a state transition.
+                        {
                             let current = pane_state.detailed_state.lock().unwrap().clone();
-                            if matches!(current,
-                                libslop::PaneDetailedState::AwaitingInputPermission
-                                | libslop::PaneDetailedState::AwaitingInputElicitation
-                            ) {
-                                debug!("transcript user event while pane {} in {:?} — transitioning to Ready", pane_id, current);
+                            let event = PaneStateEvent::TranscriptRecord { record_type: &record_type, record: &record };
+                            if let Some(new_state) = reduce_pane_state(&current, &event) {
+                                debug!("transcript {} event while pane {} in {:?} — transitioning to {:?}", record_type, pane_id, current, new_state);
                                 set_pane_detailed_state(
-                                    &config, &pane_id, &libslop::PaneDetailedState::Ready,
+                                    &config, &pane_id, &new_state,
                                     Some(&current), &event_tx, &panes,
                                 ).await;
                             }
@@ -349,31 +404,83 @@ type ManagedPanes = Arc<dashmap::DashSet<String>>;
 
 /// Populate the managed-pane set from the `slopd` tmux session.
 /// Only panes that have the `@slopd_managed` pane option set are considered managed
-/// (i.e. were registered via `slopctl run`). This filters out panes that were
-/// created directly in the slopd session without going through slopd.
-/// Resets state to booting_up for all recovered panes since we don't know
-/// where Claude actually is after a slopd restart.
-async fn load_managed_panes(config: &libslop::SlopdConfig, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) {
+/// (i.e. were registered via `slopctl run`). For each recovered pane, replays the
+/// last N transcript records through the state reducer to recover the real state
+/// instead of leaving it stuck at BootingUp.
+async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) {
+    let format_str = format!(
+        "#{{pane_id}} #{{{}}} #{{{}}}",
+        libslop::TmuxOption::SlopdManaged.as_str(),
+        libslop::TmuxOption::SlopdTranscriptPath.as_str(),
+    );
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F",
-               &format!("#{{pane_id}} #{{{}}}",
-                        libslop::TmuxOption::SlopdManaged.as_str())])
+        .args(["list-panes", "-s", "-t", "slopd", "-F", &format_str])
         .output()
         .await;
     if let Ok(out) = output {
         if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut parts = line.splitn(2, ' ');
+                let mut parts = line.splitn(3, ' ');
                 let pane_id = parts.next().unwrap_or("").trim();
                 let slopd_managed = parts.next().unwrap_or("").trim();
+                let transcript_path = parts.next().unwrap_or("").trim();
                 if pane_id.is_empty() || slopd_managed != "true" {
                     continue;
                 }
                 managed.insert(pane_id.to_string());
-                set_pane_detailed_state(config, pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+
+                // Replay the last N transcript records to recover the real state.
+                let recovered_state = if !transcript_path.is_empty() {
+                    recover_state_from_transcript(transcript_path).await
+                } else {
+                    None
+                };
+
+                let initial_state = recovered_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
+                set_pane_detailed_state(config, pane_id, &initial_state, None, event_tx, panes).await;
+
+                // Start the transcript tailer if we have a path.
+                if !transcript_path.is_empty() {
+                    let state = pane_state(panes, pane_id);
+                    let new_cancel = tokio_util::sync::CancellationToken::new();
+                    *state.transcript_cancel.lock().unwrap() = new_cancel.clone();
+                    *state.transcript_path.lock().unwrap() = Some(transcript_path.to_string());
+                    tokio::spawn(tail_transcript(
+                        std::path::PathBuf::from(transcript_path),
+                        pane_id.to_string(),
+                        state.clone(),
+                        config.clone(),
+                        panes.clone(),
+                        event_tx.clone(),
+                        new_cancel,
+                    ));
+                }
             }
         }
     }
+}
+
+/// Replay the last N records from a transcript file through the state reducer
+/// to recover the pane's actual state after a slopd restart.
+async fn recover_state_from_transcript(
+    transcript_path: &str,
+) -> Option<libslop::PaneDetailedState> {
+    let path = std::path::Path::new(transcript_path);
+    let (records, _) = read_transcript_tail(path, 100).await.ok()?;
+    if records.is_empty() {
+        return None;
+    }
+
+    // Replay records through the reducer starting from BootingUp.
+    let mut state = libslop::PaneDetailedState::BootingUp;
+    for (_offset, record) in &records {
+        let record_type = record.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let event = PaneStateEvent::TranscriptRecord { record_type, record };
+        if let Some(new_state) = reduce_pane_state(&state, &event) {
+            state = new_state;
+        }
+    }
+    Some(state)
 }
 
 type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
@@ -1029,6 +1136,7 @@ async fn handle_request(
                 }
             }
 
+            // Side effects for specific hooks (not state-related).
             if event == "SessionStart" {
                 if let (Some(pane), Some(session_id)) = (
                     pane_id.as_deref(),
@@ -1038,22 +1146,21 @@ async fn handle_request(
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
-
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::Ready, None, event_tx, panes).await;
                 }
             }
-
             if event == "UserPromptSubmit" {
                 if let Some(pane) = pane_id.as_deref() {
                     debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                     pane_state(panes, pane).prompt_submitted.notify_waiters();
-                    set_pane_detailed_state(config, pane, &libslop::PaneDetailedState::BusyProcessing, None, event_tx, panes).await;
                 }
             }
 
-            let detailed_state = hook_event_to_detailed_state(event.as_str());
-            if let (Some(pane), Some(state)) = (pane_id.as_deref(), detailed_state) {
-                set_pane_detailed_state(config, pane, &state, None, event_tx, panes).await;
+            // Unified state transition via reducer.
+            if let Some(pane) = pane_id.as_deref() {
+                let current = pane_state(panes, pane).detailed_state.lock().unwrap().clone();
+                if let Some(new_state) = reduce_pane_state(&current, &PaneStateEvent::Hook { event: &event }) {
+                    set_pane_detailed_state(config, pane, &new_state, Some(&current), event_tx, panes).await;
+                }
             }
 
             let _ = event_tx.send(libslop::Record {
@@ -1135,7 +1242,8 @@ async fn handle_request(
                     // wait indefinitely for the pane to become ready again.
                     let current_state = pane_state(panes, &pane_id).detailed_state.lock().unwrap().clone();
                     if current_state == libslop::PaneDetailedState::BootingUp {
-                        set_pane_detailed_state(config, &pane_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+                        let new_state = reduce_pane_state(&current_state, &PaneStateEvent::Init).unwrap();
+                        set_pane_detailed_state(config, &pane_id, &new_state, None, event_tx, panes).await;
                     }
                     if let Some(ref parent) = parent_pane_id {
                         // Build the ancestor chain: [parent, parent's ancestors...].

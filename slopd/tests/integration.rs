@@ -4208,3 +4208,78 @@ fn interrupt_in_awaiting_permission_transitions_to_ready() {
     let _ = permission_thread.join();
     kill_slopd(slopd);
 }
+
+/// After slopd restarts, a pane whose Claude is idle in ready state should recover
+/// its state from the transcript rather than staying stuck at BootingUp.
+#[test]
+fn ready_pane_recovers_state_after_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Confirm pane is in Ready state.
+    let (simple, detailed) = env.pane_state(&pane_id);
+    assert_eq!(simple, libslop::PaneState::Ready);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready);
+
+    // Send a prompt so there's a Stop hook in the transcript (Claude returns to ready).
+    let send_out = env.slopctl(&["send", &pane_id, "/echo hello"]);
+    assert!(send_out.status.success(), "send failed: {:?}", send_out);
+
+    // Wait for pane to return to Ready after processing the prompt.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for Ready after send");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Restart slopd. The tmux session and mock_claude survive.
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    // Give slopd time to load managed panes and process any transcript events.
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // slopd should recover the real state by replaying transcript records.
+    let (simple, detailed) = env.pane_state(&pane_id);
+    assert_eq!(
+        detailed,
+        libslop::PaneDetailedState::Ready,
+        "expected Ready after slopd restart (recovered from transcript), got {:?}",
+        detailed,
+    );
+    assert_eq!(
+        simple,
+        libslop::PaneState::Ready,
+        "expected Ready after slopd restart, got {:?}",
+        simple,
+    );
+
+    kill_slopd(slopd2);
+}
