@@ -4127,3 +4127,84 @@ fn reparent_deep_chain_during_slopd_restart() {
 
     kill_slopd(slopd);
 }
+
+/// Regression: interrupting Claude while it's in AwaitingInputPermission state causes
+/// it to write transcript `user` events (tool rejection + interrupt message) but NOT
+/// fire any hooks. slopd detects this via the transcript tailer and transitions the
+/// state back to Ready.
+#[test]
+fn interrupt_in_awaiting_permission_transitions_to_ready() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Send /permission 1 to put mock_claude into AwaitingInputPermission state.
+    // This fires UserPromptSubmit, PreToolUse hooks, waits 1s (busy period),
+    // then fires PermissionRequest and blocks on the permission dialog.
+    let env2 = env.clone();
+    let pane_id2 = pane_id.clone();
+    let permission_thread = std::thread::spawn(move || {
+        env2.slopctl(&["send", &pane_id2, "/permission 1"])
+    });
+
+    // Wait until pane reaches AwaitingInputPermission.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::AwaitingInputPermission {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for AwaitingInputPermission state");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Interrupt the pane. Mock claude writes transcript user events (no hooks).
+    // slopd should detect these transcript events and transition to Ready.
+    let int_out = env.slopctl(&["interrupt", &pane_id]);
+    assert!(int_out.status.success(), "interrupt failed: {:?}", int_out);
+
+    // Wait for slopd to detect the transcript events and transition to Ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Ready state after interrupt; still {:?}",
+            detailed,
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (simple, detailed) = env.pane_state(&pane_id);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready);
+    assert_eq!(simple, libslop::PaneState::Ready);
+
+    let _ = permission_thread.join();
+    kill_slopd(slopd);
+}

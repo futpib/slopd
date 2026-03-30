@@ -354,6 +354,77 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(secs));
                     continue;
                 }
+                if let Some(secs) = prompt.strip_prefix("/permission ") {
+                    // Simulate Claude processing a tool use then awaiting permission.
+                    // Like /busy, but after the busy period fires PermissionRequest
+                    // instead of finishing. When interrupted in the permission dialog,
+                    // real Claude writes transcript `user` events but does NOT fire
+                    // any hooks — so slopd never learns the state changed.
+                    let secs: u64 = secs.trim().parse().unwrap_or(0);
+
+                    // Fire hooks for the prompt submission and tool use.
+                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                        "message": { "role": "user", "content": &prompt },
+                    })));
+                    let mut submit_payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    submit_payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(&settings, "UserPromptSubmit", &submit_payload);
+                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                    })));
+
+                    fire_hooks(&settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path));
+
+                    // Busy period (tool use running), like /busy.
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+
+                    // Now the tool needs permission — fire PermissionRequest.
+                    fire_hooks(&settings, "PermissionRequest", &hook_payload("PermissionRequest", session_id, &cwd, &transcript_path));
+
+                    // Block waiting for interrupt (like the real permission dialog).
+                    // When interrupted, write transcript events but NO hooks, just like real Claude.
+                    let mut interrupt_byte = [0u8; 1];
+                    loop {
+                        match stdin.read(&mut interrupt_byte) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        match interrupt_byte[0] {
+                            0x03 | 0x04 | 0x1b => {
+                                // Interrupted — write transcript user events like real Claude.
+                                // First: tool_result rejection.
+                                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                                    "message": {
+                                        "role": "user",
+                                        "content": [{
+                                            "type": "tool_result",
+                                            "tool_use_id": format!("mock-tool-use-{}", uuid_counter()),
+                                            "content": "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+                                            "is_error": true,
+                                        }],
+                                    },
+                                })));
+                                // Second: interrupt message.
+                                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                                    "message": {
+                                        "role": "user",
+                                        "content": [{
+                                            "type": "text",
+                                            "text": "[Request interrupted by user for tool use]",
+                                        }],
+                                    },
+                                })));
+                                // NO hooks fired — this is the real Claude behaviour that
+                                // slopd must handle via transcript detection.
+                                break;
+                            }
+                            _ => {
+                                // Ignore other input while in permission dialog.
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(secs) = prompt.strip_prefix("/busy ") {
                     // Simulate Claude running a tool use for `secs` seconds.
                     // During this time the real Claude still accepts terminal input and

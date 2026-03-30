@@ -141,6 +141,8 @@ async fn tail_transcript(
     path: std::path::PathBuf,
     pane_id: String,
     pane_state: Arc<PaneState>,
+    config: Arc<libslop::SlopdConfig>,
+    panes: PaneMap,
     event_tx: EventTx,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -196,6 +198,25 @@ async fn tail_transcript(
                             if record.get("operation").and_then(|v| v.as_str()) == Some("enqueue") {
                                 debug!("transcript enqueue: notifying pending senders for pane {}", pane_id);
                                 pane_state.prompt_submitted.notify_waiters();
+                            }
+                        }
+
+                        // When Claude is interrupted while awaiting permission or
+                        // elicitation input, it writes transcript `user` events
+                        // (tool rejection + interrupt message) but does NOT fire
+                        // any hooks. Detect this and transition to Ready so the
+                        // state doesn't stay stuck.
+                        if record_type == "user" {
+                            let current = pane_state.detailed_state.lock().unwrap().clone();
+                            if matches!(current,
+                                libslop::PaneDetailedState::AwaitingInputPermission
+                                | libslop::PaneDetailedState::AwaitingInputElicitation
+                            ) {
+                                debug!("transcript user event while pane {} in {:?} — transitioning to Ready", pane_id, current);
+                                set_pane_detailed_state(
+                                    &config, &pane_id, &libslop::PaneDetailedState::Ready,
+                                    Some(&current), &event_tx, &panes,
+                                ).await;
                             }
                         }
 
@@ -1000,6 +1021,8 @@ async fn handle_request(
                         std::path::PathBuf::from(transcript_path),
                         pane.to_string(),
                         state.clone(),
+                        config.clone(),
+                        panes.clone(),
                         event_tx.clone(),
                         new_cancel,
                     ));
