@@ -3,7 +3,10 @@ members = [
     "slopd",
     "slopctl",
     "libslop",
+    "libslopctl",
     "libsloptest",
+    "iroh-slopd",
+    "iroh-slopctl",
 ]
 resolver = "2"
 

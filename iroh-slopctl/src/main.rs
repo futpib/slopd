@@ -1,12 +1,26 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
-use tokio::net::UnixStream;
+use iroh::{Endpoint, PublicKey, SecretKey};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+const ALPN: &[u8] = b"iroh-slopd/0";
+
 #[derive(Parser)]
-#[command(name = "slopctl", about = "Control a running slopd daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
+#[command(name = "iroh-slopctl", about = "Remote control for slopd via iroh", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
 struct Cli {
-    #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity (-v INFO, -vv DEBUG, -vvv TRACE)")]
+    #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity")]
     verbose: u8,
+
+    /// Endpoint name (from config) or raw EndpointId to connect to. Overrides the default.
+    #[arg(long, global = true)]
+    endpoint: Option<String>,
+
+    /// Read the server's full EndpointAddr from this JSON file (for direct connections without discovery).
+    #[arg(long, global = true, value_name = "PATH")]
+    addr_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -14,122 +28,88 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print this client's EndpointId (for server authorization).
+    Info,
     /// Show slopd uptime and state.
     Status,
     /// List panes in the slopd session.
     Ps {
-        /// Filter by key=value (repeatable, AND semantics). Supported keys: tag.
         #[arg(long = "filter", value_name = "KEY=VALUE")]
         filters: Vec<String>,
-        /// Output as JSON array instead of table.
         #[arg(long)]
         json: bool,
     },
     /// Open a new Claude pane in the slopd tmux session.
     Run {
-        /// Working directory for the new pane. The shell expands ~ and
-        /// environment variables before this value reaches slopctl.
-        /// Overrides [run] start_directory from config.toml for this session.
         #[arg(short = 'c', long, value_name = "DIR")]
-        start_directory: Option<std::path::PathBuf>,
-        /// Extra arguments passed to the Claude executable (after --).
+        start_directory: Option<PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
     /// Terminate a Claude pane.
     Kill {
-        /// Tmux pane ID (e.g. %42).
         pane_id: String,
-    },
-    /// Forward a Claude lifecycle hook event to slopd (called by Claude hooks).
-    Hook {
-        /// Hook event name (e.g. UserPromptSubmit).
-        event: String,
     },
     /// Type a prompt into pane(s) and wait for UserPromptSubmit confirmation.
     Send {
-        /// Tmux pane ID (e.g. %42) or filter (e.g. tag=worker).
         pane_id: String,
-        /// Prompt text to send.
         prompt: String,
-        /// Additional filter by key=value (repeatable, AND semantics). Supported keys: tag.
         #[arg(long = "filter", value_name = "KEY=VALUE")]
         filters: Vec<String>,
-        /// How to select among matching panes: one (error if not exactly one), any (pick one at random), all.
         #[arg(long, default_value = "one")]
         select: SelectMode,
-        /// Seconds to wait for UserPromptSubmit confirmation per pane.
         #[arg(long, default_value = "60")]
         timeout: u64,
-        /// Interrupt the pane before sending (equivalent to slopctl interrupt then send).
         #[arg(long, short = 'i')]
         interrupt: bool,
     },
     /// Send Ctrl+C, Ctrl+D, and Escape to interrupt a running agent.
     Interrupt {
-        /// Tmux pane ID (e.g. %42).
         pane_id: String,
     },
     /// Subscribe to a stream of events and print each as a JSON line.
     Listen {
-        /// Filter by hook event name (repeatable; omit for all events). Matches source:hook events.
         #[arg(long = "hook", value_name = "EVENT")]
         hooks: Vec<String>,
-        /// Filter by slopd event name (repeatable). Matches source:slopd events (e.g. StateChange, DetailedStateChange).
         #[arg(long = "event", value_name = "EVENT")]
         events: Vec<String>,
-        /// Filter by transcript record type (repeatable). Matches source:transcript events (e.g. user, assistant, progress).
         #[arg(long = "transcript", value_name = "TYPE")]
         transcripts: Vec<String>,
-        /// Only receive events from this tmux pane.
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
-        /// Only receive events from this Claude session.
         #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
-        /// Replay the last N transcript records before switching to live events (requires --pane-id).
         #[arg(long, value_name = "N")]
         replay: Option<u64>,
     },
     /// Read historical transcript records from a pane.
     Transcript {
-        /// Tmux pane ID (e.g. %42).
         pane_id: String,
-        /// Byte-offset cursor; return records strictly before this offset.
         #[arg(long)]
         before: Option<u64>,
-        /// Maximum number of records to return.
         #[arg(long, default_value = "50")]
         limit: u64,
     },
     /// Add a tag to a pane.
     Tag {
-        /// Tmux pane ID (e.g. %42).
         pane_id: String,
-        /// Tag name (ASCII letters, digits, _, -).
         tag: String,
     },
     /// Remove a tag from a pane.
     Untag {
-        /// Tmux pane ID (e.g. %42).
         pane_id: String,
-        /// Tag name to remove.
         tag: String,
     },
     /// List all tags on a pane.
     Tags {
-        /// Tmux pane ID (e.g. %42). Defaults to $TMUX_PANE if omitted.
         pane_id: Option<String>,
     },
 }
 
 #[derive(Clone, clap::ValueEnum)]
 enum SelectMode {
-    /// Require exactly one matching pane; error otherwise.
     One,
-    /// Pick one at random from matches; error if none.
     Any,
-    /// Send to all matching panes; error if none.
     All,
 }
 
@@ -140,6 +120,103 @@ impl From<&SelectMode> for libslopctl::SelectMode {
             SelectMode::Any => libslopctl::SelectMode::Any,
             SelectMode::All => libslopctl::SelectMode::All,
         }
+    }
+}
+
+fn config_path() -> PathBuf {
+    libslop::config_dir().join("iroh-slopctl/config.toml")
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Config {
+    secret_key: Option<String>,
+    default: Option<String>,
+    #[serde(default)]
+    endpoints: HashMap<String, EndpointConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EndpointConfig {
+    endpoint_id: String,
+}
+
+impl Config {
+    fn load() -> Self {
+        let path = config_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
+                eprintln!("warning: failed to parse {}: {}", path.display(), e);
+                Config::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(e) => {
+                eprintln!("warning: failed to read {}: {}", path.display(), e);
+                Config::default()
+            }
+        }
+    }
+
+    fn save(&self) {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("failed to create config dir: {}", e);
+                std::process::exit(1);
+            });
+        }
+        let contents = toml::to_string_pretty(self).unwrap();
+        std::fs::write(&path, contents).unwrap_or_else(|e| {
+            eprintln!("failed to write config: {}", e);
+            std::process::exit(1);
+        });
+    }
+
+    fn secret_key(&mut self) -> SecretKey {
+        if let Some(ref key_str) = self.secret_key {
+            let bytes = data_encoding::BASE32_NOPAD.decode(key_str.as_bytes()).unwrap_or_else(|e| {
+                eprintln!("invalid secret_key in config (bad base32): {}", e);
+                std::process::exit(1);
+            });
+            let bytes: [u8; 32] = bytes.try_into().unwrap_or_else(|_| {
+                eprintln!("invalid secret_key in config: expected 32 bytes");
+                std::process::exit(1);
+            });
+            SecretKey::from(bytes)
+        } else {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).expect("failed to generate random key");
+            let key = SecretKey::from(bytes);
+            self.secret_key = Some(data_encoding::BASE32_NOPAD.encode(&key.to_bytes()));
+            self.save();
+            key
+        }
+    }
+
+    fn resolve_endpoint(&self, override_endpoint: Option<&str>) -> iroh::EndpointAddr {
+        let endpoint_str = if let Some(name_or_id) = override_endpoint {
+            if let Some(ep) = self.endpoints.get(name_or_id) {
+                ep.endpoint_id.clone()
+            } else {
+                name_or_id.to_string()
+            }
+        } else if let Some(ref default_name) = self.default {
+            if let Some(ep) = self.endpoints.get(default_name) {
+                ep.endpoint_id.clone()
+            } else {
+                eprintln!("default endpoint {:?} not found in config", default_name);
+                std::process::exit(1);
+            }
+        } else {
+            eprintln!("no endpoint specified and no default configured");
+            eprintln!("use --endpoint <name-or-id> or set 'default' in config");
+            std::process::exit(1);
+        };
+
+        let id = endpoint_str.parse::<PublicKey>().unwrap_or_else(|e| {
+            eprintln!("invalid endpoint_id {:?}: {}", endpoint_str, e);
+            std::process::exit(1);
+        });
+        iroh::EndpointAddr::from(id)
     }
 }
 
@@ -166,7 +243,15 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    // Validate filter arguments eagerly before touching the socket.
+    let mut config = Config::load();
+
+    if let Command::Info = cli.command {
+        let secret_key = config.secret_key();
+        println!("{}", secret_key.public());
+        return;
+    }
+
+    // Validate filters eagerly.
     if let Command::Ps { ref filters, .. } = cli.command {
         libslopctl::parse_filters(filters.clone()).unwrap_or_else(|e| die_err(e));
     }
@@ -180,58 +265,47 @@ async fn main() {
         }
     }
     if let Command::Tags { pane_id: None } = cli.command {
-        if std::env::var("TMUX_PANE").is_err() {
-            eprintln!("error: <PANE_ID> is required when $TMUX_PANE is not set");
-            std::process::exit(2);
-        }
+        eprintln!("error: <PANE_ID> is required for iroh-slopctl (no $TMUX_PANE available)");
+        std::process::exit(2);
     }
 
-    let _config = libslop::SlopctlConfig::load();
+    let secret_key = config.secret_key();
 
-    let socket_path = libslop::socket_path();
-    debug!("connecting to {}", socket_path.display());
-
-    // Hook must never exit 2 — that would block the Claude action.
-    // Exit 1 on errors (so failures are visible), but never 2.
-    if let Command::Hook { event } = cli.command {
-        let mut stdin = String::new();
-        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin) {
-            eprintln!("slopctl hook: failed to read stdin: {}", e);
+    let addr = if let Some(ref addr_file) = cli.addr_file {
+        let contents = std::fs::read_to_string(addr_file).unwrap_or_else(|e| {
+            eprintln!("failed to read addr file {}: {}", addr_file.display(), e);
             std::process::exit(1);
-        }
-        let payload: serde_json::Value = match serde_json::from_str(&stdin) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("slopctl hook: failed to parse payload: {}", e);
-                std::process::exit(1);
-            }
-        };
-        let pane_id = std::env::var("TMUX_PANE").ok();
-        let stream = match UnixStream::connect(&socket_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("slopctl hook: failed to connect to {}: {}", socket_path.display(), e);
-                std::process::exit(1);
-            }
-        };
-        let (reader, writer) = stream.into_split();
-        let mut client = libslopctl::Client::new(reader, writer);
-        match client.hook(event, payload, pane_id).await {
-            Ok(()) => std::process::exit(0),
-            Err(e) => {
-                eprintln!("slopctl hook: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
+        });
+        serde_json::from_str::<iroh::EndpointAddr>(&contents).unwrap_or_else(|e| {
+            eprintln!("failed to parse addr file: {}", e);
+            std::process::exit(1);
+        })
+    } else {
+        config.resolve_endpoint(cli.endpoint.as_deref())
+    };
 
-    let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
-        eprintln!("Failed to connect to {}: {}", socket_path.display(), e);
+    debug!("connecting to endpoint {:?}", addr);
+
+    let endpoint = Endpoint::builder()
+        .secret_key(secret_key)
+        .bind()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to bind iroh endpoint: {}", e);
+            std::process::exit(1);
+        });
+
+    let connection = endpoint.connect(addr, ALPN).await.unwrap_or_else(|e| {
+        eprintln!("failed to connect to remote endpoint: {}", e);
         std::process::exit(1);
     });
 
-    let (reader, writer) = stream.into_split();
-    let mut client = libslopctl::Client::new(reader, writer);
+    let (send, recv) = connection.open_bi().await.unwrap_or_else(|e| {
+        eprintln!("failed to open stream: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut client = libslopctl::Client::new(recv, send);
 
     if let Command::Listen { hooks, events, transcripts, pane_id, session_id, replay } = cli.command {
         let mut subscription = if let Some(last_n) = replay {
@@ -302,6 +376,8 @@ async fn main() {
                 }
             }
         }
+
+        endpoint.close().await;
         return;
     }
 
@@ -320,6 +396,8 @@ async fn main() {
                 for pane_id in pane_ids {
                     println!("{}", pane_id);
                 }
+
+                endpoint.close().await;
                 return;
             }
         }
@@ -341,9 +419,8 @@ async fn main() {
             }
         }
         Command::Run { extra_args, start_directory } => {
-            let pane_id = client.run(
-                std::env::var("TMUX_PANE").ok(), extra_args, start_directory,
-            ).await.unwrap_or_else(|e| die_err(e));
+            let pane_id = client.run(None, extra_args, start_directory)
+                .await.unwrap_or_else(|e| die_err(e));
             println!("{}", pane_id);
         }
         Command::Kill { pane_id } => {
@@ -368,7 +445,7 @@ async fn main() {
             println!("{} {}", pane_id, tag);
         }
         Command::Tags { pane_id } => {
-            let pane_id = pane_id.or_else(|| std::env::var("TMUX_PANE").ok()).unwrap();
+            let pane_id = pane_id.unwrap();
             let tags = client.tags(pane_id).await.unwrap_or_else(|e| die_err(e));
             for tag in tags {
                 println!("{}", tag);
@@ -380,8 +457,10 @@ async fn main() {
             let out = serde_json::json!({ "records": records });
             println!("{}", out);
         }
-        Command::Hook { .. } | Command::Listen { .. } => unreachable!(),
+        Command::Info | Command::Listen { .. } => unreachable!(),
     }
+
+    endpoint.close().await;
 }
 
 fn print_ps(panes: Vec<libslop::PaneInfo>) {

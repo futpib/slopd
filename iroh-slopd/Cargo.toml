@@ -1,21 +1,26 @@
 [package]
-name = "slopctl"
+name = "iroh-slopd"
 version = "0.1.0"
 edition = "2024"
-description = "CLI client for slopd — all user-facing subcommands"
+description = "iroh-based tunnel proxy for slopd — exposes slopd over iroh with EndpointId allowlist auth"
 
 [dependencies]
 libslop = { path = "../libslop" }
-libslopctl = { path = "../libslopctl" }
+iroh = "0.96"
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.0", features = ["derive"] }
-timeago = { version = "0.6.0", default-features = false }
+dirs = "6.0.0"
+getrandom = "0.3"
+data-encoding = "2"
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }
+serde_json = "1"
 
 [lints]
 workspace = true

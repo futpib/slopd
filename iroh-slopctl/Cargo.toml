@@ -1,21 +1,24 @@
 [package]
-name = "slopctl"
+name = "iroh-slopctl"
 version = "0.1.0"
 edition = "2024"
-description = "CLI client for slopd — all user-facing subcommands"
+description = "iroh-based remote CLI client for slopd — connects via iroh instead of Unix socket"
 
 [dependencies]
 libslop = { path = "../libslop" }
 libslopctl = { path = "../libslopctl" }
+iroh = "0.96"
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.0", features = ["derive"] }
+dirs = "6.0.0"
+getrandom = "0.3"
+data-encoding = "2"
 timeago = { version = "0.6.0", default-features = false }
-
-[dev-dependencies]
-libsloptest = { path = "../libsloptest" }
 
 [lints]
 workspace = true
