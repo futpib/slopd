@@ -14,7 +14,7 @@ pub fn cargo_bin(name: &str) -> PathBuf {
 }
 
 pub fn build_bin(name: &str) {
-    if cfg!(coverage) {
+    if cfg!(coverage) && cargo_bin(name).exists() {
         return;
     }
     use std::collections::HashSet;
