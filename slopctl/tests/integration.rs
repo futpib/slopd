@@ -251,7 +251,7 @@ fn status_with_slopd_running() {
 
     assert!(output.status.success(), "slopctl exited with failure: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Status"), "unexpected output: {}", stdout);
+    assert!(stdout.contains("uptime:"), "unexpected output: {}", stdout);
 }
 
 #[test]
