@@ -1709,7 +1709,6 @@ dependencies = [
  "libslopctl",
  "serde",
  "serde_json",
- "timeago",
  "tokio",
  "toml",
  "tracing",
@@ -1811,8 +1810,10 @@ dependencies = [
 name = "libslopctl"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "libslop",
  "serde_json",
+ "timeago",
  "tokio",
  "tracing",
 ]
@@ -3098,7 +3099,6 @@ dependencies = [
  "libslopctl",
  "libsloptest",
  "serde_json",
- "timeago",
  "tokio",
  "tracing",
  "tracing-subscriber",

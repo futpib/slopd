@@ -12,7 +12,6 @@ serde_json = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.0", features = ["derive"] }
-timeago = { version = "0.6.0", default-features = false }
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }

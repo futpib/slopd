@@ -6,9 +6,11 @@ description = "Transport-agnostic client library for slopd — JSON-RPC protocol
 
 [dependencies]
 libslop = { path = "../libslop" }
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "signal"] }
 serde_json = "1"
 tracing = "0.1.44"
+clap = { version = "4.6.0", features = ["derive"] }
+timeago = { version = "0.6.0", default-features = false }
 
 [lints]
 workspace = true
