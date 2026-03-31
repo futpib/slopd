@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use iroh::{Endpoint, PublicKey, SecretKey};
+use iroh::{Endpoint, PublicKey, SecretKey, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -286,7 +286,7 @@ async fn main() {
 
     debug!("connecting to endpoint {:?}", addr);
 
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .bind()
         .await

@@ -6,16 +6,16 @@ description = "iroh-based tunnel proxy for slopd — exposes slopd over iroh wit
 
 [dependencies]
 libslop = { path = "../libslop" }
-iroh = "0.96"
+iroh = "0.97"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1.0.7"
+toml = "1.1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 clap = { version = "4.6.0", features = ["derive"] }
 dirs = "6.0.0"
-getrandom = "0.3"
+getrandom = "0.4"
 data-encoding = "2"
 
 [dev-dependencies]

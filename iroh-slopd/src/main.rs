@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use iroh::{Endpoint, PublicKey, SecretKey};
+use iroh::{Endpoint, PublicKey, SecretKey, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -201,7 +201,7 @@ async fn main() {
 
     let config = Arc::new(config);
 
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .bind()
