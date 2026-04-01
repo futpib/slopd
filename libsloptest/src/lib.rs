@@ -45,6 +45,13 @@ pub fn kill_slopd(child: Child) {
     kill_child(child);
 }
 
+/// Send SIGINT and wait. Like `kill_child` but uses SIGINT instead of SIGTERM.
+pub fn sigint_child(mut child: Child) {
+    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    child.wait().unwrap();
+}
+
 pub struct TmuxServer {
     #[allow(dead_code)]
     tmpdir: tempfile::TempDir,

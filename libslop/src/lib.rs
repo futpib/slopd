@@ -573,6 +573,61 @@ mod tests {
         let result = expand_path(std::path::Path::new("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
         assert_eq!(result, std::path::PathBuf::from("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
     }
+
+    #[test]
+    fn resolve_slopctl_absolute_path_returned_as_is() {
+        assert_eq!(resolve_slopctl("/usr/local/bin/slopctl"), "/usr/local/bin/slopctl");
+    }
+
+    #[test]
+    fn resolve_slopctl_nonexistent_bare_name_falls_back_to_original() {
+        // A binary that is definitely not on PATH and not a sibling of the test binary.
+        let result = resolve_slopctl("__slopctl_nonexistent_test_binary__");
+        assert_eq!(result, "__slopctl_nonexistent_test_binary__");
+    }
+
+    #[test]
+    fn resolve_slopctl_finds_sibling_binary() {
+        // Create a temporary "slopctl" next to the current test executable so
+        // resolve_slopctl can discover it as a sibling.
+        let exe = std::env::current_exe().unwrap();
+        let sibling = exe.with_file_name("__test_slopctl_sibling__");
+        std::fs::write(&sibling, "").unwrap();
+        let result = resolve_slopctl("__test_slopctl_sibling__");
+        std::fs::remove_file(&sibling).unwrap();
+        assert_eq!(result, sibling.to_string_lossy());
+    }
+
+    #[test]
+    fn resolve_slopctl_prefers_path_over_sibling() {
+        // "sh" is on PATH — resolve_slopctl should return the bare name, not a sibling.
+        assert_eq!(resolve_slopctl("sh"), "sh");
+    }
+
+    #[test]
+    fn remove_hooks_removes_both_bare_and_absolute_slopctl() {
+        let mut settings = serde_json::json!({});
+        // Inject with bare name.
+        inject_hooks(&mut settings, "slopctl");
+        // Also inject with an absolute path (simulates a second slopd with different config).
+        inject_hooks(&mut settings, "/opt/bin/slopctl");
+
+        remove_hooks(&mut settings);
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            let slopctl_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl"))
+                    })
+                })
+            }).count();
+            assert_eq!(slopctl_count, 0, "event {} still has {} slopctl entries after removal", event, slopctl_count);
+        }
+    }
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
@@ -688,6 +743,29 @@ pub struct SlopdRunConfig {
 
 fn default_slopctl() -> String {
     "slopctl".to_string()
+}
+
+/// Resolve the configured slopctl path to an absolute path if the bare name
+/// is not found on PATH. Falls back to a sibling of the current executable
+/// (e.g. when running via `cargo run`).
+pub fn resolve_slopctl(configured: &str) -> String {
+    // If it's already an absolute path, keep it.
+    if configured.starts_with('/') {
+        return configured.to_string();
+    }
+    // If found on PATH, use the bare name.
+    if which::which(configured).is_ok() {
+        return configured.to_string();
+    }
+    // Try sibling of the current executable.
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name(configured);
+        if sibling.exists() {
+            return sibling.to_string_lossy().into_owned();
+        }
+    }
+    // Give up — return the original and let it fail at hook time.
+    configured.to_string()
 }
 
 impl Default for SlopdRunConfig {

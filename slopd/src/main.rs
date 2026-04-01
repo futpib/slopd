@@ -706,6 +706,8 @@ async fn main() {
         };
     }
 
+    config.run.slopctl = libslop::resolve_slopctl(&config.run.slopctl);
+
     if let Some(CliCommand::UninjectHooks) = cli.command {
         let settings_path = config.claude_settings_path();
         if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
@@ -816,6 +818,9 @@ async fn main() {
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    ).expect("failed to install SIGINT handler");
 
     // Background task: periodically reconcile managed_panes against live tmux
     // panes to detect panes that exited without going through slopctl kill.
@@ -842,6 +847,10 @@ async fn main() {
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down");
                 break;
             }
         }
