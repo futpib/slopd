@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,6 +15,14 @@ struct Cli {
     /// Specify the program and optional arguments, e.g. --executable claude --foo --bar
     #[arg(long, num_args = 1.., allow_hyphen_values = true)]
     executable: Option<Vec<String>>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Remove slopctl hook entries from Claude's settings.json.
+    UninjectHooks,
 }
 
 fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
@@ -697,6 +705,17 @@ async fn main() {
             libslop::Executable::Array(executable)
         };
     }
+
+    if let Some(CliCommand::UninjectHooks) = cli.command {
+        let settings_path = config.claude_settings_path();
+        if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
+            error!("failed to remove hooks from {}: {}", settings_path.display(), e);
+            std::process::exit(1);
+        }
+        info!("removed slopctl hooks from {}", settings_path.display());
+        return;
+    }
+
     let config = Arc::new(config);
 
     if config.tmux.should_start_server() {
@@ -817,6 +836,13 @@ async fn main() {
                 break;
             }
         }
+    }
+
+    let settings_path = config.claude_settings_path();
+    if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
+        warn!("failed to remove hooks from {} on shutdown: {}", settings_path.display(), e);
+    } else {
+        info!("removed slopctl hooks from {}", settings_path.display());
     }
 }
 

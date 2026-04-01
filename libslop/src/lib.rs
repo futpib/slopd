@@ -189,6 +189,70 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
     }
 }
 
+/// Remove all slopctl hook entries from a Claude settings.json value.
+/// Entries from other tools are preserved.
+pub fn remove_hooks(settings: &mut serde_json::Value) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return;
+    };
+
+    for &event in HOOK_EVENTS {
+        let Some(entries) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) else {
+            continue;
+        };
+        let suffix = format!(" hook {}", event);
+        entries.retain(|entry| {
+            let is_ours = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+                hooks_arr.iter().any(|h| {
+                    if h.get("type").and_then(|t| t.as_str()) != Some("command") {
+                        return false;
+                    }
+                    let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    if !cmd.ends_with(&suffix) {
+                        return false;
+                    }
+                    let prefix = &cmd[..cmd.len() - suffix.len()];
+                    prefix == "slopctl" || prefix.ends_with("/slopctl")
+                })
+            });
+            !is_ours
+        });
+    }
+}
+
+/// Read, remove slopctl hooks, and write a Claude settings.json file.
+pub fn remove_hooks_from_file(
+    settings_path: &PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // If the settings file doesn't exist, there's nothing to remove.
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let lock_path = settings_path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write()?;
+
+    let mut settings: serde_json::Value = match std::fs::read_to_string(settings_path) {
+        Ok(contents) => serde_json::from_str(&contents)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    remove_hooks(&mut settings);
+
+    let mut file = atomic_write_file::AtomicWriteFile::options().open(settings_path)?;
+    use std::io::Write;
+    write!(file, "{}", serde_json::to_string_pretty(&settings)?)?;
+    file.commit()?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +394,143 @@ mod tests {
             }).count();
             assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
         }
+    }
+
+    #[test]
+    fn remove_hooks_removes_all_slopctl_entries() {
+        let mut settings = serde_json::json!({});
+        inject_hooks(&mut settings, "slopctl");
+
+        // Verify hooks were injected.
+        for &event in HOOK_EVENTS {
+            assert!(settings["hooks"][event].as_array().unwrap().len() > 0);
+        }
+
+        remove_hooks(&mut settings);
+
+        // All slopctl entries must be gone.
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            let slopctl_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["type"] == "command"
+                            && h["command"].as_str()
+                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                    })
+                })
+            }).count();
+            assert_eq!(slopctl_count, 0, "event {} still has {} slopctl entries", event, slopctl_count);
+        }
+    }
+
+    #[test]
+    fn remove_hooks_preserves_other_tool_entries() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "foobar hook Stop"}]
+                    }
+                ]
+            }
+        });
+
+        inject_hooks(&mut settings, "slopctl");
+        remove_hooks(&mut settings);
+
+        let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
+        let foobar_count = stop_entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+            })
+        }).count();
+        assert_eq!(foobar_count, 1, "foobar hook Stop entry was incorrectly removed");
+    }
+
+    #[test]
+    fn remove_hooks_handles_absolute_path_slopctl() {
+        let mut settings = serde_json::json!({});
+        inject_hooks(&mut settings, "/usr/local/bin/slopctl");
+
+        remove_hooks(&mut settings);
+
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            let slopctl_count = entries.iter().filter(|entry| {
+                entry["hooks"].as_array().map_or(false, |hooks| {
+                    hooks.iter().any(|h| {
+                        h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl"))
+                    })
+                })
+            }).count();
+            assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after removal", event);
+        }
+    }
+
+    #[test]
+    fn remove_hooks_preserves_non_hook_settings() {
+        let mut settings = serde_json::json!({
+            "permissions": {"allow": ["Read"]},
+            "hooks": {}
+        });
+
+        inject_hooks(&mut settings, "slopctl");
+        remove_hooks(&mut settings);
+
+        assert_eq!(settings["permissions"]["allow"][0], "Read");
+    }
+
+    #[test]
+    fn remove_hooks_from_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        inject_hooks_into_file(&path, "slopctl").unwrap();
+
+        // Verify hooks exist.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert!(settings["hooks"]["SessionStart"].as_array().unwrap().len() > 0);
+
+        remove_hooks_from_file(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        for &event in HOOK_EVENTS {
+            let entries = settings["hooks"][event].as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{}", event));
+            assert_eq!(entries.len(), 0, "event {} still has entries after removal", event);
+        }
+    }
+
+    #[test]
+    fn remove_hooks_from_file_noop_when_no_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"permissions": {"allow": ["Read"]}}"#).unwrap();
+
+        remove_hooks_from_file(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(settings["permissions"]["allow"][0], "Read");
+    }
+
+    #[test]
+    fn remove_hooks_cleans_up_empty_hook_events() {
+        let mut settings = serde_json::json!({});
+        inject_hooks(&mut settings, "slopctl");
+        remove_hooks(&mut settings);
+
+        // After removing all slopctl hooks, each event array should be empty
+        // but the hooks object should still exist.
+        assert!(settings["hooks"].is_object());
     }
 
     #[test]

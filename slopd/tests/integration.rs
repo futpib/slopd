@@ -377,11 +377,9 @@ fn run_injects_hooks_into_claude_settings() {
     let slopd = env.spawn_slopd();
 
     let output = env.slopctl(&["run"]);
-
-    kill_slopd(slopd);
-
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
+    // Check hooks while slopd is still running (it removes them on exit).
     let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
         .expect("settings.json was not created");
     let settings: serde_json::Value =
@@ -403,6 +401,8 @@ fn run_injects_hooks_into_claude_settings() {
         });
         assert!(has_our_hook, "missing slopctl hook for event {}", event);
     }
+
+    kill_slopd(slopd);
 }
 
 #[test]
@@ -423,17 +423,19 @@ fn run_hook_injection_is_idempotent() {
         return;
     };
 
-    for _ in 0..2 {
-        let slopd = env.spawn_slopd();
+    // First cycle: inject, kill (auto-removes on exit).
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    kill_slopd(slopd);
+    std::thread::sleep(Duration::from_millis(50));
 
-        let output = env.slopctl(&["run"]);
+    // Second cycle: inject again on top of removed state.
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
-        kill_slopd(slopd);
-
-        assert!(output.status.success(), "slopctl run failed: {:?}", output);
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
+    // Check while slopd is still running (it removes hooks on exit).
     let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
         .expect("settings.json was not created");
     let settings: serde_json::Value =
@@ -455,6 +457,8 @@ fn run_hook_injection_is_idempotent() {
         }).count();
         assert_eq!(our_hook_count, 1, "expected exactly one slopctl hook for event {}, got {}", event, our_hook_count);
     }
+
+    kill_slopd(slopd);
 }
 
 #[test]
@@ -4876,4 +4880,208 @@ fn executable_cli_flag_with_args() {
     assert_eq!(detailed_state, libslop::PaneDetailedState::BootingUp);
 
     kill_slopd(slopd);
+}
+
+#[test]
+fn uninject_hooks_removes_slopctl_entries() {
+    build_bin("slopd");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_config_dir).unwrap();
+
+    // Inject hooks directly (not via slopd, to avoid auto-cleanup on exit).
+    let settings_path = claude_config_dir.join("settings.json");
+    libslop::inject_hooks_into_file(&settings_path, "slopctl").unwrap();
+
+    // Verify hooks were injected.
+    let settings_contents = std::fs::read_to_string(&settings_path)
+        .expect("settings.json was not created");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        assert!(!entries.is_empty(), "hooks.{} should have entries after injection", event);
+    }
+
+    // Write a minimal slopd config pointing to our claude_config_dir.
+    let config_dir = tempfile::tempdir().unwrap();
+    let slopd_config_dir = config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(
+        slopd_config_dir.join("config.toml"),
+        format!("claude_config_dir = {:?}\n", claude_config_dir.to_str().unwrap()),
+    ).unwrap();
+
+    // Run slopd uninject-hooks to remove them.
+    let uninject_output = Command::new(cargo_bin("slopd"))
+        .args(["uninject-hooks"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("HOME", config_dir.path())
+        .output()
+        .expect("failed to run slopd uninject-hooks");
+    assert!(uninject_output.status.success(), "slopd uninject-hooks failed: {:?}", uninject_output);
+
+    // Verify hooks were removed.
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
+        .expect("settings.json missing after uninject");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let slopctl_count = entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                })
+            })
+        }).count();
+        assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after uninject", event);
+    }
+}
+
+#[test]
+fn uninject_hooks_preserves_other_hook_entries() {
+    build_bin("slopd");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    std::fs::create_dir_all(&claude_config_dir).unwrap();
+
+    // Write settings.json with a foreign hook entry, then inject slopctl hooks.
+    let settings_path = claude_config_dir.join("settings.json");
+    let initial_settings = serde_json::json!({
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "my-tool notify stop"}]
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&initial_settings).unwrap(),
+    ).unwrap();
+    libslop::inject_hooks_into_file(&settings_path, "slopctl").unwrap();
+
+    // Write a minimal slopd config pointing to our claude_config_dir.
+    let config_dir = tempfile::tempdir().unwrap();
+    let slopd_config_dir = config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(
+        slopd_config_dir.join("config.toml"),
+        format!("claude_config_dir = {:?}\n", claude_config_dir.to_str().unwrap()),
+    ).unwrap();
+
+    // Run slopd uninject-hooks.
+    let uninject_output = Command::new(cargo_bin("slopd"))
+        .args(["uninject-hooks"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("HOME", config_dir.path())
+        .output()
+        .expect("failed to run slopd uninject-hooks");
+    assert!(uninject_output.status.success(), "slopd uninject-hooks failed: {:?}", uninject_output);
+
+    // The foreign hook entry must still be present.
+    let settings_contents = std::fs::read_to_string(&settings_path)
+        .expect("settings.json missing after uninject");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
+    let foreign_count = stop_entries.iter().filter(|entry| {
+        entry["hooks"].as_array().map_or(false, |hooks| {
+            hooks.iter().any(|h| h["command"].as_str() == Some("my-tool notify stop"))
+        })
+    }).count();
+    assert_eq!(foreign_count, 1, "foreign hook entry was incorrectly removed");
+}
+
+#[test]
+fn uninject_hooks_without_settings_file_succeeds() {
+    build_bin("slopd");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+
+    let config_dir = tempfile::tempdir().unwrap();
+    // Write a minimal slopd config pointing claude_config_dir to a nonexistent path.
+    let slopd_config_dir = config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(
+        slopd_config_dir.join("config.toml"),
+        format!("claude_config_dir = {:?}\n", claude_config_dir.to_str().unwrap()),
+    ).unwrap();
+
+    // Should succeed even when there's no settings.json to modify.
+    let output = Command::new(cargo_bin("slopd"))
+        .args(["uninject-hooks"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("HOME", config_dir.path())
+        .output()
+        .expect("failed to run slopd uninject-hooks");
+    assert!(output.status.success(), "slopd uninject-hooks should succeed even without settings.json: {:?}", output);
+}
+
+#[test]
+fn slopd_removes_hooks_on_normal_exit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&["sleep", "infinity"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Start slopd and run a pane to inject hooks.
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+
+    // Verify hooks were injected while slopd is running.
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
+        .expect("settings.json was not created");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        assert!(!entries.is_empty(), "hooks.{} should have entries while slopd is running", event);
+    }
+
+    // Stop slopd (SIGTERM — normal exit).
+    kill_slopd(slopd);
+
+    // After exit, hooks should be removed from settings.json.
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
+        .expect("settings.json missing after slopd exit");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let slopctl_count = entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                })
+            })
+        }).count();
+        assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after slopd exit", event);
+    }
 }
