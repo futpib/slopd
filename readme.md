@@ -399,7 +399,7 @@ Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and
 
 ## Remote access (iroh)
 
-`iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine without exposing the Unix socket over a network.
+`iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance by exposing the Unix socket over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine via an encrypted P2P connection with EndpointId allowlist authentication.
 
 ```
  [remote machine]               [local machine]
