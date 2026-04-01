@@ -19,6 +19,13 @@ enum Command {
         /// Hook event name (e.g. UserPromptSubmit).
         event: String,
     },
+    /// Forward a tmux hook event to slopd (called by tmux hooks).
+    TmuxHook {
+        /// Tmux hook event name (e.g. pane-exited).
+        event: String,
+        /// Pane ID from the hook (#{hook_pane}), if available.
+        pane_id: Option<String>,
+    },
     #[command(flatten)]
     Common(libslopctl::CommonCommand),
 }
@@ -82,6 +89,26 @@ async fn main() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("slopctl hook: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // tmux-hook is fire-and-forget like hook; exit 1 on errors, never 2.
+    if let Command::TmuxHook { event, pane_id } = cli.command {
+        let stream = match UnixStream::connect(&socket_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("slopctl tmux-hook: failed to connect to {}: {}", socket_path.display(), e);
+                std::process::exit(1);
+            }
+        };
+        let (reader, writer) = stream.into_split();
+        let mut client = libslopctl::Client::new(reader, writer);
+        match client.tmux_hook(event, pane_id).await {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("slopctl tmux-hook: {}", e);
                 std::process::exit(1);
             }
         }

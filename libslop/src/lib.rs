@@ -585,6 +585,8 @@ pub enum RequestBody {
     Run { parent_pane_id: Option<String>, extra_args: Vec<String>, start_directory: Option<PathBuf> },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
+    /// Notification from a tmux hook (called by slopctl tmux-hook).
+    TmuxHook { event: String, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },
     /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
     Interrupt { pane_id: String },
@@ -618,6 +620,7 @@ pub enum ResponseBody {
     Sent { pane_id: String },
     Interrupted { pane_id: String },
     Hooked,
+    TmuxHooked,
     /// Sent once to confirm a Subscribe or SubscribeTranscript request was accepted.
     Subscribed,
     /// Streamed to subscribers (both Subscribe and SubscribeTranscript).

@@ -4283,3 +4283,309 @@ fn ready_pane_recovers_state_after_slopd_restart() {
 
     kill_slopd(slopd2);
 }
+
+/// PaneCreated event fires when a pane is spawned via slopctl run.
+#[test]
+fn listen_event_pane_created_fires_on_run() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = spawn_event_listener(&env, "PaneCreated");
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneCreated" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
+
+    kill_slopd(slopd);
+}
+
+/// PaneDestroyed event fires when a pane is killed via slopctl kill.
+#[test]
+fn listen_event_pane_destroyed_fires_on_kill() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    let kill_output = env.slopctl(&["kill", &pane_id]);
+    assert!(kill_output.status.success(), "slopctl kill failed: {:?}", kill_output);
+
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
+
+    kill_slopd(slopd);
+}
+
+/// User-defined tmux hooks on the slopd session survive a slopd restart.
+#[test]
+fn user_tmux_hooks_survive_slopd_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Add a user-defined hook on the slopd session (session-scope hook).
+    // tmux normalizes single quotes to double quotes in show-hooks output.
+    let user_hook_cmd = "display-message 'user hook fired'";
+    let user_hook_normalized = "display-message \"user hook fired\"";
+    let status = env.tmux.tmux()
+        .args(["set-hook", "-a", "-t", "slopd", "after-kill-pane", user_hook_cmd])
+        .status()
+        .expect("failed to set user tmux hook");
+    assert!(status.success(), "failed to set user tmux hook");
+
+    // Record all hooks before restart.
+    let before = env.tmux.tmux()
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .expect("failed to show hooks");
+    let before_hooks = String::from_utf8_lossy(&before.stdout).to_string();
+    assert!(
+        before_hooks.contains(user_hook_normalized),
+        "user hook not found before restart: {}",
+        before_hooks,
+    );
+
+    // Restart slopd — it should re-register its hooks without removing the user's.
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    let after = env.tmux.tmux()
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .expect("failed to show hooks after restart");
+    let after_hooks = String::from_utf8_lossy(&after.stdout).to_string();
+
+    assert!(
+        after_hooks.contains(user_hook_normalized),
+        "user hook was removed by slopd restart: {}",
+        after_hooks,
+    );
+
+    // Also verify slopd's own hooks are still present.
+    assert!(
+        after_hooks.contains("slopctl tmux-hook after-kill-pane"),
+        "slopd's after-kill-pane hook missing after restart: {}",
+        after_hooks,
+    );
+
+    kill_slopd(slopd2);
+}
+
+/// slopd registers its tmux hooks idempotently — no duplicates after restart.
+#[test]
+fn slopd_tmux_hooks_not_duplicated_on_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+    kill_slopd(slopd2);
+    let slopd3 = env.spawn_slopd();
+
+    let output = env.tmux.tmux()
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .expect("failed to show hooks");
+    let hooks = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Count how many times our after-kill-pane hook appears — should be exactly 1.
+    let count = hooks.lines()
+        .filter(|l| l.contains("slopctl tmux-hook after-kill-pane"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "expected exactly 1 slopd after-kill-pane hook, found {}: {}",
+        count, hooks,
+    );
+
+    kill_slopd(slopd3);
+}
+
+/// slopctl kill succeeds even if the pane's process already exited (pane is dead
+/// in tmux but still tracked by slopd). This covers the race where the process
+/// exits between slopd's managed_panes check and the tmux kill-pane call.
+#[test]
+fn kill_succeeds_when_pane_already_dead() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    // Use "true" as the executable so the pane exits immediately.
+    let Some(env) = TestEnv::new(Some(&["true"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for the process to exit and the pane to disappear from tmux.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+            .output()
+            .expect("failed to list panes");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !stdout.lines().any(|l| l.trim() == pane_id) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timed out waiting for pane {} to exit", pane_id);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Kill should succeed even though the pane is already gone from tmux.
+    let kill_output = env.slopctl(&["kill", &pane_id]);
+    assert!(
+        kill_output.status.success(),
+        "slopctl kill should succeed for already-dead pane: {:?}",
+        kill_output,
+    );
+    let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
+    assert_eq!(kill_stdout.trim(), pane_id);
+
+    kill_slopd(slopd);
+}
+
+/// PaneDestroyed event fires when a pane's process exits (detected by the
+/// background reconciler, not by slopctl kill).
+#[test]
+fn pane_destroyed_fires_on_process_exit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    // Use "sleep 0.2" so the pane lives long enough to subscribe, then exits.
+    let Some(env) = TestEnv::new(Some(&["sleep", "0.2"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // The process will exit on its own; the reconciler should detect it and
+    // emit PaneDestroyed within a few seconds.
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
+
+    kill_slopd(slopd);
+}
+
+/// slopd removes stale tmux hook entries from a previous slopctl path when
+/// re-registering hooks with the current path.
+#[test]
+fn slopd_removes_stale_tmux_hook_entries() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Create the slopd session and plant a stale hook before starting slopd.
+    // We need the session to exist first.
+    let status = env.tmux.tmux()
+        .args(["new-session", "-d", "-s", "slopd"])
+        .status()
+        .expect("failed to create slopd session");
+    // Session may already exist from prior test env setup; ignore failure.
+    let _ = status;
+
+    let stale_hook = "run-shell \"XDG_RUNTIME_DIR=/old/runtime /old/path/slopctl tmux-hook after-kill-pane || true\"";
+    let status = env.tmux.tmux()
+        .args(["set-hook", "-a", "-t", "slopd", "after-kill-pane", stale_hook])
+        .status()
+        .expect("failed to set stale hook");
+    assert!(status.success(), "failed to plant stale hook");
+
+    // Verify stale hook is present.
+    let before = env.tmux.tmux()
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .expect("failed to show hooks");
+    let before_hooks = String::from_utf8_lossy(&before.stdout).to_string();
+    assert!(before_hooks.contains("/old/path/slopctl"), "stale hook not planted: {}", before_hooks);
+
+    // Start slopd — it should remove the stale entry and add its own.
+    let slopd = env.spawn_slopd();
+
+    let after = env.tmux.tmux()
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .expect("failed to show hooks after slopd start");
+    let after_hooks = String::from_utf8_lossy(&after.stdout).to_string();
+
+    // Stale entry must be gone.
+    assert!(
+        !after_hooks.contains("/old/path/slopctl"),
+        "stale hook entry was not removed: {}",
+        after_hooks,
+    );
+
+    // Current slopctl entry must be present.
+    assert!(
+        after_hooks.contains("slopctl tmux-hook after-kill-pane"),
+        "current slopctl hook missing after stale cleanup: {}",
+        after_hooks,
+    );
+
+    kill_slopd(slopd);
+}

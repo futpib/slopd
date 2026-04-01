@@ -382,6 +382,17 @@ impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R
         }
     }
 
+    pub async fn tmux_hook(
+        &mut self,
+        event: String,
+        pane_id: Option<String>,
+    ) -> Result<(), Error> {
+        match self.request(libslop::RequestBody::TmuxHook { event, pane_id }).await? {
+            libslop::ResponseBody::TmuxHooked => Ok(()),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
     pub async fn tag(&mut self, pane_id: String, tag: String) -> Result<(String, String), Error> {
         match self.request(libslop::RequestBody::Tag { pane_id, tag, remove: false }).await? {
             libslop::ResponseBody::Tagged { pane_id, tag } => Ok((pane_id, tag)),

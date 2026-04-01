@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 /// Commands that only make sense locally (requires $TMUX_PANE / Unix socket).
-const SLOPCTL_ONLY_COMMANDS: &[&str] = &["hook"];
+const SLOPCTL_ONLY_COMMANDS: &[&str] = &["hook", "tmux-hook"];
 
 /// Commands that only make sense for the remote iroh client.
 const IROH_ONLY_COMMANDS: &[&str] = &["info"];

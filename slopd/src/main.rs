@@ -525,6 +525,152 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool
     })
 }
 
+/// Tmux session-scope hooks that slopd subscribes to on the slopd session.
+/// Each entry is (hook_name, include_pane_id).
+/// Note: pane-exited and pane-died are pane/window-scoped in tmux and cannot
+/// be set at session level, so we rely on a background polling reconciler for
+/// detecting process exit.
+const TMUX_HOOKS: &[(&str, bool)] = &[
+    ("after-kill-pane", false),
+    ("window-linked", false),
+    ("window-unlinked", false),
+];
+
+/// Build the `run-shell` command string for a tmux hook.
+/// Includes XDG_RUNTIME_DIR so slopctl can find the slopd socket even when
+/// the hook fires in the tmux server's environment (not a pane).
+fn tmux_hook_command(slopctl: &str, hook_name: &str, include_pane_id: bool) -> String {
+    let runtime_dir = libslop::runtime_dir();
+    let runtime_str = runtime_dir.to_str().unwrap();
+    if include_pane_id {
+        format!("run-shell \"XDG_RUNTIME_DIR={} {} tmux-hook {} #{{hook_pane}} || true\"", runtime_str, slopctl, hook_name)
+    } else {
+        format!("run-shell \"XDG_RUNTIME_DIR={} {} tmux-hook {} || true\"", runtime_str, slopctl, hook_name)
+    }
+}
+
+/// Idempotently register slopd's tmux hooks on the slopd session.
+/// Appends our hook commands if not already present; removes stale entries
+/// from a previous slopctl path.
+async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
+    let slopctl = &config.run.slopctl;
+
+    // Read existing hooks.
+    let existing = match tmux(config)
+        .args(["show-hooks", "-t", "slopd"])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+        _ => String::new(),
+    };
+
+    for &(hook_name, include_pane_id) in TMUX_HOOKS {
+        let our_command = tmux_hook_command(slopctl, hook_name, include_pane_id);
+
+        // Check if our exact command is already present.
+        let already_present = existing.lines().any(|line| {
+            line.starts_with(&format!("{}[", hook_name)) && line.contains(&our_command)
+        });
+        if already_present {
+            continue;
+        }
+
+        // Remove stale entries: lines whose command contains "slopctl tmux-hook <hook>"
+        // (or an absolute path ending in /slopctl) but is not our current command.
+        let stale_marker = format!("slopctl tmux-hook {}", hook_name);
+        let mut stale_indices: Vec<i32> = Vec::new();
+        for line in existing.lines() {
+            let prefix_bracket = format!("{}[", hook_name);
+            if !line.starts_with(&prefix_bracket) {
+                continue;
+            }
+            // Check if this is a slopctl tmux-hook command (but not ours).
+            let is_slopctl_hook = line.contains(&stale_marker)
+                && !line.contains(&our_command);
+            if !is_slopctl_hook {
+                continue;
+            }
+            // Extract the array index from "hook-name[N] ...".
+            if let Some(idx_str) = line.strip_prefix(&prefix_bracket)
+                .and_then(|s| s.split(']').next())
+            {
+                if let Ok(idx) = idx_str.parse::<i32>() {
+                    stale_indices.push(idx);
+                }
+            }
+        }
+
+        // Remove stale entries in reverse order so indices stay valid.
+        stale_indices.sort_unstable();
+        for &idx in stale_indices.iter().rev() {
+            let indexed_name = format!("{}[{}]", hook_name, idx);
+            let _ = tmux(config)
+                .args(["set-hook", "-u", "-t", "slopd", &indexed_name])
+                .output()
+                .await;
+        }
+
+        // Append our hook.
+        if let Err(e) = tmux(config)
+            .args(["set-hook", "-a", "-t", "slopd", hook_name, &our_command])
+            .status()
+            .await
+        {
+            warn!("failed to set tmux hook {}: {}", hook_name, e);
+        }
+    }
+}
+
+/// Reconcile managed_panes against live tmux panes, emitting PaneDestroyed
+/// for any managed pane that no longer exists.
+async fn reconcile_panes(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    managed_panes: &ManagedPanes,
+    event_tx: &EventTx,
+) {
+    let output = tmux(config)
+        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+        .output()
+        .await;
+    let live_ids: std::collections::HashSet<String> = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+        _ => return,
+    };
+
+    let dead: Vec<String> = managed_panes.iter()
+        .map(|entry| entry.key().clone())
+        .filter(|id| !live_ids.contains(id))
+        .collect();
+
+    for pane_id in dead {
+        info!("pane {} no longer exists, emitting PaneDestroyed", pane_id);
+        reparent_children_of(config, managed_panes, &pane_id).await;
+        if let Some((_, state)) = panes.remove(&pane_id) {
+            state.transcript_cancel.lock().unwrap().cancel();
+        }
+        managed_panes.remove(&pane_id);
+        let _ = event_tx.send(libslop::Record {
+            source: "slopd".to_string(),
+            event_type: "PaneDestroyed".to_string(),
+            pane_id: Some(pane_id.clone()),
+            payload: serde_json::json!({
+                "pane_id": pane_id,
+            }),
+            cursor: None,
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -581,6 +727,8 @@ async fn main() {
         .await
         .expect("failed to set @slopd_managed option on tmux session");
 
+    register_tmux_hooks(&config).await;
+
     let socket_path = libslop::socket_path();
     let socket_dir = socket_path.parent().unwrap();
 
@@ -628,6 +776,22 @@ async fn main() {
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
+
+    // Background task: periodically reconcile managed_panes against live tmux
+    // panes to detect panes that exited without going through slopctl kill.
+    // This catches cases that tmux session-scope hooks cannot (e.g. process
+    // exit, which only fires pane-scope hooks).
+    let reconcile_config = config.clone();
+    let reconcile_panes_map = panes.clone();
+    let reconcile_managed = managed_panes.clone();
+    let reconcile_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            reconcile_panes(&reconcile_config, &reconcile_panes_map, &reconcile_managed, &reconcile_tx).await;
+        }
+    });
 
     loop {
         tokio::select! {
@@ -1055,20 +1219,38 @@ async fn handle_request(
                 .args(["kill-pane", "-t", &pane_id])
                 .output()
                 .await;
-            match output {
-                Ok(out) if out.status.success() => {
-                    if let Some((_, state)) = panes.remove(&pane_id) {
-                        state.transcript_cancel.lock().unwrap().cancel();
-                    }
-                    managed_panes.remove(&pane_id);
-                    libslop::ResponseBody::Kill { pane_id }
+            // Clean up internal state regardless of whether tmux kill-pane
+            // succeeded (the pane may already be dead from process exit).
+            match &output {
+                Err(e) => {
+                    return libslop::ResponseBody::Error { message: e.to_string() };
                 }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    libslop::ResponseBody::Error { message: stderr }
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warn!("tmux kill-pane failed for pane {} (already dead?): {}", pane_id, stderr.trim());
                 }
-                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                _ => {}
             }
+            if let Some((_, state)) = panes.remove(&pane_id) {
+                state.transcript_cancel.lock().unwrap().cancel();
+            }
+            managed_panes.remove(&pane_id);
+            let _ = event_tx.send(libslop::Record {
+                source: "slopd".to_string(),
+                event_type: "PaneDestroyed".to_string(),
+                pane_id: Some(pane_id.clone()),
+                payload: serde_json::json!({
+                    "pane_id": pane_id,
+                }),
+                cursor: None,
+            });
+            libslop::ResponseBody::Kill { pane_id }
+        }
+
+        libslop::RequestBody::TmuxHook { event, pane_id } => {
+            debug!("tmux-hook: {} pane={:?}", event, pane_id);
+            reconcile_panes(config, panes, managed_panes, event_tx).await;
+            libslop::ResponseBody::TmuxHooked
         }
 
         libslop::RequestBody::Hook { event, payload, pane_id } => {
@@ -1268,6 +1450,16 @@ async fn handle_request(
                             warn!("failed to set @slopd_ancestor_panes on pane {}: {}", pane_id, e);
                         }
                     }
+                    let _ = event_tx.send(libslop::Record {
+                        source: "slopd".to_string(),
+                        event_type: "PaneCreated".to_string(),
+                        pane_id: Some(pane_id.clone()),
+                        payload: serde_json::json!({
+                            "pane_id": pane_id,
+                            "parent_pane_id": parent_pane_id,
+                        }),
+                        cursor: None,
+                    });
                     libslop::ResponseBody::Run { pane_id }
                 }
                 Ok(out) => {
