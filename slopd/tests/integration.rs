@@ -178,6 +178,33 @@ fn slopd_creates_marked_tmux_session() {
 }
 
 #[test]
+fn slopd_reuses_existing_slopd_session_without_attaching() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Pre-create the slopd session so it already exists when slopd starts.
+    let status = env.tmux.tmux()
+        .args(["new-session", "-d", "-s", "slopd"])
+        .status()
+        .expect("failed to pre-create slopd session");
+    assert!(status.success(), "failed to pre-create slopd session");
+
+    // slopd must start successfully even though the session already exists.
+    // Before the fix, `new-session -A` would attach to the terminal, causing
+    // slopd to hang instead of running in the background.
+    let mut slopd = env.spawn_slopd();
+
+    let still_running = slopd.try_wait().unwrap().is_none();
+    kill_slopd(slopd);
+
+    assert!(still_running, "slopd should keep running when the slopd session already exists");
+}
+
+#[test]
 fn run_spawns_executable_in_new_tmux_window() {
     build_bin("slopd");
     build_bin("slopctl");

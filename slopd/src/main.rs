@@ -740,14 +740,23 @@ async fn main() {
         }
     }
 
-    // Create the slopd session if it doesn't exist (-A: attach if exists, -d: keep detached)
-    tmux(&config)
-        .args(["new-session", "-d", "-A", "-s", "slopd"])
+    // Create the slopd session if it doesn't exist
+    let has_session = tmux(&config)
+        .args(["has-session", "-t", "slopd"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .await
-        .expect("failed to create slopd tmux session");
+        .expect("failed to run tmux has-session");
+    if !has_session.success() {
+        tmux(&config)
+            .args(["new-session", "-d", "-s", "slopd"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .expect("failed to create slopd tmux session");
+    }
 
     // Mark the session with a user option so it can be identified
     tmux(&config)
