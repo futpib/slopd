@@ -20,6 +20,9 @@
 - [slopctl commands](#slopctl-commands)
 - [Claude hook integration](#claude-hook-integration)
 - [Event system](#event-system)
+- [Remote access (iroh)](#remote-access-iroh)
+  - [iroh-slopd](#iroh-slopd)
+  - [iroh-slopctl](#iroh-slopctl)
 - [Workspace layout](#workspace-layout)
 
 ---
@@ -63,6 +66,9 @@
 ```bash
 cargo install --path slopd
 cargo install --path slopctl
+# Optional: remote access via iroh
+cargo install --path iroh-slopd
+cargo install --path iroh-slopctl
 ```
 
 Or build without installing:
@@ -391,6 +397,109 @@ Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and
 
 ---
 
+## Remote access (iroh)
+
+`iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance by exposing the Unix socket over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine via an encrypted P2P connection with EndpointId allowlist authentication.
+
+```
+ [remote machine]               [local machine]
+ iroh-slopctl ──── iroh ────► iroh-slopd ──► slopd.sock ──► slopd
+```
+
+`iroh-slopctl` supports all the same subcommands as `slopctl` (plus `info`). It is a drop-in remote replacement.
+
+### iroh-slopd
+
+`iroh-slopd` is a proxy that listens for iroh connections and forwards them to the local slopd Unix socket. Only clients whose EndpointId has been explicitly authorized are allowed to connect.
+
+**Config file:** `~/.config/iroh-slopd/config.toml`
+
+```toml
+# Auto-generated on first run; do not edit manually.
+secret_key = "..."
+
+# List of authorized client EndpointIds (z-base-32 public keys).
+authorized_clients = []
+```
+
+**Subcommands:**
+
+| Command | Description |
+|---------|-------------|
+| `iroh-slopd` | Run the proxy server (default mode) |
+| `iroh-slopd info` | Print this server's EndpointId |
+| `iroh-slopd authorize <endpoint-id>` | Add a client EndpointId to the allowlist |
+| `iroh-slopd revoke <endpoint-id>` | Remove a client EndpointId from the allowlist |
+
+**Setup walkthrough:**
+
+```bash
+# 1. On the server — get the server's EndpointId
+iroh-slopd info
+# example output: abc123...
+
+# 2. On the client — get the client's EndpointId
+iroh-slopctl info
+# example output: xyz789...
+
+# 3. On the server — authorize the client
+iroh-slopd authorize xyz789...
+
+# 4. On the server — start the proxy
+iroh-slopd
+# iroh-slopd endpoint: abc123...
+# iroh-slopd addr: {"node_id":"...","info":{...}}
+```
+
+Use `--addr-file PATH` to write the full `EndpointAddr` JSON to a file on startup. This is useful in scripts or tests that need to pass the address to a client without relying on discovery:
+
+```bash
+iroh-slopd --addr-file /tmp/iroh-addr.json
+```
+
+Verbosity can be increased with `-v` / `-vv` / `-vvv`.
+
+### iroh-slopctl
+
+`iroh-slopctl` is a remote slopctl that connects to `iroh-slopd` instead of a local Unix socket. It supports all the same commands as `slopctl` (see [slopctl commands](#slopctl-commands)) plus an `info` subcommand.
+
+**Config file:** `~/.config/iroh-slopctl/config.toml`
+
+```toml
+# Auto-generated on first run; do not edit manually.
+secret_key = "..."
+
+# Default named endpoint to connect to when --endpoint is not given.
+default = "my-server"
+
+[endpoints.my-server]
+endpoint_id = "abc123..."
+```
+
+**Connecting:**
+
+```bash
+# Connect by EndpointId (raw key)
+iroh-slopctl --endpoint abc123... ps
+
+# Connect by name defined in config
+iroh-slopctl --endpoint my-server ps
+
+# Connect using a full EndpointAddr JSON file (no discovery needed)
+iroh-slopctl --addr-file /tmp/iroh-addr.json ps --json
+
+# Use the default endpoint from config
+iroh-slopctl ps
+```
+
+**Additional subcommand:**
+
+| Command | Description |
+|---------|-------------|
+| `iroh-slopctl info` | Print this client's EndpointId (share with server for authorization) |
+
+---
+
 ## Workspace layout
 
 | Crate | Description |
@@ -398,4 +507,7 @@ Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and
 | `slopd` | Daemon binary — tmux management, RPC server, event broadcasting |
 | `slopctl` | CLI client binary — all user-facing subcommands |
 | `libslop` | Shared library — protocol types, config, hook injection, path helpers |
+| `libslopctl` | Transport-agnostic client library — JSON-RPC protocol, typed methods, streaming |
+| `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
+| `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |
