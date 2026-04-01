@@ -810,6 +810,15 @@ async fn main() {
     // session while the scan is in progress.
     load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
 
+    // Re-inject hooks if there are recovered panes — the previous slopd instance
+    // removed them on exit, but the Claude sessions are still running in tmux.
+    if !managed_panes.is_empty() {
+        let settings_path = config.claude_settings_path();
+        if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
+            warn!("failed to re-inject hooks into {}: {}", settings_path.display(), e);
+        }
+    }
+
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     let listener = UnixListener::bind(&socket_path).unwrap();

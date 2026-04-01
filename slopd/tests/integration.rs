@@ -5279,3 +5279,77 @@ fn uninject_hooks_removes_absolute_path_slopctl_entries() {
         assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after uninject", event);
     }
 }
+
+#[test]
+fn slopd_reinjects_hooks_on_restart_with_existing_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&["sleep", "infinity"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // First cycle: start slopd, spawn a pane, then stop slopd (removes hooks).
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["run"]);
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    kill_slopd(slopd);
+
+    // Hooks should be gone after slopd exits.
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
+        .expect("settings.json missing after first slopd exit");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let slopctl_count = entries.iter().filter(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl"))
+                })
+            })
+        }).count();
+        assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after first slopd exit", event);
+    }
+
+    // Second cycle: restart slopd WITHOUT running a new pane.
+    // The existing pane from the first cycle is still alive in tmux.
+    // slopd should detect the recovered pane and re-inject hooks.
+    let slopd = env.spawn_slopd();
+
+    // Give slopd a moment to recover panes and inject hooks.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let settings_contents = std::fs::read_to_string(claude_config_dir.join("settings.json"))
+        .expect("settings.json missing after slopd restart");
+    let settings: serde_json::Value =
+        serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
+    for &event in libslop::HOOK_EVENTS {
+        let entries = settings["hooks"][event].as_array()
+            .unwrap_or_else(|| panic!("missing hooks.{}", event));
+        let has_our_hook = entries.iter().any(|entry| {
+            entry["hooks"].as_array().map_or(false, |hooks| {
+                hooks.iter().any(|h| {
+                    h["type"] == "command"
+                        && h["command"].as_str()
+                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                })
+            })
+        });
+        assert!(has_our_hook, "event {} should have slopctl hook after restart with existing panes", event);
+    }
+
+    kill_slopd(slopd);
+}
