@@ -25,10 +25,19 @@ pub fn build_bin(name: &str) {
     if built.contains(name) {
         return;
     }
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--workspace", "--bin", name, "--all-features"])
-        .status()
-        .expect("failed to run cargo build");
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args(["build", "--workspace", "--bin", name, "--all-features"]);
+    // Under cargo-llvm-cov the test binary lives in a different target directory
+    // (e.g. target/llvm-cov-target/).  A plain `cargo build` would place the
+    // binary in target/debug/ instead, where cargo_bin() won't find it.  Point
+    // CARGO_TARGET_DIR at the coverage target directory so the binary ends up
+    // next to the test executable.
+    if cfg!(coverage) {
+        if let Some(target_dir) = cargo_bin(name).parent().and_then(|p| p.parent()) {
+            cmd.env("CARGO_TARGET_DIR", target_dir);
+        }
+    }
+    let status = cmd.status().expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);
     built.insert(name.to_string());
 }
