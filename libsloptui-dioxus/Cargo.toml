@@ -1,0 +1,22 @@
+[package]
+name = "libsloptui-dioxus"
+version = "0.1.0"
+edition = "2024"
+description = "Dioxus TUI rendering and event loop for slopd viewers"
+
+[dependencies]
+libslop = { path = "../libslop" }
+libslopctl = { path = "../libslopctl" }
+libsloptui-core = { path = "../libsloptui-core" }
+dioxus = "0.7"
+dioxus-html = "0.7"
+dioxus-tui = { git = "https://github.com/JakkuSakura/dioxus-tui", branch = "main" }
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "6.0.0"
+timeago = { version = "0.6.0", default-features = false }
+
+[lints]
+workspace = true

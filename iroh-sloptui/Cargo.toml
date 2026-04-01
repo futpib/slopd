@@ -7,7 +7,10 @@ description = "iroh-based remote TUI process viewer for slopd"
 [dependencies]
 libslop = { path = "../libslop" }
 libslopctl = { path = "../libslopctl" }
-libsloptui-ratatui = { path = "../libsloptui-ratatui" }
+libsloptui-core = { path = "../libsloptui-core" }
+libsloptui-dioxus = { path = "../libsloptui-dioxus" }
+dioxus = "0.7"
+dioxus-tui = { git = "https://github.com/JakkuSakura/dioxus-tui", branch = "main" }
 iroh = "0.97"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

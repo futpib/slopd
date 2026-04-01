@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Parser;
+use dioxus::prelude::*;
 use iroh::{Endpoint, PublicKey, SecretKey, endpoint::presets};
+use libsloptui_core::{App, AppEvent};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 
 const ALPN: &[u8] = b"iroh-slopd/0";
 
@@ -23,11 +24,11 @@ struct Cli {
     )]
     verbose: u8,
 
-    /// Endpoint name (from config) or raw EndpointId to connect to. Overrides the default.
+    /// Endpoint name (from config) or raw EndpointId to connect to.
     #[arg(long, global = true)]
     endpoint: Option<String>,
 
-    /// Read the server's full EndpointAddr from this JSON file (for direct connections without discovery).
+    /// Read the server's full EndpointAddr from this JSON file.
     #[arg(long, global = true, value_name = "PATH")]
     addr_file: Option<PathBuf>,
 }
@@ -131,11 +132,15 @@ impl Config {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
+/// Connection params resolved from CLI args before dioxus launch.
+struct ConnParams {
+    secret_key: SecretKey,
+    addr: iroh::EndpointAddr,
+}
 
-    let _log_guard = libsloptui_ratatui::setup_logging(cli.verbose);
+fn main() {
+    let cli = Cli::parse();
+    let _log_guard = libsloptui_dioxus::setup_logging(cli.verbose);
 
     let mut config = Config::load();
     let secret_key = config.secret_key();
@@ -153,33 +158,55 @@ async fn main() {
         config.resolve_endpoint(cli.endpoint.as_deref())
     };
 
-    debug!("connecting to endpoint {:?}", addr);
+    // Store connection params in a static so the dioxus component can access them.
+    CONN_PARAMS.set(ConnParams { secret_key, addr }).ok();
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("failed to bind iroh endpoint: {}", e);
-            std::process::exit(1);
-        });
+    let _ = dioxus_tui::launch(IrohApp);
+}
 
-    let connection = endpoint.connect(addr, ALPN).await.unwrap_or_else(|e| {
-        eprintln!("failed to connect to remote endpoint: {}", e);
-        std::process::exit(1);
+static CONN_PARAMS: std::sync::OnceLock<ConnParams> = std::sync::OnceLock::new();
+
+#[component]
+fn IrohApp() -> Element {
+    let app = use_signal(App::new);
+    let tx = use_signal(|| None::<tokio::sync::mpsc::UnboundedSender<AppEvent>>);
+
+    use_future(move || async move {
+        let params = CONN_PARAMS.get().unwrap();
+
+        let endpoint = match Endpoint::builder(presets::N0)
+            .secret_key(params.secret_key.clone())
+            .bind()
+            .await
+        {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::error!("failed to bind iroh endpoint: {}", e);
+                return;
+            }
+        };
+
+        let connection = match endpoint.connect(params.addr.clone(), ALPN).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("failed to connect to remote endpoint: {}", e);
+                return;
+            }
+        };
+
+        let (send, recv) = match connection.open_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("failed to open stream: {}", e);
+                return;
+            }
+        };
+
+        let client = libslopctl::Client::new(recv, send);
+        libsloptui_dioxus::run_event_loop(client, app, tx).await;
+
+        endpoint.close().await;
     });
 
-    let (send, recv) = connection.open_bi().await.unwrap_or_else(|e| {
-        eprintln!("failed to open stream: {}", e);
-        std::process::exit(1);
-    });
-
-    let mut client = libslopctl::Client::new(recv, send);
-
-    libsloptui_ratatui::run(&mut client).await.unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
-    endpoint.close().await;
+    rsx! { libsloptui_dioxus::AppRoot { app, tx } }
 }

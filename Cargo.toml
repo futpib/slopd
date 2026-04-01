@@ -9,7 +9,7 @@ members = [
     "iroh-slopctl",
     "sloptui",
     "libsloptui-core",
-    "libsloptui-ratatui",
+    "libsloptui-dioxus",
     "iroh-sloptui",
 ]
 resolver = "2"
