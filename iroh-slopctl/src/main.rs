@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use iroh::{Endpoint, PublicKey, SecretKey, endpoint::presets};
+use iroh::endpoint::ConnectionError;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -131,6 +132,16 @@ impl Config {
     }
 }
 
+fn check_unauthorized(close_reason: Option<&ConnectionError>, client_id: &PublicKey) {
+    let err = match close_reason {
+        Some(ConnectionError::ApplicationClosed(close))
+            if close.reason.as_ref() == b"unauthorized" => close,
+        _ => return,
+    };
+    eprintln!("hint: the remote endpoint rejected the connection as unauthorized ({})", err);
+    eprintln!("hint: ask the remote to run: iroh-slopd authorize {}", client_id);
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -163,6 +174,7 @@ async fn main() {
     }
 
     let secret_key = config.secret_key();
+    let client_id = secret_key.public();
 
     let addr = if let Some(ref addr_file) = cli.addr_file {
         let contents = std::fs::read_to_string(addr_file).unwrap_or_else(|e| {
@@ -194,6 +206,7 @@ async fn main() {
     });
 
     let (send, recv) = connection.open_bi().await.unwrap_or_else(|e| {
+        check_unauthorized(Some(&e), &client_id);
         eprintln!("failed to open stream: {}", e);
         std::process::exit(1);
     });
@@ -205,8 +218,10 @@ async fn main() {
             parent_pane_id: None,
             fallback_pane_id: None,
         };
-        libslopctl::execute_command(&mut client, cmd, &ctx)
-            .await.unwrap_or_else(|e| libslopctl::die_err(e));
+        if let Err(e) = libslopctl::execute_command(&mut client, cmd, &ctx).await {
+            check_unauthorized(connection.close_reason().as_ref(), &client_id);
+            libslopctl::die_err(e);
+        }
     }
 
     endpoint.close().await;

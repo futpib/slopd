@@ -117,6 +117,13 @@ fn iroh_e2e_unauthorized_client_is_rejected() {
         output,
     );
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("iroh-slopd authorize"),
+        "stderr should hint about `iroh-slopd authorize`, got: {}",
+        stderr,
+    );
+
     kill_child(iroh_slopd);
     kill_slopd(slopd);
 }
