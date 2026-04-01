@@ -732,10 +732,13 @@ impl<
     /// Cancel an active subscription. The server will stop streaming records
     /// for the given subscription.
     pub async fn unsubscribe(&mut self, subscription: &Subscription) -> Result<(), Error> {
-        let subscription_id = subscription.id;
+        self.unsubscribe_by_id(subscription.id).await
+    }
+
+    /// Cancel an active subscription by its request ID.
+    pub async fn unsubscribe_by_id(&mut self, subscription_id: u64) -> Result<(), Error> {
         match self.request(libslop::RequestBody::Unsubscribe { subscription_id }).await? {
             libslop::ResponseBody::Unsubscribed { .. } => {
-                // Remove the subscription channel from the demux state.
                 if let Some(ref demux) = self.demux {
                     demux.lock().await.subscriptions.remove(&subscription_id);
                 }

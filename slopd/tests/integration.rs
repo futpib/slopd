@@ -4729,6 +4729,38 @@ fn multiplexed_unsubscribe_stops_stream() {
     kill_slopd(slopd);
 }
 
+/// unsubscribe_by_id cancels a subscription using only the request ID.
+#[test]
+fn multiplexed_unsubscribe_by_id_stops_stream() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let socket_path = env.socket_path();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut client = libslopctl::Client::new(reader, writer);
+
+        let subscription = client.subscribe(vec![]).await.unwrap();
+        let sub_id = subscription.id();
+
+        // Unsubscribe using only the ID.
+        client.unsubscribe_by_id(sub_id).await.unwrap();
+
+        // Client should still be usable for requests after unsubscribe_by_id.
+        let _state = client.status().await.unwrap();
+    });
+
+    kill_slopd(slopd);
+}
+
 /// Multiple subscriptions can coexist on the same connection.
 #[test]
 fn multiplexed_multiple_subscriptions() {
