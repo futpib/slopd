@@ -4803,3 +4803,77 @@ fn multiplexed_multiple_subscriptions() {
 
     kill_slopd(slopd);
 }
+
+#[test]
+fn executable_cli_flag_overrides_config() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // Config uses the default executable ("claude") — the --executable CLI flag
+    // should override it to mock_claude.
+    let Some(env) = TestEnv::new_full(
+        None,
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd_with_args(&["--executable", &mock_claude_path]);
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    let session_id = env.wait_for_session_start(listener, &pane_id);
+
+    // mock_claude always uses this session ID.
+    assert_eq!(session_id, "mock-session-id-1234");
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn executable_cli_flag_with_args() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // Config uses the default executable — the --executable flag passes
+    // mock_claude with --no-session-start, so no SessionStart hook fires.
+    let Some(env) = TestEnv::new_full(
+        None,
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd_with_args(&["--executable", &mock_claude_path, "--no-session-start"]);
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // With --no-session-start, mock_claude skips the SessionStart hook,
+    // so the pane should stay in BootingUp state rather than transitioning to Ready.
+    std::thread::sleep(Duration::from_millis(500));
+    let (state, detailed_state) = env.pane_state(&pane_id);
+    assert_eq!(state, libslop::PaneState::BootingUp);
+    assert_eq!(detailed_state, libslop::PaneDetailedState::BootingUp);
+
+    kill_slopd(slopd);
+}

@@ -165,7 +165,7 @@ impl TestEnv {
     }
 
     pub fn spawn_slopd(&self) -> Child {
-        self.spawn_slopd_inner(None)
+        self.spawn_slopd_inner(None, &[])
     }
 
     /// Like `spawn_slopd` but sets `SLOPD_TEST_RUN_YIELD_MS` to the given value.
@@ -176,12 +176,18 @@ impl TestEnv {
     /// deterministic regression tests for the race described in:
     ///   fix: guard Run handler from resetting pane state that a concurrent hook already advanced
     pub fn spawn_slopd_with_run_yield(&self, delay_ms: u64) -> Child {
-        self.spawn_slopd_inner(Some(delay_ms))
+        self.spawn_slopd_inner(Some(delay_ms), &[])
     }
 
-    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>) -> Child {
+    /// Like `spawn_slopd` but passes extra CLI arguments to the slopd binary.
+    pub fn spawn_slopd_with_args(&self, extra_args: &[&str]) -> Child {
+        self.spawn_slopd_inner(None, extra_args)
+    }
+
+    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>, extra_args: &[&str]) -> Child {
         let mut cmd = Command::new(cargo_bin("slopd"));
-        cmd.env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+        cmd.args(extra_args)
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env("HOME", self.config_dir.path())
             .env_remove("TMUX")

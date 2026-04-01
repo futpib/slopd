@@ -474,6 +474,7 @@ impl Default for Executable {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdRunConfig {
+    #[serde(default)]
     pub executable: Executable,
     /// Path to slopctl binary used for hook injection (default: "slopctl")
     #[serde(default = "default_slopctl")]

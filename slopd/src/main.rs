@@ -11,6 +11,10 @@ use tracing::{debug, error, info, warn};
 struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Override the executable used to spawn Claude sessions (default: from config or "claude").
+    /// Specify the program and optional arguments, e.g. --executable claude --foo --bar
+    #[arg(long, num_args = 1.., allow_hyphen_values = true)]
+    executable: Option<Vec<String>>,
 }
 
 fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
@@ -685,7 +689,15 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Arc::new(libslop::SlopdConfig::load());
+    let mut config = libslop::SlopdConfig::load();
+    if let Some(executable) = cli.executable {
+        config.run.executable = if executable.len() == 1 {
+            libslop::Executable::String(executable.into_iter().next().unwrap())
+        } else {
+            libslop::Executable::Array(executable)
+        };
+    }
+    let config = Arc::new(config);
 
     if config.tmux.should_start_server() {
         tmux(&config)
