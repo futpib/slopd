@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Subcommand;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
 #[derive(Debug)]
@@ -270,19 +273,77 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     }
 }
 
-/// Transport-agnostic client for the slopd JSON-RPC protocol.
-pub struct Client<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> {
-    lines: Lines<BufReader<R>>,
-    writer: W,
-    next_id: u64,
+/// Shared state for the background demux task.
+struct DemuxState {
+    /// Pending one-shot request waiters, keyed by request ID.
+    pending: HashMap<u64, oneshot::Sender<libslop::Response>>,
+    /// Active subscription channels, keyed by subscription request ID.
+    subscriptions: HashMap<u64, mpsc::UnboundedSender<libslop::Response>>,
 }
 
-impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R, W> {
+/// Background demux task: reads lines from the transport, routes responses to
+/// the appropriate waiter (oneshot for request/response, mpsc for subscriptions).
+async fn demux_loop<R: tokio::io::AsyncRead + Unpin>(
+    mut lines: tokio::io::Lines<BufReader<R>>,
+    state: Arc<Mutex<DemuxState>>,
+) {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => {
+                // Connection closed — wake all waiters with an error-like drop.
+                let mut s = state.lock().await;
+                s.pending.clear();
+                s.subscriptions.clear();
+                return;
+            }
+        };
+        debug!("received: {}", line);
+        let response: libslop::Response = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("demux: failed to parse response: {}", e);
+                continue;
+            }
+        };
+        let id = response.id;
+        let mut s = state.lock().await;
+        if let Some(tx) = s.subscriptions.get(&id) {
+            let _ = tx.send(response);
+        } else if let Some(tx) = s.pending.remove(&id) {
+            let _ = tx.send(response);
+        }
+        // Responses for unknown IDs are silently dropped (same as before).
+    }
+}
+
+/// Transport-agnostic client for the slopd JSON-RPC protocol.
+///
+/// Supports two modes:
+/// - **Direct mode** (before any subscription): reads/writes synchronously on
+///   the connection. Simple and zero-overhead.
+/// - **Multiplexed mode** (after the first `subscribe`/`subscribe_transcript`):
+///   a background task demuxes incoming lines by ID, routing subscription
+///   records to mpsc channels and request-response pairs to oneshot channels.
+pub struct Client<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> {
+    /// Present in direct mode; taken when transitioning to multiplexed.
+    lines: Option<tokio::io::Lines<BufReader<R>>>,
+    writer: W,
+    next_id: u64,
+    /// Present in multiplexed mode.
+    demux: Option<Arc<Mutex<DemuxState>>>,
+}
+
+impl<
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+> Client<R, W> {
     pub fn new(reader: R, writer: W) -> Self {
         Self {
-            lines: BufReader::new(reader).lines(),
+            lines: Some(BufReader::new(reader).lines()),
             writer,
             next_id: 1,
+            demux: None,
         }
     }
 
@@ -292,16 +353,51 @@ impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R
         id
     }
 
+    /// Ensure the background demux task is running (transition to multiplexed mode).
+    fn ensure_demux(&mut self) {
+        if self.demux.is_some() {
+            return;
+        }
+        let lines = self.lines.take().expect("lines must be present in direct mode");
+        let state = Arc::new(Mutex::new(DemuxState {
+            pending: HashMap::new(),
+            subscriptions: HashMap::new(),
+        }));
+        self.demux = Some(Arc::clone(&state));
+        tokio::spawn(demux_loop(lines, state));
+    }
+
+    /// Write a request to the transport.
+    async fn write_request(&mut self, request: &libslop::Request) -> Result<(), Error> {
+        let mut json = serde_json::to_string(request)?;
+        debug!("sending: {}", json);
+        json.push('\n');
+        self.writer.write_all(json.as_bytes()).await?;
+        Ok(())
+    }
+
     /// Send a request and wait for the response with matching id.
     pub async fn request(&mut self, body: libslop::RequestBody) -> Result<libslop::ResponseBody, Error> {
         let id = self.alloc_id();
         let request = libslop::Request { id, body };
-        let mut json = serde_json::to_string(&request)?;
-        debug!("sending: {}", json);
-        json.push('\n');
-        self.writer.write_all(json.as_bytes()).await?;
+
+        if let Some(ref demux) = self.demux {
+            // Multiplexed mode: register a oneshot, send, then await.
+            let (tx, rx) = oneshot::channel();
+            demux.lock().await.pending.insert(id, tx);
+            self.write_request(&request).await?;
+            let response = rx.await.map_err(|_| Error::ConnectionClosed)?;
+            return match response.body {
+                libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
+                body => Ok(body),
+            };
+        }
+
+        // Direct mode: read lines until the matching response arrives.
+        self.write_request(&request).await?;
+        let lines = self.lines.as_mut().expect("lines must be present in direct mode");
         loop {
-            match self.lines.next_line().await? {
+            match lines.next_line().await? {
                 Some(line) => {
                     debug!("received: {}", line);
                     let response: libslop::Response = serde_json::from_str(&line)?;
@@ -475,9 +571,32 @@ impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R
             }
         };
 
-        // Send all requests on the same connection, each with a unique ID,
-        // then read responses correlating by ID.
-        let mut pending: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        // In multiplexed mode we must go through request() one at a time,
+        // since the demux task handles routing.
+        if self.demux.is_some() {
+            let mut out = Vec::new();
+            for pane_id in target_pane_ids {
+                let body = libslop::RequestBody::Send {
+                    pane_id: pane_id.clone(),
+                    prompt: prompt.to_string(),
+                    timeout_secs,
+                    interrupt,
+                };
+                match self.request(body).await? {
+                    libslop::ResponseBody::Sent { pane_id } => out.push(pane_id),
+                    libslop::ResponseBody::Error { message } => {
+                        return Err(Error::Server(format!("error sending to {}: {}", pane_id, message)));
+                    }
+                    _ => {
+                        return Err(Error::Server(format!("unexpected response for {}", pane_id)));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Direct mode: pipeline all requests, then collect responses by ID.
+        let mut pending: HashMap<u64, String> = HashMap::new();
         for pane_id in &target_pane_ids {
             let id = self.alloc_id();
             let body = libslop::RequestBody::Send {
@@ -487,17 +606,14 @@ impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R
                 interrupt,
             };
             let request = libslop::Request { id, body };
-            let mut json = serde_json::to_string(&request)?;
-            debug!("sending: {}", json);
-            json.push('\n');
-            self.writer.write_all(json.as_bytes()).await?;
+            self.write_request(&request).await?;
             pending.insert(id, pane_id.clone());
         }
 
-        // Collect all responses; order may differ from send order.
-        let mut results: std::collections::HashMap<u64, libslop::ResponseBody> = std::collections::HashMap::new();
+        let lines = self.lines.as_mut().expect("lines must be present in direct mode");
+        let mut results: HashMap<u64, libslop::ResponseBody> = HashMap::new();
         while results.len() < pending.len() {
-            match self.lines.next_line().await? {
+            match lines.next_line().await? {
                 Some(line) => {
                     debug!("received: {}", line);
                     let response: libslop::Response = serde_json::from_str(&line)?;
@@ -529,78 +645,110 @@ impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> Client<R
         Ok(out)
     }
 
-    /// Subscribe to events. Consumes the client and returns a Subscription
-    /// that yields Record items.
-    pub async fn subscribe(mut self, filters: Vec<libslop::EventFilter>) -> Result<Subscription<R>, Error> {
+    /// Subscribe to events. Returns a Subscription handle; the client remains
+    /// usable for further requests on the same connection.
+    pub async fn subscribe(&mut self, filters: Vec<libslop::EventFilter>) -> Result<Subscription, Error> {
+        self.ensure_demux();
+
         let id = self.alloc_id();
         let request = libslop::Request {
             id,
             body: libslop::RequestBody::Subscribe { filters },
         };
-        let mut json = serde_json::to_string(&request)?;
-        debug!("sending: {}", json);
-        json.push('\n');
-        self.writer.write_all(json.as_bytes()).await?;
 
-        // Read the Subscribed confirmation.
+        // Register the subscription channel *before* sending so we don't miss
+        // the Subscribed confirmation.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let demux = Arc::clone(self.demux.as_ref().unwrap());
+        demux.lock().await.subscriptions.insert(id, tx);
+
+        self.write_request(&request).await?;
+
+        // Wait for the Subscribed confirmation.
+        let mut rx = rx;
         loop {
-            match self.lines.next_line().await? {
-                Some(line) => {
-                    debug!("received: {}", line);
-                    let response: libslop::Response = serde_json::from_str(&line)?;
-                    if response.id == id {
-                        match response.body {
-                            libslop::ResponseBody::Subscribed => break,
-                            libslop::ResponseBody::Error { message } => return Err(Error::Server(message)),
-                            other => return Err(Error::UnexpectedResponse(format!("{:?}", other))),
-                        }
+            match rx.recv().await {
+                Some(response) => match response.body {
+                    libslop::ResponseBody::Subscribed => break,
+                    libslop::ResponseBody::Error { message } => {
+                        demux.lock().await.subscriptions.remove(&id);
+                        return Err(Error::Server(message));
                     }
+                    other => {
+                        demux.lock().await.subscriptions.remove(&id);
+                        return Err(Error::UnexpectedResponse(format!("{:?}", other)));
+                    }
+                },
+                None => {
+                    return Err(Error::ConnectionClosed);
                 }
-                None => return Err(Error::ConnectionClosed),
             }
         }
 
-        Ok(Subscription { lines: self.lines, id })
+        Ok(Subscription { rx, id })
     }
 
-    /// Subscribe to a pane's transcript with replay. Consumes the client and
-    /// returns a Subscription that yields Record items.
-    pub async fn subscribe_transcript(mut self, pane_id: String, last_n: u64) -> Result<Subscription<R>, Error> {
+    /// Subscribe to a pane's transcript with replay. Returns a Subscription
+    /// handle; the client remains usable for further requests.
+    pub async fn subscribe_transcript(&mut self, pane_id: String, last_n: u64) -> Result<Subscription, Error> {
+        self.ensure_demux();
+
         let id = self.alloc_id();
         let request = libslop::Request {
             id,
             body: libslop::RequestBody::SubscribeTranscript { pane_id, last_n },
         };
-        let mut json = serde_json::to_string(&request)?;
-        debug!("sending: {}", json);
-        json.push('\n');
-        self.writer.write_all(json.as_bytes()).await?;
 
-        // Read the Subscribed confirmation.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let demux = Arc::clone(self.demux.as_ref().unwrap());
+        demux.lock().await.subscriptions.insert(id, tx);
+
+        self.write_request(&request).await?;
+
+        // Wait for the Subscribed confirmation.
+        let mut rx = rx;
         loop {
-            match self.lines.next_line().await? {
-                Some(line) => {
-                    debug!("received: {}", line);
-                    let response: libslop::Response = serde_json::from_str(&line)?;
-                    if response.id == id {
-                        match response.body {
-                            libslop::ResponseBody::Subscribed => break,
-                            libslop::ResponseBody::Error { message } => return Err(Error::Server(message)),
-                            other => return Err(Error::UnexpectedResponse(format!("{:?}", other))),
-                        }
+            match rx.recv().await {
+                Some(response) => match response.body {
+                    libslop::ResponseBody::Subscribed => break,
+                    libslop::ResponseBody::Error { message } => {
+                        demux.lock().await.subscriptions.remove(&id);
+                        return Err(Error::Server(message));
                     }
+                    other => {
+                        demux.lock().await.subscriptions.remove(&id);
+                        return Err(Error::UnexpectedResponse(format!("{:?}", other)));
+                    }
+                },
+                None => {
+                    return Err(Error::ConnectionClosed);
                 }
-                None => return Err(Error::ConnectionClosed),
             }
         }
 
-        Ok(Subscription { lines: self.lines, id })
+        Ok(Subscription { rx, id })
+    }
+
+    /// Cancel an active subscription. The server will stop streaming records
+    /// for the given subscription.
+    pub async fn unsubscribe(&mut self, subscription: &Subscription) -> Result<(), Error> {
+        let subscription_id = subscription.id;
+        match self.request(libslop::RequestBody::Unsubscribe { subscription_id }).await? {
+            libslop::ResponseBody::Unsubscribed { .. } => {
+                // Remove the subscription channel from the demux state.
+                if let Some(ref demux) = self.demux {
+                    demux.lock().await.subscriptions.remove(&subscription_id);
+                }
+                Ok(())
+            }
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
     }
 }
 
 /// A subscription stream that yields Record items from slopd.
-pub struct Subscription<R: tokio::io::AsyncRead + Unpin> {
-    lines: Lines<BufReader<R>>,
+pub struct Subscription {
+    rx: mpsc::UnboundedReceiver<libslop::Response>,
     id: u64,
 }
 
@@ -610,17 +758,18 @@ pub enum SubscriptionItem {
     Subscribed,
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> Subscription<R> {
+impl Subscription {
+    /// The request ID of this subscription (needed for unsubscribe).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Read the next record from the subscription.
-    /// Returns `Ok(None)` when the connection closes cleanly.
+    /// Returns `Ok(None)` when the connection closes or the subscription is cancelled.
     pub async fn next(&mut self) -> Result<Option<SubscriptionItem>, Error> {
-        match self.lines.next_line().await? {
-            Some(line) => {
-                debug!("received: {}", line);
-                let response: libslop::Response = serde_json::from_str(&line)?;
-                if response.id != self.id {
-                    return Ok(None);
-                }
+        match self.rx.recv().await {
+            Some(response) => {
+                debug!("subscription {}: received {:?}", self.id, response.body);
                 match response.body {
                     libslop::ResponseBody::Record(record) => Ok(Some(SubscriptionItem::Record(record))),
                     libslop::ResponseBody::Subscribed => Ok(Some(SubscriptionItem::Subscribed)),
@@ -634,9 +783,8 @@ impl<R: tokio::io::AsyncRead + Unpin> Subscription<R> {
 }
 
 /// Run the Listen command: build filters, subscribe, print events until SIGTERM or EOF.
-/// Consumes the client because subscribe() takes ownership.
 pub async fn execute_listen<R, W>(
-    client: Client<R, W>,
+    client: &mut Client<R, W>,
     hooks: Vec<String>,
     events: Vec<String>,
     transcripts: Vec<String>,
@@ -645,7 +793,7 @@ pub async fn execute_listen<R, W>(
     replay: Option<u64>,
 ) -> Result<(), Error>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut subscription = if let Some(last_n) = replay {
@@ -720,14 +868,13 @@ where
 }
 
 /// Execute a CommonCommand against the given client.
-/// Listen must be handled separately before calling this (it consumes the client).
 pub async fn execute_command<R, W>(
     client: &mut Client<R, W>,
     command: CommonCommand,
     ctx: &CommandContext,
 ) -> Result<(), Error>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
     // Handle Send-with-filter first.
@@ -797,7 +944,9 @@ where
             let out = serde_json::json!({ "records": records });
             println!("{}", out);
         }
-        CommonCommand::Listen { .. } => unreachable!("Listen must be handled before calling execute_command"),
+        CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, replay } => {
+            execute_listen(client, hooks, events, transcripts, pane_id, session_id, replay).await?;
+        }
     }
     Ok(())
 }

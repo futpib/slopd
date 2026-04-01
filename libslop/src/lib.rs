@@ -603,6 +603,10 @@ pub enum RequestBody {
     Tags { pane_id: String },
     /// List all panes in the slopd session.
     Ps,
+    /// Cancel a subscription previously created by Subscribe or SubscribeTranscript.
+    /// The `id` field in the outer Request identifies the Unsubscribe request itself;
+    /// `subscription_id` is the `id` of the original Subscribe/SubscribeTranscript request.
+    Unsubscribe { subscription_id: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -631,6 +635,8 @@ pub enum ResponseBody {
     Untagged { pane_id: String, tag: String },
     Tags { pane_id: String, tags: Vec<String> },
     Ps { panes: Vec<PaneInfo> },
+    /// Confirms that a subscription has been cancelled.
+    Unsubscribed { subscription_id: u64 },
     Error { message: String },
 }
 

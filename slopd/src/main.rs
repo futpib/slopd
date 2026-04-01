@@ -809,7 +809,7 @@ async fn main() {
 }
 
 async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     id: u64,
     body: libslop::ResponseBody,
 ) -> std::io::Result<()> {
@@ -817,7 +817,7 @@ async fn write_response(
     let mut json = serde_json::to_string(&response).unwrap();
     debug!("sending: {}", json);
     json.push('\n');
-    writer.write_all(json.as_bytes()).await
+    writer.lock().await.write_all(json.as_bytes()).await
 }
 
 /// Deduplication state for SubscribeTranscript: skip transcript records for the
@@ -830,7 +830,7 @@ struct Dedup {
 /// Stream broadcast records to a subscriber, applying filters and optional dedup.
 async fn stream_events(
     rx: &mut tokio::sync::broadcast::Receiver<libslop::Record>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     id: u64,
     filters: &[libslop::EventFilter],
     dedup: Option<&Dedup>,
@@ -861,6 +861,25 @@ async fn stream_events(
     }
 }
 
+/// Owned version of stream_events for spawning as a task.
+/// Takes owned filters and dedup so it can be 'static.
+/// Respects the cancellation token for clean shutdown.
+async fn stream_events_owned(
+    mut rx: tokio::sync::broadcast::Receiver<libslop::Record>,
+    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    id: u64,
+    filters: Vec<libslop::EventFilter>,
+    dedup: Option<Dedup>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        result = stream_events(&mut rx, &writer, id, &filters, dedup.as_ref()) => {
+            let _ = result;
+        }
+    }
+}
+
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     start_time: u64,
@@ -870,8 +889,12 @@ async fn handle_connection(
     event_tx: EventTx,
     pane_registered: PaneRegistered,
 ) {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let writer = Arc::new(Mutex::new(writer));
     let mut lines = BufReader::new(reader).lines();
+    // Track active subscriptions so they can be cancelled via Unsubscribe.
+    let mut subscriptions: std::collections::HashMap<u64, tokio_util::sync::CancellationToken> =
+        std::collections::HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         debug!("received: {}", line);
@@ -879,26 +902,27 @@ async fn handle_connection(
             Ok(req) => req,
             Err(e) => {
                 warn!("failed to parse request: {}", e);
-                let _ = write_response(&mut writer, 0, libslop::ResponseBody::Error { message: e.to_string() }).await;
+                let _ = write_response(&writer, 0, libslop::ResponseBody::Error { message: e.to_string() }).await;
                 continue;
             }
         };
 
         match req.body {
             libslop::RequestBody::Subscribe { filters } => {
-                let mut rx = event_tx.subscribe();
-                if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
+                let rx = event_tx.subscribe();
+                if write_response(&writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
                     return;
                 }
-                if stream_events(&mut rx, &mut writer, req.id, &filters, None).await.is_err() {
-                    return;
-                }
-                continue;
+                // Spawn event streaming as a background task so the read
+                // loop can continue processing further requests.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                subscriptions.insert(req.id, cancel.clone());
+                tokio::spawn(stream_events_owned(rx, Arc::clone(&writer), req.id, filters, None, cancel));
             }
 
             libslop::RequestBody::SubscribeTranscript { pane_id, last_n } => {
                 // Step 1: Subscribe to broadcast FIRST to avoid gaps.
-                let mut rx = event_tx.subscribe();
+                let rx = event_tx.subscribe();
 
                 // Step 2: Read last N records from the transcript file on disk.
                 let transcript_path = panes
@@ -920,7 +944,7 @@ async fn handle_connection(
                 };
 
                 // Step 3: Send Subscribed confirmation.
-                if write_response(&mut writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
+                if write_response(&writer, req.id, libslop::ResponseBody::Subscribed).await.is_err() {
                     return;
                 }
 
@@ -938,7 +962,7 @@ async fn handle_connection(
                         pane_id: Some(pane_id.clone()),
                         payload: payload.clone(),
                     };
-                    if write_response(&mut writer, req.id, libslop::ResponseBody::Record(record)).await.is_err() {
+                    if write_response(&writer, req.id, libslop::ResponseBody::Record(record)).await.is_err() {
                         return;
                     }
                 }
@@ -951,12 +975,12 @@ async fn handle_connection(
                     pane_id: Some(pane_id.clone()),
                     payload: serde_json::Value::Null,
                 };
-                if write_response(&mut writer, req.id, libslop::ResponseBody::Record(replay_end)).await.is_err() {
+                if write_response(&writer, req.id, libslop::ResponseBody::Record(replay_end)).await.is_err() {
                     return;
                 }
 
-                // Step 6: Enter live event loop, skipping transcript records already replayed.
-                // Only forward transcript records for this pane.
+                // Step 6: Spawn live event streaming as a background task,
+                // skipping transcript records already replayed.
                 let transcript_filter = vec![libslop::EventFilter {
                     source: Some("transcript".to_string()),
                     event_type: None,
@@ -965,15 +989,25 @@ async fn handle_connection(
                     payload_match: serde_json::Map::new(),
                 }];
                 let dedup = Some(Dedup { pane_id, file_end_offset });
-                if stream_events(&mut rx, &mut writer, req.id, &transcript_filter, dedup.as_ref()).await.is_err() {
-                    return;
+                let cancel = tokio_util::sync::CancellationToken::new();
+                subscriptions.insert(req.id, cancel.clone());
+                tokio::spawn(stream_events_owned(rx, Arc::clone(&writer), req.id, transcript_filter, dedup, cancel));
+            }
+
+            libslop::RequestBody::Unsubscribe { subscription_id } => {
+                if let Some(cancel) = subscriptions.remove(&subscription_id) {
+                    cancel.cancel();
+                    let _ = write_response(&writer, req.id, libslop::ResponseBody::Unsubscribed { subscription_id }).await;
+                } else {
+                    let _ = write_response(&writer, req.id, libslop::ResponseBody::Error {
+                        message: format!("no active subscription with id {}", subscription_id),
+                    }).await;
                 }
-                continue;
             }
 
             body => {
                 let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered).await;
-                if write_response(&mut writer, req.id, body).await.is_err() {
+                if write_response(&writer, req.id, body).await.is_err() {
                     break;
                 }
             }
@@ -1715,9 +1749,11 @@ async fn handle_request(
             }
         }
 
-        libslop::RequestBody::Subscribe { .. } | libslop::RequestBody::SubscribeTranscript { .. } => {
+        libslop::RequestBody::Subscribe { .. }
+        | libslop::RequestBody::SubscribeTranscript { .. }
+        | libslop::RequestBody::Unsubscribe { .. } => {
             // Handled in handle_connection before reaching here.
-            unreachable!("Subscribe/SubscribeTranscript should be handled before handle_request")
+            unreachable!("Subscribe/SubscribeTranscript/Unsubscribe should be handled before handle_request")
         }
     }
 }

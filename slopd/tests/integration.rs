@@ -4589,3 +4589,217 @@ fn slopd_removes_stale_tmux_hook_entries() {
 
     kill_slopd(slopd);
 }
+
+/// After subscribing, the client can still issue request-response calls (e.g. ps)
+/// on the same connection.
+#[test]
+fn multiplexed_subscribe_then_request() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a pane so ps() returns something.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let socket_path = env.socket_path();
+
+    // Use the library client directly via tokio.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut client = libslopctl::Client::new(reader, writer);
+
+        // Subscribe to all events.
+        let mut subscription = client.subscribe(vec![]).await.unwrap();
+
+        // While subscribed, issue a ps() request on the same client.
+        let panes = client.ps().await.unwrap();
+        assert!(!panes.is_empty(), "ps() should return at least one pane");
+        assert!(panes.iter().any(|p| p.pane_id == pane_id), "pane {} not in ps output", pane_id);
+
+        // Also verify subscription still works: fire a hook and check we get an event.
+        // Use a separate connection to fire the hook.
+        let stream2 = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (r2, w2) = stream2.into_split();
+        let mut hook_client = libslopctl::Client::new(r2, w2);
+
+        let payload = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "transcript_path": "/dev/null",
+            "cwd": "/tmp",
+            "prompt": "multiplex-test"
+        });
+        hook_client.hook("UserPromptSubmit".to_string(), payload, Some(pane_id.clone())).await.unwrap();
+
+        // Read from the subscription until we get the hook event or timeout.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = subscription.next() => {
+                    match result {
+                        Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
+                            if record.event_type == "UserPromptSubmit" {
+                                found = true;
+                                break;
+                            }
+                        }
+                        Ok(Some(libslopctl::SubscriptionItem::Subscribed)) => {}
+                        Ok(None) => break,
+                        Err(e) => panic!("subscription error: {}", e),
+                    }
+                }
+            }
+        }
+        assert!(found, "expected to receive UserPromptSubmit event via subscription");
+    });
+
+    kill_slopd(slopd);
+}
+
+/// Unsubscribe stops the subscription stream.
+#[test]
+fn multiplexed_unsubscribe_stops_stream() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let socket_path = env.socket_path();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut client = libslopctl::Client::new(reader, writer);
+
+        let subscription = client.subscribe(vec![]).await.unwrap();
+
+        // Unsubscribe.
+        client.unsubscribe(&subscription).await.unwrap();
+
+        // After unsubscribe, the client should still be usable for requests.
+        let _state = client.status().await.unwrap();
+    });
+
+    kill_slopd(slopd);
+}
+
+/// Multiple subscriptions can coexist on the same connection.
+#[test]
+fn multiplexed_multiple_subscriptions() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let socket_path = env.socket_path();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut client = libslopctl::Client::new(reader, writer);
+
+        // Create two subscriptions: one for hook events, one for slopd events.
+        let mut hook_sub = client.subscribe(vec![libslop::EventFilter {
+            source: Some("hook".to_string()),
+            event_type: None,
+            pane_id: None,
+            session_id: None,
+            payload_match: serde_json::Map::new(),
+        }]).await.unwrap();
+
+        let mut slopd_sub = client.subscribe(vec![libslop::EventFilter {
+            source: Some("slopd".to_string()),
+            event_type: None,
+            pane_id: None,
+            session_id: None,
+            payload_match: serde_json::Map::new(),
+        }]).await.unwrap();
+
+        // Fire a hook event — should appear on hook_sub but not on slopd_sub
+        // (filter is source:hook vs source:slopd).
+        let stream2 = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (r2, w2) = stream2.into_split();
+        let mut hook_client = libslopctl::Client::new(r2, w2);
+
+        let payload = serde_json::json!({
+            "session_id": "s1",
+            "hook_event_name": "SessionStart",
+            "transcript_path": "/dev/null",
+            "cwd": "/tmp"
+        });
+        hook_client.hook("SessionStart".to_string(), payload, Some(pane_id.clone())).await.unwrap();
+
+        // hook_sub should receive the hook event.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut hook_found = false;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = hook_sub.next() => {
+                    match result {
+                        Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
+                            if record.source == "hook" {
+                                hook_found = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(hook_found, "hook subscription should receive hook event");
+
+        // slopd_sub should receive the StateChange event (fired by slopd when
+        // it processes the SessionStart hook).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut state_change_found = false;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = slopd_sub.next() => {
+                    match result {
+                        Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
+                            if record.event_type == "StateChange" || record.event_type == "DetailedStateChange" {
+                                state_change_found = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(state_change_found, "slopd subscription should receive state change event");
+
+        // Client should still work for requests.
+        let panes = client.ps().await.unwrap();
+        assert!(!panes.is_empty());
+    });
+
+    kill_slopd(slopd);
+}

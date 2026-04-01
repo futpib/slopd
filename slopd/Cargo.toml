@@ -23,8 +23,10 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }
+libslopctl = { path = "../libslopctl" }
 libslop = { path = "../libslop" }
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 [lints]
 workspace = true

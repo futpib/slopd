@@ -120,15 +120,6 @@ async fn main() {
     });
 
     let (reader, writer) = stream.into_split();
-
-    // Listen must be handled before execute_command (it consumes the client).
-    if let Command::Common(libslopctl::CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, replay }) = cli.command {
-        let client = libslopctl::Client::new(reader, writer);
-        libslopctl::execute_listen(client, hooks, events, transcripts, pane_id, session_id, replay)
-            .await.unwrap_or_else(|e| libslopctl::die_err(e));
-        return;
-    }
-
     let mut client = libslopctl::Client::new(reader, writer);
 
     if let Command::Common(cmd) = cli.command {
