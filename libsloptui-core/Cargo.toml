@@ -1,0 +1,15 @@
+[package]
+name = "libsloptui-core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport- and renderer-agnostic UI state for slopd viewers"
+
+[dependencies]
+libslop = { path = "../libslop" }
+libslopctl = { path = "../libslopctl" }
+tokio = { version = "1", features = ["sync"] }
+serde_json = "1"
+tracing = "0.1.44"
+
+[lints]
+workspace = true
