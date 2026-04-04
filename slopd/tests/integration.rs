@@ -4512,15 +4512,20 @@ fn kill_succeeds_when_pane_already_dead() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Kill should succeed even though the pane is already gone from tmux.
+    // Kill should either succeed (slopd still had the pane in managed_panes)
+    // or report "not managed" (the reconciler already cleaned it up).
     let kill_output = env.slopctl(&["kill", &pane_id]);
-    assert!(
-        kill_output.status.success(),
-        "slopctl kill should succeed for already-dead pane: {:?}",
-        kill_output,
-    );
-    let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
-    assert_eq!(kill_stdout.trim(), pane_id);
+    if kill_output.status.success() {
+        let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
+        assert_eq!(kill_stdout.trim(), pane_id);
+    } else {
+        let stderr = String::from_utf8_lossy(&kill_output.stderr);
+        assert!(
+            stderr.contains("not managed"),
+            "unexpected kill error: {:?}",
+            kill_output,
+        );
+    }
 
     kill_slopd(slopd);
 }
@@ -5382,6 +5387,111 @@ fn slopd_reinjects_hooks_on_restart_with_existing_panes() {
         });
         assert!(has_our_hook, "event {} should have slopctl hook after restart with existing panes", event);
     }
+
+    kill_slopd(slopd);
+}
+
+/// slopd continues working normally when its tmux exits on last pane closed.
+#[test]
+fn slopd_survives_tmux_exit_on_last_pane_closed() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Assert tmux is running.
+    let status = env.tmux.tmux()
+        .args(["list-sessions"])
+        .status()
+        .expect("failed to list tmux sessions");
+    assert!(status.success(), "tmux should be running");
+
+    let slopd = env.spawn_slopd();
+
+    // slopctl run mock_claude.
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Instruct mock_claude to exit 0.
+    let send_output = env.slopctl(&["send", &pane_id, "/exit 0"]);
+    assert!(send_output.status.success(), "slopctl send /exit 0 failed: {:?}", send_output);
+
+    // Wait for the reconciler to detect the pane is gone.
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Assert slopctl ps works.
+    let ps_output = env.slopctl(&["ps", "--json"]);
+    assert!(ps_output.status.success(), "slopctl ps should work: {:?}", ps_output);
+
+    // Assert slopctl run works.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run should work: {:?}", run_output);
+
+    kill_slopd(slopd);
+}
+
+/// slopd continues working normally when the initial shell pane in the slopd
+/// tmux session receives Ctrl+D and exits (no slopctl run involved).
+#[test]
+fn slopd_survives_initial_shell_pane_exit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Assert tmux is running.
+    let status = env.tmux.tmux()
+        .args(["list-sessions"])
+        .status()
+        .expect("failed to list tmux sessions");
+    assert!(status.success(), "tmux should be running");
+
+    let slopd = env.spawn_slopd();
+
+    // Find the initial shell pane in the slopd session.
+    let list_output = env.tmux.tmux()
+        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+        .output()
+        .expect("failed to list panes");
+    let pane_id = String::from_utf8_lossy(&list_output.stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopd session should have a pane");
+
+    // Send Ctrl+D to the shell pane to make it exit.
+    let status = env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "", "C-d"])
+        .status()
+        .expect("tmux send-keys failed");
+    assert!(status.success(), "tmux send-keys C-d failed");
+
+    // Wait for the pane to exit.
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Assert slopctl ps works.
+    let ps_output = env.slopctl(&["ps", "--json"]);
+    assert!(ps_output.status.success(), "slopctl ps should work: {:?}", ps_output);
+
+    // Assert slopctl run works.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run should work: {:?}", run_output);
 
     kill_slopd(slopd);
 }

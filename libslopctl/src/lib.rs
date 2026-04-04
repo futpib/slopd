@@ -14,6 +14,7 @@ pub enum Error {
     Server(String),
     UnexpectedResponse(String),
     ConnectionClosed,
+    Timeout,
     FilterError(String),
     SelectError(String),
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for Error {
             Error::Server(msg) => write!(f, "server error: {}", msg),
             Error::UnexpectedResponse(r) => write!(f, "unexpected response: {}", r),
             Error::ConnectionClosed => write!(f, "connection closed unexpectedly"),
+            Error::Timeout => write!(f, "timed out waiting for response from slopd"),
             Error::FilterError(msg) => write!(f, "filter error: {}", msg),
             Error::SelectError(msg) => write!(f, "select error: {}", msg),
         }
@@ -338,6 +340,8 @@ impl<
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 > Client<R, W> {
+    const REQUEST_TIMEOUT_SECS: u64 = 15;
+
     pub fn new(reader: R, writer: W) -> Self {
         Self {
             lines: Some(BufReader::new(reader).lines()),
@@ -378,6 +382,11 @@ impl<
 
     /// Send a request and wait for the response with matching id.
     pub async fn request(&mut self, body: libslop::RequestBody) -> Result<libslop::ResponseBody, Error> {
+        let timeout = std::time::Duration::from_secs(Self::REQUEST_TIMEOUT_SECS);
+        self.request_with_timeout(body, timeout).await
+    }
+
+    async fn request_with_timeout(&mut self, body: libslop::RequestBody, timeout: std::time::Duration) -> Result<libslop::ResponseBody, Error> {
         let id = self.alloc_id();
         let request = libslop::Request { id, body };
 
@@ -386,7 +395,10 @@ impl<
             let (tx, rx) = oneshot::channel();
             demux.lock().await.pending.insert(id, tx);
             self.write_request(&request).await?;
-            let response = rx.await.map_err(|_| Error::ConnectionClosed)?;
+            let response = tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(|_| Error::ConnectionClosed)?;
             return match response.body {
                 libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
                 body => Ok(body),
@@ -396,21 +408,26 @@ impl<
         // Direct mode: read lines until the matching response arrives.
         self.write_request(&request).await?;
         let lines = self.lines.as_mut().expect("lines must be present in direct mode");
-        loop {
-            match lines.next_line().await? {
-                Some(line) => {
-                    debug!("received: {}", line);
-                    let response: libslop::Response = serde_json::from_str(&line)?;
-                    if response.id == id {
-                        return match response.body {
-                            libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
-                            body => Ok(body),
-                        };
+        let read_loop = async {
+            loop {
+                match lines.next_line().await? {
+                    Some(line) => {
+                        debug!("received: {}", line);
+                        let response: libslop::Response = serde_json::from_str(&line)?;
+                        if response.id == id {
+                            return match response.body {
+                                libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
+                                body => Ok(body),
+                            };
+                        }
                     }
+                    None => return Err(Error::ConnectionClosed),
                 }
-                None => return Err(Error::ConnectionClosed),
             }
-        }
+        };
+        tokio::time::timeout(timeout, read_loop)
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 
     pub async fn status(&mut self) -> Result<libslop::DaemonState, Error> {
@@ -453,7 +470,9 @@ impl<
         timeout_secs: u64,
         interrupt: bool,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Send { pane_id, prompt, timeout_secs, interrupt }).await? {
+        // Send waits for slopd's server-side timeout plus a margin.
+        let client_timeout = std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
+        match self.request_with_timeout(libslop::RequestBody::Send { pane_id, prompt, timeout_secs, interrupt }, client_timeout).await? {
             libslop::ResponseBody::Sent { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -573,6 +592,7 @@ impl<
 
         // In multiplexed mode we must go through request() one at a time,
         // since the demux task handles routing.
+        let client_timeout = std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
         if self.demux.is_some() {
             let mut out = Vec::new();
             for pane_id in target_pane_ids {
@@ -582,7 +602,7 @@ impl<
                     timeout_secs,
                     interrupt,
                 };
-                match self.request(body).await? {
+                match self.request_with_timeout(body, client_timeout).await? {
                     libslop::ResponseBody::Sent { pane_id } => out.push(pane_id),
                     libslop::ResponseBody::Error { message } => {
                         return Err(Error::Server(format!("error sending to {}: {}", pane_id, message)));
@@ -612,18 +632,24 @@ impl<
 
         let lines = self.lines.as_mut().expect("lines must be present in direct mode");
         let mut results: HashMap<u64, libslop::ResponseBody> = HashMap::new();
-        while results.len() < pending.len() {
-            match lines.next_line().await? {
-                Some(line) => {
-                    debug!("received: {}", line);
-                    let response: libslop::Response = serde_json::from_str(&line)?;
-                    if pending.contains_key(&response.id) {
-                        results.insert(response.id, response.body);
+        let read_loop = async {
+            while results.len() < pending.len() {
+                match lines.next_line().await? {
+                    Some(line) => {
+                        debug!("received: {}", line);
+                        let response: libslop::Response = serde_json::from_str(&line)?;
+                        if pending.contains_key(&response.id) {
+                            results.insert(response.id, response.body);
+                        }
                     }
+                    None => return Err(Error::ConnectionClosed),
                 }
-                None => return Err(Error::ConnectionClosed),
             }
-        }
+            Ok::<(), Error>(())
+        };
+        tokio::time::timeout(client_timeout, read_loop)
+            .await
+            .map_err(|_| Error::Timeout)??;
 
         // Return results in send order.
         let mut out = Vec::new();

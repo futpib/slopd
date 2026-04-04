@@ -520,6 +520,10 @@ fn main() {
                 }
                 if let Some(code) = prompt.strip_prefix("/exit ") {
                     let code: i32 = code.trim().parse().unwrap_or(0);
+                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    payload["prompt"] = serde_json::json!(prompt);
+                    fire_hooks(&settings, "UserPromptSubmit", &payload);
+                    fire_stop(&settings, session_id, &cwd, &transcript_path);
                     unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
                     std::process::exit(code);
                 }

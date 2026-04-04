@@ -1,5 +1,6 @@
 use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[test]
 fn slopctl_version_contains_commit_hash() {
@@ -265,4 +266,63 @@ fn status_without_slopd_running() {
         .expect("failed to run slopctl");
 
     assert!(!output.status.success(), "slopctl should have failed but succeeded");
+}
+
+/// slopctl times out when the server accepts the connection but never responds.
+#[test]
+fn slopctl_times_out_on_unresponsive_server() {
+    build_bin("slopctl");
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let socket_dir = runtime_dir.path().join("slopd");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let socket_path = socket_dir.join("slopd.sock");
+
+    // Create a listener that accepts connections but never responds.
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("failed to bind fake socket");
+
+    // Accept connections in a background thread (hold them open, never write).
+    let accept_thread = std::thread::spawn(move || {
+        let mut conns = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => conns.push(s),
+                Err(_) => break,
+            }
+        }
+        conns
+    });
+
+    let start = Instant::now();
+    let mut child = Command::new(cargo_bin("slopctl"))
+        .args(["ps", "--json"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .spawn()
+        .expect("failed to spawn slopctl");
+
+    // Give slopctl up to 30 seconds to exit on its own.
+    let deadline = start + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("failed to poll slopctl") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                child.kill().expect("failed to kill slopctl");
+                child.wait().ok();
+                drop(accept_thread);
+                panic!("slopctl hung for {:?} — it should time out on its own", start.elapsed());
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let elapsed = start.elapsed();
+
+    drop(accept_thread);
+
+    assert!(!status.success(), "slopctl should have failed");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "slopctl took {:?} — should time out much sooner",
+        elapsed,
+    );
 }

@@ -636,6 +636,75 @@ async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
     }
 }
 
+type SessionLock = Arc<Mutex<()>>;
+
+/// Recreate the slopd tmux session (server + session + hooks) under the lock.
+async fn recreate_slopd_session(config: &libslop::SlopdConfig, session_lock: &SessionLock) {
+    let _guard = session_lock.lock().await;
+
+    // Start the server if needed (it may have exited entirely).
+    if config.tmux.should_start_server() {
+        let _ = tmux(config)
+            .arg("start-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+
+    // Check again under the lock — another task may have already recreated it.
+    let has_session = tmux(config)
+        .args(["has-session", "-t", "slopd"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    if matches!(has_session, Ok(s) if s.success()) {
+        return;
+    }
+
+    info!("slopd tmux session is gone, recreating");
+    let _ = tmux(config)
+        .args(["new-session", "-d", "-s", "slopd"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    let _ = tmux(config)
+        .args(["set-option", "-t", "slopd", libslop::TmuxOption::SlopdManaged.as_str(), "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    register_tmux_hooks(config).await;
+}
+
+/// Check whether a failed tmux output indicates the server or session is gone.
+fn is_tmux_session_gone(output: &std::process::Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("no server running on")
+        || stderr.contains("can't find session:")
+        || stderr.contains("can't find window:")
+}
+
+/// Run a tmux command that targets the slopd session.  If it fails because
+/// the server or session is gone, recreate under the lock and retry once.
+async fn tmux_session_output(
+    config: &libslop::SlopdConfig,
+    session_lock: &SessionLock,
+    build_cmd: impl Fn(&libslop::SlopdConfig) -> tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    let output = build_cmd(config).output().await?;
+    if !is_tmux_session_gone(&output) {
+        return Ok(output);
+    }
+    recreate_slopd_session(config, session_lock).await;
+    build_cmd(config).output().await
+}
+
 /// Reconcile managed_panes against live tmux panes, emitting PaneDestroyed
 /// for any managed pane that no longer exists.
 async fn reconcile_panes(
@@ -655,6 +724,14 @@ async fn reconcile_panes(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
+        }
+        Ok(out) if {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            stderr.contains("no server running on")
+                || stderr.contains("can't find session:")
+        } => {
+            // Server or session is gone — all managed panes are dead.
+            std::collections::HashSet::new()
         }
         _ => return,
     };
@@ -835,6 +912,7 @@ async fn main() {
     // panes to detect panes that exited without going through slopctl kill.
     // This catches cases that tmux session-scope hooks cannot (e.g. process
     // exit, which only fires pane-scope hooks).
+    let session_lock: SessionLock = Arc::new(Mutex::new(()));
     let reconcile_config = config.clone();
     let reconcile_panes_map = panes.clone();
     let reconcile_managed = managed_panes.clone();
@@ -852,7 +930,7 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -953,6 +1031,7 @@ async fn handle_connection(
     managed_panes: ManagedPanes,
     event_tx: EventTx,
     pane_registered: PaneRegistered,
+    session_lock: SessionLock,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -1071,7 +1150,7 @@ async fn handle_connection(
             }
 
             body => {
-                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered).await;
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock).await;
                 if write_response(&writer, req.id, body).await.is_err() {
                     break;
                 }
@@ -1182,10 +1261,12 @@ async fn reparent_children_of(
     }
 }
 
-async fn list_panes(config: &libslop::SlopdConfig) -> Result<Vec<libslop::PaneInfo>, String> {
-    let list_out = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity} #{pane_current_path}"])
-        .output()
+async fn list_panes(config: &libslop::SlopdConfig, session_lock: &SessionLock) -> Result<Vec<libslop::PaneInfo>, String> {
+    let list_out = tmux_session_output(config, session_lock, |c| {
+        let mut cmd = tmux(c);
+        cmd.args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity} #{pane_current_path}"]);
+        cmd
+    })
         .await
         .map_err(|e| e.to_string())?;
     if !list_out.status.success() {
@@ -1290,6 +1371,7 @@ async fn handle_request(
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
     pane_registered: &PaneRegistered,
+    session_lock: &SessionLock,
 ) -> libslop::ResponseBody {
     match body {
 
@@ -1461,35 +1543,35 @@ async fn handle_request(
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
             }
             let xdg_runtime_dir = libslop::runtime_dir();
-            let mut cmd = tmux(config);
-            cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
-                .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                .args(["-e", &format!("SLOPCTL={}", config.run.slopctl)]);
             // Resolve start directory: per-session flag takes precedence over config default.
             // Config value is expanded (~ and $VAR); the CLI value is already shell-expanded.
             let effective_start_dir = start_directory.or_else(|| {
                 config.run.start_directory.as_ref().map(|p| libslop::expand_path(p))
             });
-            if let Some(ref dir) = effective_start_dir {
-                match dir.to_str() {
-                    Some(dir_str) => { cmd.args(["-c", dir_str]); }
-                    None => warn!("start_directory contains non-UTF-8 characters, ignoring: {}", dir.display()),
+            let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
+            let output = tmux_session_output(config, session_lock, |c| {
+                let mut cmd = tmux(c);
+                cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+                    .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
+                    .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
+                if let Some(ref dir) = effective_start_dir {
+                    if let Some(dir_str) = dir.to_str() {
+                        cmd.args(["-c", dir_str]);
+                    }
                 }
-            }
-            if let Some(ref custom_dir) = config.claude_config_dir {
-                cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
-            }
-            // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
-            // write their coverage data even when launched inside a tmux window.
-            if let Ok(profile_file) = std::env::var("LLVM_PROFILE_FILE") {
-                cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", profile_file)]);
-            }
-            let output = cmd
-                .arg(config.run.executable.program())
-                .args(config.run.executable.args())
-                .args(&extra_args)
-                .output()
-                .await;
+                if let Some(ref custom_dir) = c.claude_config_dir {
+                    cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
+                }
+                // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
+                // write their coverage data even when launched inside a tmux window.
+                if let Some(ref pf) = profile_file {
+                    cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
+                }
+                cmd.arg(c.run.executable.program())
+                    .args(c.run.executable.args())
+                    .args(&extra_args);
+                cmd
+            }).await;
             match output {
                 Ok(out) if out.status.success() => {
                     let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1768,7 +1850,7 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Ps => {
-            match list_panes(config).await {
+            match list_panes(config, session_lock).await {
                 Ok(panes) => libslop::ResponseBody::Ps { panes },
                 Err(e) => libslop::ResponseBody::Error { message: e },
             }
