@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Parser)]
 #[command(name = "slopd", about = "Claude session manager daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
@@ -959,7 +959,7 @@ async fn write_response(
 ) -> std::io::Result<()> {
     let response = libslop::Response { id, body };
     let mut json = serde_json::to_string(&response).unwrap();
-    debug!("sending: {}", json);
+    trace!("sending: {}", json);
     json.push('\n');
     writer.lock().await.write_all(json.as_bytes()).await
 }
@@ -1042,7 +1042,7 @@ async fn handle_connection(
         std::collections::HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        debug!("received: {}", line);
+        trace!("received: {}", line);
         let req = match serde_json::from_str::<libslop::Request>(&line) {
             Ok(req) => req,
             Err(e) => {
@@ -1436,7 +1436,7 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Hook { event, payload, pane_id } => {
-            debug!("hook: {} pane={:?}", event, pane_id);
+            debug!("hook: {} pane={:?} payload={}", event, pane_id, payload);
 
             // Ignore hooks from panes that were not spawned by slopd. This can happen
             // when an external Claude instance shares the same settings.json with
