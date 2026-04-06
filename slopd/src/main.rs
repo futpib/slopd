@@ -1436,12 +1436,16 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Hook { event, payload, pane_id } => {
-            debug!("hook: {} pane={:?} payload={}", event, pane_id, payload);
+            let Some(pane) = pane_id.as_deref() else {
+                debug!("hook: {} ignored (no pane_id)", event);
+                return libslop::ResponseBody::Hooked;
+            };
+            debug!("hook: {} pane={} payload={}", event, pane, payload);
 
             // Ignore hooks from panes that were not spawned by slopd. This can happen
             // when an external Claude instance shares the same settings.json with
             // injected hooks.
-            if let Some(pane) = pane_id.as_deref() {
+            {
                 if !managed_panes.contains(pane) {
                     // The hook might have arrived before the Run handler's
                     // managed_panes.insert() ran (race between tmux creating the pane
@@ -1469,10 +1473,7 @@ async fn handle_request(
             // includes a transcript_path we haven't seen yet for this pane.
             // This covers both SessionStart and any hook fired after a slopd
             // restart where the tailer is no longer running.
-            if let (Some(pane), Some(transcript_path)) = (
-                pane_id.as_deref(),
-                payload.get("transcript_path").and_then(|v| v.as_str()),
-            ) {
+            if let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
                 let state = pane_state(panes, pane);
                 let already_tailing = state.transcript_path.lock().unwrap().as_deref() == Some(transcript_path);
                 if !already_tailing {
@@ -1502,10 +1503,7 @@ async fn handle_request(
 
             // Side effects for specific hooks (not state-related).
             if event == "SessionStart" {
-                if let (Some(pane), Some(session_id)) = (
-                    pane_id.as_deref(),
-                    payload.get("session_id").and_then(|v| v.as_str()),
-                ) {
+                if let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
@@ -1513,14 +1511,12 @@ async fn handle_request(
                 }
             }
             if event == "UserPromptSubmit" {
-                if let Some(pane) = pane_id.as_deref() {
-                    debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
-                    pane_state(panes, pane).prompt_submitted.notify_waiters();
-                }
+                debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
+                pane_state(panes, pane).prompt_submitted.notify_waiters();
             }
 
             // Unified state transition via reducer.
-            if let Some(pane) = pane_id.as_deref() {
+            {
                 let current = pane_state(panes, pane).detailed_state.lock().unwrap().clone();
                 if let Some(new_state) = reduce_pane_state(&current, &PaneStateEvent::Hook { event: &event }) {
                     set_pane_detailed_state(config, pane, &new_state, Some(&current), event_tx, panes).await;
