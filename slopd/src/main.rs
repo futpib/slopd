@@ -764,7 +764,10 @@ async fn reconcile_panes(
 async fn main() {
     let cli = Cli::parse();
 
-    let level = libslop::verbosity_to_level(cli.verbose);
+    let mut config = libslop::SlopdConfig::load();
+
+    let verbosity = cli.verbose.max(config.verbose);
+    let level = libslop::verbosity_to_level(verbosity);
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_env_filter(
@@ -773,8 +776,6 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-
-    let mut config = libslop::SlopdConfig::load();
     if let Some(executable) = cli.executable {
         config.run.executable = if executable.len() == 1 {
             libslop::Executable::String(executable.into_iter().next().unwrap())

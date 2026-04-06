@@ -669,6 +669,10 @@ pub fn inject_hooks_into_file(
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SlopdConfig {
+    /// Verbosity level: 0 = warn, 1 = info, 2 = debug, 3 = trace (default: 0).
+    /// Overridden by CLI `-v` flags or `RUST_LOG`.
+    #[serde(default)]
+    pub verbose: u8,
     #[serde(default)]
     pub tmux: SlopdTmuxConfig,
     #[serde(default)]
