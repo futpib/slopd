@@ -151,7 +151,7 @@ All commands communicate with the running `slopd` daemon over its Unix socket.
 Print daemon uptime.
 
 ```
-uptime: 1h 23m 45s
+uptime: 5025s
 ```
 
 ### `slopctl ps [--filter KEY=VALUE] [--json]`
@@ -159,9 +159,9 @@ uptime: 1h 23m 45s
 List all panes managed by slopd.
 
 ```
-PANE  CREATED        LAST_ACTIVE    SESSION         PARENT  TAGS      STATE  DETAILED_STATE
-%1    2 minutes ago  2 minutes ago  session-abc123  -       -         ready  ready
-%2    5 seconds ago  5 seconds ago  -               %1      web,prod  busy   busy_tool_use
+PANE  CREATED        LAST_ACTIVE    SESSION         PARENT  TAGS      STATE  DETAILED_STATE  WORKING_DIR
+%1    2 minutes ago  2 minutes ago  session-abc123  -       -         ready  ready           ~/code/project
+%2    5 seconds ago  5 seconds ago  -               %1      web,prod  busy   busy_tool_use   -
 ```
 
 Filter by tag:
@@ -249,7 +249,7 @@ Forward a Claude lifecycle hook event to slopd. Reads the JSON payload from stdi
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
 ```
 
-### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID]`
+### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--replay N]`
 
 Subscribe to the event stream and print events as JSON lines.
 
@@ -268,6 +268,9 @@ slopctl listen --transcript user --transcript assistant
 
 # Mix sources: hook Stop events and state changes for a pane
 slopctl listen --hook Stop --event DetailedStateChange --pane-id %1
+
+# Replay the last 20 transcript records then stream live events
+slopctl listen --transcript user --transcript assistant --pane-id %1 --replay 20
 ```
 
 Flag summary:
@@ -277,6 +280,23 @@ Flag summary:
 | `--hook EVENT` | `source:hook` | `Stop`, `UserPromptSubmit`, … |
 | `--event EVENT` | `source:slopd` | `StateChange`, `DetailedStateChange` |
 | `--transcript TYPE` | `source:transcript` | `user`, `assistant`, `progress` |
+
+`--replay N`: Replay the last N transcript records from the pane's history before switching to live events. Requires `--pane-id`.
+
+### `slopctl transcript <PANE_ID> [--limit N] [--before CURSOR]`
+
+Read historical transcript records from a pane. Returns records as a JSON object with a `records` array.
+
+```bash
+# Last 50 records (default)
+slopctl transcript %1
+
+# Last 10 records
+slopctl transcript %1 --limit 10
+
+# Records before a specific byte-offset cursor (for pagination)
+slopctl transcript %1 --before 4096
+```
 
 ### `slopctl tag <PANE_ID> <TAG>`
 
@@ -295,9 +315,9 @@ Remove a tag from a pane.
 slopctl untag %1 prod
 ```
 
-### `slopctl tags <PANE_ID>`
+### `slopctl tags [PANE_ID]`
 
-List all tags on a pane.
+List all tags on a pane. `PANE_ID` defaults to `$TMUX_PANE` if omitted.
 
 ```bash
 slopctl tags %1
