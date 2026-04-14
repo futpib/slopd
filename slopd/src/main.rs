@@ -1534,7 +1534,7 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory } => {
+        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env } => {
             let settings_path = config.claude_settings_path();
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
@@ -1546,6 +1546,29 @@ async fn handle_request(
                 config.run.start_directory.as_ref().map(|p| libslop::expand_path(p))
             });
             let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
+            // Merge env: config env_files (in order) → config env → request env.
+            // Later entries override earlier ones (tmux applies -e left-to-right).
+            let mut merged_env: Vec<(String, String)> = Vec::new();
+            for raw_path in &config.run.env_files {
+                let path = libslop::expand_path(raw_path);
+                match libslop::load_env_file(&path) {
+                    Ok(pairs) => merged_env.extend(pairs),
+                    Err(e) => {
+                        return libslop::ResponseBody::Error { message: e };
+                    }
+                }
+            }
+            for (k, v) in &config.run.env {
+                match libslop::expand_env_value(v) {
+                    Ok(expanded) => merged_env.push((k.clone(), expanded)),
+                    Err(e) => {
+                        return libslop::ResponseBody::Error {
+                            message: format!("invalid [run.env] {}: {}", k, e),
+                        };
+                    }
+                }
+            }
+            merged_env.extend(env.iter().cloned());
             let output = tmux_session_output(config, session_lock, |c| {
                 let mut cmd = tmux(c);
                 cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
@@ -1563,6 +1586,9 @@ async fn handle_request(
                 // write their coverage data even when launched inside a tmux window.
                 if let Some(ref pf) = profile_file {
                     cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
+                }
+                for (k, v) in &merged_env {
+                    cmd.args(["-e", &format!("{}={}", k, v)]);
                 }
                 cmd.arg(c.run.executable.program())
                     .args(c.run.executable.args())

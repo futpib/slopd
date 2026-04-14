@@ -48,6 +48,49 @@ pub fn expand_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(expanded.as_ref())
 }
 
+/// Expand `$VAR` / `${VAR}` references in a string against the current process
+/// environment. Missing variables are an error (unlike `expand_path`, which
+/// leaves them as-is for path-like values).
+pub fn expand_env_value(value: &str) -> Result<String, String> {
+    shellexpand::env_with_context(value, |var| {
+        std::env::var(var)
+            .map(Some)
+            .map_err(|_| format!("environment variable ${} is not set", var))
+    })
+    .map(|cow| cow.into_owned())
+    .map_err(|e| e.to_string())
+}
+
+/// Parse a `KEY=VALUE` string into a pair, expanding `$VAR` / `${VAR}` in the
+/// value against the current process environment. Rejects empty keys and
+/// inputs missing the `=` separator.
+pub fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --env {:?}: expected KEY=VALUE", raw))?;
+    if key.is_empty() {
+        return Err(format!("invalid --env {:?}: empty key", raw));
+    }
+    let expanded = expand_env_value(value)
+        .map_err(|e| format!("invalid --env {:?}: {}", raw, e))?;
+    Ok((key.to_string(), expanded))
+}
+
+/// Load environment pairs from a dotenv-style file. Returns pairs in the
+/// order they appear in the file. Values are expanded by dotenvy's own
+/// substitution rules (it supports `${VAR}` against the process env).
+pub fn load_env_file(path: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let iter = dotenvy::from_path_iter(path)
+        .map_err(|e| format!("failed to open env file {}: {}", path.display(), e))?;
+    let mut out = Vec::new();
+    for item in iter {
+        let (k, v) = item
+            .map_err(|e| format!("failed to parse env file {}: {}", path.display(), e))?;
+        out.push((k, v));
+    }
+    Ok(out)
+}
+
 pub enum TmuxOption {
     /// Marks the slopd-managed tmux session; value is "true"
     SlopdManaged,
@@ -743,6 +786,17 @@ pub struct SlopdRunConfig {
     /// `$VAR` / `${VAR}` expansion. Overridden per-session by
     /// `slopctl run --start-directory`.
     pub start_directory: Option<PathBuf>,
+    /// Extra environment variables for every new Claude pane. Values support
+    /// `$VAR` / `${VAR}` expansion against slopd's environment at spawn time.
+    /// Merged with (and overridden by) `slopctl run --env` / `--env-file`.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Paths to env-files loaded for every new Claude pane. Paths support
+    /// `~` / `$VAR` expansion. Files are loaded in order; later files and
+    /// [run.env] entries override earlier ones. CLI `--env-file` / `--env`
+    /// override all of these.
+    #[serde(default)]
+    pub env_files: Vec<PathBuf>,
 }
 
 fn default_slopctl() -> String {
@@ -778,6 +832,8 @@ impl Default for SlopdRunConfig {
             executable: Executable::default(),
             slopctl: default_slopctl(),
             start_directory: None,
+            env: std::collections::BTreeMap::new(),
+            env_files: Vec::new(),
         }
     }
 }
@@ -866,7 +922,15 @@ pub struct EventFilter {
 #[serde(tag = "type")]
 pub enum RequestBody {
     Status,
-    Run { parent_pane_id: Option<String>, extra_args: Vec<String>, start_directory: Option<PathBuf> },
+    Run {
+        parent_pane_id: Option<String>,
+        extra_args: Vec<String>,
+        start_directory: Option<PathBuf>,
+        /// Extra environment variables for the new pane (client-side-resolved).
+        /// Merged after the daemon's `[run.env]` config; later pairs win.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
     /// Notification from a tmux hook (called by slopctl tmux-hook).

@@ -29,6 +29,52 @@ fn tmux_available() -> bool {
     }
 }
 
+/// Drive mock_claude's `/env KEY` slash-command in `pane_id` and return the
+/// value mock_claude observed for `key`. Panics if the response does not
+/// arrive within 5 seconds.
+fn read_pane_env(env: &TestEnv, pane_id: &str, key: &str) -> String {
+    // mock_claude starts in alternating newline mode; one Enter is literal and
+    // the second submits. Switch to always-submit first.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    env.tmux.tmux()
+        .args(["send-keys", "-t", pane_id, &format!("/env {}", key), "Enter"])
+        .status().unwrap();
+
+    let needle = format!("/env:{}=", key);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let joined = text.replace('\n', "").replace('\r', "");
+        if let Some(pos) = joined.find(&needle) {
+            let tail = &joined[pos + needle.len()..];
+            let value = tail.split_whitespace().next().unwrap_or("").to_string();
+            return value;
+        }
+        assert!(Instant::now() < deadline,
+            "timed out waiting for /env {} response; pane: {:?}", key, text);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run slopctl against the test env, optionally forwarding extra env vars to
+/// slopctl itself (so `--env KEY=${VAR}` expansion can resolve).
+fn slopctl_with_env(env: &TestEnv, args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(cargo_bin("slopctl"));
+    cmd.args(args)
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("failed to run slopctl")
+}
+
 /// Hook must never exit 2 — that would block the Claude action.
 /// Errors should exit 1 (visible failure), never 2.
 #[test]
@@ -5494,4 +5540,239 @@ fn slopd_survives_initial_shell_pane_exit() {
     assert!(run_output.status.success(), "slopctl run should work: {:?}", run_output);
 
     kill_slopd(slopd);
+}
+
+#[test]
+fn run_forwards_env_from_cli_flag() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["run", "--env", "SLOPD_TEST_FOO=hello"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_FOO");
+    kill_slopd(slopd);
+    assert_eq!(value, "hello", "--env should forward KEY=VALUE to the pane");
+}
+
+#[test]
+fn run_expands_cli_env_value_from_slopctl_env() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let out = slopctl_with_env(
+        &env,
+        &["run", "--env", "SLOPD_TEST_BAR=${SLOPD_TEST_SOURCE}"],
+        &[("SLOPD_TEST_SOURCE", "resolved")],
+    );
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_BAR");
+    kill_slopd(slopd);
+    assert_eq!(value, "resolved",
+        "${{VAR}} in --env should be expanded from slopctl's environment");
+}
+
+#[test]
+fn run_cli_env_missing_var_is_error() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let mut cmd = Command::new(cargo_bin("slopctl"));
+    cmd.args(["run", "--env", "SLOPD_TEST_X=${SLOPD_TEST_DEFINITELY_UNSET}"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env_remove("SLOPD_TEST_DEFINITELY_UNSET");
+    let out = cmd.output().expect("failed to run slopctl");
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "missing var should fail: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("SLOPD_TEST_DEFINITELY_UNSET"),
+        "error should mention the missing variable; got: {}", stderr);
+}
+
+#[test]
+fn run_forwards_env_from_env_file() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let env_file = env.config_dir.path().join("test.env");
+    std::fs::write(&env_file, "# a comment\nSLOPD_TEST_FILE_A=aaa\nSLOPD_TEST_FILE_B=bbb\n").unwrap();
+
+    let out = env.slopctl(&["run", "--env-file", env_file.to_str().unwrap()]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let a = read_pane_env(&env, &pane_id, "SLOPD_TEST_FILE_A");
+    let b = read_pane_env(&env, &pane_id, "SLOPD_TEST_FILE_B");
+    kill_slopd(slopd);
+    assert_eq!(a, "aaa");
+    assert_eq!(b, "bbb");
+}
+
+#[test]
+fn run_cli_flag_overrides_env_file() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let env_file = env.config_dir.path().join("test.env");
+    std::fs::write(&env_file, "SLOPD_TEST_PREC=from-file\n").unwrap();
+
+    let out = env.slopctl(&[
+        "run",
+        "--env-file", env_file.to_str().unwrap(),
+        "--env", "SLOPD_TEST_PREC=from-flag",
+    ]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_PREC");
+    kill_slopd(slopd);
+    assert_eq!(value, "from-flag", "--env should override --env-file");
+}
+
+#[test]
+fn run_forwards_env_from_config_run_env() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let socket = env.tmux.socket.to_str().unwrap().to_string();
+    let config = format!(
+        "[tmux]\nsocket = {:?}\n\n[run]\nexecutable = [{:?}]\n\n[run.env]\nSLOPD_TEST_CFG = \"cfg-value\"\n",
+        socket, mock_claude_path,
+    );
+    let slopd_config_dir = env.config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_CFG");
+    kill_slopd(slopd);
+    assert_eq!(value, "cfg-value", "[run.env] in config should reach the pane");
+}
+
+#[test]
+fn run_forwards_env_from_config_env_files() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let env_file = env.config_dir.path().join("cfg.env");
+    std::fs::write(&env_file, "SLOPD_TEST_CFG_FILE=from-cfg-file\n").unwrap();
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let socket = env.tmux.socket.to_str().unwrap().to_string();
+    let config = format!(
+        "[tmux]\nsocket = {:?}\n\n[run]\nexecutable = [{:?}]\nenv_files = [{:?}]\n",
+        socket, mock_claude_path, env_file.to_str().unwrap(),
+    );
+    let slopd_config_dir = env.config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_CFG_FILE");
+    kill_slopd(slopd);
+    assert_eq!(value, "from-cfg-file", "[run] env_files should reach the pane");
+}
+
+#[test]
+fn run_cli_env_overrides_config_env() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let socket = env.tmux.socket.to_str().unwrap().to_string();
+    let config = format!(
+        "[tmux]\nsocket = {:?}\n\n[run]\nexecutable = [{:?}]\n\n[run.env]\nSLOPD_TEST_PREC = \"from-config\"\n",
+        socket, mock_claude_path,
+    );
+    let slopd_config_dir = env.config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl(&["run", "--env", "SLOPD_TEST_PREC=from-cli"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let value = read_pane_env(&env, &pane_id, "SLOPD_TEST_PREC");
+    kill_slopd(slopd);
+    assert_eq!(value, "from-cli", "CLI --env should override [run.env] in config");
 }

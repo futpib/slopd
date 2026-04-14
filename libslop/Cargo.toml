@@ -7,6 +7,7 @@ description = "Shared library for slopd/slopctl — protocol types, config, hook
 [dependencies]
 atomic-write-file = "0.3.0"
 dirs = "6.0.0"
+dotenvy = "0.15.7"
 fd-lock = "4.0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

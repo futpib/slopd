@@ -132,6 +132,17 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Supports ~ and $VAR / ${VAR} expansion.
 # Overridden per-session by `slopctl run --start-directory`.
 # start_directory = "~/code/my-project"
+
+# Extra environment variables for every new Claude pane.
+# Values support $VAR / ${VAR} expansion against slopd's environment.
+# [run.env]
+# FOO = "bar"
+# TOKEN = "${MY_TOKEN}"
+
+# Paths to dotenv-style files loaded for every new Claude pane.
+# Paths support ~ and $VAR expansion. Files loaded in order; later entries win.
+# CLI `--env` / `--env-file` override these.
+# env_files = ["~/.config/slopd/pane.env"]
 ```
 
 ### slopctl config
@@ -176,7 +187,7 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run [-c DIR] [-- EXTRA_ARGS...]`
+### `slopctl run [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
@@ -191,6 +202,18 @@ Use `-c` / `--start-directory` to set the working directory for this session, ov
 ```bash
 PANE=$(slopctl run -c ~/code/other-project)
 PANE=$(slopctl run --start-directory ~/code/other-project)
+```
+
+Use `-e` / `--env KEY=VALUE` (repeatable) to add environment variables to the new pane. Values support `$VAR` / `${VAR}` expansion against slopctl's environment; a missing variable is an error:
+
+```bash
+PANE=$(slopctl run --env FOO=bar --env TOKEN=${MY_TOKEN})
+```
+
+Use `--env-file PATH` (repeatable) to load environment variables from a dotenv-style file (`KEY=VALUE` per line, `#` comments, blank lines ignored). Files are loaded in the order given; later files and `--env` flags override earlier ones, and CLI flags override `[run.env]` / `[run.env_files]` from config:
+
+```bash
+PANE=$(slopctl run --env-file ~/.config/slopd/pane.env --env DEBUG=1)
 ```
 
 ### `slopctl kill <PANE_ID>`

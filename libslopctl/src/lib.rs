@@ -78,6 +78,17 @@ pub enum CommonCommand {
         /// Overrides [run] start_directory from config.toml for this session.
         #[arg(short = 'c', long, value_name = "DIR")]
         start_directory: Option<PathBuf>,
+        /// Extra environment variables for the new pane (repeatable).
+        /// Format: KEY=VALUE. The value supports $VAR / ${VAR} expansion
+        /// against slopctl's environment; missing variables are an error.
+        /// Overrides values from --env-file and [run.env]/[run.env_files] in config.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+        /// Path to a dotenv-style file of KEY=VALUE lines (repeatable).
+        /// Files are loaded in order; later files (and --env) override earlier ones.
+        /// Overrides entries from [run.env_files] / [run.env] in config.
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_files: Vec<PathBuf>,
         /// Extra arguments passed to the Claude executable (after --).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
@@ -179,6 +190,27 @@ pub fn die(msg: &str) -> ! {
 
 pub fn die_err(e: Error) -> ! {
     die(&e.to_string());
+}
+
+/// Build the merged env list for `slopctl run`: entries from env-files (in flag
+/// order) followed by entries from --env flags (in flag order). Values in
+/// --env are expanded against slopctl's environment; entries from env-files
+/// are returned as dotenvy parses them. Later entries override earlier ones
+/// (the wire format preserves order; slopd and tmux both apply last-wins).
+pub fn build_cli_env(
+    env_files: &[PathBuf],
+    envs: &[String],
+) -> Result<Vec<(String, String)>, Error> {
+    let mut out = Vec::new();
+    for path in env_files {
+        let pairs = libslop::load_env_file(path).map_err(Error::FilterError)?;
+        out.extend(pairs);
+    }
+    for raw in envs {
+        let pair = libslop::parse_env_kv(raw).map_err(Error::FilterError)?;
+        out.push(pair);
+    }
+    Ok(out)
 }
 
 /// Parse "key=value" filter strings. Returns an error on malformed input.
@@ -449,8 +481,9 @@ impl<
         parent_pane_id: Option<String>,
         extra_args: Vec<String>,
         start_directory: Option<PathBuf>,
+        env: Vec<(String, String)>,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory }).await? {
+        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env }).await? {
             libslop::ResponseBody::Run { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -937,8 +970,9 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory } => {
-            let pane_id = client.run(ctx.parent_pane_id.clone(), extra_args, start_directory).await?;
+        CommonCommand::Run { extra_args, start_directory, envs, env_files } => {
+            let env = build_cli_env(&env_files, &envs)?;
+            let pane_id = client.run(ctx.parent_pane_id.clone(), extra_args, start_directory, env).await?;
             println!("{}", pane_id);
         }
         CommonCommand::Kill { pane_id } => {
