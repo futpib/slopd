@@ -144,7 +144,7 @@ async fn set_pane_detailed_state(
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
-    *pane_state(panes, pane_id).detailed_state.lock().unwrap() = detailed.clone();
+    *panes.get_or_insert(pane_id).detailed_state.lock().unwrap() = detailed.clone();
     let simple = detailed.to_simple();
     for (opt, val) in [
         (libslop::TmuxOption::SlopdState, simple.as_str()),
@@ -400,19 +400,100 @@ async fn read_transcript_before(
     Ok((window.into(), at_beginning))
 }
 
-type PaneMap = Arc<dashmap::DashMap<String, Arc<PaneState>>>;
+/// Map of tmux pane ID → per-pane shared state.
+///
+/// ## Why this is a newtype, not a plain `DashMap`
+///
+/// An earlier version exposed `dashmap::DashMap` directly and deadlocked in
+/// production (commit 2bac67b / r163): a `for entry in panes.iter()` loop held
+/// a shard read guard across a `tmux(...).output().await`, and a concurrent
+/// `panes.remove(...)` parked on the same shard's writer-preferring
+/// `parking_lot::RwLock`.
+///
+/// The newtype fixes this by construction.  Only owned-return APIs are exposed
+/// (`Arc<PaneState>`, `Option<Arc<PaneState>>`, `Vec<String>`) — none of which
+/// borrow from the underlying map.  There is no way for a caller to obtain a
+/// shard guard, so there is no way to hold one across an `.await`.
+///
+/// **Review rule:** do not add methods that return `dashmap::mapref::one::Ref`,
+/// `RefMut`, `Entry`, or `Iter` (or anything that borrows from the map).  Every
+/// public method must return an owned value.
+#[derive(Clone)]
+struct PaneMap {
+    inner: Arc<dashmap::DashMap<String, Arc<PaneState>>>,
+}
 
-fn pane_state(panes: &PaneMap, pane_id: &str) -> Arc<PaneState> {
-    panes
-        .entry(pane_id.to_string())
-        .or_insert_with(|| Arc::new(PaneState::new()))
-        .clone()
+impl PaneMap {
+    fn new() -> Self {
+        Self { inner: Arc::new(dashmap::DashMap::new()) }
+    }
+
+    /// Return the `Arc<PaneState>` for `pane_id`, creating a fresh one if
+    /// absent.  The shard guard is released before this returns.
+    fn get_or_insert(&self, pane_id: &str) -> Arc<PaneState> {
+        self.inner
+            .entry(pane_id.to_string())
+            .or_insert_with(|| Arc::new(PaneState::new()))
+            .clone()
+    }
+
+    /// Return the existing `Arc<PaneState>` for `pane_id` if any.  The shard
+    /// guard is released before this returns.
+    fn get(&self, pane_id: &str) -> Option<Arc<PaneState>> {
+        self.inner.get(pane_id).map(|r| r.clone())
+    }
+
+    /// Remove and return the `Arc<PaneState>` for `pane_id` if any.  The
+    /// shard guard is released before this returns.
+    fn remove(&self, pane_id: &str) -> Option<Arc<PaneState>> {
+        self.inner.remove(pane_id).map(|(_, v)| v)
+    }
 }
 
 /// Set of pane IDs in the `slopd` tmux session.
 /// Populated from tmux on startup (so it survives slopd restarts) and kept
 /// in sync as panes are created/killed.
-type ManagedPanes = Arc<dashmap::DashSet<String>>;
+///
+/// See `PaneMap` doc-comment for the reason this is a newtype — same deadlock
+/// hazard applies to `DashSet::iter()`.  Only owned-return APIs are exposed.
+#[derive(Clone)]
+struct ManagedPanes {
+    inner: Arc<dashmap::DashSet<String>>,
+}
+
+impl ManagedPanes {
+    fn new() -> Self {
+        Self { inner: Arc::new(dashmap::DashSet::new()) }
+    }
+
+    fn insert(&self, pane_id: String) -> bool {
+        self.inner.insert(pane_id)
+    }
+
+    fn remove(&self, pane_id: &str) -> bool {
+        self.inner.remove(pane_id).is_some()
+    }
+
+    fn contains(&self, pane_id: &str) -> bool {
+        self.inner.contains(pane_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Return a snapshot of the current pane IDs as an owned `Vec<String>`.
+    ///
+    /// This is the only way to iterate.  The shard guards used internally are
+    /// released before the `Vec` is returned, so the caller is free to
+    /// `.await` while walking the snapshot.  Writers that arrive after the
+    /// snapshot is taken are not reflected — this is intentional; any change
+    /// concurrent with a reconcile/reparent pass will be picked up on the
+    /// next pass.
+    fn snapshot(&self) -> Vec<String> {
+        self.inner.iter().map(|r| r.key().clone()).collect()
+    }
+}
 
 /// Populate the managed-pane set from the `slopd` tmux session.
 /// Only panes that have the `@slopd_managed` pane option set are considered managed
@@ -453,7 +534,7 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
 
                 // Start the transcript tailer if we have a path.
                 if !transcript_path.is_empty() {
-                    let state = pane_state(panes, pane_id);
+                    let state = panes.get_or_insert(pane_id);
                     let new_cancel = tokio_util::sync::CancellationToken::new();
                     *state.transcript_cancel.lock().unwrap() = new_cancel.clone();
                     *state.transcript_path.lock().unwrap() = Some(transcript_path.to_string());
@@ -736,15 +817,15 @@ async fn reconcile_panes(
         _ => return,
     };
 
-    let dead: Vec<String> = managed_panes.iter()
-        .map(|entry| entry.key().clone())
+    let dead: Vec<String> = managed_panes.snapshot()
+        .into_iter()
         .filter(|id| !live_ids.contains(id))
         .collect();
 
     for pane_id in dead {
         info!("pane {} no longer exists, emitting PaneDestroyed", pane_id);
         reparent_children_of(config, managed_panes, &pane_id).await;
-        if let Some((_, state)) = panes.remove(&pane_id) {
+        if let Some(state) = panes.remove(&pane_id) {
             state.transcript_cancel.lock().unwrap().cancel();
         }
         managed_panes.remove(&pane_id);
@@ -875,8 +956,8 @@ async fn main() {
         .unwrap()
         .as_secs();
 
-    let panes: PaneMap = Arc::new(dashmap::DashMap::new());
-    let managed_panes: ManagedPanes = Arc::new(dashmap::DashSet::new());
+    let panes = PaneMap::new();
+    let managed_panes = ManagedPanes::new();
     let pane_registered: PaneRegistered = Arc::new(tokio::sync::Notify::new());
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<libslop::Record>(256);
@@ -1222,8 +1303,7 @@ async fn reparent_children_of(
     managed_panes: &ManagedPanes,
     dead_pane_id: &str,
 ) {
-    for entry in managed_panes.iter() {
-        let child_id = entry.key().clone();
+    for child_id in managed_panes.snapshot() {
         if child_id == dead_pane_id {
             continue;
         }
@@ -1413,7 +1493,7 @@ async fn handle_request(
                 }
                 _ => {}
             }
-            if let Some((_, state)) = panes.remove(&pane_id) {
+            if let Some(state) = panes.remove(&pane_id) {
                 state.transcript_cancel.lock().unwrap().cancel();
             }
             managed_panes.remove(&pane_id);
@@ -1474,7 +1554,7 @@ async fn handle_request(
             // This covers both SessionStart and any hook fired after a slopd
             // restart where the tailer is no longer running.
             if let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
-                let state = pane_state(panes, pane);
+                let state = panes.get_or_insert(pane);
                 let already_tailing = state.transcript_path.lock().unwrap().as_deref() == Some(transcript_path);
                 if !already_tailing {
                     debug!("hook {}: starting transcript tail for pane {} path={}", event, pane, transcript_path);
@@ -1512,12 +1592,12 @@ async fn handle_request(
             }
             if event == "UserPromptSubmit" {
                 debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
-                pane_state(panes, pane).prompt_submitted.notify_waiters();
+                panes.get_or_insert(pane).prompt_submitted.notify_waiters();
             }
 
             // Unified state transition via reducer.
             {
-                let current = pane_state(panes, pane).detailed_state.lock().unwrap().clone();
+                let current = panes.get_or_insert(pane).detailed_state.lock().unwrap().clone();
                 if let Some(new_state) = reduce_pane_state(&current, &PaneStateEvent::Hook { event: &event }) {
                     set_pane_detailed_state(config, pane, &new_state, Some(&current), event_tx, panes).await;
                 }
@@ -1626,7 +1706,7 @@ async fn handle_request(
                     // the pane to Ready before we reach this point. Without this guard we
                     // would reset a Ready pane back to BootingUp, causing slopctl send to
                     // wait indefinitely for the pane to become ready again.
-                    let current_state = pane_state(panes, &pane_id).detailed_state.lock().unwrap().clone();
+                    let current_state = panes.get_or_insert(&pane_id).detailed_state.lock().unwrap().clone();
                     if current_state == libslop::PaneDetailedState::BootingUp {
                         let new_state = reduce_pane_state(&current_state, &PaneStateEvent::Init).unwrap();
                         set_pane_detailed_state(config, &pane_id, &new_state, None, event_tx, panes).await;
@@ -1680,7 +1760,7 @@ async fn handle_request(
                     message: format!("pane {} is not managed by slopd", pane_id),
                 };
             }
-            let state = pane_state(panes, &pane_id);
+            let state = panes.get_or_insert(&pane_id);
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(timeout_secs);
 
@@ -1811,7 +1891,7 @@ async fn handle_request(
                     message: format!("pane {} is not managed by slopd", pane_id),
                 };
             }
-            let state = pane_state(panes, &pane_id);
+            let state = panes.get_or_insert(&pane_id);
 
             // Acquire the type-mutex so we don't interleave with concurrent sends.
             let _guard = state.type_mutex.lock().await;
