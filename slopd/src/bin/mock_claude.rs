@@ -222,14 +222,54 @@ fn fire_stop(
     })));
 }
 
-fn handle_prompt(prompt: &str) {
+/// Session state needed by commands that fire hooks or write transcript records.
+/// None in --print mode, Some in interactive mode.
+struct SessionContext<'a> {
+    no_hooks: bool,
+    settings: &'a serde_json::Value,
+    session_id: &'a str,
+    cwd: &'a std::path::Path,
+    transcript_path: &'a PathBuf,
+}
+
+enum PromptResult {
+    /// Command handled; caller should skip further processing.
+    Handled,
+    /// Exit with the given code.
+    Exit(i32),
+    /// Not a recognized simple command; caller should try interactive commands.
+    Unhandled,
+}
+
+/// Dispatch prompt commands that work in both --print and interactive mode.
+/// When `ctx` is Some, commands that need hooks/transcript use it.
+fn handle_prompt(prompt: &str, ctx: Option<&SessionContext>) -> PromptResult {
     if let Some(text) = prompt.strip_prefix("/echo ") {
         println!("{}", text.trim());
+        return PromptResult::Handled;
+    }
+    if let Some(secs) = prompt.strip_prefix("/sleep ") {
+        let secs: u64 = secs.trim().parse().unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return PromptResult::Handled;
+    }
+    if let Some(key) = prompt.strip_prefix("/env ") {
+        let val = std::env::var(key.trim())
+            .unwrap_or_else(|_| "UNSET".to_string());
+        println!("/env:{}={}", key.trim(), val);
+        return PromptResult::Handled;
     }
     if let Some(code) = prompt.strip_prefix("/exit ") {
         let code: i32 = code.trim().parse().unwrap_or(0);
-        std::process::exit(code);
+        if let Some(ctx) = ctx {
+            let mut payload = hook_payload("UserPromptSubmit", ctx.session_id, ctx.cwd, ctx.transcript_path);
+            payload["prompt"] = serde_json::json!(prompt);
+            fire_hooks(ctx.no_hooks, ctx.settings, "UserPromptSubmit", &payload);
+            fire_stop(ctx.no_hooks, ctx.settings, ctx.session_id, ctx.cwd, ctx.transcript_path);
+        }
+        return PromptResult::Exit(code);
     }
+    PromptResult::Unhandled
 }
 
 const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks"];
@@ -249,8 +289,10 @@ fn main() {
             .last()
             .cloned()
             .unwrap_or_default();
-        handle_prompt(&prompt);
-        return;
+        match handle_prompt(&prompt, None) {
+            PromptResult::Exit(code) => std::process::exit(code),
+            _ => return,
+        }
     }
 
     // Real Claude reads $CLAUDE_CONFIG_DIR/settings.json (default: ~/.claude/settings.json).
@@ -368,16 +410,22 @@ fn main() {
                     continue;
                 }
 
-                if let Some(text) = prompt.strip_prefix("/echo ") {
-                    println!("{}", text.trim());
-                    continue;
+                let ctx = SessionContext {
+                    no_hooks,
+                    settings: &settings,
+                    session_id,
+                    cwd: &cwd,
+                    transcript_path: &transcript_path,
+                };
+                match handle_prompt(&prompt, Some(&ctx)) {
+                    PromptResult::Handled => continue,
+                    PromptResult::Exit(code) => {
+                        unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
+                        std::process::exit(code);
+                    }
+                    PromptResult::Unhandled => {}
                 }
 
-                if let Some(secs) = prompt.strip_prefix("/sleep ") {
-                    let secs: u64 = secs.trim().parse().unwrap_or(0);
-                    std::thread::sleep(std::time::Duration::from_secs(secs));
-                    continue;
-                }
                 if let Some(secs) = prompt.strip_prefix("/permission ") {
                     // Simulate Claude processing a tool use then awaiting permission.
                     // Like /busy, but after the busy period fires PermissionRequest
@@ -525,21 +573,6 @@ fn main() {
                             fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
                         }
                     }
-                    continue;
-                }
-                if let Some(code) = prompt.strip_prefix("/exit ") {
-                    let code: i32 = code.trim().parse().unwrap_or(0);
-                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
-                    payload["prompt"] = serde_json::json!(prompt);
-                    fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
-                    fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
-                    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
-                    std::process::exit(code);
-                }
-                if let Some(key) = prompt.strip_prefix("/env ") {
-                    let val = std::env::var(key.trim())
-                        .unwrap_or_else(|_| "UNSET".to_string());
-                    println!("/env:{}={}", key.trim(), val);
                     continue;
                 }
                 if let Some(event) = prompt.strip_prefix("/hook ") {
