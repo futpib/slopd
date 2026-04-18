@@ -1,7 +1,6 @@
 [Unit]
 Description=slopd — Claude agent session manager
 Documentation=https://github.com/futpib/slopd
-After=default.target
 
 [Service]
 ExecStart=%h/.cargo/bin/slopd
