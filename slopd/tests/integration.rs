@@ -4640,6 +4640,56 @@ fn pane_destroyed_fires_on_process_exit() {
     kill_slopd(slopd);
 }
 
+/// When a managed pane's process crashes without firing any hooks or writing a
+/// transcript, slopd's reconciler must still detect the pane is gone, emit
+/// PaneDestroyed, and remove it from ps output.
+#[test]
+fn pane_destroyed_on_crash_without_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // --break-hooks suppresses all hook calls; --print '/exit 1' makes
+    // mock_claude exit immediately with code 1 (no interactive loop, no
+    // SessionStart, no transcript).
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path, "--break-hooks", "--print", "/exit 1"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Subscribe to PaneDestroyed before spawning the pane.
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    // Spawn mock_claude — it will exit immediately without firing any hooks.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // The reconciler should detect the pane is gone and emit PaneDestroyed.
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+
+    assert_eq!(event["source"], "slopd");
+    assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
+
+    // The pane should no longer appear in ps output.
+    let ps_output = env.slopctl(&["ps", "--json"]);
+    assert!(ps_output.status.success());
+    let panes_after: Vec<serde_json::Value> = serde_json::from_slice(&ps_output.stdout).unwrap();
+    assert!(
+        !panes_after.iter().any(|p| p["pane_id"] == pane_id.as_str()),
+        "pane should not be listed after crash",
+    );
+
+    kill_slopd(slopd);
+}
+
 /// slopd removes stale tmux hook entries from a previous slopctl path when
 /// re-registering hooks with the current path.
 #[test]
