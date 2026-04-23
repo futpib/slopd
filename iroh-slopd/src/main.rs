@@ -123,20 +123,21 @@ async fn proxy_connection(
     };
     let (mut unix_read, mut unix_write) = unix_stream.into_split();
 
-    tokio::select! {
-        result = tokio::io::copy(&mut iroh_recv, &mut unix_write) => {
-            if let Err(e) = result {
-                debug!("iroh->unix copy ended: {}", e);
-            }
-            let _ = unix_write.shutdown().await;
+    let iroh_to_unix = async {
+        if let Err(e) = tokio::io::copy(&mut iroh_recv, &mut unix_write).await {
+            debug!("iroh->unix copy ended: {}", e);
         }
-        result = tokio::io::copy(&mut unix_read, &mut iroh_send) => {
-            if let Err(e) = result {
-                debug!("unix->iroh copy ended: {}", e);
-            }
-            let _ = iroh_send.finish();
+        let _ = unix_write.shutdown().await;
+    };
+
+    let unix_to_iroh = async {
+        if let Err(e) = tokio::io::copy(&mut unix_read, &mut iroh_send).await {
+            debug!("unix->iroh copy ended: {}", e);
         }
-    }
+        let _ = iroh_send.finish();
+    };
+
+    tokio::join!(iroh_to_unix, unix_to_iroh);
 }
 
 #[tokio::main]
