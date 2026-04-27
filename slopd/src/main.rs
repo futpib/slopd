@@ -817,6 +817,15 @@ async fn reconcile_panes(
         _ => return,
     };
 
+    // Test hook: simulate the production failure mode where `tmux list-panes`
+    // transiently returned without our managed panes.  Used by the reconcile
+    // false-positive regression test.
+    let live_ids = if std::env::var("SLOPD_TEST_RECONCILE_FORCE_EMPTY").is_ok() {
+        std::collections::HashSet::new()
+    } else {
+        live_ids
+    };
+
     let dead: Vec<String> = managed_panes.snapshot()
         .into_iter()
         .filter(|id| !live_ids.contains(id))

@@ -181,7 +181,7 @@ impl TestEnv {
     }
 
     pub fn spawn_slopd(&self) -> Child {
-        self.spawn_slopd_inner(None, &[])
+        self.spawn_slopd_inner(None, &[], &[])
     }
 
     /// Like `spawn_slopd` but sets `SLOPD_TEST_RUN_YIELD_MS` to the given value.
@@ -192,15 +192,20 @@ impl TestEnv {
     /// deterministic regression tests for the race described in:
     ///   fix: guard Run handler from resetting pane state that a concurrent hook already advanced
     pub fn spawn_slopd_with_run_yield(&self, delay_ms: u64) -> Child {
-        self.spawn_slopd_inner(Some(delay_ms), &[])
+        self.spawn_slopd_inner(Some(delay_ms), &[], &[])
     }
 
     /// Like `spawn_slopd` but passes extra CLI arguments to the slopd binary.
     pub fn spawn_slopd_with_args(&self, extra_args: &[&str]) -> Child {
-        self.spawn_slopd_inner(None, extra_args)
+        self.spawn_slopd_inner(None, extra_args, &[])
     }
 
-    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>, extra_args: &[&str]) -> Child {
+    /// Like `spawn_slopd` but injects extra environment variables.
+    pub fn spawn_slopd_with_envs(&self, envs: &[(&str, &str)]) -> Child {
+        self.spawn_slopd_inner(None, &[], envs)
+    }
+
+    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>, extra_args: &[&str], extra_envs: &[(&str, &str)]) -> Child {
         let mut cmd = Command::new(cargo_bin("slopd"));
         cmd.args(extra_args)
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
@@ -213,6 +218,9 @@ impl TestEnv {
             .stderr(Stdio::null());
         if let Some(ms) = run_yield_ms {
             cmd.env("SLOPD_TEST_RUN_YIELD_MS", ms.to_string());
+        }
+        for (k, v) in extra_envs {
+            cmd.env(k, v);
         }
         let child = cmd.spawn().expect("failed to spawn slopd");
         // Wait for slopd to be ready by polling until a connection to its socket succeeds.
