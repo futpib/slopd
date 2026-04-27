@@ -817,12 +817,35 @@ async fn reconcile_panes(
         _ => return,
     };
 
-    let dead: Vec<String> = managed_panes.snapshot()
+    // Test hook: simulate the production failure mode where `tmux list-panes`
+    // transiently returned without our managed panes.  Used by the reconcile
+    // false-positive regression test.
+    let live_ids = if std::env::var("SLOPD_TEST_RECONCILE_FORCE_EMPTY").is_ok() {
+        std::collections::HashSet::new()
+    } else {
+        live_ids
+    };
+
+    let candidates: Vec<String> = managed_panes.snapshot()
         .into_iter()
         .filter(|id| !live_ids.contains(id))
         .collect();
 
-    for pane_id in dead {
+    for pane_id in candidates {
+        // The session-scoped list-panes call above can transiently fail to
+        // include a still-alive pane: the slopd session may be briefly missing
+        // (recreated between ticks), tmux may return "can't find session:"
+        // during a concurrent operation, or the result may be otherwise
+        // incomplete.  Once we wrongly call `managed_panes.remove(...)`, the
+        // pane is permanently disowned for the rest of this slopd's lifetime
+        // — Send/Interrupt/Tag all reject it, and hooks from it are dropped.
+        // Verify per-pane via show-options before declaring death.  Pane IDs
+        // are global to the tmux server, so this works regardless of which
+        // session the pane currently lives in.
+        if pane_is_still_alive(config, &pane_id).await {
+            continue;
+        }
+
         info!("pane {} no longer exists, emitting PaneDestroyed", pane_id);
         reparent_children_of(config, managed_panes, &pane_id).await;
         if let Some(state) = panes.remove(&pane_id) {
@@ -838,6 +861,35 @@ async fn reconcile_panes(
             }),
             cursor: None,
         });
+    }
+}
+
+/// Confirm that `pane_id` is still alive in tmux and still flagged as
+/// slopd-managed.  Returns `true` if show-options succeeds and reports
+/// `@slopd_managed=true`.  Returns `false` when tmux confirms the pane is
+/// gone (stderr signalling "no such pane:" / "can't find pane:") or when
+/// `@slopd_managed` has been cleared.  On ambiguous errors (e.g. tmux
+/// unavailable, unknown stderr) we return `true` to err on the side of
+/// keeping the pane managed — the next reconcile tick will retry, which is
+/// far cheaper than the alternative of permanently disowning a live pane.
+async fn pane_is_still_alive(config: &libslop::SlopdConfig, pane_id: &str) -> bool {
+    let out = tmux(config)
+        .args(["show-options", "-t", pane_id, "-p"])
+        .output()
+        .await;
+    match out {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            parse_pane_options(&stdout).slopd_managed
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // tmux phrasing varies by version: "no such pane:", "can't find pane:".
+            // Anything else is treated as a transient/ambiguous error and the
+            // pane is kept (caller will retry next tick).
+            !(stderr.contains("no such pane:") || stderr.contains("can't find pane:"))
+        }
+        Err(_) => true,
     }
 }
 
@@ -1342,19 +1394,20 @@ async fn reparent_children_of(
     }
 }
 
-async fn list_panes(config: &libslop::SlopdConfig, session_lock: &SessionLock) -> Result<Vec<libslop::PaneInfo>, String> {
-    let list_out = tmux_session_output(config, session_lock, |c| {
-        let mut cmd = tmux(c);
-        cmd.args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id} #{window_activity} #{pane_current_path}"]);
-        cmd
-    })
-        .await
-        .map_err(|e| e.to_string())?;
-    if !list_out.status.success() {
-        return Err(String::from_utf8_lossy(&list_out.stderr).trim().to_string());
-    }
+async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes) -> Result<Vec<libslop::PaneInfo>, String> {
+    // Iterate slopd's authoritative in-memory managed_panes set, not
+    // `tmux list-panes`.  The two are not always equivalent:
+    //   - A pane can have @slopd_managed=true set in tmux yet not be in
+    //     managed_panes (stale option, manual `tmux new-window`, or a pane
+    //     that was reconciled away while still alive in tmux).  Showing such
+    //     a pane in `ps` confuses callers because Send/Interrupt/Tag all
+    //     reject it.
+    //   - managed_panes is what Send/Interrupt/Tag/Kill check, so iterating
+    //     it makes `ps` consistent with the operations a caller can perform.
+    // Per-pane metadata (activity, cwd, slopd options) still comes from tmux;
+    // panes that have died in tmux but are still in managed_panes are skipped
+    // here — the next reconcile tick will clean them up.
 
-    // First pass: collect all managed panes with their parsed options.
     struct RawPane {
         pane_id: String,
         last_active: u64,
@@ -1362,30 +1415,33 @@ async fn list_panes(config: &libslop::SlopdConfig, session_lock: &SessionLock) -
         opts: ParsedPaneOptions,
     }
     let mut raw_panes = Vec::new();
-    for line in String::from_utf8_lossy(&list_out.stdout).lines() {
-        let mut parts = line.splitn(3, ' ');
-        let pane_id = match parts.next() {
-            Some(p) if !p.is_empty() => p.to_string(),
+    for pane_id in managed_panes.snapshot() {
+        let dm_out = tmux(config)
+            .args(["display-message", "-p", "-t", &pane_id, "-F",
+                   "#{window_activity} #{pane_current_path}"])
+            .output()
+            .await;
+        let (last_active, working_dir) = match dm_out {
+            Ok(out) if out.status.success() => {
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let mut parts = line.splitn(2, ' ');
+                let activity: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                let cwd = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                (activity, cwd)
+            }
             _ => continue,
         };
-        let last_active: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        let working_dir = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
         let opts_out = tmux(config)
             .args(["show-options", "-t", &pane_id, "-p"])
             .output()
             .await;
-        match opts_out {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let opts = parse_pane_options(&stdout);
-                if !opts.slopd_managed {
-                    continue;
-                }
-                raw_panes.push(RawPane { pane_id, last_active, working_dir, opts });
-            }
+        let opts = match opts_out {
+            Ok(out) if out.status.success() => parse_pane_options(&String::from_utf8_lossy(&out.stdout)),
             _ => continue,
         };
+
+        raw_panes.push(RawPane { pane_id, last_active, working_dir, opts });
     }
 
     // Build set of live managed pane IDs.
@@ -1953,7 +2009,7 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Ps => {
-            match list_panes(config, session_lock).await {
+            match list_panes(config, managed_panes).await {
                 Ok(panes) => libslop::ResponseBody::Ps { panes },
                 Err(e) => libslop::ResponseBody::Error { message: e },
             }

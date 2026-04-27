@@ -5871,3 +5871,135 @@ fn run_cli_env_overrides_config_env() {
     kill_slopd(slopd);
     assert_eq!(value, "from-cli", "CLI --env should override [run.env] in config");
 }
+
+/// Reproducer for the bug observed in production: when `tmux list-panes -s -t slopd`
+/// inside `reconcile_panes` transiently returns no panes (success+empty stdout, or
+/// "can't find session:" stderr — happens when the tmux session is briefly missing
+/// or when a tmux command interleave returns nothing), reconcile concluded that
+/// every managed pane was destroyed and removed it from the in-memory
+/// `managed_panes` set.  Once disowned, every subsequent `Send`/`Interrupt`/`Tag`
+/// returned "pane is not managed by slopd" — even though the pane was alive and
+/// continued running Claude.
+///
+/// Slopd journal at the time the production bug bit (Apr 26 20:46:25):
+///   "pane %1 no longer exists, emitting PaneDestroyed"
+///   followed by repeated "ignoring hook from unmanaged pane %1"
+///   followed by every dm-relay delivery failing with "is not managed by slopd"
+///
+/// The fix is per-pane verification: before declaring a managed pane destroyed,
+/// query its options directly (`show-options -t %X -p`).  If the pane is alive
+/// and still has `@slopd_managed=true` set, keep it.
+///
+/// This test injects the failure mode via `SLOPD_TEST_RECONCILE_FORCE_EMPTY=1`,
+/// which forces every reconcile tick to behave as if tmux returned an empty pane
+/// list.  Without the fix, reconcile removes the pane within one tick.  With the
+/// fix, per-pane verification preserves it.
+#[test]
+fn reconcile_does_not_disown_alive_pane_when_list_panes_returns_empty() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd_with_envs(&[("SLOPD_TEST_RECONCILE_FORCE_EMPTY", "1")]);
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Reconcile interval is 2 s.  Wait long enough that several ticks have fired
+    // and any false-positive removal would have happened.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // The pane is still alive, and managed_panes should still contain it.
+    // `slopctl tag` only checks managed_panes, so it is a clean probe of whether
+    // the pane was wrongly disowned.  Before the fix this returns
+    // "pane %X is not managed by slopd"; after the fix it succeeds.
+    let tag_out = env.slopctl(&["tag", &pane_id, "verify"]);
+    let stderr = String::from_utf8_lossy(&tag_out.stderr);
+    assert!(
+        tag_out.status.success(),
+        "slopctl tag should succeed because pane is still alive, but got: status={:?} stderr={}",
+        tag_out.status,
+        stderr,
+    );
+
+    kill_slopd(slopd);
+}
+
+/// `slopctl ps` must reflect slopd's in-memory `managed_panes` set rather than
+/// arbitrary tmux pane options.  A pane that has `@slopd_managed=true` set on
+/// it but that is not in `managed_panes` (e.g. the option is stale, or a pane
+/// was created outside `slopctl run`) must NOT appear in `ps` output, because
+/// `Send`/`Interrupt`/`Tag` would all reject it as "pane is not managed".
+///
+/// Without this guarantee, dm-relay (and other clients) discover a pane via
+/// `slopctl ps`, then fail to operate on it because slopd's authoritative set
+/// disagrees — exactly the inconsistency that surfaced in the production
+/// disowning bug, where `slopctl ps` kept showing %1 long after slopd's
+/// `Send`/`Interrupt` started rejecting it.
+#[test]
+fn ps_reflects_managed_panes_not_tmux_options() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "60"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a pane the normal way — this one IS in managed_panes.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let managed_pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Create an "impostor" pane: a fresh window in slopd's tmux session, with
+    // `@slopd_managed=true` set on it manually.  This pane was never inserted
+    // into managed_panes — it represents a stale option, a manual intervention,
+    // or a pane that was reconciled away while still alive in tmux.
+    let new_window_out = env.tmux.tmux()
+        .args(["new-window", "-d", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+        .output()
+        .expect("tmux new-window failed");
+    assert!(new_window_out.status.success(),
+        "tmux new-window failed: stderr={}",
+        String::from_utf8_lossy(&new_window_out.stderr));
+    let impostor_pane_id = String::from_utf8_lossy(&new_window_out.stdout).trim().to_string();
+    assert!(impostor_pane_id.starts_with('%'),
+        "expected pane id like %42, got {:?}", impostor_pane_id);
+
+    let set_status = env.tmux.tmux()
+        .args(["set-option", "-t", &impostor_pane_id, "-p", "@slopd_managed", "true"])
+        .status()
+        .expect("tmux set-option failed");
+    assert!(set_status.success());
+
+    let ps_output = env.slopctl(&["ps", "--json"]);
+    assert!(ps_output.status.success(),
+        "slopctl ps failed: {:?}", String::from_utf8_lossy(&ps_output.stderr));
+    let panes: Vec<serde_json::Value> = serde_json::from_slice(&ps_output.stdout)
+        .expect("ps --json output should be JSON");
+    let pane_ids: Vec<&str> = panes.iter()
+        .map(|p| p["pane_id"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        pane_ids.iter().any(|id| *id == managed_pane_id),
+        "managed pane {} should be in ps output: {:?}",
+        managed_pane_id, pane_ids,
+    );
+    assert!(
+        !pane_ids.iter().any(|id| *id == impostor_pane_id),
+        "impostor pane {} (not in managed_panes) must NOT be in ps output: {:?}",
+        impostor_pane_id, pane_ids,
+    );
+
+    kill_slopd(slopd);
+}
