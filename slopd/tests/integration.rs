@@ -5342,8 +5342,23 @@ fn run_injects_hooks_with_absolute_slopctl_path_when_not_on_path() {
     let claude_config_dir = home_dir.path().join(".claude");
 
     // Do NOT pass an explicit slopctl path — let slopd resolve it.
-    // Since "slopctl" is not on PATH in the test environment, slopd should
-    // resolve it to the absolute path of the sibling binary.
+    // The test's premise is that "slopctl" is NOT on PATH, so slopd must fall
+    // back to the sibling-of-current-exe resolution and produce an absolute
+    // path.  But `slopd-git` is commonly installed system-wide as
+    // `/usr/bin/slopctl`, and on most distros there is no PATH entry that
+    // contains tmux without also containing slopctl.  Build a sandbox
+    // directory that contains only the binaries slopd actually needs (tmux),
+    // and pass it as PATH — `which::which("slopctl")` then fails, exercising
+    // the sibling-resolution branch this test was written to cover.
+    let path_dir = tempfile::tempdir().unwrap();
+    let tmux_path = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p)
+            .map(|d| d.join("tmux"))
+            .find(|p| p.exists()))
+        .expect("tmux must be installed for tests");
+    std::os::unix::fs::symlink(&tmux_path, path_dir.path().join("tmux"))
+        .expect("failed to symlink tmux into sandbox PATH");
+
     let Some(env) = TestEnv::new_full(
         Some(&["sleep", "infinity"]),
         None,
@@ -5353,7 +5368,7 @@ fn run_injects_hooks_with_absolute_slopctl_path_when_not_on_path() {
         return;
     };
 
-    let slopd = env.spawn_slopd();
+    let slopd = env.spawn_slopd_with_envs(&[("PATH", path_dir.path().to_str().unwrap())]);
     let output = env.slopctl(&["run"]);
     assert!(output.status.success(), "slopctl run failed: {:?}", output);
 
