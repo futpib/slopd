@@ -143,6 +143,35 @@ pub enum CommonCommand {
         #[arg(long, value_name = "N")]
         replay: Option<u64>,
     },
+    /// Subscribe to events and exit on the first one matching the filters
+    /// (and optional --until predicates), or fail with non-zero exit on timeout.
+    /// Mirrors the filter surface of `listen`.
+    Wait {
+        /// Filter by hook event name (repeatable; omit for all events). Matches source:hook events.
+        #[arg(long = "hook", value_name = "EVENT")]
+        hooks: Vec<String>,
+        /// Filter by slopd event name (repeatable). Matches source:slopd events (e.g. StateChange, DetailedStateChange).
+        #[arg(long = "event", value_name = "EVENT")]
+        events: Vec<String>,
+        /// Filter by transcript record type (repeatable). Matches source:transcript events (e.g. user, assistant, progress).
+        #[arg(long = "transcript", value_name = "TYPE")]
+        transcripts: Vec<String>,
+        /// Only receive events from this tmux pane.
+        #[arg(long, value_name = "PANE_ID")]
+        pane_id: Option<String>,
+        /// Only receive events from this Claude session.
+        #[arg(long, value_name = "SESSION_ID")]
+        session_id: Option<String>,
+        /// Additional payload predicate(s) of the form KEY=VALUE (repeatable, AND).
+        /// KEY is a dotted path into the event's `payload` (e.g. `detailed_state`,
+        /// `tool_input.command`). Comparison is string-equality after JSON
+        /// stringification (numbers/bools are compared as their JSON form).
+        #[arg(long = "until", value_name = "KEY=VALUE")]
+        until: Vec<String>,
+        /// Seconds to wait before failing with non-zero exit. 0 disables the timeout.
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+    },
     /// Read historical transcript records from a pane.
     Transcript {
         /// Tmux pane ID (e.g. %42).
@@ -844,6 +873,128 @@ impl Subscription {
     }
 }
 
+/// Build the EventFilter list for `listen`/`wait` from CLI-shaped inputs.
+///
+/// Empty hooks/events/transcripts and no pane/session means "match everything"
+/// (empty filter list). If only pane/session are set, returns a single
+/// catch-all filter scoped to that pane/session.
+pub fn build_listen_filters(
+    hooks: Vec<String>,
+    events: Vec<String>,
+    transcripts: Vec<String>,
+    pane_id: Option<String>,
+    session_id: Option<String>,
+) -> Vec<libslop::EventFilter> {
+    if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() {
+        return vec![];
+    }
+    if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
+        return vec![libslop::EventFilter {
+            source: None,
+            event_type: None,
+            pane_id,
+            session_id,
+            payload_match: serde_json::Map::new(),
+        }];
+    }
+    let hook_filters = hooks.into_iter().map(|h| libslop::EventFilter {
+        source: Some("hook".to_string()),
+        event_type: Some(h),
+        pane_id: pane_id.clone(),
+        session_id: session_id.clone(),
+        payload_match: serde_json::Map::new(),
+    });
+    let event_filters = events.into_iter().map(|e| libslop::EventFilter {
+        source: Some("slopd".to_string()),
+        event_type: Some(e),
+        pane_id: pane_id.clone(),
+        session_id: None,
+        payload_match: serde_json::Map::new(),
+    });
+    let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
+        source: Some("transcript".to_string()),
+        event_type: Some(t),
+        pane_id: pane_id.clone(),
+        session_id: session_id.clone(),
+        payload_match: serde_json::Map::new(),
+    });
+    hook_filters.chain(event_filters).chain(transcript_filters).collect()
+}
+
+/// A parsed `--until KEY=VALUE` predicate: dotted key path + expected value.
+#[derive(Debug, Clone)]
+pub struct UntilPredicate {
+    pub path: Vec<String>,
+    pub expected: String,
+}
+
+/// Parse `--until` flag values. Returns one predicate per input, in order.
+/// Each input must be `KEY=VALUE`; KEY is a dotted path with no empty segments.
+pub fn parse_until(raw: Vec<String>) -> Result<Vec<UntilPredicate>, Error> {
+    raw.into_iter().map(|p| {
+        let (key, value) = p.split_once('=').ok_or_else(|| {
+            Error::FilterError(format!("invalid --until predicate {:?}: expected KEY=VALUE", p))
+        })?;
+        let path: Vec<String> = key.split('.').map(|s| s.to_string()).collect();
+        if path.iter().any(|s| s.is_empty()) {
+            return Err(Error::FilterError(
+                format!("invalid --until predicate {:?}: empty path segment", p),
+            ));
+        }
+        Ok(UntilPredicate {
+            path,
+            expected: value.to_string(),
+        })
+    }).collect()
+}
+
+/// Lookup a dotted path inside a JSON value.
+fn lookup_path<'a>(mut value: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
+    for segment in path {
+        value = value.get(segment)?;
+    }
+    Some(value)
+}
+
+/// True iff every predicate matches the record's payload.
+fn record_matches(record: &libslop::Record, predicates: &[UntilPredicate]) -> bool {
+    predicates.iter().all(|pred| {
+        let Some(found) = lookup_path(&record.payload, &pred.path) else { return false };
+        let actual = match found {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        actual == pred.expected
+    })
+}
+
+/// Print the `{"subscribed":true}` confirmation, then print every Record from
+/// the subscription as a JSON line. After printing each record, `should_stop`
+/// is consulted; returning true ends the loop with `Ok(())`. Returns
+/// `Err(ConnectionClosed)` if the subscription closes before that. Used by
+/// both `listen` (never stops on its own) and `wait` (stops on first match).
+async fn print_subscription_until<F>(
+    subscription: &mut Subscription,
+    mut should_stop: F,
+) -> Result<(), Error>
+where
+    F: FnMut(&libslop::Record) -> bool,
+{
+    println!("{{\"subscribed\":true}}");
+    loop {
+        match subscription.next().await? {
+            Some(SubscriptionItem::Record(record)) => {
+                println!("{}", serde_json::to_string(&record).unwrap());
+                if should_stop(&record) {
+                    return Ok(());
+                }
+            }
+            Some(SubscriptionItem::Subscribed) => {}
+            None => return Err(Error::ConnectionClosed),
+        }
+    }
+}
+
 /// Run the Listen command: build filters, subscribe, print events until SIGTERM or EOF.
 pub async fn execute_listen<R, W>(
     client: &mut Client<R, W>,
@@ -868,65 +1019,65 @@ where
         };
         client.subscribe_transcript(replay_pane_id, last_n).await?
     } else {
-        let filters: Vec<libslop::EventFilter> = if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() {
-            vec![]
-        } else if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
-            vec![libslop::EventFilter {
-                source: None,
-                event_type: None,
-                pane_id,
-                session_id,
-                payload_match: serde_json::Map::new(),
-            }]
-        } else {
-            let hook_filters = hooks.into_iter().map(|h| libslop::EventFilter {
-                source: Some("hook".to_string()),
-                event_type: Some(h),
-                pane_id: pane_id.clone(),
-                session_id: session_id.clone(),
-                payload_match: serde_json::Map::new(),
-            });
-            let event_filters = events.into_iter().map(|e| libslop::EventFilter {
-                source: Some("slopd".to_string()),
-                event_type: Some(e),
-                pane_id: pane_id.clone(),
-                session_id: None,
-                payload_match: serde_json::Map::new(),
-            });
-            let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
-                source: Some("transcript".to_string()),
-                event_type: Some(t),
-                pane_id: pane_id.clone(),
-                session_id: session_id.clone(),
-                payload_match: serde_json::Map::new(),
-            });
-            hook_filters.chain(event_filters).chain(transcript_filters).collect()
-        };
+        let filters = build_listen_filters(hooks, events, transcripts, pane_id, session_id);
         client.subscribe(filters).await?
     };
-
-    println!("{{\"subscribed\":true}}");
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     ).expect("failed to install SIGTERM handler");
 
-    loop {
-        tokio::select! {
-            _ = sigterm.recv() => break,
-            result = subscription.next() => {
-                match result {
-                    Ok(Some(SubscriptionItem::Record(record))) => {
-                        println!("{}", serde_json::to_string(&record).unwrap());
-                    }
-                    Ok(Some(SubscriptionItem::Subscribed)) => {}
-                    Ok(None) => break,
-                    Err(e) => return Err(e),
-                }
+    // listen never stops voluntarily, so should_stop is always false; only
+    // SIGTERM or EOF (returned as Err::ConnectionClosed) breaks the loop.
+    tokio::select! {
+        _ = sigterm.recv() => Ok(()),
+        result = print_subscription_until(&mut subscription, |_| false) => {
+            match result {
+                Err(Error::ConnectionClosed) => Ok(()),
+                other => other,
             }
         }
     }
-    Ok(())
+}
+
+/// Run the Wait command: subscribe with the listen-shaped filters, then print
+/// records as JSON lines exactly like `listen` does. Exits 0 after printing the
+/// first record that satisfies all `--until` predicates; exits 2 on timeout.
+pub async fn execute_wait<R, W>(
+    client: &mut Client<R, W>,
+    hooks: Vec<String>,
+    events: Vec<String>,
+    transcripts: Vec<String>,
+    pane_id: Option<String>,
+    session_id: Option<String>,
+    until: Vec<String>,
+    timeout_secs: u64,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let predicates = parse_until(until)?;
+    let filters = build_listen_filters(hooks, events, transcripts, pane_id, session_id);
+    let mut subscription = client.subscribe(filters).await?;
+
+    let wait_loop = print_subscription_until(
+        &mut subscription,
+        |record| record_matches(record, &predicates),
+    );
+
+    if timeout_secs == 0 {
+        return wait_loop.await;
+    }
+
+    let duration = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(duration, wait_loop).await {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!("error: timed out after {}s waiting for matching event", timeout_secs);
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Execute a CommonCommand against the given client.
@@ -959,6 +1110,7 @@ where
         CommonCommand::Status => {
             let state = client.status().await?;
             println!("uptime: {}s", state.uptime_secs);
+            println!("subscribers: {}", state.subscriber_count);
         }
         CommonCommand::Ps { filters, json } => {
             let parsed = parse_filters(filters)?;
@@ -1009,6 +1161,9 @@ where
         }
         CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, replay } => {
             execute_listen(client, hooks, events, transcripts, pane_id, session_id, replay).await?;
+        }
+        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, until, timeout } => {
+            execute_wait(client, hooks, events, transcripts, pane_id, session_id, until, timeout).await?;
         }
     }
     Ok(())

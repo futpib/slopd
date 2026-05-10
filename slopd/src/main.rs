@@ -1170,9 +1170,26 @@ async fn handle_connection(
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut lines = BufReader::new(reader).lines();
-    // Track active subscriptions so they can be cancelled via Unsubscribe.
-    let mut subscriptions: std::collections::HashMap<u64, tokio_util::sync::CancellationToken> =
-        std::collections::HashMap::new();
+    // Track active subscriptions so they can be cancelled via Unsubscribe
+    // and so that they are reaped when the connection closes (otherwise the
+    // background `stream_events_owned` task leaks until an event causes its
+    // next write to fail).
+    //
+    // Held inside a cancel-on-drop guard so any subscriptions still alive when
+    // `handle_connection` returns (clean EOF, broken pipe, parse error, slopctl
+    // crash, etc.) get their background tasks cancelled.
+    struct SubscriptionGuard {
+        subscriptions: std::collections::HashMap<u64, tokio_util::sync::CancellationToken>,
+    }
+    impl Drop for SubscriptionGuard {
+        fn drop(&mut self) {
+            for (_, cancel) in self.subscriptions.drain() {
+                cancel.cancel();
+            }
+        }
+    }
+    let mut guard = SubscriptionGuard { subscriptions: std::collections::HashMap::new() };
+    let subscriptions = &mut guard.subscriptions;
 
     while let Ok(Some(line)) = lines.next_line().await {
         trace!("received: {}", line);
@@ -1520,6 +1537,7 @@ async fn handle_request(
             libslop::ResponseBody::Status {
                 state: libslop::DaemonState {
                     uptime_secs: now.saturating_sub(start_time),
+                    subscriber_count: event_tx.receiver_count() as u64,
                 },
             }
         }

@@ -205,6 +205,35 @@ impl TestEnv {
         self.spawn_slopd_inner(None, &[], envs)
     }
 
+    /// Like `spawn_slopd` but captures slopd stderr (piped) so callers can
+    /// scan it for warnings (e.g. "subscriber lagged"). Sets RUST_LOG=warn so
+    /// only warn/error lines are emitted.
+    pub fn spawn_slopd_with_stderr_captured(&self) -> Child {
+        let mut cmd = Command::new(cargo_bin("slopd"));
+        cmd.env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env("HOME", self.config_dir.path())
+            .env("RUST_LOG", "warn")
+            .env_remove("TMUX")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("failed to spawn slopd");
+        let socket = self.runtime_dir.path().join("slopd/slopd.sock");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for slopd to accept connections at {}", socket.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
     fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>, extra_args: &[&str], extra_envs: &[(&str, &str)]) -> Child {
         let mut cmd = Command::new(cargo_bin("slopd"));
         cmd.args(extra_args)

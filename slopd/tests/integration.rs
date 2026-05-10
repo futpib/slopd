@@ -6003,3 +6003,293 @@ fn ps_reflects_managed_panes_not_tmux_options() {
 
     kill_slopd(slopd);
 }
+
+/// Read `slopctl status` output and return the value after `subscribers: `.
+fn read_subscriber_count(env: &TestEnv) -> u64 {
+    let out = env.slopctl(&["status"]);
+    assert!(out.status.success(), "slopctl status failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("subscribers: ") {
+            return rest.trim().parse().unwrap_or_else(|e| {
+                panic!("could not parse subscriber count from {:?}: {}", line, e)
+            });
+        }
+    }
+    panic!("subscribers: line missing from status output: {:?}", stdout);
+}
+
+/// Block until `slopctl status` reports at least `min` subscribers, or timeout.
+fn wait_for_subscriber_count_at_least(env: &TestEnv, min: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = read_subscriber_count(env);
+        if count >= min {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for subscriber_count >= {} (last seen: {})", min, count);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Block until `slopctl status` reports at most `max` subscribers, or timeout.
+fn wait_for_subscriber_count_at_most(env: &TestEnv, max: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = read_subscriber_count(env);
+        if count <= max {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for subscriber_count <= {} (last seen: {})", max, count);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn wait_exits_zero_on_matching_hook_event() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Need a managed pane so hook events aren't dropped.
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let wait_child = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "UserPromptSubmit", "--timeout", "10"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl wait");
+
+    // Wait for the subscription to land before firing, otherwise we'd race.
+    wait_for_subscriber_count_at_least(&env, 1, Duration::from_secs(5));
+
+    let prompt_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, Some(&pane_id));
+    assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
+
+    let out = wait_child.wait_with_output().expect("failed to wait on slopctl wait");
+    kill_slopd(slopd);
+
+    assert!(out.status.success(), "slopctl wait should exit 0 on matching event, got {:?}", out.status);
+
+    // Output parity with `listen`: a {"subscribed":true} line first, then the
+    // matching record as a JSON line.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let first = lines.next().expect("missing subscribed line");
+    assert!(first.contains("\"subscribed\":true"), "first line should be subscribed confirmation: {:?}", first);
+
+    // Find the UserPromptSubmit record (slopd-internal events may interleave).
+    let hook_event = lines
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v["source"] == "hook" && v["event_type"] == "UserPromptSubmit")
+        .unwrap_or_else(|| panic!("no UserPromptSubmit hook record in wait stdout: {:?}", stdout));
+    assert_eq!(hook_event["pane_id"], pane_id);
+}
+
+#[test]
+fn wait_exits_nonzero_on_timeout() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "NeverFires", "--timeout", "1"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("failed to run slopctl wait");
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "slopctl wait should exit non-zero on timeout, got {:?}", out);
+}
+
+#[test]
+fn wait_until_payload_predicate_matches() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Need a managed pane so hooks transition slopd's state machine.
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Subscribe to DetailedStateChange filtered by detailed_state=ready.
+    let mut wait_child = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--event", "DetailedStateChange",
+            "--pane-id", &pane_id,
+            "--until", "detailed_state=ready",
+            "--timeout", "10",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl wait");
+
+    wait_for_subscriber_count_at_least(&env, 1, Duration::from_secs(5));
+
+    // Fire a hook that transitions the pane to a non-ready state first, so the
+    // subsequent ready event is the one that satisfies the predicate.
+    let stop_payload = r#"{"session_id":"s1","hook_event_name":"Stop"}"#;
+    let out = fire_hook(&env, "Stop", stop_payload, Some(&pane_id));
+    assert!(out.status.success(), "slopctl hook Stop failed: {:?}", out);
+
+    let status = wait_child.wait().expect("failed to wait on slopctl wait");
+    kill_slopd(slopd);
+
+    assert!(status.success(),
+        "slopctl wait --until detailed_state=ready should exit 0, got {:?}", status);
+}
+
+/// When slopctl disconnects (clean exit, crash, or kill), the spawned subscriber
+/// task on the slopd side must be reaped. Otherwise the broadcast::Receiver
+/// stays alive, eats channel slots, and silently leaks across reconnects.
+#[test]
+fn wait_subscription_reaped_on_disconnect() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let baseline = read_subscriber_count(&env);
+
+    // Spawn a wait that will block effectively forever (filter never matches).
+    let wait_child = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "NeverFires", "--timeout", "300"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl wait");
+
+    wait_for_subscriber_count_at_least(&env, baseline + 1, Duration::from_secs(5));
+
+    // SIGKILL: simulates a crash/abrupt termination — no graceful cleanup
+    // from slopctl's side, so slopd must notice the closed socket and reap.
+    // std::process::Child::kill sends SIGKILL on Unix.
+    let mut wait_child = wait_child;
+    wait_child.kill().unwrap();
+    wait_child.wait().unwrap();
+
+    // The subscriber should drop back to baseline within a short window.
+    wait_for_subscriber_count_at_most(&env, baseline, Duration::from_secs(5));
+
+    kill_slopd(slopd);
+}
+
+/// `wait` and `listen` must produce identical stdout (subscribed line + every
+/// record as a JSON line) for the same event sequence. wait stops after the
+/// matching record; listen would continue, so we compare wait's full output
+/// against the prefix of listen's output.
+#[test]
+fn wait_and_listen_produce_identical_output_until_match() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Spawn both wait and listen with the same filters BEFORE firing any
+    // event, so both subscriptions see the same broadcast sequence.
+    let wait_child = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "UserPromptSubmit", "--pane-id", &pane_id, "--timeout", "10"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl wait");
+    let listen_child = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit", "--pane-id", &pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    wait_for_subscriber_count_at_least(&env, 2, Duration::from_secs(5));
+
+    let prompt_payload = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+    let out = fire_hook(&env, "UserPromptSubmit", prompt_payload, Some(&pane_id));
+    assert!(out.status.success(), "slopctl hook UserPromptSubmit failed: {:?}", out);
+
+    let wait_out = wait_child.wait_with_output().expect("failed to wait on wait child");
+    assert!(wait_out.status.success(), "wait should exit 0, got {:?}", wait_out.status);
+
+    // Read listen's first len(wait_stdout) bytes, then kill it.
+    let mut listen_child = listen_child;
+    let listen_stdout = listen_child.stdout.take().expect("listen has no stdout");
+    let wait_stdout = String::from_utf8_lossy(&wait_out.stdout).to_string();
+    let target_len = wait_stdout.len();
+
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = listen_stdout;
+        let mut buf = vec![0u8; target_len];
+        let mut filled = 0;
+        while filled < target_len {
+            match reader.read(&mut buf[filled..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        let _ = tx.send(buf);
+    });
+    let listen_prefix = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out reading listen stdout prefix");
+    kill_child(listen_child);
+    kill_slopd(slopd);
+
+    let listen_prefix = String::from_utf8_lossy(&listen_prefix).to_string();
+    assert_eq!(
+        wait_stdout, listen_prefix,
+        "wait stdout must equal the equivalent prefix of listen stdout\nwait:   {:?}\nlisten: {:?}",
+        wait_stdout, listen_prefix,
+    );
+}

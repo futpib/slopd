@@ -1098,4 +1098,9 @@ pub struct PaneInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonState {
     pub uptime_secs: u64,
+    /// Number of broadcast::Receiver instances currently held by event-streaming
+    /// subscriber tasks. Useful for verifying that subscriptions are reaped when
+    /// their owning connection closes.
+    #[serde(default)]
+    pub subscriber_count: u64,
 }

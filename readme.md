@@ -306,6 +306,22 @@ Flag summary:
 
 `--replay N`: Replay the last N transcript records from the pane's history before switching to live events. Requires `--pane-id`.
 
+### `slopctl wait [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--until KEY=VALUE] [--timeout SECS]`
+
+One-shot version of `listen`: same filter surface and same output (the `{"subscribed":true}` confirmation followed by each record as a JSON line). Exits 0 after printing the first matching event, or non-zero on timeout.
+
+```bash
+# Wait until pane reaches the ready state
+slopctl wait --event DetailedStateChange --pane-id %1 --until detailed_state=ready
+
+# Wait for the next UserPromptSubmit on a tagged pane (60s default timeout)
+slopctl wait --hook UserPromptSubmit --pane-id %1
+```
+
+`--until KEY=VALUE` (repeatable, AND): each predicate looks up `KEY` as a dotted path inside the event's `payload` and compares its value (string-equal). Without `--until`, any event matching the filters wins.
+
+`--timeout SECS`: default 60. Pass `0` to wait indefinitely.
+
 ### `slopctl transcript <PANE_ID> [--limit N] [--before CURSOR]`
 
 Read historical transcript records from a pane. Returns records as a JSON object with a `records` array.
