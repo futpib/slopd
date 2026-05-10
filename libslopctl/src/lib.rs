@@ -306,11 +306,11 @@ pub fn validate_command_filters(command: &CommonCommand) -> Result<(), Error> {
             }
         }
         CommonCommand::Listen { where_preds, .. } => {
-            parse_until(where_preds.clone())?;
+            parse_payload_predicates(where_preds.clone())?;
         }
         CommonCommand::Wait { where_preds, until, .. } => {
-            parse_until(where_preds.clone())?;
-            parse_until(until.clone())?;
+            parse_payload_predicates(where_preds.clone())?;
+            parse_payload_predicates(until.clone())?;
         }
         _ => {}
     }
@@ -907,20 +907,16 @@ pub fn build_listen_filters(
     transcripts: Vec<String>,
     pane_id: Option<String>,
     session_id: Option<String>,
-    where_preds: Vec<UntilPredicate>,
+    where_preds: Vec<libslop::PayloadPredicate>,
 ) -> Vec<libslop::EventFilter> {
-    let path_match: Vec<(libslop::PayloadPath, String)> = where_preds
-        .into_iter()
-        .map(|p| (p.path, p.expected))
-        .collect();
-    if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() && path_match.is_empty() {
+    if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() && where_preds.is_empty() {
         return vec![];
     }
     if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
         return vec![libslop::EventFilter {
             pane_id,
             session_id,
-            payload_path_match: path_match,
+            payload_path_match: where_preds,
             ..Default::default()
         }];
     }
@@ -929,7 +925,7 @@ pub fn build_listen_filters(
         event_type: Some(h),
         pane_id: pane_id.clone(),
         session_id: session_id.clone(),
-        payload_path_match: path_match.clone(),
+        payload_path_match: where_preds.clone(),
         ..Default::default()
     });
     let event_filters = events.into_iter().map(|e| libslop::EventFilter {
@@ -937,7 +933,7 @@ pub fn build_listen_filters(
         event_type: Some(e),
         pane_id: pane_id.clone(),
         session_id: None,
-        payload_path_match: path_match.clone(),
+        payload_path_match: where_preds.clone(),
         ..Default::default()
     });
     let transcript_filters = transcripts.into_iter().map(|t| libslop::EventFilter {
@@ -945,44 +941,17 @@ pub fn build_listen_filters(
         event_type: Some(t),
         pane_id: pane_id.clone(),
         session_id: session_id.clone(),
-        payload_path_match: path_match.clone(),
+        payload_path_match: where_preds.clone(),
         ..Default::default()
     });
     hook_filters.chain(event_filters).chain(transcript_filters).collect()
 }
 
-/// A parsed `--until KEY=VALUE` predicate: jq-style payload path + expected
-/// value. The path matches if any reachable scalar equals `expected`. See
-/// `libslop::parse_payload_path` for the supported syntax (`foo.bar`,
-/// `foo[]`, `foo[3]`, etc.).
-#[derive(Debug, Clone)]
-pub struct UntilPredicate {
-    pub path: libslop::PayloadPath,
-    pub expected: String,
-}
-
-/// Parse `--until` / `--where` flag values. Returns one predicate per input,
-/// in order. Each input must be `KEY=VALUE`; KEY is a jq-style path.
-pub fn parse_until(raw: Vec<String>) -> Result<Vec<UntilPredicate>, Error> {
-    raw.into_iter().map(|p| {
-        let (key, value) = p.split_once('=').ok_or_else(|| {
-            Error::FilterError(format!("invalid predicate {:?}: expected KEY=VALUE", p))
-        })?;
-        let path = libslop::parse_payload_path(key).map_err(|e| {
-            Error::FilterError(format!("invalid predicate {:?}: {}", p, e))
-        })?;
-        Ok(UntilPredicate {
-            path,
-            expected: value.to_string(),
-        })
-    }).collect()
-}
-
-/// True iff every predicate matches the record's payload.
-fn record_matches(record: &libslop::Record, predicates: &[UntilPredicate]) -> bool {
-    predicates.iter().all(|pred| {
-        libslop::path_matches(&record.payload, &pred.path, &pred.expected)
-    })
+/// CLI helper: parse `--until` / `--where` flag values into the shared
+/// `libslop::PayloadPredicate` type, mapping libslop's String error into our
+/// `Error::FilterError`.
+pub fn parse_payload_predicates(raw: Vec<String>) -> Result<Vec<libslop::PayloadPredicate>, Error> {
+    libslop::parse_payload_predicates(raw).map_err(Error::FilterError)
 }
 
 /// Print the `{"subscribed":true}` confirmation, then print every Record from
@@ -1027,7 +996,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let where_parsed = parse_until(where_preds)?;
+    let where_parsed = parse_payload_predicates(where_preds)?;
     let mut subscription = if let Some(last_n) = replay {
         if !where_parsed.is_empty() {
             eprintln!("error: --where is incompatible with --replay (transcript replay does not filter by payload)");
@@ -1081,14 +1050,14 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let predicates = parse_until(until)?;
-    let where_parsed = parse_until(where_preds)?;
+    let predicates = parse_payload_predicates(until)?;
+    let where_parsed = parse_payload_predicates(where_preds)?;
     let filters = build_listen_filters(hooks, events, transcripts, pane_id, session_id, where_parsed);
     let mut subscription = client.subscribe(filters).await?;
 
     let wait_loop = print_subscription_until(
         &mut subscription,
-        |record| record_matches(record, &predicates),
+        |record| libslop::predicates_match(&record.payload, &predicates),
     );
 
     if timeout_secs == 0 {

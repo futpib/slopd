@@ -614,10 +614,8 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool
                 return false;
             }
         }
-        for (path, expected) in &f.payload_path_match {
-            if !libslop::path_matches(&ev.payload, path, expected) {
-                return false;
-            }
+        if !libslop::predicates_match(&ev.payload, &f.payload_path_match) {
+            return false;
         }
         true
     })

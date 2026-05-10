@@ -1150,6 +1150,41 @@ fn scalar_eq(v: &serde_json::Value, expected: &str) -> bool {
     }
 }
 
+/// A parsed predicate against an event's `payload`: a jq-style path plus the
+/// expected scalar (string-equal comparison). Used both client-side
+/// (`wait --until`) and on the wire (`EventFilter::payload_path_match` for
+/// `listen --where`). Construct via `parse_payload_predicate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadPredicate {
+    pub path: PayloadPath,
+    pub expected: String,
+}
+
+/// Parse a single `KEY=VALUE` predicate where KEY is a jq-style path. Returns
+/// a human-readable error on malformed input.
+pub fn parse_payload_predicate(raw: &str) -> Result<PayloadPredicate, String> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| {
+        format!("invalid predicate {:?}: expected KEY=VALUE", raw)
+    })?;
+    let path = parse_payload_path(key)
+        .map_err(|e| format!("invalid predicate {:?}: {}", raw, e))?;
+    Ok(PayloadPredicate {
+        path,
+        expected: value.to_string(),
+    })
+}
+
+/// Parse many `KEY=VALUE` predicates in flag order. Used by both `--until`
+/// and `--where`.
+pub fn parse_payload_predicates(raw: Vec<String>) -> Result<Vec<PayloadPredicate>, String> {
+    raw.into_iter().map(|p| parse_payload_predicate(&p)).collect()
+}
+
+/// True iff every predicate matches the value (AND).
+pub fn predicates_match(value: &serde_json::Value, predicates: &[PayloadPredicate]) -> bool {
+    predicates.iter().all(|p| path_matches(value, &p.path, &p.expected))
+}
+
 /// Describes which events a subscriber wants to receive.
 /// All specified fields must match (AND within one filter).
 /// Multiple filters in a Subscribe request are OR-ed.
@@ -1166,12 +1201,9 @@ pub struct EventFilter {
     /// Additional payload key-value pairs that must all match (shallow equality).
     #[serde(default)]
     pub payload_match: serde_json::Map<String, serde_json::Value>,
-    /// jq-style path predicates (parsed PayloadPath, expected string value).
-    /// All must match. Path syntax: `foo.bar`, `foo[]`, `foo[3]`,
-    /// `messages[].content[].type`. Comparison is string-equal against the
-    /// reachable scalar.
+    /// jq-style path predicates that must all match. See `PayloadPredicate`.
     #[serde(default)]
-    pub payload_path_match: Vec<(PayloadPath, String)>,
+    pub payload_path_match: Vec<PayloadPredicate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
