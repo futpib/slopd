@@ -840,8 +840,27 @@ impl Default for SlopdRunConfig {
 
 impl SlopdConfig {
     pub fn load() -> Self {
-        let path = config_dir().join("slopd/config.toml");
+        let path = Self::config_path();
         load_config(path)
+    }
+
+    /// Path to the slopd config file (`$XDG_CONFIG_HOME/slopd/config.toml`).
+    pub fn config_path() -> PathBuf {
+        config_dir().join("slopd/config.toml")
+    }
+
+    /// Load and parse the config from `path`, propagating I/O and parse errors
+    /// instead of warning-and-defaulting like `load()`. A missing file returns
+    /// `Ok(default)` because that's the documented "no config" behavior. Used
+    /// by SIGHUP reload, where a parse error must keep the previous config
+    /// rather than silently dropping back to defaults.
+    pub fn try_load_from(path: &std::path::Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|e| format!("failed to parse {}: {}", path.display(), e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("failed to read {}: {}", path.display(), e)),
+        }
     }
 
     pub fn claude_config_dir(&self) -> PathBuf {
@@ -1103,4 +1122,10 @@ pub struct DaemonState {
     /// their owning connection closes.
     #[serde(default)]
     pub subscriber_count: u64,
+    /// Generation counter incremented on every successful SIGHUP reload.
+    /// 0 = initial config; 1 = after the first successful reload; etc. Failed
+    /// reloads (parse errors, missing files report as the previous generation)
+    /// do not advance this counter.
+    #[serde(default)]
+    pub config_generation: u64,
 }

@@ -101,6 +101,18 @@ slopd
 
 Verbosity can be increased with `-v` / `-vv` / `-vvv` (maps to INFO / DEBUG / TRACE).
 
+### Reloading config
+
+`SIGHUP` re-reads `config.toml` without restarting:
+
+```bash
+kill -HUP $(pgrep -x slopd)
+# or, when running under systemd:
+systemctl --user reload slopd
+```
+
+The reload affects subsequent operations only — already-running Claude panes keep the executable, env, and `claude_config_dir` they were spawned with. Verbosity / log level cannot be changed at reload (re-start to apply). A malformed `config.toml` keeps the previous config; check the daemon log for the parse error. `slopctl status` exposes a `config_generation` counter that bumps on each successful reload.
+
 ---
 
 ## Configuration

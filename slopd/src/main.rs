@@ -909,15 +909,21 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-    if let Some(executable) = cli.executable {
-        config.run.executable = if executable.len() == 1 {
-            libslop::Executable::String(executable.into_iter().next().unwrap())
-        } else {
-            libslop::Executable::Array(executable)
-        };
-    }
-
-    config.run.slopctl = libslop::resolve_slopctl(&config.run.slopctl);
+    // Apply CLI overrides and the slopctl path resolution to the initial
+    // config; capture as a closure so SIGHUP can re-apply the same massaging
+    // to a freshly-loaded config.
+    let executable_override = cli.executable.clone();
+    let apply_overrides = move |cfg: &mut libslop::SlopdConfig| {
+        if let Some(executable) = executable_override.clone() {
+            cfg.run.executable = if executable.len() == 1 {
+                libslop::Executable::String(executable.into_iter().next().unwrap())
+            } else {
+                libslop::Executable::Array(executable)
+            };
+        }
+        cfg.run.slopctl = libslop::resolve_slopctl(&cfg.run.slopctl);
+    };
+    apply_overrides(&mut config);
 
     if let Some(CliCommand::UninjectHooks) = cli.command {
         let settings_path = config.claude_settings_path();
@@ -929,7 +935,16 @@ async fn main() {
         return;
     }
 
-    let config = Arc::new(config);
+    let initial_config = Arc::new(config);
+    // Watch channel lets SIGHUP swap the live config atomically. Every code
+    // path that needs the current config snapshots `config_rx.borrow().clone()`
+    // at the moment it dispatches work; in-flight operations keep their
+    // existing Arc snapshot for consistency.
+    let (config_tx, config_rx) = tokio::sync::watch::channel::<Arc<libslop::SlopdConfig>>(initial_config.clone());
+    // Counter bumped on every successful reload so callers can wait deterministically
+    // for SIGHUP to take effect (exposed via Status.config_generation).
+    let config_generation: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let config = initial_config;
 
     if config.tmux.should_start_server() {
         tmux(&config)
@@ -1041,13 +1056,16 @@ async fn main() {
     let mut sigint = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::interrupt(),
     ).expect("failed to install SIGINT handler");
+    let mut sighup = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::hangup(),
+    ).expect("failed to install SIGHUP handler");
 
     // Background task: periodically reconcile managed_panes against live tmux
     // panes to detect panes that exited without going through slopctl kill.
     // This catches cases that tmux session-scope hooks cannot (e.g. process
     // exit, which only fires pane-scope hooks).
     let session_lock: SessionLock = Arc::new(Mutex::new(()));
-    let reconcile_config = config.clone();
+    let reconcile_config_rx = config_rx.clone();
     let reconcile_panes_map = panes.clone();
     let reconcile_managed = managed_panes.clone();
     let reconcile_tx = event_tx.clone();
@@ -1055,7 +1073,9 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             interval.tick().await;
-            reconcile_panes(&reconcile_config, &reconcile_panes_map, &reconcile_managed, &reconcile_tx).await;
+            // Snapshot the current config for this reconcile pass.
+            let config_snapshot = reconcile_config_rx.borrow().clone();
+            reconcile_panes(&config_snapshot, &reconcile_panes_map, &reconcile_managed, &reconcile_tx).await;
         }
     });
 
@@ -1064,7 +1084,8 @@ async fn main() {
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
-                tokio::spawn(handle_connection(stream, start_time, config.clone(), panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone()));
+                let config_snapshot = config_rx.borrow().clone();
+                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -1074,10 +1095,28 @@ async fn main() {
                 info!("received SIGINT, shutting down");
                 break;
             }
+            _ = sighup.recv() => {
+                let path = libslop::SlopdConfig::config_path();
+                match libslop::SlopdConfig::try_load_from(&path) {
+                    Ok(mut new_config) => {
+                        apply_overrides(&mut new_config);
+                        let _ = config_tx.send(Arc::new(new_config));
+                        let new_gen = config_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        info!("reloaded config from {} (generation {})", path.display(), new_gen);
+                    }
+                    Err(e) => {
+                        warn!("SIGHUP: failed to reload config from {} (keeping previous config): {}", path.display(), e);
+                    }
+                }
+            }
         }
     }
 
-    let settings_path = config.claude_settings_path();
+    // Use the latest config for the shutdown hook cleanup. If claude_config_dir
+    // changed at reload time hooks may linger in the previous path — that's a
+    // documented limitation of mid-run config reloads.
+    let shutdown_config = config_rx.borrow().clone();
+    let settings_path = shutdown_config.claude_settings_path();
     if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
         warn!("failed to remove hooks from {} on shutdown: {}", settings_path.display(), e);
     } else {
@@ -1166,6 +1205,7 @@ async fn handle_connection(
     event_tx: EventTx,
     pane_registered: PaneRegistered,
     session_lock: SessionLock,
+    config_generation: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -1301,7 +1341,7 @@ async fn handle_connection(
             }
 
             body => {
-                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock).await;
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock, &config_generation).await;
                 if write_response(&writer, req.id, body).await.is_err() {
                     break;
                 }
@@ -1526,6 +1566,7 @@ async fn handle_request(
     event_tx: &EventTx,
     pane_registered: &PaneRegistered,
     session_lock: &SessionLock,
+    config_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> libslop::ResponseBody {
     match body {
 
@@ -1538,6 +1579,7 @@ async fn handle_request(
                 state: libslop::DaemonState {
                     uptime_secs: now.saturating_sub(start_time),
                     subscriber_count: event_tx.receiver_count() as u64,
+                    config_generation: config_generation.load(std::sync::atomic::Ordering::Relaxed),
                 },
             }
         }

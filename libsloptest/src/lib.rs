@@ -61,6 +61,13 @@ pub fn sigint_child(mut child: Child) {
     child.wait().unwrap();
 }
 
+/// Send SIGHUP without waiting. The child stays alive (slopd handles SIGHUP
+/// by reloading config, not exiting).
+pub fn sighup_pid(pid: u32) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP).unwrap();
+}
+
 pub struct TmuxServer {
     #[allow(dead_code)]
     tmpdir: tempfile::TempDir,

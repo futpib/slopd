@@ -1111,6 +1111,7 @@ where
             let state = client.status().await?;
             println!("uptime: {}s", state.uptime_secs);
             println!("subscribers: {}", state.subscriber_count);
+            println!("config_generation: {}", state.config_generation);
         }
         CommonCommand::Ps { filters, json } => {
             let parsed = parse_filters(filters)?;

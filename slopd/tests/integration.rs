@@ -1,4 +1,4 @@
-use libsloptest::{build_bin, cargo_bin, kill_child, kill_slopd, sigint_child, tempfile, TestEnv};
+use libsloptest::{build_bin, cargo_bin, kill_child, kill_slopd, sighup_pid, sigint_child, tempfile, TestEnv};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -6049,6 +6049,37 @@ fn wait_for_subscriber_count_at_most(env: &TestEnv, max: u64, timeout: Duration)
     }
 }
 
+/// Read `slopctl status` output and return the value after `config_generation: `.
+fn read_config_generation(env: &TestEnv) -> u64 {
+    let out = env.slopctl(&["status"]);
+    assert!(out.status.success(), "slopctl status failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("config_generation: ") {
+            return rest.trim().parse().unwrap_or_else(|e| {
+                panic!("could not parse config_generation from {:?}: {}", line, e)
+            });
+        }
+    }
+    panic!("config_generation: line missing from status output: {:?}", stdout);
+}
+
+/// Block until `slopctl status` reports `config_generation >= min`. Used after
+/// `sighup_pid` to wait deterministically for the reload to take effect.
+fn wait_for_config_generation_at_least(env: &TestEnv, min: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let observed = read_config_generation(env);
+        if observed >= min {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for config_generation >= {} (last seen: {})", min, observed);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn wait_exits_zero_on_matching_hook_event() {
     build_bin("slopd");
@@ -6292,4 +6323,196 @@ fn wait_and_listen_produce_identical_output_until_match() {
         "wait stdout must equal the equivalent prefix of listen stdout\nwait:   {:?}\nlisten: {:?}",
         wait_stdout, listen_prefix,
     );
+}
+
+/// SIGHUP must cause slopd to re-read its config file: a `slopctl run` issued
+/// after the signal should use the new executable from the file.
+#[test]
+fn sighup_reloads_executable_from_config() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // Initial config: mock_claude with --no-session-start, so panes stay BootingUp.
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path, "--no-session-start"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "first slopctl run failed: {:?}", run_out);
+    let pane1 = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Confirm the pre-reload behavior: --no-session-start keeps the pane BootingUp.
+    std::thread::sleep(Duration::from_millis(500));
+    let (_, detailed) = env.pane_state(&pane1);
+    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp,
+        "pre-reload pane should be BootingUp under --no-session-start");
+
+    // Rewrite the config to drop --no-session-start, then SIGHUP, then wait
+    // until the reload counter advances so the next `slopctl run` is guaranteed
+    // to use the new config.
+    env.tmux.write_slopd_config_full(
+        &env.config_dir,
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+        None,
+    );
+    sighup_pid(slopd.id());
+    wait_for_config_generation_at_least(&env, 1, Duration::from_secs(5));
+
+    // Subscribe BEFORE the post-reload run so we don't miss the SessionStart.
+    let listener = env.spawn_session_start_listener();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "post-reload slopctl run failed: {:?}", run_out);
+    let pane2 = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // The new executable does NOT have --no-session-start, so SessionStart fires.
+    env.wait_for_session_start(listener, &pane2);
+
+    kill_slopd(slopd);
+}
+
+/// A SIGHUP that hits a malformed config file must not crash slopd, must not
+/// silently drop back to defaults, and must keep the pre-reload behavior.
+#[test]
+fn sighup_with_invalid_config_keeps_old_config() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path, "--no-session-start"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Corrupt the config file. SIGHUP should log a warning but keep the
+    // previously-loaded config — and importantly NOT bump config_generation.
+    let config_path = env.config_dir.path().join("slopd/config.toml");
+    std::fs::write(&config_path, "this isn't [valid toml = ").unwrap();
+    let gen_before = read_config_generation(&env);
+    sighup_pid(slopd.id());
+
+    // Give slopd a moment to process the signal. There's no positive signal
+    // to wait for (a failed reload doesn't bump generation), so a small sleep
+    // is the best we can do without instrumenting failure cases.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Daemon must still respond and generation must NOT have advanced.
+    let gen_after = read_config_generation(&env);
+    assert_eq!(gen_after, gen_before,
+        "config_generation must not advance on a failed reload");
+
+    // The original config (with --no-session-start) must still be in effect:
+    // a fresh `slopctl run` should still produce a BootingUp pane.
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    std::thread::sleep(Duration::from_millis(500));
+    let (_, detailed) = env.pane_state(&pane);
+    assert_eq!(detailed, libslop::PaneDetailedState::BootingUp,
+        "pane should still be BootingUp; the invalid SIGHUP should not have changed config");
+
+    kill_slopd(slopd);
+}
+
+/// SIGHUP with no config file present must be a no-op (no crash, daemon still
+/// healthy). Mirrors the startup behavior where a missing config falls back
+/// to defaults.
+#[test]
+fn sighup_with_missing_config_does_not_crash() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path, "--no-session-start"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Removing the file then SIGHUP-ing reloads to defaults (mirrors the
+    // startup behavior). We just want to confirm the daemon survives.
+    let config_path = env.config_dir.path().join("slopd/config.toml");
+    std::fs::remove_file(&config_path).unwrap();
+    sighup_pid(slopd.id());
+    wait_for_config_generation_at_least(&env, 1, Duration::from_secs(5));
+
+    let status_out = env.slopctl(&["status"]);
+    assert!(status_out.status.success(),
+        "slopctl status failed after missing-config SIGHUP: {:?}", status_out);
+
+    kill_slopd(slopd);
+}
+
+/// SIGHUP must not disturb existing panes — they keep running with whatever
+/// executable spawned them. Reload only affects subsequent operations.
+#[test]
+fn sighup_does_not_disturb_existing_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane);
+
+    // Rewrite to a different executable, then SIGHUP. The existing pane should
+    // be unaffected.
+    env.tmux.write_slopd_config_full(
+        &env.config_dir,
+        Some(&[&mock_claude_path, "--no-session-start"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+        None,
+    );
+    sighup_pid(slopd.id());
+    wait_for_config_generation_at_least(&env, 1, Duration::from_secs(5));
+
+    // Pane should still be visible in ps and reachable via the daemon.
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    assert!(ps_out.status.success(), "slopctl ps failed: {:?}", ps_out);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).unwrap();
+    assert!(panes.iter().any(|p| p.pane_id == pane),
+        "existing pane {} should still be in ps after SIGHUP: {:?}", pane, panes);
+
+    kill_slopd(slopd);
 }

@@ -4,6 +4,7 @@ Documentation=https://github.com/futpib/slopd
 
 [Service]
 ExecStart=%h/.cargo/bin/slopd
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 KillMode=process
