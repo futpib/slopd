@@ -671,6 +671,126 @@ mod tests {
             assert_eq!(slopctl_count, 0, "event {} still has {} slopctl entries after removal", event, slopctl_count);
         }
     }
+
+    // --- jq-style payload path tests ---
+
+    fn p(s: &str) -> PayloadPath {
+        parse_payload_path(s).unwrap_or_else(|e| panic!("parse_payload_path({:?}) failed: {}", s, e))
+    }
+
+    #[test]
+    fn parse_path_simple_keys() {
+        assert_eq!(p("foo"), vec![PathSegment::Key("foo".into())]);
+        assert_eq!(p("foo.bar"), vec![
+            PathSegment::Key("foo".into()),
+            PathSegment::Key("bar".into()),
+        ]);
+        // Leading dot is optional and equivalent.
+        assert_eq!(p(".foo.bar"), p("foo.bar"));
+    }
+
+    #[test]
+    fn parse_path_array_segments() {
+        assert_eq!(p("foo[]"), vec![
+            PathSegment::Key("foo".into()),
+            PathSegment::AnyElement,
+        ]);
+        assert_eq!(p("foo[0]"), vec![
+            PathSegment::Key("foo".into()),
+            PathSegment::Index(0),
+        ]);
+        assert_eq!(p("foo[].bar"), vec![
+            PathSegment::Key("foo".into()),
+            PathSegment::AnyElement,
+            PathSegment::Key("bar".into()),
+        ]);
+        assert_eq!(p("foo[0][1].bar"), vec![
+            PathSegment::Key("foo".into()),
+            PathSegment::Index(0),
+            PathSegment::Index(1),
+            PathSegment::Key("bar".into()),
+        ]);
+    }
+
+    #[test]
+    fn parse_path_empty_path() {
+        assert_eq!(parse_payload_path("").unwrap(), Vec::<PathSegment>::new());
+        assert_eq!(parse_payload_path(".").unwrap(), Vec::<PathSegment>::new());
+    }
+
+    #[test]
+    fn parse_path_rejects_malformed() {
+        assert!(parse_payload_path("foo..bar").is_err(), "double dot should fail");
+        assert!(parse_payload_path("[0]").is_err(), "leading bracket should fail");
+        assert!(parse_payload_path("foo[").is_err(), "unclosed bracket should fail");
+        assert!(parse_payload_path("foo[abc]").is_err(), "non-int index should fail");
+        assert!(parse_payload_path("foo[-1]").is_err(), "negative index not yet supported");
+    }
+
+    #[test]
+    fn path_matches_object_key() {
+        let v = serde_json::json!({"detailed_state": "ready"});
+        assert!(path_matches(&v, &p("detailed_state"), "ready"));
+        assert!(!path_matches(&v, &p("detailed_state"), "busy"));
+        assert!(!path_matches(&v, &p("missing"), "ready"));
+    }
+
+    #[test]
+    fn path_matches_nested() {
+        let v = serde_json::json!({"tool_input": {"command": "ls"}});
+        assert!(path_matches(&v, &p("tool_input.command"), "ls"));
+        assert!(!path_matches(&v, &p("tool_input.command"), "rm"));
+    }
+
+    #[test]
+    fn path_matches_any_element() {
+        // The key case: an assistant message whose content[] contains a text block.
+        let v = serde_json::json!({
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "…"},
+                    {"type": "text", "text": "hello"},
+                ],
+            },
+        });
+        assert!(path_matches(&v, &p("message.content[].type"), "text"));
+        assert!(path_matches(&v, &p("message.content[].type"), "thinking"));
+        assert!(!path_matches(&v, &p("message.content[].type"), "tool_use"));
+    }
+
+    #[test]
+    fn path_matches_index() {
+        let v = serde_json::json!({"items": ["a", "b", "c"]});
+        assert!(path_matches(&v, &p("items[0]"), "a"));
+        assert!(path_matches(&v, &p("items[2]"), "c"));
+        assert!(!path_matches(&v, &p("items[2]"), "a"));
+        // Out-of-bounds → no match, no panic.
+        assert!(!path_matches(&v, &p("items[99]"), "a"));
+    }
+
+    #[test]
+    fn path_matches_scalar_types() {
+        let v = serde_json::json!({"n": 42, "b": true, "s": "x", "z": null});
+        assert!(path_matches(&v, &p("n"), "42"));
+        assert!(path_matches(&v, &p("b"), "true"));
+        assert!(path_matches(&v, &p("s"), "x"));
+        assert!(path_matches(&v, &p("z"), "null"));
+    }
+
+    #[test]
+    fn path_does_not_match_compound_against_string() {
+        let v = serde_json::json!({"obj": {"a": 1}, "arr": [1, 2]});
+        // jq-equivalent: `.obj == "anything"` is false; same here.
+        assert!(!path_matches(&v, &p("obj"), "{\"a\":1}"));
+        assert!(!path_matches(&v, &p("arr"), "[1,2]"));
+    }
+
+    #[test]
+    fn path_any_element_short_circuits_on_non_array() {
+        // `.foo[]` against `foo: "string"` should not match anything.
+        let v = serde_json::json!({"foo": "bar"});
+        assert!(!path_matches(&v, &p("foo[].x"), "bar"));
+    }
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
@@ -919,10 +1039,121 @@ pub struct Request {
     pub body: RequestBody,
 }
 
+/// One step in a jq-style payload path. Segments are separated by `.` in the
+/// surface syntax; `[]` and `[N]` may follow any key segment any number of
+/// times.
+///
+/// Example parse: `message.content[].type` →
+/// `[Key("message"), Key("content"), AnyElement, Key("type")]`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathSegment {
+    /// Object key access (`.foo`).
+    Key(String),
+    /// Array index access (`[3]`).
+    Index(usize),
+    /// "Any element" of an array (`[]`). Matches if the rest of the path
+    /// reaches an equal scalar via at least one element.
+    AnyElement,
+}
+
+/// A parsed jq-style payload path. Constructed via `parse_payload_path`.
+pub type PayloadPath = Vec<PathSegment>;
+
+/// Parse a jq-style path. Accepts an optional leading `.`. Each segment is
+/// either a non-empty identifier-like key or `[]` / `[N]` immediately after a
+/// key. Empty path (just `""` or `"."`) is allowed and means "the value
+/// itself."
+///
+/// Returns Err with a human-readable message on malformed input.
+pub fn parse_payload_path(raw: &str) -> Result<PayloadPath, String> {
+    let trimmed = raw.strip_prefix('.').unwrap_or(raw);
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: PayloadPath = Vec::new();
+    for piece in trimmed.split('.') {
+        if piece.is_empty() {
+            return Err(format!("invalid path {:?}: empty segment between dots", raw));
+        }
+        // A piece is `name`, `name[]`, `name[3]`, `name[][3]`, etc.
+        // Find the first `[` (if any); everything before it is the key, the
+        // rest is a sequence of `[…]` brackets.
+        let (key, brackets) = match piece.find('[') {
+            Some(i) => (&piece[..i], &piece[i..]),
+            None => (piece, ""),
+        };
+        if key.is_empty() {
+            return Err(format!(
+                "invalid path {:?}: bracket without preceding key in segment {:?}",
+                raw, piece,
+            ));
+        }
+        out.push(PathSegment::Key(key.to_string()));
+        let mut rest = brackets;
+        while !rest.is_empty() {
+            let close = rest.find(']').ok_or_else(|| {
+                format!("invalid path {:?}: unclosed `[` in segment {:?}", raw, piece)
+            })?;
+            let inside = &rest[1..close];
+            if inside.is_empty() {
+                out.push(PathSegment::AnyElement);
+            } else {
+                let n: usize = inside.parse().map_err(|_| {
+                    format!(
+                        "invalid path {:?}: array index {:?} is not a non-negative integer",
+                        raw, inside,
+                    )
+                })?;
+                out.push(PathSegment::Index(n));
+            }
+            rest = &rest[close + 1..];
+        }
+    }
+    Ok(out)
+}
+
+/// Walk a JSON value following the path; return true if any reachable scalar
+/// at the end of the path equals `expected` (string-equal after JSON
+/// stringification for numbers/bools/null). Arrays and objects never match a
+/// scalar `expected`.
+pub fn path_matches(value: &serde_json::Value, path: &[PathSegment], expected: &str) -> bool {
+    fn walk(v: &serde_json::Value, path: &[PathSegment], expected: &str) -> bool {
+        let Some((head, rest)) = path.split_first() else {
+            return scalar_eq(v, expected);
+        };
+        match head {
+            PathSegment::Key(k) => match v.get(k) {
+                Some(child) => walk(child, rest, expected),
+                None => false,
+            },
+            PathSegment::Index(i) => match v.get(*i) {
+                Some(child) => walk(child, rest, expected),
+                None => false,
+            },
+            PathSegment::AnyElement => match v.as_array() {
+                Some(arr) => arr.iter().any(|child| walk(child, rest, expected)),
+                None => false,
+            },
+        }
+    }
+    walk(value, path, expected)
+}
+
+fn scalar_eq(v: &serde_json::Value, expected: &str) -> bool {
+    match v {
+        serde_json::Value::String(s) => s == expected,
+        serde_json::Value::Null => expected == "null",
+        serde_json::Value::Bool(b) => b.to_string() == expected,
+        serde_json::Value::Number(n) => n.to_string() == expected,
+        // Arrays and objects intentionally don't match scalar string values.
+        _ => false,
+    }
+}
+
 /// Describes which events a subscriber wants to receive.
 /// All specified fields must match (AND within one filter).
 /// Multiple filters in a Subscribe request are OR-ed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventFilter {
     /// Event source: "hook" or "slopd". Omit to match all sources.
     pub source: Option<String>,
@@ -935,6 +1166,12 @@ pub struct EventFilter {
     /// Additional payload key-value pairs that must all match (shallow equality).
     #[serde(default)]
     pub payload_match: serde_json::Map<String, serde_json::Value>,
+    /// jq-style path predicates (parsed PayloadPath, expected string value).
+    /// All must match. Path syntax: `foo.bar`, `foo[]`, `foo[3]`,
+    /// `messages[].content[].type`. Comparison is string-equal against the
+    /// reachable scalar.
+    #[serde(default)]
+    pub payload_path_match: Vec<(PayloadPath, String)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

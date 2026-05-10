@@ -4919,18 +4919,12 @@ fn multiplexed_multiple_subscriptions() {
         // Create two subscriptions: one for hook events, one for slopd events.
         let mut hook_sub = client.subscribe(vec![libslop::EventFilter {
             source: Some("hook".to_string()),
-            event_type: None,
-            pane_id: None,
-            session_id: None,
-            payload_match: serde_json::Map::new(),
+            ..Default::default()
         }]).await.unwrap();
 
         let mut slopd_sub = client.subscribe(vec![libslop::EventFilter {
             source: Some("slopd".to_string()),
-            event_type: None,
-            pane_id: None,
-            session_id: None,
-            payload_match: serde_json::Map::new(),
+            ..Default::default()
         }]).await.unwrap();
 
         // Fire a hook event — should appear on hook_sub but not on slopd_sub
@@ -6515,4 +6509,151 @@ fn sighup_does_not_disturb_existing_panes() {
         "existing pane {} should still be in ps after SIGHUP: {:?}", pane, panes);
 
     kill_slopd(slopd);
+}
+
+/// `wait --until` with a jq-style path containing `[]` should match when ANY
+/// element of the array satisfies the rest of the path. Verifies that the
+/// real motivating case (an assistant message whose content[] has a "text"
+/// block sandwiched among "thinking" blocks) now works.
+#[test]
+fn wait_until_jq_array_path_matches_any_element() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Need a managed pane so hook events aren't dropped.
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let wait_child = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "JqArrayCase", "--until", "items[].type=text", "--timeout", "10"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl wait");
+
+    wait_for_subscriber_count_at_least(&env, 1, Duration::from_secs(5));
+
+    // Payload mimics the real "thinking then text" assistant content shape.
+    let payload = r#"{"items":[{"type":"thinking","text":"…"},{"type":"text","text":"hi"}]}"#;
+    let out = fire_hook(&env, "JqArrayCase", payload, Some(&pane_id));
+    assert!(out.status.success(), "fire_hook failed: {:?}", out);
+
+    let out = wait_child.wait_with_output().expect("wait failed");
+    kill_slopd(slopd);
+
+    assert!(out.status.success(),
+        "wait --until items[].type=text should exit 0, got {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"event_type\":\"JqArrayCase\""),
+        "matching record should be printed; got: {:?}", stdout);
+}
+
+/// Server-side `--where` should drop non-matching events at the daemon —
+/// they never reach the listener. Fires two events with different payloads
+/// against `listen --where` and asserts only the matching one is delivered.
+#[test]
+fn listen_where_filters_at_server() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args([
+            "listen",
+            "--hook", "JqArrayCase",
+            "--where", "items[].type=text",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+
+    // Read the {"subscribed":true} confirmation so we know the subscription is live.
+    let stdout = listen.stdout.as_mut().unwrap();
+    let mut subscribed = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        use std::io::Read;
+        stdout.read_exact(&mut buf).expect("subscribed read failed");
+        if buf[0] == b'\n' { break; }
+        subscribed.push(buf[0]);
+    }
+    let subscribed = String::from_utf8_lossy(&subscribed);
+    assert!(subscribed.contains("subscribed"), "first line: {:?}", subscribed);
+
+    // Event #1: should be filtered OUT (no items.[].type == "text").
+    let payload_no = r#"{"items":[{"type":"thinking"},{"type":"tool_use"}]}"#;
+    let out = fire_hook(&env, "JqArrayCase", payload_no, Some(&pane_id));
+    assert!(out.status.success(), "fire_hook (no) failed: {:?}", out);
+
+    // Event #2: should be DELIVERED.
+    let payload_yes = r#"{"items":[{"type":"thinking"},{"type":"text"}],"marker":"yes"}"#;
+    let out = fire_hook(&env, "JqArrayCase", payload_yes, Some(&pane_id));
+    assert!(out.status.success(), "fire_hook (yes) failed: {:?}", out);
+
+    // Read up to one record (with timeout). The first event-line we see must
+    // be the "yes" payload — if --where wasn't enforced, the "no" payload
+    // would arrive first.
+    let stdout = listen.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { return };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if v.get("source").and_then(|s| s.as_str()) == Some("hook") {
+                    let _ = tx.send(v);
+                    return;
+                }
+            }
+        }
+    });
+    let received = rx.recv_timeout(Duration::from_secs(5))
+        .expect("timed out — --where may not be enforced server-side");
+
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    assert_eq!(received["payload"]["marker"], "yes",
+        "first delivered event must be the matching one (--where enforced server-side); got: {}",
+        received);
+}
+
+/// `wait --until` with a malformed path should fail fast with a clear error,
+/// not silently never-match-and-time-out.
+#[test]
+fn wait_until_rejects_malformed_path() {
+    build_bin("slopctl");
+
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--hook", "Whatever", "--until", "foo[abc]=x"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+
+    assert!(!out.status.success(), "wait should reject malformed path");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid predicate") || stderr.contains("non-negative integer"),
+        "error should mention the bad path; got stderr: {:?}", stderr);
 }

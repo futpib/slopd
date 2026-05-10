@@ -284,7 +284,7 @@ Forward a Claude lifecycle hook event to slopd. Reads the JSON payload from stdi
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
 ```
 
-### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--replay N]`
+### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--where KEY=VALUE] [--replay N]`
 
 Subscribe to the event stream and print events as JSON lines.
 
@@ -304,6 +304,9 @@ slopctl listen --transcript user --transcript assistant
 # Mix sources: hook Stop events and state changes for a pane
 slopctl listen --hook Stop --event DetailedStateChange --pane-id %1
 
+# Server-side payload filter: only assistant messages with a text block
+slopctl listen --transcript assistant --where 'message.content[].type=text'
+
 # Replay the last 20 transcript records then stream live events
 slopctl listen --transcript user --transcript assistant --pane-id %1 --replay 20
 ```
@@ -318,7 +321,9 @@ Flag summary:
 
 `--replay N`: Replay the last N transcript records from the pane's history before switching to live events. Requires `--pane-id`.
 
-### `slopctl wait [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--until KEY=VALUE] [--timeout SECS]`
+`--where KEY=VALUE` (repeatable, AND): server-side payload predicate. KEY is a [jq-style path](#payload-paths) into the event's `payload`; non-matching events are not delivered. Incompatible with `--replay`.
+
+### `slopctl wait [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--where KEY=VALUE] [--until KEY=VALUE] [--timeout SECS]`
 
 One-shot version of `listen`: same filter surface and same output (the `{"subscribed":true}` confirmation followed by each record as a JSON line). Exits 0 after printing the first matching event, or non-zero on timeout.
 
@@ -328,11 +333,30 @@ slopctl wait --event DetailedStateChange --pane-id %1 --until detailed_state=rea
 
 # Wait for the next UserPromptSubmit on a tagged pane (60s default timeout)
 slopctl wait --hook UserPromptSubmit --pane-id %1
+
+# Wait for an assistant message that contains a text block
+slopctl wait --pane-id %1 --transcript assistant --until 'message.content[].type=text'
 ```
 
-`--until KEY=VALUE` (repeatable, AND): each predicate looks up `KEY` as a dotted path inside the event's `payload` and compares its value (string-equal). Without `--until`, any event matching the filters wins.
+`--until KEY=VALUE` (repeatable, AND): client-side stop predicate. KEY is a [jq-style path](#payload-paths). Without `--until`, any event matching the filters wins.
+
+`--where KEY=VALUE` (repeatable, AND): server-side payload predicate, same syntax as `--until` (see `listen`). Use `--where` when the listener is expensive or the predicate is selective; use `--until` when you want to see every event but stop on a specific one.
 
 `--timeout SECS`: default 60. Pass `0` to wait indefinitely.
+
+#### Payload paths
+
+`--where` and `--until` accept a jq-style path on the left side of `KEY=VALUE`. Supported syntax:
+
+| Form | Meaning |
+|------|---------|
+| `foo` or `.foo` | Object key (leading `.` is optional) |
+| `foo.bar` | Nested object access |
+| `foo[]` | Any element of an array (succeeds if any element matches the rest of the path) |
+| `foo[3]` | Specific array index |
+| `messages[].content[].type` | Combined: any message, any content block, type field |
+
+Comparison is string-equal against the reachable scalar (`null`, `true`, numbers compared as their JSON form). Arrays and objects never match a scalar value. A missing path is not a match.
 
 ### `slopctl transcript <PANE_ID> [--limit N] [--before CURSOR]`
 

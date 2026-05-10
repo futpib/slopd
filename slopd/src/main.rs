@@ -614,6 +614,11 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool
                 return false;
             }
         }
+        for (path, expected) in &f.payload_path_match {
+            if !libslop::path_matches(&ev.payload, path, expected) {
+                return false;
+            }
+        }
         true
     })
 }
@@ -1318,10 +1323,8 @@ async fn handle_connection(
                 // skipping transcript records already replayed.
                 let transcript_filter = vec![libslop::EventFilter {
                     source: Some("transcript".to_string()),
-                    event_type: None,
                     pane_id: Some(pane_id.clone()),
-                    session_id: None,
-                    payload_match: serde_json::Map::new(),
+                    ..Default::default()
                 }];
                 let dedup = Some(Dedup { pane_id, file_end_offset });
                 let cancel = tokio_util::sync::CancellationToken::new();
