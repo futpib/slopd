@@ -123,7 +123,7 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # [run]
 # Command used to launch Claude. Can be a string or an array.
 # executable = "claude"
-# executable = ["claude", "--dangerously-skip-permissions"]
+# executable = ["claude", "--dangerously-skip-permissions", "--model", "sonnet", "--effort", "max", "--thinking-display", "summarized"]
 
 # Path to the slopctl binary injected into Claude hooks.
 # slopctl = "slopctl"
