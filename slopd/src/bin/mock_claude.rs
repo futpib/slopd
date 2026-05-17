@@ -185,6 +185,32 @@ fn transcript_record(record_type: &str, session_id: &str, extra: serde_json::Val
     record
 }
 
+/// Write the transcript records a client-local slash command (/model, /effort,
+/// /compact, /clear) produces in real Claude: a `user` record carrying the
+/// `<command-name>` block, optionally followed by a `<local-command-stdout>`
+/// `user` record. Crucially, NO hooks fire (no UserPromptSubmit/Stop) — this is
+/// the real-Claude behaviour slopd must detect via the transcript tailer.
+fn write_slash_command(
+    transcript_path: &PathBuf,
+    session_id: &str,
+    name: &str,
+    args: &str,
+    stdout: Option<&str>,
+) {
+    let content = format!(
+        "<command-name>/{n}</command-name>\n            <command-message>{n}</command-message>\n            <command-args>{a}</command-args>",
+        n = name, a = args,
+    );
+    write_transcript_record(transcript_path, &transcript_record("user", session_id, serde_json::json!({
+        "message": { "role": "user", "content": content },
+    })));
+    if let Some(out) = stdout {
+        write_transcript_record(transcript_path, &transcript_record("user", session_id, serde_json::json!({
+            "message": { "role": "user", "content": format!("<local-command-stdout>{}</local-command-stdout>", out) },
+        })));
+    }
+}
+
 fn uuid_counter() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -220,6 +246,26 @@ fn fire_stop(
         "subtype": "turn_duration",
         "durationMs": 0,
     })));
+}
+
+/// Fire UserPromptSubmit + Stop for an accepted prompt that produces no model
+/// turn — the mock test-harness control commands (/echo, /sleep, /env,
+/// /newline-mode). This is how `slopctl send` of such a command is confirmed,
+/// mirroring that the input was accepted. (Real client-local slash commands
+/// like /model fire NO hooks and are confirmed via the transcript
+/// `<command-name>` signal instead.)
+fn fire_accepted_no_turn(
+    no_hooks: bool,
+    settings: &serde_json::Value,
+    session_id: &str,
+    cwd: &std::path::Path,
+    transcript_path: &PathBuf,
+    prompt: &str,
+) {
+    let mut payload = hook_payload("UserPromptSubmit", session_id, cwd, transcript_path);
+    payload["prompt"] = serde_json::json!(prompt);
+    fire_hooks(no_hooks, settings, "UserPromptSubmit", &payload);
+    fire_stop(no_hooks, settings, session_id, cwd, transcript_path);
 }
 
 /// Session state needed by commands that fire hooks or write transcript records.
@@ -398,6 +444,15 @@ fn main() {
                 // Trim leading newlines that were inserted as literals by alternating mode.
                 let prompt = raw_prompt.trim_start_matches('\n').to_string();
 
+                // Real Claude ignores an empty submission (pressing Enter on an
+                // empty prompt does nothing — no UserPromptSubmit, no turn).
+                // Without this, slopd's Enter-retry loop (which spams Enter
+                // until UserPromptSubmit) would submit an empty line after a
+                // client-local slash command and spuriously fire the hook.
+                if prompt.trim().is_empty() {
+                    continue;
+                }
+
                 if let Some(mode) = prompt.strip_prefix("/newline-mode ") {
                     match mode.trim() {
                         "always-submit" => newline_mode = NewlineMode::AlwaysSubmit,
@@ -407,6 +462,7 @@ fn main() {
                         }
                         other => eprintln!("mock_claude: unknown newline mode {:?}", other),
                     }
+                    fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
                     continue;
                 }
 
@@ -418,12 +474,40 @@ fn main() {
                     transcript_path: &transcript_path,
                 };
                 match handle_prompt(&prompt, Some(&ctx)) {
-                    PromptResult::Handled => continue,
+                    PromptResult::Handled => {
+                        fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
+                        continue;
+                    }
                     PromptResult::Exit(code) => {
                         unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
                         std::process::exit(code);
                     }
                     PromptResult::Unhandled => {}
+                }
+
+                // Client-local slash commands: write the transcript records
+                // real Claude writes, fire NO hooks (no UserPromptSubmit/Stop).
+                // slopd must detect these via the transcript tailer.
+                if let Some(id) = prompt.strip_prefix("/model ") {
+                    let id = id.trim();
+                    write_slash_command(&transcript_path, session_id, "model", id,
+                        Some(&format!("Set model to {}", id)));
+                    continue;
+                }
+                if let Some(level) = prompt.strip_prefix("/effort ") {
+                    let level = level.trim();
+                    write_slash_command(&transcript_path, session_id, "effort", level,
+                        Some(&format!("Set effort level to {}: mock", level)));
+                    continue;
+                }
+                if prompt.trim() == "/compact" {
+                    write_slash_command(&transcript_path, session_id, "compact", "",
+                        Some("Compacted."));
+                    continue;
+                }
+                if prompt.trim() == "/clear" {
+                    write_slash_command(&transcript_path, session_id, "clear", "", None);
+                    continue;
                 }
 
                 if let Some(secs) = prompt.strip_prefix("/permission ") {

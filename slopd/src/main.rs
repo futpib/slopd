@@ -274,6 +274,23 @@ async fn tail_transcript(
                             }
                         }
 
+                        // Client-local slash commands (/model, /effort, /compact,
+                        // /clear) fire NO UserPromptSubmit hook. Their transcript
+                        // signature is a `user` record whose message.content
+                        // starts with `<command-name>/`. Treat that as a
+                        // prompt-accepted signal so `slopctl send` confirms —
+                        // added beside the hook path (either signal confirms).
+                        if record_type == "user"
+                            && record
+                                .get("message")
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|content| content.starts_with("<command-name>/"))
+                        {
+                            debug!("transcript slash-command: notifying pending senders for pane {}", pane_id);
+                            pane_state.prompt_submitted.notify_waiters();
+                        }
+
                         // Check if this transcript record triggers a state transition.
                         {
                             let current = pane_state.detailed_state.lock().unwrap().clone();

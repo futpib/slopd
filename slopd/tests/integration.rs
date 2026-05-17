@@ -6657,3 +6657,139 @@ fn wait_until_rejects_malformed_path() {
     assert!(stderr.contains("invalid predicate") || stderr.contains("non-negative integer"),
         "error should mention the bad path; got stderr: {:?}", stderr);
 }
+
+// ---------------------------------------------------------------------------
+// Transcript-signal confirmation for client-local slash commands.
+//
+// /model, /effort, /compact, /clear fire NO UserPromptSubmit hook in real
+// Claude (empirically confirmed against real Claude 2026-05-17). slopd's
+// `slopctl send` confirmation currently waits only on the UserPromptSubmit
+// hook (or a queue-operation enqueue transcript record), so sending any of
+// these slash commands times out even though the command was accepted.
+//
+// The existing hook/state-based confirmation is kept; a transcript-signal
+// confirmation is added beside it — the generic `<command-name>/X` user
+// record notifies pending senders. Either signal confirms.
+// ---------------------------------------------------------------------------
+
+/// Spawn a managed mock_claude pane and return (env, slopd child, pane_id).
+fn spawn_pane_for_slash_test() -> Option<(Arc<TestEnv>, std::process::Child, String, std::path::PathBuf)> {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let env = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    )?;
+    // Leak the tempdir so the transcript survives for the duration of the test.
+    std::mem::forget(home_dir);
+
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+    let listener = env.spawn_session_start_listener();
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+    Some((env, slopd, pane_id, claude_config_dir))
+}
+
+/// `slopctl send <pane> "/model <id>"` must be confirmed via the transcript
+/// `<command-name>` signal even though /model fires no UserPromptSubmit hook.
+#[test]
+fn send_model_slash_confirmed_via_transcript() {
+    let Some((env, slopd, pane_id, _cfg)) = spawn_pane_for_slash_test() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let out = env.slopctl(&["send", &pane_id, "/model claude-opus-4-7", "--timeout", "8"]);
+
+    kill_slopd(slopd);
+
+    assert!(
+        out.status.success(),
+        "slopctl send of /model should be confirmed via the transcript \
+         <command-name> signal (no UserPromptSubmit fires); got: {:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// `/effort <level>` is the same class as /model — confirmed via transcript.
+#[test]
+fn send_effort_slash_confirmed_via_transcript() {
+    let Some((env, slopd, pane_id, _cfg)) = spawn_pane_for_slash_test() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let out = env.slopctl(&["send", &pane_id, "/effort high", "--timeout", "8"]);
+
+    kill_slopd(slopd);
+
+    assert!(
+        out.status.success(),
+        "slopctl send of /effort should be confirmed via transcript; got: {:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// `/compact` and `/clear` also fire no UserPromptSubmit — both must confirm
+/// via the generic `<command-name>` transcript signal.
+#[test]
+fn send_compact_and_clear_confirmed_via_transcript() {
+    let Some((env, slopd, pane_id, _cfg)) = spawn_pane_for_slash_test() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let compact = env.slopctl(&["send", &pane_id, "/compact", "--timeout", "8"]);
+    assert!(
+        compact.status.success(),
+        "slopctl send of /compact should be confirmed via transcript; got: {:?} stderr={:?}",
+        compact.status,
+        String::from_utf8_lossy(&compact.stderr),
+    );
+
+    let clear = env.slopctl(&["send", &pane_id, "/clear", "--timeout", "8"]);
+
+    kill_slopd(slopd);
+
+    assert!(
+        clear.status.success(),
+        "slopctl send of /clear should be confirmed via transcript; got: {:?} stderr={:?}",
+        clear.status,
+        String::from_utf8_lossy(&clear.stderr),
+    );
+}
+
+/// Regression guard: the existing UserPromptSubmit-hook confirmation path must
+/// keep working for normal prompts ("either one signal confirms"). This passes
+/// today and must keep passing after the transcript signal is added.
+#[test]
+fn normal_prompt_still_confirmed_via_hook() {
+    let Some((env, slopd, pane_id, _cfg)) = spawn_pane_for_slash_test() else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let out = env.slopctl(&["send", &pane_id, "hello world", "--timeout", "10"]);
+
+    kill_slopd(slopd);
+
+    assert!(
+        out.status.success(),
+        "normal prompt must still confirm via the UserPromptSubmit hook; got: {:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
