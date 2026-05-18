@@ -65,7 +65,7 @@ enum PaneStateEvent<'a> {
     /// slopd startup recovery or new pane creation.
     Init,
     /// A hook fired by Claude (received via the hook socket).
-    Hook { event: &'a str },
+    Hook { event: &'a str, notification_type: Option<&'a str> },
     /// A transcript record was observed.
     TranscriptRecord { record_type: &'a str, record: &'a serde_json::Value },
 }
@@ -79,7 +79,7 @@ fn reduce_pane_state(
     match event {
         PaneStateEvent::Init => Some(libslop::PaneDetailedState::BootingUp),
 
-        PaneStateEvent::Hook { event } => reduce_hook_event(event),
+        PaneStateEvent::Hook { event, notification_type } => reduce_hook_event(event, *notification_type),
 
         PaneStateEvent::TranscriptRecord { record_type, record } => {
             match *record_type {
@@ -95,7 +95,7 @@ fn reduce_pane_state(
                                 None
                             }
                         });
-                    hook_event.and_then(reduce_hook_event)
+                    hook_event.and_then(|e| reduce_hook_event(e, None))
                 }
 
                 // `system` with `subtype: "turn_duration"` marks the end of a turn —
@@ -119,7 +119,7 @@ fn reduce_pane_state(
 }
 
 /// Map a hook event name to the resulting detailed state.
-fn reduce_hook_event(event: &str) -> Option<libslop::PaneDetailedState> {
+fn reduce_hook_event(event: &str, notification_type: Option<&str>) -> Option<libslop::PaneDetailedState> {
     match event {
         "SessionStart" => Some(libslop::PaneDetailedState::Ready),
         "UserPromptSubmit" => Some(libslop::PaneDetailedState::BusyProcessing),
@@ -132,6 +132,15 @@ fn reduce_hook_event(event: &str) -> Option<libslop::PaneDetailedState> {
         "PreCompact" => Some(libslop::PaneDetailedState::BusyCompacting),
         "PostCompact" => Some(libslop::PaneDetailedState::BusyProcessing),
         "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
+        // Claude fires Notification with notification_type "idle_prompt"
+        // ("Claude is waiting for your input") when it returns to the prompt.
+        // This is the authoritative idle signal and the only recovery for
+        // turns that end without a clean Stop (e.g. SubagentStop after a
+        // /clear-over-busy race) — without it the pane stays stuck busy.
+        // Other Notification types (permission, etc.) must not clear state.
+        "Notification" if notification_type == Some("idle_prompt") => {
+            Some(libslop::PaneDetailedState::Ready)
+        }
         _ => None,
     }
 }
@@ -1732,7 +1741,10 @@ async fn handle_request(
             // Unified state transition via reducer.
             {
                 let current = panes.get_or_insert(pane).detailed_state.lock().unwrap().clone();
-                if let Some(new_state) = reduce_pane_state(&current, &PaneStateEvent::Hook { event: &event }) {
+                if let Some(new_state) = reduce_pane_state(&current, &PaneStateEvent::Hook {
+                    event: &event,
+                    notification_type: payload.get("notification_type").and_then(|v| v.as_str()),
+                }) {
                     set_pane_detailed_state(config, pane, &new_state, Some(&current), event_tx, panes).await;
                 }
             }

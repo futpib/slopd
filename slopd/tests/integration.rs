@@ -2325,6 +2325,87 @@ fn pane_state_transitions_through_all_hooks() {
     kill_slopd(slopd);
 }
 
+/// Regression: a turn that ends without a clean `Stop` (e.g. `SubagentStop`
+/// after a `/clear`-over-busy race) leaves the pane busy. Claude then fires a
+/// `Notification` hook with `notification_type: "idle_prompt"` ("Claude is
+/// waiting for your input"). slopd must treat that as the pane returning to
+/// Ready — otherwise it stays stuck busy forever (the %40/%46/%64 freeze
+/// reproduced 2026-05-17, where no Stop/turn_duration ever followed).
+#[test]
+fn notification_idle_prompt_unsticks_busy_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let base = |hook: &str| format!(
+        r#"{{"session_id":"s1","hook_event_name":"{}","transcript_path":"/dev/null","cwd":"/tmp"}}"#,
+        hook
+    );
+
+    // ready → busy via UserPromptSubmit, then the turn "ends" via SubagentStop
+    // (still busy) with no Stop ever arriving — the reproduced stuck shape.
+    assert_state_after_hook(&env, &pane_id, "SessionStart", &base("SessionStart"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+    assert_state_after_hook(&env, &pane_id, "UserPromptSubmit", &base("UserPromptSubmit"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+    assert_state_after_hook(&env, &pane_id, "SubagentStop", &base("SubagentStop"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // Claude announces it is idle and waiting for input → pane must be Ready.
+    let idle_payload = r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    assert_state_after_hook(&env, &pane_id, "Notification", idle_payload,
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    kill_slopd(slopd);
+}
+
+/// Guard: only `idle_prompt` Notifications return the pane to Ready. A
+/// Notification of any other type must NOT spuriously clear a busy/awaiting
+/// state (keeps the fix from over-broadening).
+#[test]
+fn notification_non_idle_does_not_unstick() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let base = |hook: &str| format!(
+        r#"{{"session_id":"s1","hook_event_name":"{}","transcript_path":"/dev/null","cwd":"/tmp"}}"#,
+        hook
+    );
+
+    assert_state_after_hook(&env, &pane_id, "SessionStart", &base("SessionStart"),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+    assert_state_after_hook(&env, &pane_id, "UserPromptSubmit", &base("UserPromptSubmit"),
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    // A non-idle Notification must leave the busy state untouched.
+    let other_payload = r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"other","message":"something else","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    assert_state_after_hook(&env, &pane_id, "Notification", other_payload,
+        libslop::PaneState::Busy, libslop::PaneDetailedState::BusyProcessing);
+
+    kill_slopd(slopd);
+}
+
 #[test]
 fn pane_state_resets_to_booting_up_on_slopd_restart() {
     build_bin("slopd");
