@@ -284,18 +284,31 @@ async fn tail_transcript(
                         }
 
                         // Client-local slash commands (/model, /effort, /compact,
-                        // /clear) fire NO UserPromptSubmit hook. Their transcript
-                        // signature is a `user` record whose message.content
-                        // starts with `<command-name>/`. Treat that as a
-                        // prompt-accepted signal so `slopctl send` confirms —
-                        // added beside the hook path (either signal confirms).
-                        if record_type == "user"
-                            && record
+                        // /clear, /rename, ...) fire NO UserPromptSubmit hook.
+                        // Their command record appears in one of two shapes:
+                        //   - type=user with message.content starting with
+                        //     `<command-name>/` (e.g. /clear)
+                        //   - type=system, subtype=local_command, with top-level
+                        //     content starting with `<command-name>/` (e.g. /rename)
+                        // Either is a prompt-accepted signal — notify pending
+                        // senders so `slopctl send` confirms without timing out.
+                        let is_slash_command_record = match record_type.as_str() {
+                            "user" => record
                                 .get("message")
                                 .and_then(|m| m.get("content"))
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|content| content.starts_with("<command-name>/"))
-                        {
+                                .is_some_and(|content| content.starts_with("<command-name>/")),
+                            "system" => record
+                                .get("subtype")
+                                .and_then(|v| v.as_str())
+                                == Some("local_command")
+                                && record
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(|content| content.starts_with("<command-name>/")),
+                            _ => false,
+                        };
+                        if is_slash_command_record {
                             debug!("transcript slash-command: notifying pending senders for pane {}", pane_id);
                             pane_state.prompt_submitted.notify_waiters();
                         }
