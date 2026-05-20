@@ -6911,60 +6911,46 @@ fn listen_pane_id_rejects_garbage_with_helpful_error() {
     assert!(stderr.contains("--pane-id"), "stderr should mention --pane-id: {:?}", stderr);
 }
 
-/// `slopctl wait --pane-id <UUID>` must route to session-id filtering, not
-/// silently match nothing. Use the SessionStart hook payload — which always
-/// carries a `session_id` — to assert the auto-detection wires up correctly:
-/// the wait should fire on a hook for the matching session.
+/// `slopctl wait --pane-id <UUID>` must fail loudly, pointing the caller at
+/// `--session-id` instead of silently routing across flags. Filter semantics
+/// stay explicit: if you want session filtering, use `--session-id`.
 #[test]
-fn wait_pane_id_accepts_uuid_as_session() {
-    build_bin("slopd");
+fn wait_pane_id_rejects_uuid_with_session_id_hint() {
     build_bin("slopctl");
-
-    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
-        eprintln!("skipping: tmux not found");
-        return;
-    };
-    let slopd = env.spawn_slopd();
-
-    // Use a canonical UUID; SessionStart hooks carry session_id verbatim in payload.
+    let runtime_dir = tempfile::tempdir().unwrap();
     let session_uuid = "31a02dee-3e6d-42f0-b7c4-4382305b7e10";
 
-    let run_out = env.slopctl(&["run"]);
-    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
-    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--pane-id", session_uuid, "--timeout", "1"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
 
-    // Wait, filtering by --pane-id <UUID>. Without auto-detect, this would
-    // subscribe to a pane that doesn't exist and time out.
-    let wait_child = Command::new(cargo_bin("slopctl"))
-        .args(["wait", "--hook", "SessionStart", "--pane-id", session_uuid, "--timeout", "5"])
-        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn slopctl wait");
-    wait_for_subscriber_count_at_least(&env, 1, Duration::from_secs(5));
+    assert!(!out.status.success(), "expected non-zero exit for UUID --pane-id");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--pane-id"), "stderr should mention --pane-id: {:?}", stderr);
+    assert!(stderr.contains("UUID"), "stderr should explain the UUID detection: {:?}", stderr);
+    assert!(stderr.contains("--session-id"),
+        "stderr should point at --session-id for UUIDs: {:?}", stderr);
+}
 
-    // Fire a SessionStart hook with the matching session_id.
-    let payload = format!(r#"{{"session_id":"{}","hook_event_name":"SessionStart"}}"#, session_uuid);
-    let out = fire_hook(&env, "SessionStart", &payload, Some(&pane_id));
-    assert!(out.status.success(), "slopctl hook SessionStart failed: {:?}", out);
+/// Same loud-failure behavior for `slopctl listen --pane-id <UUID>`.
+#[test]
+fn listen_pane_id_rejects_uuid_with_session_id_hint() {
+    build_bin("slopctl");
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let session_uuid = "31a02dee-3e6d-42f0-b7c4-4382305b7e10";
 
-    let out = wait_child.wait_with_output().expect("failed to wait on slopctl wait");
-    kill_slopd(slopd);
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", session_uuid])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl listen");
 
-    assert!(out.status.success(),
-        "slopctl wait --pane-id <UUID> --hook SessionStart should exit 0, got {:?} stdout={:?}",
-        out.status, String::from_utf8_lossy(&out.stdout));
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let matched = stdout.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|v| v["source"] == "hook"
-            && v["event_type"] == "SessionStart"
-            && v["payload"]["session_id"] == session_uuid);
-    assert!(matched,
-        "wait should have emitted the SessionStart for the matching session UUID; stdout={:?}",
-        stdout);
+    assert!(!out.status.success(), "expected non-zero exit for UUID --pane-id");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--session-id"),
+        "stderr should point at --session-id for UUIDs: {:?}", stderr);
 }
 
 /// `slopctl wait --seed-current` against a pane already in the target state

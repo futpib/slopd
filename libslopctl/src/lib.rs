@@ -133,10 +133,9 @@ pub enum CommonCommand {
         /// Filter by transcript record type (repeatable). Matches source:transcript events (e.g. user, assistant, progress).
         #[arg(long = "transcript", value_name = "TYPE")]
         transcripts: Vec<String>,
-        /// Only receive events from this tmux pane. Accepts either a tmux pane
-        /// id (e.g. %42) or a Claude session UUID — a UUID-shaped value is
-        /// auto-detected and routed to --session-id. Pass garbage and you get
-        /// an eager error, not a silent no-match.
+        /// Only receive events from this tmux pane. Must be a tmux pane id
+        /// (e.g. %42); a UUID-shaped value is rejected with a hint pointing
+        /// at --session-id (use that flag for Claude session UUIDs).
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
         /// Only receive events from this Claude session.
@@ -168,10 +167,9 @@ pub enum CommonCommand {
         /// Filter by transcript record type (repeatable). Matches source:transcript events (e.g. user, assistant, progress).
         #[arg(long = "transcript", value_name = "TYPE")]
         transcripts: Vec<String>,
-        /// Only receive events from this tmux pane. Accepts either a tmux pane
-        /// id (e.g. %42) or a Claude session UUID — a UUID-shaped value is
-        /// auto-detected and routed to --session-id. Pass garbage and you get
-        /// an eager error, not a silent no-match.
+        /// Only receive events from this tmux pane. Must be a tmux pane id
+        /// (e.g. %42); a UUID-shaped value is rejected with a hint pointing
+        /// at --session-id (use that flag for Claude session UUIDs).
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
         /// Only receive events from this Claude session.
@@ -337,17 +335,9 @@ pub fn validate_command_filters(command: &CommonCommand) -> Result<(), Error> {
     Ok(())
 }
 
-/// Classification of a `--pane-id` argument.
-#[derive(Debug, PartialEq, Eq)]
-enum PaneIdKind {
-    /// A tmux pane id (`%<digits>`).
-    TmuxPane,
-    /// A Claude session UUID (8-4-4-4-12 hex digits, RFC 4122-shaped).
-    SessionUuid,
-}
-
-/// Return true for strings shaped like a UUID (8-4-4-4-12 hex digits).
-/// Used to distinguish a Claude session UUID from a tmux pane id (`%<n>`).
+/// Return true for strings shaped like a UUID (8-4-4-4-12 hex digits). Used to
+/// detect when a caller has passed a Claude session UUID to `--pane-id` so we
+/// can point them at `--session-id` instead of silently subscribing to nothing.
 fn looks_like_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 5 {
@@ -359,51 +349,42 @@ fn looks_like_uuid(s: &str) -> bool {
     })
 }
 
-/// Classify a `--pane-id` argument as a tmux pane id (`%<n>`) or a Claude
-/// session UUID. Anything else is an error.
-fn classify_pane_id_arg(arg: &str) -> Result<PaneIdKind, Error> {
+/// Validate the `--pane-id` argument shape. Accepts only tmux pane ids
+/// (`%<digits>`). A UUID-shaped value is rejected with a hint pointing at
+/// `--session-id` — we deliberately do NOT silently route across flags, to
+/// keep filter semantics explicit. Anything else is rejected as garbage.
+fn validate_pane_id_arg(arg: &str) -> Result<(), Error> {
     if let Some(rest) = arg.strip_prefix('%') {
         if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(PaneIdKind::TmuxPane);
+            return Ok(());
         }
     }
     if looks_like_uuid(arg) {
-        return Ok(PaneIdKind::SessionUuid);
+        return Err(Error::FilterError(format!(
+            "--pane-id {:?} looks like a Claude session UUID; use --session-id for UUIDs \
+             (`--pane-id` is for tmux pane ids like %42)",
+            arg
+        )));
     }
     Err(Error::FilterError(format!(
-        "--pane-id {:?} is not a tmux pane id (e.g. %42) or a Claude session UUID; \
-         pass a tmux pane id (starts with '%') or use --session-id for a UUID",
+        "--pane-id {:?} is not a tmux pane id (expected `%<digits>`, e.g. %42); \
+         use --session-id for a Claude session UUID",
         arg
     )))
 }
 
-/// Auto-detect whether `--pane-id` is a tmux pane id or a Claude session UUID.
-/// A UUID-shaped value is silently routed to `--session-id` so callers that
-/// confuse the two flags still match. Returns `(pane_id, session_id)` with the
-/// UUID promoted into `session_id` when applicable. Errors when both flags
-/// disagree on the same session, or when `--pane-id` is neither shape.
+/// Validate `--pane-id` and `--session-id` argument shapes. `--pane-id` must
+/// be a tmux pane id (`%<n>`); passing a UUID errors with a `--session-id`
+/// hint rather than silently routing across flags. Returns the values
+/// unchanged on success.
 pub fn resolve_pane_id_or_session(
     pane_id: Option<String>,
     session_id: Option<String>,
 ) -> Result<(Option<String>, Option<String>), Error> {
-    let Some(pane_arg) = pane_id else {
-        return Ok((None, session_id));
-    };
-    match classify_pane_id_arg(&pane_arg)? {
-        PaneIdKind::TmuxPane => Ok((Some(pane_arg), session_id)),
-        PaneIdKind::SessionUuid => {
-            if let Some(ref explicit) = session_id {
-                if explicit != &pane_arg {
-                    return Err(Error::FilterError(format!(
-                        "--pane-id {:?} looks like a session UUID but --session-id is {:?}; \
-                         pass only one (or matching values)",
-                        pane_arg, explicit
-                    )));
-                }
-            }
-            Ok((None, Some(pane_arg)))
-        }
+    if let Some(ref pane_arg) = pane_id {
+        validate_pane_id_arg(pane_arg)?;
     }
+    Ok((pane_id, session_id))
 }
 
 /// Print a table of pane info to stdout.
@@ -1446,34 +1427,35 @@ mod tests {
     }
 
     #[test]
-    fn classify_pane_id_arg_tmux() {
-        assert_eq!(classify_pane_id_arg("%0").unwrap(), PaneIdKind::TmuxPane);
-        assert_eq!(classify_pane_id_arg("%79").unwrap(), PaneIdKind::TmuxPane);
-        assert_eq!(classify_pane_id_arg("%12345").unwrap(), PaneIdKind::TmuxPane);
+    fn validate_pane_id_arg_accepts_tmux_pane() {
+        assert!(validate_pane_id_arg("%0").is_ok());
+        assert!(validate_pane_id_arg("%79").is_ok());
+        assert!(validate_pane_id_arg("%12345").is_ok());
     }
 
     #[test]
-    fn classify_pane_id_arg_uuid() {
-        assert_eq!(
-            classify_pane_id_arg("31a02dee-3e6d-42f0-b7c4-4382305b7e10").unwrap(),
-            PaneIdKind::SessionUuid,
-        );
-    }
-
-    #[test]
-    fn classify_pane_id_arg_errors_on_garbage() {
-        let err = classify_pane_id_arg("not-a-pane-id").unwrap_err();
+    fn validate_pane_id_arg_rejects_uuid_with_session_id_hint() {
+        let err = validate_pane_id_arg("31a02dee-3e6d-42f0-b7c4-4382305b7e10").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--pane-id"), "missing flag name in error: {}", msg);
-        assert!(msg.contains("tmux pane id"), "missing hint in error: {}", msg);
         assert!(msg.contains("UUID"), "missing UUID hint in error: {}", msg);
+        assert!(msg.contains("--session-id"), "must point at --session-id: {}", msg);
     }
 
     #[test]
-    fn classify_pane_id_arg_rejects_percent_without_digits() {
+    fn validate_pane_id_arg_rejects_garbage() {
+        let err = validate_pane_id_arg("not-a-pane-id").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--pane-id"), "missing flag name in error: {}", msg);
+        assert!(msg.contains("tmux pane id"), "missing shape hint: {}", msg);
+        assert!(msg.contains("--session-id"), "should still hint at session-id: {}", msg);
+    }
+
+    #[test]
+    fn validate_pane_id_arg_rejects_percent_without_digits() {
         // `%` alone or `%abc` shouldn't be treated as a tmux pane id.
-        assert!(classify_pane_id_arg("%").is_err());
-        assert!(classify_pane_id_arg("%abc").is_err());
+        assert!(validate_pane_id_arg("%").is_err());
+        assert!(validate_pane_id_arg("%abc").is_err());
     }
 
     #[test]
@@ -1484,11 +1466,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pane_id_or_session_promotes_uuid_to_session() {
+    fn resolve_pane_id_or_session_rejects_uuid_in_pane_id() {
         let uuid = "31a02dee-3e6d-42f0-b7c4-4382305b7e10";
-        let (p, s) = resolve_pane_id_or_session(Some(uuid.into()), None).unwrap();
-        assert_eq!(p, None);
-        assert_eq!(s.as_deref(), Some(uuid));
+        let err = resolve_pane_id_or_session(Some(uuid.into()), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("UUID"), "should explain it's a UUID: {}", msg);
+        assert!(msg.contains("--session-id"), "should point at --session-id: {}", msg);
     }
 
     #[test]
@@ -1497,24 +1480,6 @@ mod tests {
         let (p, s) = resolve_pane_id_or_session(None, Some(uuid.into())).unwrap();
         assert_eq!(p, None);
         assert_eq!(s.as_deref(), Some(uuid));
-    }
-
-    #[test]
-    fn resolve_pane_id_or_session_matching_uuid_collapses() {
-        let uuid = "31a02dee-3e6d-42f0-b7c4-4382305b7e10";
-        let (p, s) = resolve_pane_id_or_session(Some(uuid.into()), Some(uuid.into())).unwrap();
-        assert_eq!(p, None);
-        assert_eq!(s.as_deref(), Some(uuid));
-    }
-
-    #[test]
-    fn resolve_pane_id_or_session_rejects_conflict() {
-        let uuid_a = "31a02dee-3e6d-42f0-b7c4-4382305b7e10";
-        let uuid_b = "00000000-0000-0000-0000-000000000000";
-        let err = resolve_pane_id_or_session(Some(uuid_a.into()), Some(uuid_b.into())).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("--pane-id"), "missing flag in conflict error: {}", msg);
-        assert!(msg.contains("--session-id"), "missing flag in conflict error: {}", msg);
     }
 
     #[test]
