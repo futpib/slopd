@@ -189,6 +189,14 @@ pub enum CommonCommand {
         /// The leading dot is optional: `state=ready` and `.state=ready` are equivalent.
         #[arg(long = "until", value_name = "KEY=VALUE")]
         until: Vec<String>,
+        /// Skip the pre-wait pane-state snapshot and go straight to live events.
+        /// By default `wait` snapshots the targeted pane via `ps` and exits 0
+        /// with a synthetic `CurrentState` record if the snapshot already
+        /// satisfies `--where` / `--until`. Use this flag when you want to wait
+        /// for the next transition specifically, ignoring whatever state the
+        /// pane is in right now.
+        #[arg(long = "no-snapshot")]
+        no_snapshot: bool,
         /// Seconds to wait before failing with non-zero exit. 0 disables the timeout.
         #[arg(long, default_value = "60")]
         timeout: u64,
@@ -1189,8 +1197,9 @@ where
 /// `ps` and checked against the predicates: if the snapshot already matches, a
 /// synthetic `CurrentState` record is emitted and the wait exits 0 without
 /// consuming any event. This closes the subscribe-then-snapshot race. Skipped
-/// (falls through to live waiting) when neither `--pane-id` nor `--session-id`
-/// is set or when filters constrain to sources other than slopd state.
+/// (falls through to live waiting) when `no_snapshot` is set, when neither
+/// `--pane-id` nor `--session-id` is set, or when filters constrain to
+/// sources other than slopd state.
 pub async fn execute_wait<R, W>(
     client: &mut Client<R, W>,
     hooks: Vec<String>,
@@ -1200,6 +1209,7 @@ pub async fn execute_wait<R, W>(
     session_id: Option<String>,
     where_preds: Vec<String>,
     until: Vec<String>,
+    no_snapshot: bool,
     timeout_secs: u64,
 ) -> Result<(), Error>
 where
@@ -1224,7 +1234,7 @@ where
     let mut subscription = client.subscribe(filters).await?;
     println!("{{\"subscribed\":true}}");
 
-    if pane_id.is_some() || session_id.is_some() {
+    if !no_snapshot && (pane_id.is_some() || session_id.is_some()) {
         let seeded = seed_current_if_match(
             client,
             pane_id.as_deref(),
@@ -1353,8 +1363,8 @@ where
         CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, where_preds, replay } => {
             execute_listen(client, hooks, events, transcripts, pane_id, session_id, where_preds, replay).await?;
         }
-        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout } => {
-            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout).await?;
+        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout } => {
+            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout).await?;
         }
     }
     Ok(())

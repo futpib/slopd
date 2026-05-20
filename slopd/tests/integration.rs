@@ -7050,6 +7050,64 @@ fn wait_without_target_falls_through_to_live_wait() {
         "expected normal timeout error, not a target-required error; got: {:?}", stderr);
 }
 
+/// `slopctl wait --no-snapshot` skips the pre-wait pane-state snapshot and
+/// waits for a real live event instead, even when the pane already satisfies
+/// the predicates. Use case: the caller explicitly wants the *next* transition.
+#[test]
+fn wait_no_snapshot_ignores_current_state_and_waits_for_event() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Drive the pane to Ready. Without --no-snapshot the wait below would
+    // exit immediately via the seeded CurrentState record.
+    assert_state_after_hook(&env, &pane_id, "SessionStart",
+        &format!(r#"{{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","pane_id":"{}"}}"#, pane_id),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // With --no-snapshot: the wait skips the snapshot and times out because
+    // no further state-change event ever fires (the pane is already Ready).
+    let start = Instant::now();
+    let out = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--pane-id", &pane_id,
+            "--where", "state=ready",
+            "--no-snapshot",
+            "--timeout", "1",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+    let elapsed = start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(),
+        "wait --no-snapshot should time out (the pane is already in target state, no next transition); got {:?}",
+        out.status);
+    // Should actually wait until the timeout, not exit instantly.
+    assert!(elapsed >= Duration::from_millis(800),
+        "wait --no-snapshot should not short-circuit on the snapshot; got elapsed {:?}", elapsed);
+
+    // Confirm the subscribed line went out but no CurrentState seeded record.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let has_seeded = stdout.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|v| v["event_type"] == "CurrentState");
+    assert!(!has_seeded,
+        "wait --no-snapshot must not emit a CurrentState seeded record; stdout={:?}", stdout);
+}
+
 /// `--where` accepts both `state=ready` and `.state=ready` — the leading dot
 /// is optional, matching jq syntax. This regression-guards the `--help` text.
 #[test]
