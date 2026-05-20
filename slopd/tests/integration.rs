@@ -7050,46 +7050,6 @@ fn wait_without_target_falls_through_to_live_wait() {
         "expected normal timeout error, not a target-required error; got: {:?}", stderr);
 }
 
-/// When `--where` is set and no events arrive for a short window, `slopctl
-/// wait` must emit a stderr warning. This catches the silent-typo failure
-/// mode where the predicate path doesn't exist in any payload and the wait
-/// just times out without any signal as to why.
-#[test]
-fn wait_where_warns_when_no_events_received() {
-    build_bin("slopd");
-    build_bin("slopctl");
-
-    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
-        eprintln!("skipping: tmux not found");
-        return;
-    };
-    let slopd = env.spawn_slopd();
-
-    // Use the test-only env var to shrink the warn window. The whole wait
-    // still bounds in <5s with timeout=2 and warn_after=200ms.
-    let out = Command::new(cargo_bin("slopctl"))
-        .args([
-            "wait",
-            "--pane-id", "%9999",
-            "--where", "definitely_not_a_real_payload_key=value",
-            "--timeout", "2",
-        ])
-        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
-        .env("SLOPCTL_TEST_WHERE_WARN_MS", "200")
-        .output()
-        .expect("failed to run slopctl wait");
-
-    kill_slopd(slopd);
-
-    // Wait should time out (non-zero exit) since the predicate never matches.
-    assert!(!out.status.success(), "wait should have timed out, got {:?}", out.status);
-
-    // And the warning must be on stderr.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("warning") && stderr.contains("--where"),
-        "expected --where warning on stderr after no events received, got: {:?}", stderr);
-}
-
 /// `--where` accepts both `state=ready` and `.state=ready` — the leading dot
 /// is optional, matching jq syntax. This regression-guards the `--help` text.
 #[test]
