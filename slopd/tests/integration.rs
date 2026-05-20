@@ -6953,11 +6953,11 @@ fn listen_pane_id_rejects_uuid_with_session_id_hint() {
         "stderr should point at --session-id for UUIDs: {:?}", stderr);
 }
 
-/// `slopctl wait --seed-current` against a pane already in the target state
-/// must exit immediately with a synthetic `CurrentState` record, without
-/// waiting for a real state-change event to fire.
+/// `slopctl wait` against a pane already in the target state must exit
+/// immediately with a synthetic `CurrentState` record. The snapshot-then-wait
+/// is the default behavior: no flag needed.
 #[test]
-fn wait_seed_current_short_circuits_when_state_already_matches() {
+fn wait_short_circuits_when_pane_state_already_matches() {
     build_bin("slopd");
     build_bin("slopctl");
 
@@ -6976,17 +6976,16 @@ fn wait_seed_current_short_circuits_when_state_already_matches() {
         &format!(r#"{{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","pane_id":"{}"}}"#, pane_id),
         libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
 
-    // Now: wait --seed-current. The pane is already Ready, so the seed must
-    // match and return without consuming any real event. Use a tight timeout
-    // — without seed-current this would block on a state change that never
-    // happens (the pane is already in the target state).
+    // wait with --pane-id and --where: the pane is already Ready, so the seed
+    // must match and return without consuming any real event. Without the
+    // automatic seed this would block on a state change that never happens
+    // (the pane is already in the target state).
     let start = Instant::now();
     let out = Command::new(cargo_bin("slopctl"))
         .args([
             "wait",
             "--pane-id", &pane_id,
             "--where", "state=ready",
-            "--seed-current",
             "--timeout", "30",
         ])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
@@ -6997,10 +6996,10 @@ fn wait_seed_current_short_circuits_when_state_already_matches() {
     kill_slopd(slopd);
 
     assert!(out.status.success(),
-        "slopctl wait --seed-current should exit 0 when state already matches; got {:?} stderr={:?}",
+        "slopctl wait should exit 0 when state already matches; got {:?} stderr={:?}",
         out.status, String::from_utf8_lossy(&out.stderr));
     assert!(elapsed < Duration::from_secs(5),
-        "wait --seed-current should return immediately, took {:?}", elapsed);
+        "wait should return immediately on snapshot match, took {:?}", elapsed);
 
     // Output: {"subscribed":true} line, then a synthetic record with
     // event_type=CurrentState and seeded_current=true in payload.
@@ -7020,10 +7019,11 @@ fn wait_seed_current_short_circuits_when_state_already_matches() {
     assert_eq!(seeded["payload"]["seeded_current"], true);
 }
 
-/// `--seed-current` must error eagerly if neither --pane-id nor --session-id
-/// is set; there's nothing to snapshot without a target pane.
+/// `slopctl wait` without `--pane-id` or `--session-id` skips the snapshot
+/// (no target to query) and falls through to normal live-event waiting.
+/// This is silent fall-through, not an error.
 #[test]
-fn wait_seed_current_requires_pane_or_session() {
+fn wait_without_target_falls_through_to_live_wait() {
     build_bin("slopd");
     build_bin("slopctl");
 
@@ -7033,19 +7033,21 @@ fn wait_seed_current_requires_pane_or_session() {
     };
     let slopd = env.spawn_slopd();
 
+    // No --pane-id / --session-id. With no target, snapshot can't run, so
+    // the wait falls through to live events and times out (no hook fires).
     let out = Command::new(cargo_bin("slopctl"))
-        .args(["wait", "--where", "state=ready", "--seed-current", "--timeout", "1"])
+        .args(["wait", "--hook", "NeverFires", "--timeout", "1"])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
         .output()
         .expect("failed to run slopctl wait");
 
     kill_slopd(slopd);
 
-    assert!(!out.status.success(), "wait --seed-current without target should fail");
+    assert!(!out.status.success(), "wait should time out (non-zero exit), got {:?}", out.status);
+    // No spurious "requires --pane-id" error — just a normal timeout.
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--seed-current"), "error should mention the flag: {:?}", stderr);
-    assert!(stderr.contains("--pane-id") || stderr.contains("--session-id"),
-        "error should mention the required flag: {:?}", stderr);
+    assert!(stderr.contains("timed out"),
+        "expected normal timeout error, not a target-required error; got: {:?}", stderr);
 }
 
 /// When `--where` is set and no events arrive for a short window, `slopctl
@@ -7105,7 +7107,7 @@ fn wait_where_leading_dot_optional_end_to_end() {
     assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
     let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
 
-    // Drive the pane to Ready so --seed-current can match.
+    // Drive the pane to Ready so the snapshot can match.
     assert_state_after_hook(&env, &pane_id, "SessionStart",
         &format!(r#"{{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","pane_id":"{}"}}"#, pane_id),
         libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
@@ -7116,7 +7118,6 @@ fn wait_where_leading_dot_optional_end_to_end() {
             "wait",
             "--pane-id", &pane_id,
             "--where", ".state=ready",
-            "--seed-current",
             "--timeout", "5",
         ])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
@@ -7129,7 +7130,6 @@ fn wait_where_leading_dot_optional_end_to_end() {
             "wait",
             "--pane-id", &pane_id,
             "--where", "state=ready",
-            "--seed-current",
             "--timeout", "5",
         ])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())

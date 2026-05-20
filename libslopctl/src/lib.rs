@@ -190,14 +190,6 @@ pub enum CommonCommand {
         /// The leading dot is optional: `state=ready` and `.state=ready` are equivalent.
         #[arg(long = "until", value_name = "KEY=VALUE")]
         until: Vec<String>,
-        /// Before entering the live event wait, snapshot the pane's current state
-        /// via `ps` and check it against `--where` / `--until`. If the snapshot
-        /// already matches, emit a synthetic `CurrentState` event and exit 0
-        /// without waiting. Closes the subscribe-then-snapshot race when waiting
-        /// for a pane to reach a steady state (e.g. `state=ready`). Requires
-        /// `--pane-id` or `--session-id`.
-        #[arg(long = "seed-current")]
-        seed_current: bool,
         /// Seconds to wait before failing with non-zero exit. 0 disables the timeout.
         #[arg(long, default_value = "60")]
         timeout: u64,
@@ -1207,9 +1199,13 @@ where
 /// Run the Wait command: subscribe with the listen-shaped filters, then print
 /// records as JSON lines exactly like `listen` does. Exits 0 after printing the
 /// first record that satisfies all `--until` predicates; exits 2 on timeout.
-/// When `--seed-current` is set, a synthetic `CurrentState` record built from
-/// `slopctl ps` is checked first so a pane already in the desired state
-/// returns immediately without racing the subscribe.
+///
+/// Before entering the live wait, the pane's current state is snapshotted via
+/// `ps` and checked against the predicates: if the snapshot already matches, a
+/// synthetic `CurrentState` record is emitted and the wait exits 0 without
+/// consuming any event. This closes the subscribe-then-snapshot race. Skipped
+/// (falls through to live waiting) when neither `--pane-id` nor `--session-id`
+/// is set or when filters constrain to sources other than slopd state.
 pub async fn execute_wait<R, W>(
     client: &mut Client<R, W>,
     hooks: Vec<String>,
@@ -1219,7 +1215,6 @@ pub async fn execute_wait<R, W>(
     session_id: Option<String>,
     where_preds: Vec<String>,
     until: Vec<String>,
-    seed_current: bool,
     timeout_secs: u64,
 ) -> Result<(), Error>
 where
@@ -1230,15 +1225,9 @@ where
     let where_parsed = parse_payload_predicates(where_preds)?;
     let (pane_id, session_id) = resolve_pane_id_or_session(pane_id, session_id)?;
 
-    if seed_current && pane_id.is_none() && session_id.is_none() {
-        return Err(Error::FilterError(
-            "--seed-current requires --pane-id or --session-id (cannot seed without a target pane)".to_string(),
-        ));
-    }
-
     // Subscribe FIRST so we don't miss a transition between seed-check and
-    // wait-start. The seed check runs after subscribe is confirmed; if it
-    // matches we emit the synthetic record and exit without consuming events.
+    // wait-start. If the snapshot matches we emit the synthetic record and
+    // exit without consuming any event.
     let filters = build_listen_filters(
         hooks.clone(),
         events.clone(),
@@ -1250,7 +1239,7 @@ where
     let mut subscription = client.subscribe(filters).await?;
     println!("{{\"subscribed\":true}}");
 
-    if seed_current {
+    if pane_id.is_some() || session_id.is_some() {
         let seeded = seed_current_if_match(
             client,
             pane_id.as_deref(),
@@ -1397,8 +1386,8 @@ where
         CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, where_preds, replay } => {
             execute_listen(client, hooks, events, transcripts, pane_id, session_id, where_preds, replay).await?;
         }
-        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, seed_current, timeout } => {
-            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, seed_current, timeout).await?;
+        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout } => {
+            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout).await?;
         }
     }
     Ok(())
