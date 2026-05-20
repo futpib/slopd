@@ -188,6 +188,14 @@ pub enum CommonCommand {
         /// against the reachable scalar; arrays/objects never match.
         #[arg(long = "until", value_name = "KEY=VALUE")]
         until: Vec<String>,
+        /// Before entering the live event wait, snapshot the pane's current state
+        /// via `ps` and check it against `--where` / `--until`. If the snapshot
+        /// already matches, emit a synthetic `CurrentState` event and exit 0
+        /// without waiting. Closes the subscribe-then-snapshot race when waiting
+        /// for a pane to reach a steady state (e.g. `state=ready`). Requires
+        /// `--pane-id` or `--session-id`.
+        #[arg(long = "seed-current")]
+        seed_current: bool,
         /// Seconds to wait before failing with non-zero exit. 0 disables the timeout.
         #[arg(long, default_value = "60")]
         timeout: u64,
@@ -1058,6 +1066,87 @@ where
     }
 }
 
+/// Build a synthetic `CurrentState` record for a pane's current state. Used by
+/// `--seed-current` to short-circuit the wait when the pane already satisfies
+/// the predicates. The payload mirrors what a real `DetailedStateChange` carries
+/// (`state` and `detailed_state`) plus the pane's `session_id`, so predicates
+/// against any of those work against the seed.
+fn build_seed_record(pane: &libslop::PaneInfo) -> libslop::Record {
+    let payload = serde_json::json!({
+        "state": pane.state.as_str(),
+        "detailed_state": pane.detailed_state.as_str(),
+        "session_id": pane.session_id,
+        "seeded_current": true,
+    });
+    libslop::Record {
+        cursor: None,
+        source: "slopd".to_string(),
+        event_type: "CurrentState".to_string(),
+        pane_id: Some(pane.pane_id.clone()),
+        payload,
+    }
+}
+
+/// If `--seed-current` is set and the current snapshot of the targeted pane
+/// satisfies all `--where` and `--until` predicates, return a synthetic
+/// `CurrentState` record. Returns `Ok(None)` to fall through to live event
+/// waiting. Skipped (returns None) when `--hook`/`--transcript` filters are
+/// set or when `--event` excludes state-relevant types, because the seed
+/// represents a steady state — not a hook/transcript record.
+async fn seed_current_if_match<R, W>(
+    client: &mut Client<R, W>,
+    pane_id: Option<&str>,
+    session_id: Option<&str>,
+    hooks: &[String],
+    events: &[String],
+    transcripts: &[String],
+    where_preds: &[libslop::PayloadPredicate],
+    until_preds: &[libslop::PayloadPredicate],
+) -> Result<Option<libslop::Record>, Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // The synthetic event is conceptually "slopd / state", not a hook or a
+    // transcript record. If the user is filtering on those sources we can't
+    // honestly seed.
+    if !hooks.is_empty() || !transcripts.is_empty() {
+        return Ok(None);
+    }
+    // If --event is set, only seed when one of the requested event types is a
+    // state-relevant kind. Otherwise the seed would silently match an event
+    // the user didn't actually ask for.
+    if !events.is_empty() {
+        const STATE_EVENTS: &[&str] = &["CurrentState", "StateChange", "DetailedStateChange"];
+        if !events.iter().any(|e| STATE_EVENTS.contains(&e.as_str())) {
+            return Ok(None);
+        }
+    }
+
+    let panes = client.ps().await?;
+    for pane in &panes {
+        if let Some(pid) = pane_id {
+            if pane.pane_id != pid {
+                continue;
+            }
+        }
+        if let Some(sid) = session_id {
+            if pane.session_id.as_deref() != Some(sid) {
+                continue;
+            }
+        }
+        let record = build_seed_record(pane);
+        if !libslop::predicates_match(&record.payload, where_preds) {
+            continue;
+        }
+        if !libslop::predicates_match(&record.payload, until_preds) {
+            continue;
+        }
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
 /// Run the Listen command: build filters, subscribe, print events until SIGTERM or EOF.
 pub async fn execute_listen<R, W>(
     client: &mut Client<R, W>,
@@ -1119,6 +1208,9 @@ where
 /// Run the Wait command: subscribe with the listen-shaped filters, then print
 /// records as JSON lines exactly like `listen` does. Exits 0 after printing the
 /// first record that satisfies all `--until` predicates; exits 2 on timeout.
+/// When `--seed-current` is set, a synthetic `CurrentState` record built from
+/// `slopctl ps` is checked first so a pane already in the desired state
+/// returns immediately without racing the subscribe.
 pub async fn execute_wait<R, W>(
     client: &mut Client<R, W>,
     hooks: Vec<String>,
@@ -1128,6 +1220,7 @@ pub async fn execute_wait<R, W>(
     session_id: Option<String>,
     where_preds: Vec<String>,
     until: Vec<String>,
+    seed_current: bool,
     timeout_secs: u64,
 ) -> Result<(), Error>
 where
@@ -1137,13 +1230,58 @@ where
     let predicates = parse_payload_predicates(until)?;
     let where_parsed = parse_payload_predicates(where_preds)?;
     let (pane_id, session_id) = resolve_pane_id_or_session(pane_id, session_id)?;
-    let filters = build_listen_filters(hooks, events, transcripts, pane_id, session_id, where_parsed);
-    let mut subscription = client.subscribe(filters).await?;
 
-    let wait_loop = print_subscription_until(
-        &mut subscription,
-        |record| libslop::predicates_match(&record.payload, &predicates),
+    if seed_current && pane_id.is_none() && session_id.is_none() {
+        return Err(Error::FilterError(
+            "--seed-current requires --pane-id or --session-id (cannot seed without a target pane)".to_string(),
+        ));
+    }
+
+    // Subscribe FIRST so we don't miss a transition between seed-check and
+    // wait-start. The seed check runs after subscribe is confirmed; if it
+    // matches we emit the synthetic record and exit without consuming events.
+    let filters = build_listen_filters(
+        hooks.clone(),
+        events.clone(),
+        transcripts.clone(),
+        pane_id.clone(),
+        session_id.clone(),
+        where_parsed.clone(),
     );
+    let mut subscription = client.subscribe(filters).await?;
+    println!("{{\"subscribed\":true}}");
+
+    if seed_current {
+        let seeded = seed_current_if_match(
+            client,
+            pane_id.as_deref(),
+            session_id.as_deref(),
+            &hooks,
+            &events,
+            &transcripts,
+            &where_parsed,
+            &predicates,
+        ).await?;
+        if let Some(record) = seeded {
+            println!("{}", serde_json::to_string(&record).unwrap());
+            return Ok(());
+        }
+    }
+
+    let wait_loop = async {
+        loop {
+            match subscription.next().await? {
+                Some(SubscriptionItem::Record(record)) => {
+                    println!("{}", serde_json::to_string(&record).unwrap());
+                    if libslop::predicates_match(&record.payload, &predicates) {
+                        return Ok(());
+                    }
+                }
+                Some(SubscriptionItem::Subscribed) => {}
+                None => return Err(Error::ConnectionClosed),
+            }
+        }
+    };
 
     if timeout_secs == 0 {
         return wait_loop.await;
@@ -1242,8 +1380,8 @@ where
         CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, where_preds, replay } => {
             execute_listen(client, hooks, events, transcripts, pane_id, session_id, where_preds, replay).await?;
         }
-        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout } => {
-            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, timeout).await?;
+        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, seed_current, timeout } => {
+            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, seed_current, timeout).await?;
         }
     }
     Ok(())
@@ -1347,5 +1485,52 @@ mod tests {
     fn resolve_pane_id_or_session_rejects_garbage() {
         let err = resolve_pane_id_or_session(Some("garbage".into()), None).unwrap_err();
         assert!(err.to_string().contains("--pane-id"));
+    }
+
+    fn fake_pane(pane_id: &str, state: libslop::PaneDetailedState, session_id: Option<&str>) -> libslop::PaneInfo {
+        libslop::PaneInfo {
+            pane_id: pane_id.to_string(),
+            created_at: 0,
+            last_active: 0,
+            session_id: session_id.map(String::from),
+            parent_pane_id: None,
+            tags: vec![],
+            state: state.to_simple(),
+            detailed_state: state,
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn build_seed_record_has_state_and_detailed_state_in_payload() {
+        let pane = fake_pane("%79", libslop::PaneDetailedState::Ready, Some("abc-123"));
+        let record = build_seed_record(&pane);
+        assert_eq!(record.source, "slopd");
+        assert_eq!(record.event_type, "CurrentState");
+        assert_eq!(record.pane_id.as_deref(), Some("%79"));
+        assert_eq!(record.payload["state"], "ready");
+        assert_eq!(record.payload["detailed_state"], "ready");
+        assert_eq!(record.payload["session_id"], "abc-123");
+        assert_eq!(record.payload["seeded_current"], true);
+    }
+
+    #[test]
+    fn build_seed_record_predicate_match_against_state() {
+        let pane = fake_pane("%79", libslop::PaneDetailedState::Ready, None);
+        let record = build_seed_record(&pane);
+        let predicates = parse_payload_predicates(vec!["state=ready".into()]).unwrap();
+        assert!(libslop::predicates_match(&record.payload, &predicates));
+        let no_match = parse_payload_predicates(vec!["state=busy".into()]).unwrap();
+        assert!(!libslop::predicates_match(&record.payload, &no_match));
+    }
+
+    #[test]
+    fn build_seed_record_predicate_match_against_detailed_state() {
+        let pane = fake_pane("%79", libslop::PaneDetailedState::AwaitingInputPermission, None);
+        let record = build_seed_record(&pane);
+        let predicates = parse_payload_predicates(
+            vec!["detailed_state=awaiting_input_permission".into()],
+        ).unwrap();
+        assert!(libslop::predicates_match(&record.payload, &predicates));
     }
 }

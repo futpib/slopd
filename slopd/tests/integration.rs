@@ -6966,3 +6966,98 @@ fn wait_pane_id_accepts_uuid_as_session() {
         "wait should have emitted the SessionStart for the matching session UUID; stdout={:?}",
         stdout);
 }
+
+/// `slopctl wait --seed-current` against a pane already in the target state
+/// must exit immediately with a synthetic `CurrentState` record, without
+/// waiting for a real state-change event to fire.
+#[test]
+fn wait_seed_current_short_circuits_when_state_already_matches() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Drive the pane into the Ready state up-front via SessionStart hook.
+    assert_state_after_hook(&env, &pane_id, "SessionStart",
+        &format!(r#"{{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","pane_id":"{}"}}"#, pane_id),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // Now: wait --seed-current. The pane is already Ready, so the seed must
+    // match and return without consuming any real event. Use a tight timeout
+    // — without seed-current this would block on a state change that never
+    // happens (the pane is already in the target state).
+    let start = Instant::now();
+    let out = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--pane-id", &pane_id,
+            "--where", "state=ready",
+            "--seed-current",
+            "--timeout", "30",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+    let elapsed = start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(out.status.success(),
+        "slopctl wait --seed-current should exit 0 when state already matches; got {:?} stderr={:?}",
+        out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(elapsed < Duration::from_secs(5),
+        "wait --seed-current should return immediately, took {:?}", elapsed);
+
+    // Output: {"subscribed":true} line, then a synthetic record with
+    // event_type=CurrentState and seeded_current=true in payload.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let first = lines.next().expect("missing subscribed line");
+    assert!(first.contains("\"subscribed\":true"), "first line should confirm subscribe: {:?}", first);
+
+    let seeded: serde_json::Value = lines
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .find(|v: &serde_json::Value| v["event_type"] == "CurrentState")
+        .unwrap_or_else(|| panic!("missing CurrentState seeded record in wait stdout: {:?}", stdout));
+    assert_eq!(seeded["source"], "slopd");
+    assert_eq!(seeded["pane_id"], pane_id);
+    assert_eq!(seeded["payload"]["state"], "ready");
+    assert_eq!(seeded["payload"]["detailed_state"], "ready");
+    assert_eq!(seeded["payload"]["seeded_current"], true);
+}
+
+/// `--seed-current` must error eagerly if neither --pane-id nor --session-id
+/// is set; there's nothing to snapshot without a target pane.
+#[test]
+fn wait_seed_current_requires_pane_or_session() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let out = Command::new(cargo_bin("slopctl"))
+        .args(["wait", "--where", "state=ready", "--seed-current", "--timeout", "1"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "wait --seed-current without target should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--seed-current"), "error should mention the flag: {:?}", stderr);
+    assert!(stderr.contains("--pane-id") || stderr.contains("--session-id"),
+        "error should mention the required flag: {:?}", stderr);
+}
