@@ -7061,3 +7061,97 @@ fn wait_seed_current_requires_pane_or_session() {
     assert!(stderr.contains("--pane-id") || stderr.contains("--session-id"),
         "error should mention the required flag: {:?}", stderr);
 }
+
+/// When `--where` is set and no events arrive for a short window, `slopctl
+/// wait` must emit a stderr warning. This catches the silent-typo failure
+/// mode where the predicate path doesn't exist in any payload and the wait
+/// just times out without any signal as to why.
+#[test]
+fn wait_where_warns_when_no_events_received() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    // Use the test-only env var to shrink the warn window. The whole wait
+    // still bounds in <5s with timeout=2 and warn_after=200ms.
+    let out = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--pane-id", "%9999",
+            "--where", "definitely_not_a_real_payload_key=value",
+            "--timeout", "2",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env("SLOPCTL_TEST_WHERE_WARN_MS", "200")
+        .output()
+        .expect("failed to run slopctl wait");
+
+    kill_slopd(slopd);
+
+    // Wait should time out (non-zero exit) since the predicate never matches.
+    assert!(!out.status.success(), "wait should have timed out, got {:?}", out.status);
+
+    // And the warning must be on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("warning") && stderr.contains("--where"),
+        "expected --where warning on stderr after no events received, got: {:?}", stderr);
+}
+
+/// `--where` accepts both `state=ready` and `.state=ready` — the leading dot
+/// is optional, matching jq syntax. This regression-guards the `--help` text.
+#[test]
+fn wait_where_leading_dot_optional_end_to_end() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // Drive the pane to Ready so --seed-current can match.
+    assert_state_after_hook(&env, &pane_id, "SessionStart",
+        &format!(r#"{{"session_id":"s1","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","pane_id":"{}"}}"#, pane_id),
+        libslop::PaneState::Ready, libslop::PaneDetailedState::Ready);
+
+    // With leading dot: should match and exit immediately.
+    let out_dot = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--pane-id", &pane_id,
+            "--where", ".state=ready",
+            "--seed-current",
+            "--timeout", "5",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+
+    // Without leading dot: must also match.
+    let out_no_dot = Command::new(cargo_bin("slopctl"))
+        .args([
+            "wait",
+            "--pane-id", &pane_id,
+            "--where", "state=ready",
+            "--seed-current",
+            "--timeout", "5",
+        ])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl wait");
+
+    kill_slopd(slopd);
+
+    assert!(out_dot.status.success(), "wait --where .state=ready should succeed, got {:?}", out_dot.status);
+    assert!(out_no_dot.status.success(), "wait --where state=ready should succeed, got {:?}", out_no_dot.status);
+}

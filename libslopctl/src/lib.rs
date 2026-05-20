@@ -145,9 +145,10 @@ pub enum CommonCommand {
         /// Server-side payload predicate(s) of the form KEY=VALUE (repeatable, AND).
         /// KEY is a jq-style path into the event's `payload`. Supports `.foo`,
         /// `.foo[]` (any array element), `.foo[3]`, and combinations
-        /// (e.g. `message.content[].type`). Comparison is string-equality
-        /// against the reachable scalar; arrays/objects never match.
-        /// Pushed down to slopd so non-matching events are not delivered.
+        /// (e.g. `message.content[].type`). The leading dot is optional:
+        /// `state=ready` and `.state=ready` are equivalent. Comparison is
+        /// string-equality against the reachable scalar; arrays/objects never
+        /// match. Pushed down to slopd so non-matching events are not delivered.
         #[arg(long = "where", value_name = "KEY=VALUE")]
         where_preds: Vec<String>,
         /// Replay the last N transcript records before switching to live events (requires --pane-id).
@@ -176,9 +177,11 @@ pub enum CommonCommand {
         /// Only receive events from this Claude session.
         #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
-        /// Server-side payload predicate(s) (same syntax as --until). Pushed
-        /// down to slopd so non-matching events are not delivered. Use this
-        /// when the listener is expensive or the predicate is selective.
+        /// Server-side payload predicate(s) (same syntax as --until; leading
+        /// dot optional). Pushed down to slopd so non-matching events are not
+        /// delivered. Use this when the listener is expensive or the predicate
+        /// is selective. If no events arrive within a short window the
+        /// predicate may be wrong; a stderr warning fires after 10s.
         #[arg(long = "where", value_name = "KEY=VALUE")]
         where_preds: Vec<String>,
         /// Client-side stop predicate(s) of the form KEY=VALUE (repeatable, AND).
@@ -186,6 +189,7 @@ pub enum CommonCommand {
         /// `.foo[]` (any array element), `.foo[3]`, and combinations
         /// (e.g. `message.content[].type`). Comparison is string-equality
         /// against the reachable scalar; arrays/objects never match.
+        /// The leading dot is optional: `state=ready` and `.state=ready` are equivalent.
         #[arg(long = "until", value_name = "KEY=VALUE")]
         until: Vec<String>,
         /// Before entering the live event wait, snapshot the pane's current state
@@ -1039,6 +1043,20 @@ pub fn parse_payload_predicates(raw: Vec<String>) -> Result<Vec<libslop::Payload
     libslop::parse_payload_predicates(raw).map_err(Error::FilterError)
 }
 
+/// How long to wait after subscribing before warning that a `--where` predicate
+/// may be too restrictive (no records received yet). Tuned to be long enough
+/// that real-but-slow events don't trip it, short enough to catch typos quickly.
+/// Tests may override via `SLOPCTL_TEST_WHERE_WARN_MS` (milliseconds).
+const WHERE_WARN_AFTER_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn where_warn_after() -> std::time::Duration {
+    std::env::var("SLOPCTL_TEST_WHERE_WARN_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(WHERE_WARN_AFTER_DEFAULT)
+}
+
 /// Print the `{"subscribed":true}` confirmation, then print every Record from
 /// the subscription as a JSON line. After printing each record, `should_stop`
 /// is consulted; returning true ends the loop with `Ok(())`. Returns
@@ -1268,17 +1286,35 @@ where
         }
     }
 
+    let warn_enabled = !where_parsed.is_empty();
+    let warn_after = where_warn_after();
     let wait_loop = async {
+        let mut got_any = false;
+        let mut warn_timer = std::pin::pin!(tokio::time::sleep(warn_after));
+        let mut warned = false;
         loop {
-            match subscription.next().await? {
-                Some(SubscriptionItem::Record(record)) => {
-                    println!("{}", serde_json::to_string(&record).unwrap());
-                    if libslop::predicates_match(&record.payload, &predicates) {
-                        return Ok(());
+            tokio::select! {
+                _ = &mut warn_timer, if warn_enabled && !warned && !got_any => {
+                    eprintln!(
+                        "warning: no events received in {:?}; check that your --where predicate matches \
+                         actual payload paths (use `slopctl listen` to inspect events for this filter)",
+                        warn_after,
+                    );
+                    warned = true;
+                }
+                item = subscription.next() => {
+                    match item? {
+                        Some(SubscriptionItem::Record(record)) => {
+                            got_any = true;
+                            println!("{}", serde_json::to_string(&record).unwrap());
+                            if libslop::predicates_match(&record.payload, &predicates) {
+                                return Ok(());
+                            }
+                        }
+                        Some(SubscriptionItem::Subscribed) => {}
+                        None => return Err(Error::ConnectionClosed),
                     }
                 }
-                Some(SubscriptionItem::Subscribed) => {}
-                None => return Err(Error::ConnectionClosed),
             }
         }
     };
@@ -1532,5 +1568,27 @@ mod tests {
             vec!["detailed_state=awaiting_input_permission".into()],
         ).unwrap();
         assert!(libslop::predicates_match(&record.payload, &predicates));
+    }
+
+    /// Verify that the leading-dot equivalence promised in --help text is the
+    /// behavior of the underlying parser; this guards the help docs against
+    /// drift from the implementation.
+    #[test]
+    fn where_predicate_leading_dot_optional() {
+        let with_dot = parse_payload_predicates(vec![".state=ready".into()]).unwrap();
+        let without_dot = parse_payload_predicates(vec!["state=ready".into()]).unwrap();
+        assert_eq!(with_dot.len(), 1);
+        assert_eq!(without_dot.len(), 1);
+        assert_eq!(with_dot[0].path, without_dot[0].path);
+        assert_eq!(with_dot[0].expected, "ready");
+        assert_eq!(without_dot[0].expected, "ready");
+    }
+
+    /// A nested path's leading dot is also optional (consistency with top-level).
+    #[test]
+    fn where_predicate_leading_dot_optional_nested() {
+        let with_dot = parse_payload_predicates(vec![".message.content[].type=text".into()]).unwrap();
+        let without_dot = parse_payload_predicates(vec!["message.content[].type=text".into()]).unwrap();
+        assert_eq!(with_dot[0].path, without_dot[0].path);
     }
 }
