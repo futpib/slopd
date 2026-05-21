@@ -258,6 +258,12 @@ slopctl send tag=worker "Report your status" --select all
 
 # Send to any one pane tagged "idle"
 slopctl send tag=idle "Start task X" --select one
+
+# Compact the context of all running agents to reclaim context window
+slopctl send tag=worker "/compact" --select all
+
+# Reset a specific agent's conversation history entirely
+slopctl send %1 "/clear"
 ```
 
 `--select` values (only used with filter target):
