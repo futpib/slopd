@@ -18,7 +18,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y tmux
       - run: cargo install cargo-llvm-cov --locked
-      - run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info -- --test-threads=1
+      - run: cargo llvm-cov --workspace --all-features --no-report -- --test-threads=1
+      - name: Remove corrupt profraw files
+        run: |
+          LLVM_PROFDATA=$(find ~/.rustup/toolchains/stable-*/lib/rustlib/*/bin -name llvm-profdata | head -1)
+          find target/llvm-cov-target -name "*.profraw" | while read -r f; do
+            "$LLVM_PROFDATA" show "$f" > /dev/null 2>&1 || (echo "Removing corrupt profraw: $f" && rm -f "$f")
+          done
+      - run: cargo llvm-cov report --workspace --all-features --lcov --output-path lcov.info
       - uses: coverallsapp/github-action@v2
         with:
           file: lcov.info
