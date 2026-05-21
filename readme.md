@@ -171,10 +171,12 @@ All commands communicate with the running `slopd` daemon over its Unix socket.
 
 ### `slopctl status`
 
-Print daemon uptime.
+Print daemon uptime and state.
 
 ```
 uptime: 5025s
+subscribers: 3
+config_generation: 1
 ```
 
 ### `slopctl ps [--filter KEY=VALUE] [--json]`
@@ -284,6 +286,14 @@ Forward a Claude lifecycle hook event to slopd. Reads the JSON payload from stdi
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
 ```
 
+### `slopctl tmux-hook <EVENT> [PANE_ID]`
+
+Forward a tmux hook event to slopd. Normally called automatically from tmux hooks registered by the daemon — you do not need to invoke this manually.
+
+```bash
+slopctl tmux-hook after-kill-pane
+```
+
 ### `slopctl listen [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--where KEY=VALUE] [--replay N]`
 
 Subscribe to the event stream and print events as JSON lines.
@@ -323,7 +333,7 @@ Flag summary:
 
 `--where KEY=VALUE` (repeatable, AND): server-side payload predicate. KEY is a [jq-style path](#payload-paths) into the event's `payload`; non-matching events are not delivered. Incompatible with `--replay`.
 
-### `slopctl wait [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--where KEY=VALUE] [--until KEY=VALUE] [--timeout SECS]`
+### `slopctl wait [--hook EVENT] [--event EVENT] [--transcript TYPE] [--pane-id ID] [--session-id ID] [--where KEY=VALUE] [--until KEY=VALUE] [--timeout SECS] [--no-snapshot]`
 
 One-shot version of `listen`: same filter surface and same output (the `{"subscribed":true}` confirmation followed by each record as a JSON line). Exits 0 after printing the first matching event, or non-zero on timeout.
 
@@ -336,6 +346,9 @@ slopctl wait --hook UserPromptSubmit --pane-id %1
 
 # Wait for an assistant message that contains a text block
 slopctl wait --pane-id %1 --transcript assistant --until 'message.content[].type=text'
+
+# Wait for the next transition only (skip pre-wait snapshot of current state)
+slopctl wait --event DetailedStateChange --pane-id %1 --until detailed_state=ready --no-snapshot
 ```
 
 `--until KEY=VALUE` (repeatable, AND): client-side stop predicate. KEY is a [jq-style path](#payload-paths). Without `--until`, any event matching the filters wins.
@@ -343,6 +356,8 @@ slopctl wait --pane-id %1 --transcript assistant --until 'message.content[].type
 `--where KEY=VALUE` (repeatable, AND): server-side payload predicate, same syntax as `--until` (see `listen`). Use `--where` when the listener is expensive or the predicate is selective; use `--until` when you want to see every event but stop on a specific one.
 
 `--timeout SECS`: default 60. Pass `0` to wait indefinitely.
+
+`--no-snapshot`: Skip the pre-wait pane-state snapshot. By default `wait` checks the pane's current state and exits immediately if it already satisfies the predicates (emitting a synthetic `CurrentState` record). Use `--no-snapshot` when you want to wait for the next transition specifically, ignoring whatever state the pane is in right now.
 
 #### Payload paths
 
