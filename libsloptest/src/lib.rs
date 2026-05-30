@@ -4,6 +4,24 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Inject `--no-wait` into a `run` argument list so a `slopctl run` keeps the
+/// historical fire-and-forget behaviour. Most existing tests predate run's
+/// wait-for-ready default and only need the pane to exist (often a
+/// `sleep infinity` pane that never becomes "ready", which would otherwise make
+/// the wait time out); routing them through this preserves their behaviour and
+/// speed. Tests that exercise the new default call [`TestEnv::slopctl_raw`]
+/// (or build the command directly) instead. No-op for non-`run` commands or
+/// when `--no-wait` is already present.
+pub fn legacy_run_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    if args.first() == Some(&"run") && !args.contains(&"--no-wait") {
+        let mut injected = vec!["run", "--no-wait"];
+        injected.extend_from_slice(&args[1..]);
+        injected
+    } else {
+        args.to_vec()
+    }
+}
+
 pub fn cargo_bin(name: &str) -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
@@ -274,9 +292,27 @@ impl TestEnv {
         child
     }
 
+    /// Run slopctl against the test env. For `run`, `--no-wait` is injected (see
+    /// [`legacy_run_args`]) so pre-existing tests keep their fire-and-forget
+    /// expectations; use [`TestEnv::slopctl_raw`] to exercise run's
+    /// wait-for-ready default.
     pub fn slopctl(&self, args: &[&str]) -> std::process::Output {
+        self.slopctl_raw(&legacy_run_args(args))
+    }
+
+    /// Like [`TestEnv::slopctl`] but passes `args` verbatim, without the legacy
+    /// `--no-wait` injection. Use this to exercise `run`'s wait-for-ready default.
+    pub fn slopctl_raw(&self, args: &[&str]) -> std::process::Output {
         Command::new(cargo_bin("slopctl"))
             .args(args)
+            // Don't leak the ambient tmux context (e.g. when the test runner is
+            // itself inside a tmux pane). slopctl reads $TMUX_PANE for the `run`
+            // parent and the `tags` fallback, so an inherited value would point
+            // at a pane that doesn't exist in the test's isolated tmux server.
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .output()
             .expect("failed to run slopctl")

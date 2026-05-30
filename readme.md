@@ -201,12 +201,24 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+### `slopctl run [--no-wait] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
 ```bash
 PANE=$(slopctl run)
+```
+
+By default `run` waits for the new pane to become ready before returning, so a pane that dies during startup is reported as a failure instead of a dangling pane ID:
+
+- The pane becomes ready and stays alive → exit 0 and print the pane ID (as above).
+- The pane dies before becoming ready (e.g. `claude --resume <bad-id>` exits right after launch) → non-zero exit and an error on stderr, including the session-end reason when available. No pane ID is printed.
+- The pane doesn't become ready within `--ready-timeout` seconds (default 30) → non-zero exit and a timeout message, but the pane ID is still printed so you can investigate.
+
+Pass `--no-wait` to restore the historical fire-and-forget behaviour (return as soon as the pane is created):
+
+```bash
+PANE=$(slopctl run --no-wait)
 ```
 
 If called from within a tmux pane (i.e. `$TMUX_PANE` is set), the new pane automatically records that pane as its parent.

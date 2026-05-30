@@ -66,8 +66,13 @@ fn read_pane_env(env: &TestEnv, pane_id: &str, key: &str) -> String {
 /// Run slopctl against the test env, optionally forwarding extra env vars to
 /// slopctl itself (so `--env KEY=${VAR}` expansion can resolve).
 fn slopctl_with_env(env: &TestEnv, args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
+    // Keep `run` fire-and-forget for these legacy callers (matches env.slopctl).
+    let args = libsloptest::legacy_run_args(args);
     let mut cmd = Command::new(cargo_bin("slopctl"));
-    cmd.args(args)
+    cmd.args(args.as_slice())
+        // Don't leak an ambient $TMUX_PANE into a user-initiated run (matches
+        // env.slopctl); see TestEnv::slopctl_raw.
+        .env_remove("TMUX_PANE")
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path());
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -565,6 +570,123 @@ fn session_start_hook_stores_session_id_on_pane() {
     kill_slopd(slopd);
 
     assert_eq!(session_id, "mock-session-id-1234");
+}
+
+// --- `slopctl run` wait-for-ready (default) -------------------------------
+//
+// By default `slopctl run` waits for the freshly-spawned pane to become ready
+// before returning, so a pane that dies right after spawn (e.g. `claude
+// --resume <bad-id>`, which fires SessionStart → SessionEnd → exit) surfaces as
+// a non-zero exit instead of a dangling pane id. These tests use `slopctl_raw`
+// to bypass the harness's legacy `--no-wait` injection and exercise the default.
+
+/// Failure case: the pane dies before becoming ready. `run` must exit non-zero
+/// with a useful message (including the SessionEnd reason) and print no pane id.
+#[test]
+fn run_fails_when_pane_dies_before_ready() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // mock_claude --exit-after-start fires SessionStart then SessionEnd
+    // (reason=prompt_input_exit) and exits, simulating Claude bailing on a bad
+    // --resume target after writing only bootstrap metadata.
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path, "--exit-after-start"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "15"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(),
+        "run should fail when the pane dies before becoming ready: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("died before becoming ready"),
+        "stderr should explain the pane died; got: {}", stderr);
+    assert!(stderr.contains("prompt_input_exit"),
+        "stderr should include the SessionEnd reason; got: {}", stderr);
+    // Nothing usable to return, so no pane id on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
+}
+
+/// Success case: a healthy pane reaches ready and survives the settle window.
+/// `run` exits 0 and prints the pane id, exactly like the old behaviour.
+#[test]
+fn run_waits_for_ready_then_prints_pane_id() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "15"]);
+    assert!(out.status.success(), "run should succeed for a healthy pane: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(pane_id.starts_with('%'), "run should print the pane id; got: {:?}", pane_id);
+
+    // The pane is genuinely ready by the time run returns.
+    let (_state, detailed) = env.pane_state(&pane_id);
+    kill_slopd(slopd);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready,
+        "pane should be ready when run returns");
+}
+
+/// Timeout case: the pane never becomes ready (a non-Claude `sleep infinity`
+/// pane fires no SessionStart). `run` exits non-zero but still prints the pane
+/// id so the caller can investigate.
+#[test]
+fn run_times_out_when_pane_never_becomes_ready() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "2"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(), "run should fail on timeout: {:?}", out);
+    // The pane id is still printed so the caller can investigate the stuck pane.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().starts_with('%'),
+        "timed-out run should still print the pane id; got stdout: {:?}", stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("timed out"),
+        "stderr should explain the timeout; got: {}", stderr);
 }
 
 #[test]
@@ -1654,6 +1776,10 @@ fn assert_invalid_usage(args: &[&str], expected_hint: &str) {
     build_bin("slopctl");
     let out = Command::new(cargo_bin("slopctl"))
         .args(args)
+        // Don't inherit an ambient $TMUX_PANE (e.g. when running the suite from
+        // inside tmux): `slopctl tags` would treat it as the target pane and
+        // skip the missing-pane-id validation this asserts on.
+        .env_remove("TMUX_PANE")
         .output()
         .expect("failed to run slopctl");
     let stderr = String::from_utf8_lossy(&out.stderr);

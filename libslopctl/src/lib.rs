@@ -17,6 +17,9 @@ pub enum Error {
     Timeout,
     FilterError(String),
     SelectError(String),
+    /// A `run` failed after the pane was created (e.g. it died before becoming
+    /// ready). The message is already user-facing; no prefix is added.
+    RunFailed(String),
 }
 
 impl std::fmt::Display for Error {
@@ -30,6 +33,7 @@ impl std::fmt::Display for Error {
             Error::Timeout => write!(f, "timed out waiting for response from slopd"),
             Error::FilterError(msg) => write!(f, "filter error: {}", msg),
             Error::SelectError(msg) => write!(f, "select error: {}", msg),
+            Error::RunFailed(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -89,6 +93,17 @@ pub enum CommonCommand {
         /// Overrides entries from [run.env_files] / [run.env] in config.
         #[arg(long = "env-file", value_name = "PATH")]
         env_files: Vec<PathBuf>,
+        /// Don't wait for the new pane to become ready; print the pane id as soon
+        /// as it is created (the historical fire-and-forget behaviour). By
+        /// default `run` waits until the pane is ready, or fails if it dies or
+        /// times out first.
+        #[arg(long)]
+        no_wait: bool,
+        /// Seconds to wait for the new pane to become ready before giving up.
+        /// On timeout the pane id is still printed (so it can be investigated)
+        /// and the exit code is non-zero. Ignored with --no-wait.
+        #[arg(long, default_value = "30", value_name = "SECS")]
+        ready_timeout: u64,
         /// Extra arguments passed to the Claude executable (after --).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
@@ -1280,6 +1295,150 @@ where
     }
 }
 
+/// Settle window: once the freshly-spawned pane first reaches a non-booting
+/// detailed state we keep watching this long for an early death (SessionEnd or
+/// PaneDestroyed) before declaring success. The pane reaches `ready` at
+/// SessionStart but a broken session (e.g. a bad `--resume` target) exits
+/// ~1-2s *later* with `reason=prompt_input_exit`, so success cannot be declared
+/// the instant `ready` is observed — we must outlast that failure window.
+const RUN_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Build the user-facing error for a pane that died during the readiness wait,
+/// including the SessionEnd `reason` when we observed it.
+fn run_died_error(pane_id: &str, reason: Option<&str>) -> Error {
+    match reason {
+        Some(r) => Error::RunFailed(format!(
+            "pane {} died before becoming ready (session ended: {})",
+            pane_id, r,
+        )),
+        None => Error::RunFailed(format!("pane {} died before becoming ready", pane_id)),
+    }
+}
+
+/// Run the Run command. By default this waits for the freshly-spawned pane to
+/// become ready before returning, turning a silently-dead pane into a visible
+/// failure:
+///
+/// - the pane reaches a live state and survives a short settle window →
+///   print the pane id and exit 0 (same output as before).
+/// - a `SessionEnd` hook or `PaneDestroyed` event for the pane arrives first →
+///   return an error (non-zero exit), including the SessionEnd `reason` if seen.
+/// - the ready timeout elapses before the pane becomes live → print the pane id
+///   (so the caller can still investigate) and exit 2.
+///
+/// With `no_wait` it restores the historical fire-and-forget behaviour: issue
+/// the Run request and print the pane id as soon as the pane is created.
+///
+/// Correctness rests on slopd handling a connection's requests sequentially: we
+/// Subscribe (which registers our broadcast receiver) and wait for the
+/// confirmation *before* issuing Run, so we cannot miss the new pane's state
+/// transitions or an early death — including the `SessionStart`/`SessionEnd`
+/// hooks, which broadcast to the same channel. The pane id isn't known at
+/// subscribe time, so we subscribe to the relevant event *types* across all
+/// panes and filter by pane id on the client side once Run returns.
+pub async fn execute_run<R, W>(
+    client: &mut Client<R, W>,
+    parent_pane_id: Option<String>,
+    extra_args: Vec<String>,
+    start_directory: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    no_wait: bool,
+    ready_timeout_secs: u64,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if no_wait {
+        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env).await?;
+        println!("{}", pane_id);
+        return Ok(());
+    }
+
+    let filters = vec![
+        libslop::EventFilter {
+            source: Some("slopd".to_string()),
+            event_type: Some("DetailedStateChange".to_string()),
+            ..Default::default()
+        },
+        libslop::EventFilter {
+            source: Some("slopd".to_string()),
+            event_type: Some("PaneDestroyed".to_string()),
+            ..Default::default()
+        },
+        libslop::EventFilter {
+            source: Some("hook".to_string()),
+            event_type: Some("SessionEnd".to_string()),
+            ..Default::default()
+        },
+    ];
+    let mut subscription = client.subscribe(filters).await?;
+
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env).await?;
+
+    let overall_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(ready_timeout_secs);
+    // Set once the pane first reaches a live (non-booting) state; thereafter the
+    // wait races this settle deadline instead of the overall ready timeout.
+    let mut settle_deadline: Option<std::time::Instant> = None;
+
+    loop {
+        let deadline = settle_deadline.unwrap_or(overall_deadline);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            if settle_deadline.is_some() {
+                // Became live and survived the settle window: healthy.
+                println!("{}", pane_id);
+                return Ok(());
+            }
+            // Never became live within the budget. Print the id anyway so the
+            // caller can investigate, then exit non-zero.
+            println!("{}", pane_id);
+            eprintln!(
+                "error: timed out after {}s waiting for pane {} to become ready",
+                ready_timeout_secs, pane_id,
+            );
+            std::process::exit(2);
+        }
+
+        match tokio::time::timeout(remaining, subscription.next()).await {
+            Err(_) => continue, // deadline hit mid-recv; re-evaluate at top of loop
+            Ok(Ok(Some(SubscriptionItem::Record(record)))) => {
+                if record.pane_id.as_deref() != Some(pane_id.as_str()) {
+                    continue;
+                }
+                match (record.source.as_str(), record.event_type.as_str()) {
+                    ("hook", "SessionEnd") => {
+                        let reason = record.payload.get("reason").and_then(|v| v.as_str());
+                        return Err(run_died_error(&pane_id, reason));
+                    }
+                    ("slopd", "PaneDestroyed") => {
+                        return Err(run_died_error(&pane_id, None));
+                    }
+                    ("slopd", "DetailedStateChange") => {
+                        let live = record
+                            .payload
+                            .get("detailed_state")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| s != libslop::PaneDetailedState::BootingUp.as_str());
+                        if live && settle_deadline.is_none() {
+                            settle_deadline = Some(std::time::Instant::now() + RUN_SETTLE);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Ok(Some(SubscriptionItem::Subscribed))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                return Err(Error::RunFailed(format!(
+                    "lost connection to slopd while waiting for pane {} to become ready",
+                    pane_id,
+                )));
+            }
+        }
+    }
+}
+
 /// Execute a CommonCommand against the given client.
 pub async fn execute_command<R, W>(
     client: &mut Client<R, W>,
@@ -1323,10 +1482,17 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory, envs, env_files } => {
+        CommonCommand::Run { extra_args, start_directory, envs, env_files, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
-            let pane_id = client.run(ctx.parent_pane_id.clone(), extra_args, start_directory, env).await?;
-            println!("{}", pane_id);
+            execute_run(
+                client,
+                ctx.parent_pane_id.clone(),
+                extra_args,
+                start_directory,
+                env,
+                no_wait,
+                ready_timeout,
+            ).await?;
         }
         CommonCommand::Kill { pane_id } => {
             let pane_id = client.kill(pane_id).await?;

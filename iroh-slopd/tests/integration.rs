@@ -211,8 +211,10 @@ fn iroh_e2e_run_and_kill_via_iroh() {
         iroh_server_config_dir.path(),
     );
 
-    // Run a pane remotely via iroh-slopctl.
-    let run_output = iroh_slopctl(iroh_client_config_dir.path(), &addr_file, &["run"]);
+    // Run a pane remotely via iroh-slopctl. --no-wait keeps this fire-and-forget
+    // (the test only needs the pane to exist), independent of run's
+    // wait-for-ready default.
+    let run_output = iroh_slopctl(iroh_client_config_dir.path(), &addr_file, &["run", "--no-wait"]);
     assert!(run_output.status.success(), "iroh-slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
     assert!(pane_id.starts_with('%'), "expected pane_id, got: {}", pane_id);

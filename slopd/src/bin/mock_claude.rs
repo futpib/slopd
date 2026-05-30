@@ -318,13 +318,16 @@ fn handle_prompt(prompt: &str, ctx: Option<&SessionContext>) -> PromptResult {
     PromptResult::Unhandled
 }
 
-const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks"];
+const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks", "--exit-after-start"];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let print_mode = args.iter().any(|a| a == "--print" || a == "-p");
     let no_session_start = args.iter().any(|a| a == "--no-session-start");
     let no_hooks = args.iter().any(|a| a == "--break-hooks");
+    // Failure-injection mode: fire SessionStart then SessionEnd and exit early,
+    // simulating Claude bailing right after bootstrap (see the exit block below).
+    let exit_after_start = args.iter().any(|a| a == "--exit-after-start");
 
     if print_mode {
         // In --print mode, treat the last non-flag argument as the prompt,
@@ -388,6 +391,20 @@ fn main() {
         payload["source"] = serde_json::json!("startup");
         payload["model"] = serde_json::json!("mock");
         fire_hooks(no_hooks, &settings, "SessionStart", &payload);
+    }
+
+    // Failure-injection mode: simulate Claude bailing right after startup, as it
+    // does when given a bad `--resume` target — it writes only bootstrap
+    // metadata, fires SessionStart, then exits ~1-2s later with
+    // reason=prompt_input_exit. We fire SessionEnd with that reason and exit
+    // non-zero so slopd observes SessionStart → SessionEnd → (pane close) →
+    // PaneDestroyed, the exact sequence `slopctl run`'s readiness wait must catch.
+    if exit_after_start {
+        let mut payload = hook_payload("SessionEnd", session_id, &cwd, &transcript_path);
+        payload["reason"] = serde_json::json!("prompt_input_exit");
+        fire_hooks(no_hooks, &settings, "SessionEnd", &payload);
+        unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
+        std::process::exit(1);
     }
 
     // Read raw bytes from stdin, accumulating lines.
@@ -677,8 +694,11 @@ fn main() {
                     // by tmux in our environment, so the child will have @slopd_ancestor_panes
                     // pointing at us without any manual wiring.
                     let slopctl = std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
+                    // --no-wait: keep this child-spawn fire-and-forget (the test
+                    // only needs the child pane id), independent of run's new
+                    // wait-for-ready default.
                     let output = Command::new(&slopctl)
-                        .arg("run")
+                        .args(["run", "--no-wait"])
                         .stdout(Stdio::piped())
                         .spawn()
                         .and_then(|c| c.wait_with_output());
