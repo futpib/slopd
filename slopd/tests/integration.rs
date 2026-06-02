@@ -8194,3 +8194,44 @@ fn uninject_hooks_cleans_all_account_dirs() {
     assert!(!settings_has_slopctl_hooks(&personal_dir.join("settings.json")),
         "uninject-hooks should clean the personal account dir");
 }
+
+// ~ in the top-level claude_config_dir must reach the pane expanded (the README
+// shows `claude_config_dir = "~/.claude"`, so a literal ~ would be a bug).
+#[test]
+fn run_expands_tilde_in_top_level_claude_config_dir() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // spawn_slopd sets HOME to the test's config_dir, so ~ expands to there.
+    let claude_config_dir = std::path::PathBuf::from("~/claude-home");
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    enable_always_submit(&env, &pane_id);
+    let config_dir_line = query_pane_env(&env, &pane_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    let expected = env.config_dir.path().join("claude-home");
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", expected.to_str().unwrap()),
+        "~ in claude_config_dir should be expanded before reaching the pane",
+    );
+}

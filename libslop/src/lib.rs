@@ -907,6 +907,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_account_expands_tilde_in_top_level_claude_config_dir() {
+        // The default account's top-level claude_config_dir is `~`-expanded too.
+        let cfg = config_from_toml("claude_config_dir = \"~/claude-default\"\n");
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.config_dir, Some(home_dir().join("claude-default")));
+    }
+
+    #[test]
+    fn claude_config_dir_method_expands_tilde_and_var() {
+        let cfg = config_from_toml("claude_config_dir = \"~/claude-default\"\n");
+        assert_eq!(cfg.claude_config_dir(), home_dir().join("claude-default"));
+        // SAFETY: single-threaded test; no other thread reads this var concurrently.
+        unsafe { std::env::set_var("SLOPD_TEST_CC_DIR", "/tmp/cc") };
+        let cfg = config_from_toml("claude_config_dir = \"$SLOPD_TEST_CC_DIR/sub\"\n");
+        assert_eq!(cfg.claude_config_dir(), PathBuf::from("/tmp/cc/sub"));
+    }
+
+    #[test]
     fn resolved_settings_path_uses_account_dir() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
         let resolved = cfg.resolve_account(Some("work")).unwrap();
@@ -996,6 +1014,7 @@ pub struct SlopdConfig {
     /// Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude) for the
     /// reserved [`DEFAULT_ACCOUNT`] account — the one used when no account is
     /// selected. Shorthand for `[accounts.default] claude_config_dir = ...`.
+    /// Supports `~` and `$VAR` / `${VAR}` expansion.
     pub claude_config_dir: Option<PathBuf>,
     /// Named Claude accounts. Each maps an account name to its own configuration
     /// (at minimum a Claude config dir, the per-account equivalent of
@@ -1077,6 +1096,8 @@ pub struct ResolvedAccount {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SlopdTmuxConfig {
+    /// Path to a custom tmux socket (`tmux -S`). Supports `~` and `$VAR` /
+    /// `${VAR}` expansion.
     pub socket: Option<PathBuf>,
     /// Run `tmux start-server` on startup (default: true when socket is not set).
     pub start_server: Option<bool>,
@@ -1210,7 +1231,8 @@ impl SlopdConfig {
 
     pub fn claude_config_dir(&self) -> PathBuf {
         self.claude_config_dir
-            .clone()
+            .as_deref()
+            .map(expand_path)
             .unwrap_or_else(|| home_dir().join(".claude"))
     }
 
@@ -1228,8 +1250,8 @@ impl SlopdConfig {
     /// - for any other name: `[accounts.<name>]`, or an error (listing the
     ///   configured accounts) if it is not configured.
     ///
-    /// Account config dirs are `~` / `$VAR`-expanded; the top-level
-    /// `claude_config_dir` is passed through verbatim (preserving prior behavior).
+    /// All config dirs — named accounts and the top-level `claude_config_dir` —
+    /// are `~` / `$VAR`-expanded.
     pub fn resolve_account(&self, requested: Option<&str>) -> Result<ResolvedAccount, String> {
         let name = requested
             .map(str::to_string)
@@ -1243,7 +1265,7 @@ impl SlopdConfig {
                 .accounts
                 .get(DEFAULT_ACCOUNT)
                 .map(|a| expand_path(a.claude_config_dir()))
-                .or_else(|| self.claude_config_dir.clone());
+                .or_else(|| self.claude_config_dir.as_deref().map(expand_path));
             return Ok(ResolvedAccount { name, config_dir });
         }
 

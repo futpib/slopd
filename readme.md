@@ -127,6 +127,7 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude). This sets
 # the dir for the reserved "default" account — the one used when no account is
 # selected. Equivalent to writing [accounts.default].
+# Supports ~ and $VAR / ${VAR} expansion (as do all account config dirs).
 # claude_config_dir = "~/.claude"
 
 # Account used by `slopctl run` when no --account is given and none is inherited
@@ -144,6 +145,7 @@ All defaults are fine for most setups. The only key you are likely to want to se
 
 # [tmux]
 # Path to a custom tmux socket. When omitted slopd uses its default server.
+# Supports ~ and $VAR / ${VAR} expansion.
 # socket = "/run/user/1000/tmux-slopd.sock"
 
 # [run]

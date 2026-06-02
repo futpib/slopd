@@ -77,9 +77,9 @@ pub enum CommonCommand {
     },
     /// Open a new Claude pane in the slopd tmux session.
     Run {
-        /// Working directory for the new pane. The shell expands ~ and
-        /// environment variables before this value reaches slopctl.
-        /// Overrides [run] start_directory from config.toml for this session.
+        /// Working directory for the new pane. Supports ~ and $VAR / ${VAR}
+        /// expansion (applied by slopd, so a quoted ~ works and resolves against
+        /// the daemon's home). Overrides [run] start_directory from config.toml.
         #[arg(short = 'c', long, value_name = "DIR")]
         start_directory: Option<PathBuf>,
         /// Extra environment variables for the new pane (repeatable).
@@ -88,7 +88,8 @@ pub enum CommonCommand {
         /// Overrides values from --env-file and [run.env]/[run.env_files] in config.
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
-        /// Path to a dotenv-style file of KEY=VALUE lines (repeatable).
+        /// Path to a dotenv-style file of KEY=VALUE lines (repeatable). Supports
+        /// ~ and $VAR / ${VAR} expansion (against slopctl's environment).
         /// Files are loaded in order; later files (and --env) override earlier ones.
         /// Overrides entries from [run.env_files] / [run.env] in config.
         #[arg(long = "env-file", value_name = "PATH")]
@@ -276,15 +277,17 @@ pub fn die_err(e: Error) -> ! {
 /// Build the merged env list for `slopctl run`: entries from env-files (in flag
 /// order) followed by entries from --env flags (in flag order). Values in
 /// --env are expanded against slopctl's environment; entries from env-files
-/// are returned as dotenvy parses them. Later entries override earlier ones
-/// (the wire format preserves order; slopd and tmux both apply last-wins).
+/// are returned as dotenvy parses them. Env-file paths are `~` / `$VAR`-expanded
+/// (against slopctl's environment) so a quoted `~` works. Later entries override
+/// earlier ones (the wire format preserves order; slopd and tmux both apply last-wins).
 pub fn build_cli_env(
     env_files: &[PathBuf],
     envs: &[String],
 ) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     for path in env_files {
-        let pairs = libslop::load_env_file(path).map_err(Error::FilterError)?;
+        let path = libslop::expand_path(path);
+        let pairs = libslop::load_env_file(&path).map_err(Error::FilterError)?;
         out.extend(pairs);
     }
     for raw in envs {

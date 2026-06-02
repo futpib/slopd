@@ -28,6 +28,7 @@ enum CliCommand {
 fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("tmux");
     if let Some(socket) = &config.tmux.socket {
+        let socket = libslop::expand_path(socket);
         cmd.args(["-S", socket.to_str().unwrap()]);
     }
     cmd
@@ -1846,10 +1847,12 @@ async fn handle_request(
             }
             let xdg_runtime_dir = libslop::runtime_dir();
             // Resolve start directory: per-session flag takes precedence over config default.
-            // Config value is expanded (~ and $VAR); the CLI value is already shell-expanded.
-            let effective_start_dir = start_directory.or_else(|| {
-                config.run.start_directory.as_ref().map(|p| libslop::expand_path(p))
-            });
+            // Both are `~` / `$VAR`-expanded here (against slopd's environment), so a
+            // quoted `~` works and a remote `~` resolves to the remote home.
+            let effective_start_dir = start_directory
+                .as_deref()
+                .map(libslop::expand_path)
+                .or_else(|| config.run.start_directory.as_ref().map(|p| libslop::expand_path(p)));
             let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
             // Merge env: config env_files (in order) → config env → request env.
             // Later entries override earlier ones (tmux applies -e left-to-right).
