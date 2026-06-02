@@ -334,8 +334,7 @@ fn main() {
         // process it, and exit immediately (no interactive loop).
         let prompt = args.iter()
             .skip(1)
-            .filter(|a| !FLAGS.contains(&a.as_str()))
-            .last()
+            .rfind(|a| !FLAGS.contains(&a.as_str()))
             .cloned()
             .unwrap_or_default();
         match handle_prompt(&prompt, None) {

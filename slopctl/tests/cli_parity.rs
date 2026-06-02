@@ -47,11 +47,10 @@ fn parse_subcommands(help: &str) -> BTreeSet<String> {
                 break;
             }
             // Each command line looks like "  status  Show slopd uptime..."
-            if let Some(name) = trimmed.split_whitespace().next() {
-                if name != "help" {
+            if let Some(name) = trimmed.split_whitespace().next()
+                && name != "help" {
                     commands.insert(name.to_string());
                 }
-            }
         }
     }
     commands
@@ -89,18 +88,16 @@ fn parse_options(help: &str) -> BTreeMap<String, String> {
         };
         for token in flag_col.split_whitespace() {
             let token = token.trim_end_matches(',');
-            if let Some(flag) = token.strip_prefix("--") {
-                if !flag.is_empty() {
+            if let Some(flag) = token.strip_prefix("--")
+                && !flag.is_empty() {
                     options.insert(flag.to_string(), trimmed.to_string());
                 }
-            }
         }
         // Positional arguments look like: <PANE_ID> or [EXTRA_ARGS]...
-        if let Some(first) = flag_col.split_whitespace().next() {
-            if first.starts_with('<') || first.starts_with('[') {
+        if let Some(first) = flag_col.split_whitespace().next()
+            && (first.starts_with('<') || first.starts_with('[')) {
                 options.insert(first.to_string(), trimmed.to_string());
             }
-        }
     }
     options
 }

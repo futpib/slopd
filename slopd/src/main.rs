@@ -276,12 +276,11 @@ async fn tail_transcript(
                         // A queue-operation enqueue means a prompt was accepted
                         // while Claude was busy. Notify pending senders so
                         // slopctl send unblocks immediately.
-                        if record_type == "queue-operation" {
-                            if record.get("operation").and_then(|v| v.as_str()) == Some("enqueue") {
+                        if record_type == "queue-operation"
+                            && record.get("operation").and_then(|v| v.as_str()) == Some("enqueue") {
                                 debug!("transcript enqueue: notifying pending senders for pane {}", pane_id);
                                 pane_state.prompt_submitted.notify_waiters();
                             }
-                        }
 
                         // Client-local slash commands (/model, /effort, /compact,
                         // /clear, /rename, ...) fire NO UserPromptSubmit hook.
@@ -435,7 +434,7 @@ async fn read_transcript_before(
         }
     }
 
-    let at_beginning = window.front().map_or(true, |(offset, _)| *offset == 0);
+    let at_beginning = window.front().is_none_or(|(offset, _)| *offset == 0);
     Ok((window.into(), at_beginning))
 }
 
@@ -549,8 +548,8 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         .args(["list-panes", "-s", "-t", "slopd", "-F", &format_str])
         .output()
         .await;
-    if let Ok(out) = output {
-        if out.status.success() {
+    if let Ok(out) = output
+        && out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let mut parts = line.splitn(3, ' ');
                 let pane_id = parts.next().unwrap_or("").trim();
@@ -589,7 +588,6 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
                 }
             }
         }
-    }
 }
 
 /// Replay the last N records from a transcript file through the state reducer
@@ -628,26 +626,22 @@ fn filters_match(filters: &[libslop::EventFilter], ev: &libslop::Record) -> bool
         return true;
     }
     filters.iter().any(|f| {
-        if let Some(ref src) = f.source {
-            if src != &ev.source {
+        if let Some(ref src) = f.source
+            && src != &ev.source {
                 return false;
             }
-        }
-        if let Some(ref et) = f.event_type {
-            if et != &ev.event_type {
+        if let Some(ref et) = f.event_type
+            && et != &ev.event_type {
                 return false;
             }
-        }
-        if let Some(ref pane_id) = f.pane_id {
-            if ev.pane_id.as_deref() != Some(pane_id.as_str()) {
+        if let Some(ref pane_id) = f.pane_id
+            && ev.pane_id.as_deref() != Some(pane_id.as_str()) {
                 return false;
             }
-        }
-        if let Some(ref session_id) = f.session_id {
-            if ev.payload.get("session_id").and_then(|v| v.as_str()) != Some(session_id.as_str()) {
+        if let Some(ref session_id) = f.session_id
+            && ev.payload.get("session_id").and_then(|v| v.as_str()) != Some(session_id.as_str()) {
                 return false;
             }
-        }
         for (k, v) in &f.payload_match {
             if ev.payload.get(k) != Some(v) {
                 return false;
@@ -731,11 +725,9 @@ async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
             // Extract the array index from "hook-name[N] ...".
             if let Some(idx_str) = line.strip_prefix(&prefix_bracket)
                 .and_then(|s| s.split(']').next())
-            {
-                if let Ok(idx) = idx_str.parse::<i32>() {
+                && let Ok(idx) = idx_str.parse::<i32>() {
                     stale_indices.push(idx);
                 }
-            }
         }
 
         // Remove stale entries in reverse order so indices stay valid.
@@ -1047,6 +1039,8 @@ async fn main() {
     let lock_path = socket_path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        // Advisory lock file: flock'd, never written, so never truncated.
+        .truncate(false)
         .write(true)
         .open(&lock_path)
         .unwrap_or_else(|e| panic!("failed to open lock file {}: {}", lock_path.display(), e));
@@ -1197,14 +1191,13 @@ async fn stream_events(
         match rx.recv().await {
             Ok(record) => {
                 // Skip transcript records that were already replayed from disk.
-                if let Some(dedup) = dedup {
-                    if record.source == "transcript"
+                if let Some(dedup) = dedup
+                    && record.source == "transcript"
                         && record.pane_id.as_deref() == Some(&dedup.pane_id)
-                        && record.cursor.map_or(false, |o| o < dedup.file_end_offset)
+                        && record.cursor.is_some_and(|o| o < dedup.file_end_offset)
                     {
                         continue;
                     }
-                }
                 if filters_match(filters, &record) {
                     write_response(writer, id, libslop::ResponseBody::Record(record)).await?;
                 }
@@ -1238,6 +1231,7 @@ async fn stream_events_owned(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // wiring fn threading shared daemon state
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     start_time: u64,
@@ -1597,6 +1591,7 @@ async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Re
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // wiring fn threading shared daemon state
 async fn handle_request(
     body: libslop::RequestBody,
     start_time: u64,
@@ -1738,14 +1733,13 @@ async fn handle_request(
             }
 
             // Side effects for specific hooks (not state-related).
-            if event == "SessionStart" {
-                if let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
+            if event == "SessionStart"
+                && let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
                 }
-            }
             if event == "UserPromptSubmit" {
                 debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                 panes.get_or_insert(pane).prompt_submitted.notify_waiters();
@@ -1813,11 +1807,10 @@ async fn handle_request(
                 cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
                     .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
                     .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
-                if let Some(ref dir) = effective_start_dir {
-                    if let Some(dir_str) = dir.to_str() {
+                if let Some(ref dir) = effective_start_dir
+                    && let Some(dir_str) = dir.to_str() {
                         cmd.args(["-c", dir_str]);
                     }
-                }
                 if let Some(ref custom_dir) = c.claude_config_dir {
                     cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
                 }

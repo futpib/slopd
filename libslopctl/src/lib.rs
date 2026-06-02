@@ -368,11 +368,10 @@ fn looks_like_uuid(s: &str) -> bool {
 /// `--session-id` — we deliberately do NOT silently route across flags, to
 /// keep filter semantics explicit. Anything else is rejected as garbage.
 fn validate_pane_id_arg(arg: &str) -> Result<(), Error> {
-    if let Some(rest) = arg.strip_prefix('%') {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+    if let Some(rest) = arg.strip_prefix('%')
+        && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
             return Ok(());
         }
-    }
     if looks_like_uuid(arg) {
         return Err(Error::FilterError(format!(
             "--pane-id {:?} looks like a Claude session UUID; use --session-id for UUIDs \
@@ -402,6 +401,7 @@ pub fn resolve_pane_id_or_session(
 }
 
 /// Print a table of pane info to stdout.
+#[allow(clippy::type_complexity)] // the row tuple is a private formatting detail
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let now = std::time::SystemTime::now();
     let fmt = timeago::Formatter::new();
@@ -859,22 +859,22 @@ impl<
 
         // Wait for the Subscribed confirmation.
         let mut rx = rx;
-        loop {
-            match rx.recv().await {
-                Some(response) => match response.body {
-                    libslop::ResponseBody::Subscribed => break,
-                    libslop::ResponseBody::Error { message } => {
-                        demux.lock().await.subscriptions.remove(&id);
-                        return Err(Error::Server(message));
-                    }
-                    other => {
-                        demux.lock().await.subscriptions.remove(&id);
-                        return Err(Error::UnexpectedResponse(format!("{:?}", other)));
-                    }
-                },
-                None => {
-                    return Err(Error::ConnectionClosed);
+        // Exactly one response is expected: the Subscribed confirmation, or an
+        // error. (Not a loop — every branch resolves on the first message.)
+        match rx.recv().await {
+            Some(response) => match response.body {
+                libslop::ResponseBody::Subscribed => {}
+                libslop::ResponseBody::Error { message } => {
+                    demux.lock().await.subscriptions.remove(&id);
+                    return Err(Error::Server(message));
                 }
+                other => {
+                    demux.lock().await.subscriptions.remove(&id);
+                    return Err(Error::UnexpectedResponse(format!("{:?}", other)));
+                }
+            },
+            None => {
+                return Err(Error::ConnectionClosed);
             }
         }
 
@@ -900,22 +900,22 @@ impl<
 
         // Wait for the Subscribed confirmation.
         let mut rx = rx;
-        loop {
-            match rx.recv().await {
-                Some(response) => match response.body {
-                    libslop::ResponseBody::Subscribed => break,
-                    libslop::ResponseBody::Error { message } => {
-                        demux.lock().await.subscriptions.remove(&id);
-                        return Err(Error::Server(message));
-                    }
-                    other => {
-                        demux.lock().await.subscriptions.remove(&id);
-                        return Err(Error::UnexpectedResponse(format!("{:?}", other)));
-                    }
-                },
-                None => {
-                    return Err(Error::ConnectionClosed);
+        // Exactly one response is expected: the Subscribed confirmation, or an
+        // error. (Not a loop — every branch resolves on the first message.)
+        match rx.recv().await {
+            Some(response) => match response.body {
+                libslop::ResponseBody::Subscribed => {}
+                libslop::ResponseBody::Error { message } => {
+                    demux.lock().await.subscriptions.remove(&id);
+                    return Err(Error::Server(message));
                 }
+                other => {
+                    demux.lock().await.subscriptions.remove(&id);
+                    return Err(Error::UnexpectedResponse(format!("{:?}", other)));
+                }
+            },
+            None => {
+                return Err(Error::ConnectionClosed);
             }
         }
 
@@ -1092,6 +1092,7 @@ fn build_seed_record(pane: &libslop::PaneInfo) -> libslop::Record {
 /// waiting. Skipped (returns None) when `--hook`/`--transcript` filters are
 /// set or when `--event` excludes state-relevant types, because the seed
 /// represents a steady state — not a hook/transcript record.
+#[allow(clippy::too_many_arguments)] // mirrors the wait/listen CLI filter surface
 async fn seed_current_if_match<R, W>(
     client: &mut Client<R, W>,
     pane_id: Option<&str>,
@@ -1124,16 +1125,14 @@ where
 
     let panes = client.ps().await?;
     for pane in &panes {
-        if let Some(pid) = pane_id {
-            if pane.pane_id != pid {
+        if let Some(pid) = pane_id
+            && pane.pane_id != pid {
                 continue;
             }
-        }
-        if let Some(sid) = session_id {
-            if pane.session_id.as_deref() != Some(sid) {
+        if let Some(sid) = session_id
+            && pane.session_id.as_deref() != Some(sid) {
                 continue;
             }
-        }
         let record = build_seed_record(pane);
         if !libslop::predicates_match(&record.payload, where_preds) {
             continue;
@@ -1147,6 +1146,7 @@ where
 }
 
 /// Run the Listen command: build filters, subscribe, print events until SIGTERM or EOF.
+#[allow(clippy::too_many_arguments)] // mirrors the `listen` CLI flag surface
 pub async fn execute_listen<R, W>(
     client: &mut Client<R, W>,
     hooks: Vec<String>,
@@ -1215,6 +1215,7 @@ where
 /// (falls through to live waiting) when `no_snapshot` is set, when neither
 /// `--pane-id` nor `--session-id` is set, or when filters constrain to
 /// sources other than slopd state.
+#[allow(clippy::too_many_arguments)] // mirrors the `wait` CLI flag surface
 pub async fn execute_wait<R, W>(
     client: &mut Client<R, W>,
     hooks: Vec<String>,
@@ -1450,9 +1451,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     // Handle Send-with-filter first.
-    if let CommonCommand::Send { ref pane_id, .. } = command {
-        if pane_id.contains('=') {
-            if let CommonCommand::Send { pane_id, prompt, filters, select, timeout, interrupt } = command {
+    if let CommonCommand::Send { ref pane_id, .. } = command
+        && pane_id.contains('=')
+            && let CommonCommand::Send { pane_id, prompt, filters, select, timeout, interrupt } = command {
                 let mut all_filters = vec![pane_id];
                 all_filters.extend(filters);
                 let parsed = parse_filters(all_filters)?;
@@ -1462,8 +1463,6 @@ where
                 }
                 return Ok(());
             }
-        }
-    }
 
     match command {
         CommonCommand::Status => {

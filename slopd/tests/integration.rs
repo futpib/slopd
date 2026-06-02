@@ -51,7 +51,7 @@ fn read_pane_env(env: &TestEnv, pane_id: &str, key: &str) -> String {
             .args(["capture-pane", "-t", pane_id, "-p"])
             .output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        let joined = text.replace('\n', "").replace('\r', "");
+        let joined = text.replace(['\n', '\r'], "");
         if let Some(pos) = joined.find(&needle) {
             let tail = &joined[pos + needle.len()..];
             let value = tail.split_whitespace().next().unwrap_or("").to_string();
@@ -468,12 +468,12 @@ fn run_injects_hooks_into_claude_settings() {
             .as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let has_our_hook = entries.iter().any(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"]
                             .as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         });
@@ -524,12 +524,12 @@ fn run_hook_injection_is_idempotent() {
             .as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let our_hook_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"]
                             .as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         }).count();
@@ -1986,7 +1986,7 @@ fn run_does_not_set_claude_config_dir_when_not_configured() {
             .output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         // tmux may wrap long lines; join the full output before searching.
-        let joined = text.replace('\n', "").replace('\r', "");
+        let joined = text.replace(['\n', '\r'], "");
         if let Some(pos) = joined.find("/env:CLAUDE_CONFIG_DIR=") {
             break joined[pos..].split_whitespace().next().unwrap_or("").to_string();
         }
@@ -2195,9 +2195,7 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
     assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
 
     // Fire a hook event pretending to come from the unmanaged pane.
-    let payload = format!(
-        r#"{{"session_id":"unmanaged-session","hook_event_name":"UserPromptSubmit","prompt":"from outside"}}"#
-    );
+    let payload = r#"{"session_id":"unmanaged-session","hook_event_name":"UserPromptSubmit","prompt":"from outside"}"#.to_string();
     let hook_out = fire_hook(&env, "UserPromptSubmit", &payload, Some(&unmanaged_pane_id));
     assert!(hook_out.status.success(), "hook from unmanaged pane failed: {:?}", hook_out);
 
@@ -2361,9 +2359,7 @@ fn pane_state_booting_up_on_run_then_transitions_on_hooks() {
 
     // Fire SessionStart directly via slopctl hook (bypasses Send machinery, so the
     // BootingUp state guard does not block it). SessionStart → Ready.
-    let payload = format!(
-        r#"{{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}}"#
-    );
+    let payload = r#"{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}"#.to_string();
     let hook_out = fire_hook(&env, "SessionStart", &payload, Some(&pane_id));
     assert!(hook_out.status.success(), "fire SessionStart hook failed: {:?}", hook_out);
     std::thread::sleep(Duration::from_millis(100));
@@ -2975,9 +2971,7 @@ fn send_waits_for_ready_when_pane_is_booting_up() {
     // via slopctl hook (bypasses send machinery, works regardless of pane state).
     std::thread::sleep(Duration::from_millis(200));
 
-    let payload = format!(
-        r#"{{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}}"#
-    );
+    let payload = r#"{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp","source":"startup","model":"mock"}"#.to_string();
     let hook_out = fire_hook(&env, "SessionStart", &payload, Some(&pane_id));
     assert!(hook_out.status.success(), "fire SessionStart hook failed: {:?}", hook_out);
 
@@ -3340,15 +3334,14 @@ fn transcript_events_received_via_listen() {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("source").and_then(|s| s.as_str()) == Some("transcript") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("source").and_then(|s| s.as_str()) == Some("transcript") {
                     events.push(v);
                     if events.len() >= 2 {
                         let _ = tx.send(events);
                         return;
                     }
                 }
-            }
         }
         let _ = tx.send(events);
     });
@@ -3578,7 +3571,7 @@ fn mock_claude_transcript_busy_queue_records() {
     // The queued prompt should also produce user + assistant records.
     let user_records = transcript_records_of_type(&records, "user");
     let queued_user = user_records.iter()
-        .find(|r| r["message"]["content"].as_str().map_or(false, |c| c.trim() == "queued prompt"))
+        .find(|r| r["message"]["content"].as_str().is_some_and(|c| c.trim() == "queued prompt"))
         .expect("missing user record for the queued prompt");
     assert!(queued_user["sessionId"].as_str().is_some());
 
@@ -3586,7 +3579,7 @@ fn mock_claude_transcript_busy_queue_records() {
     let queued_assistant = assistant_records.iter()
         .find(|r| {
             r["message"]["content"].as_str()
-                .map_or(false, |c| c.contains("queued prompt"))
+                .is_some_and(|c| c.contains("queued prompt"))
         })
         .expect("missing assistant record for the queued prompt");
     assert!(queued_assistant["sessionId"].as_str().is_some());
@@ -3599,7 +3592,7 @@ fn mock_claude_transcript_busy_queue_records() {
     // Verify ordering: dequeue comes before the user record for the queued prompt.
     let user_idx = records.iter().position(|r| {
         r.get("type").and_then(|t| t.as_str()) == Some("user")
-            && r["message"]["content"].as_str().map_or(false, |c| c.trim() == "queued prompt")
+            && r["message"]["content"].as_str().is_some_and(|c| c.trim() == "queued prompt")
     }).unwrap();
     assert!(dequeue_idx < user_idx, "dequeue (idx {}) should come before user record (idx {})", dequeue_idx, user_idx);
 }
@@ -3691,7 +3684,7 @@ fn subscribe_transcript_replays_then_streams_live() {
                 let has_third = records.iter().any(|r| {
                     r["event_type"] == "user"
                         && r["payload"]["message"]["content"].as_str()
-                            .map_or(false, |c| c.contains("third prompt"))
+                            .is_some_and(|c| c.contains("third prompt"))
                 });
                 if has_third {
                     let _ = tx.send(records);
@@ -3712,14 +3705,14 @@ fn subscribe_transcript_replays_then_streams_live() {
     let first_user = records.iter().any(|r| {
         r["event_type"] == "user"
             && r["payload"]["message"]["content"].as_str()
-                .map_or(false, |c| c.contains("first prompt"))
+                .is_some_and(|c| c.contains("first prompt"))
     });
     assert!(first_user, "missing replayed 'first prompt' record");
 
     let second_user = records.iter().any(|r| {
         r["event_type"] == "user"
             && r["payload"]["message"]["content"].as_str()
-                .map_or(false, |c| c.contains("second prompt"))
+                .is_some_and(|c| c.contains("second prompt"))
     });
     assert!(second_user, "missing replayed 'second prompt' record");
 
@@ -3731,7 +3724,7 @@ fn subscribe_transcript_replays_then_streams_live() {
     let third_user = records.iter().any(|r| {
         r["event_type"] == "user"
             && r["payload"]["message"]["content"].as_str()
-                .map_or(false, |c| c.contains("third prompt"))
+                .is_some_and(|c| c.contains("third prompt"))
     });
     assert!(third_user, "missing live 'third prompt' record");
 
@@ -3740,7 +3733,7 @@ fn subscribe_transcript_replays_then_streams_live() {
     let third_idx = records.iter().position(|r| {
         r["event_type"] == "user"
             && r["payload"]["message"]["content"].as_str()
-                .map_or(false, |c| c.contains("third prompt"))
+                .is_some_and(|c| c.contains("third prompt"))
     }).unwrap();
     assert!(replay_end_idx < third_idx,
         "ReplayEnd (idx {}) should come before live third prompt (idx {})", replay_end_idx, third_idx);
@@ -3955,15 +3948,14 @@ fn transcript_tailing_resumes_after_slopd_restart() {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("source").and_then(|s| s.as_str()) == Some("transcript") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("source").and_then(|s| s.as_str()) == Some("transcript") {
                     events.push(v);
                     if events.len() >= 2 {
                         let _ = tx.send(events);
                         return;
                     }
                 }
-            }
         }
         let _ = tx.send(events);
     });
@@ -4418,19 +4410,19 @@ fn reparent_deep_chain_during_slopd_restart() {
     kill_slopd(slopd);
 
     // Kill P1, P2, P3, P4 via tmux while slopd is offline.
-    for i in 1..5 {
+    for pane in &chain[1..5] {
         let out = env.tmux.tmux()
-            .args(["kill-pane", "-t", &chain[i]])
+            .args(["kill-pane", "-t", pane])
             .output().unwrap();
-        assert!(out.status.success(), "tmux kill-pane {} failed", chain[i]);
+        assert!(out.status.success(), "tmux kill-pane {} failed", pane);
     }
 
     // Restart slopd.
     let slopd = env.spawn_slopd();
 
     // P1-P4 should be gone.
-    for i in 1..5 {
-        assert_pane_gone(&env, &chain[i]);
+    for pane in &chain[1..5] {
+        assert_pane_gone(&env, pane);
     }
 
     // P5's parent should be P0 (skipping all dead intermediaries).
@@ -5155,15 +5147,11 @@ fn multiplexed_multiple_subscriptions() {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 result = hook_sub.next() => {
-                    match result {
-                        Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
-                            if record.source == "hook" {
-                                hook_found = true;
-                                break;
-                            }
+                    if let Ok(Some(libslopctl::SubscriptionItem::Record(record))) = result
+                        && record.source == "hook" {
+                            hook_found = true;
+                            break;
                         }
-                        _ => {}
-                    }
                 }
             }
         }
@@ -5177,15 +5165,11 @@ fn multiplexed_multiple_subscriptions() {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => break,
                 result = slopd_sub.next() => {
-                    match result {
-                        Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
-                            if record.event_type == "StateChange" || record.event_type == "DetailedStateChange" {
-                                state_change_found = true;
-                                break;
-                            }
+                    if let Ok(Some(libslopctl::SubscriptionItem::Record(record))) = result
+                        && (record.event_type == "StateChange" || record.event_type == "DetailedStateChange") {
+                            state_change_found = true;
+                            break;
                         }
-                        _ => {}
-                    }
                 }
             }
         }
@@ -5323,11 +5307,11 @@ fn uninject_hooks_removes_slopctl_entries() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let slopctl_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         }).count();
@@ -5386,7 +5370,7 @@ fn uninject_hooks_preserves_other_hook_entries() {
         serde_json::from_str(&settings_contents).expect("settings.json is not valid JSON");
     let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
     let foreign_count = stop_entries.iter().filter(|entry| {
-        entry["hooks"].as_array().map_or(false, |hooks| {
+        entry["hooks"].as_array().is_some_and(|hooks| {
             hooks.iter().any(|h| h["command"].as_str() == Some("my-tool notify stop"))
         })
     }).count();
@@ -5465,11 +5449,11 @@ fn slopd_removes_hooks_on_normal_exit() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let slopctl_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         }).count();
@@ -5522,11 +5506,11 @@ fn slopd_removes_hooks_on_sigint() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let slopctl_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         }).count();
@@ -5583,10 +5567,10 @@ fn run_injects_hooks_with_absolute_slopctl_path_when_not_on_path() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let has_absolute_path_hook = entries.iter().any(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
-                        && h["command"].as_str().map_or(false, |c| {
+                        && h["command"].as_str().is_some_and(|c| {
                             c.contains("/slopctl hook") && c.starts_with('/')
                         })
                 })
@@ -5648,10 +5632,10 @@ fn uninject_hooks_removes_absolute_path_slopctl_entries() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let slopctl_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["command"].as_str()
-                        .map_or(false, |c| c.contains("slopctl"))
+                        .is_some_and(|c| c.contains("slopctl"))
                 })
             })
         }).count();
@@ -5692,11 +5676,11 @@ fn slopd_reinjects_hooks_on_restart_with_existing_panes() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let slopctl_count = entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl"))
+                            .is_some_and(|c| c.contains("slopctl"))
                 })
             })
         }).count();
@@ -5719,11 +5703,11 @@ fn slopd_reinjects_hooks_on_restart_with_existing_panes() {
         let entries = settings["hooks"][event].as_array()
             .unwrap_or_else(|| panic!("missing hooks.{}", event));
         let has_our_hook = entries.iter().any(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| {
                     h["type"] == "command"
                         && h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                            .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                 })
             })
         });
@@ -6827,12 +6811,11 @@ fn listen_where_filters_at_server() {
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
             let Ok(line) = line else { return };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("source").and_then(|s| s.as_str()) == Some("hook") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("source").and_then(|s| s.as_str()) == Some("hook") {
                     let _ = tx.send(v);
                     return;
                 }
-            }
         }
     });
     let received = rx.recv_timeout(Duration::from_secs(5))

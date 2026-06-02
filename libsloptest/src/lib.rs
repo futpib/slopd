@@ -50,11 +50,10 @@ pub fn build_bin(name: &str) {
     // binary in target/debug/ instead, where cargo_bin() won't find it.  Point
     // CARGO_TARGET_DIR at the coverage target directory so the binary ends up
     // next to the test executable.
-    if cfg!(coverage) {
-        if let Some(target_dir) = cargo_bin(name).parent().and_then(|p| p.parent()) {
+    if cfg!(coverage)
+        && let Some(target_dir) = cargo_bin(name).parent().and_then(|p| p.parent()) {
             cmd.env("CARGO_TARGET_DIR", target_dir);
         }
-    }
     let status = cmd.status().expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);
     built.insert(name.to_string());

@@ -48,12 +48,11 @@ async fn main() {
     if let Command::Common(ref cmd) = cli.command {
         libslopctl::validate_command_filters(cmd).unwrap_or_else(|e| libslopctl::die_err(e));
     }
-    if let Command::Common(libslopctl::CommonCommand::Tags { pane_id: None }) = cli.command {
-        if std::env::var("TMUX_PANE").is_err() {
+    if let Command::Common(libslopctl::CommonCommand::Tags { pane_id: None }) = cli.command
+        && std::env::var("TMUX_PANE").is_err() {
             eprintln!("error: <PANE_ID> is required when $TMUX_PANE is not set");
             std::process::exit(2);
         }
-    }
 
     let _config = libslop::SlopctlConfig::load();
 

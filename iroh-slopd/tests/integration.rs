@@ -31,11 +31,10 @@ fn start_iroh_slopd(
     // Wait for the addr file to appear and be non-empty.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(contents) = std::fs::read_to_string(&addr_file) {
-            if !contents.is_empty() {
+        if let Ok(contents) = std::fs::read_to_string(&addr_file)
+            && !contents.is_empty() {
                 break;
             }
-        }
         if std::time::Instant::now() > deadline {
             panic!("timed out waiting for iroh-slopd addr file at {}", addr_file.display());
         }

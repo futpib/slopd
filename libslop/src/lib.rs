@@ -200,7 +200,7 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
         // (e.g. "foobar hook {event}") are never considered stale.
         let stale_suffix = format!(" hook {}", event);
         entries.retain(|entry| {
-            let is_stale = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+            let is_stale = entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
                 hooks_arr.iter().any(|h| {
                     if h.get("type").and_then(|t| t.as_str()) != Some("command") {
                         return false;
@@ -218,7 +218,7 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
         });
 
         let already_present = entries.iter().any(|entry| {
-            entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+            entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
                 hooks_arr.iter().any(|h| {
                     h.get("type").and_then(|t| t.as_str()) == Some("command")
                         && h.get("command").and_then(|c| c.as_str()) == Some(&command)
@@ -245,7 +245,7 @@ pub fn remove_hooks(settings: &mut serde_json::Value) {
         };
         let suffix = format!(" hook {}", event);
         entries.retain(|entry| {
-            let is_ours = entry.get("hooks").and_then(|h| h.as_array()).map_or(false, |hooks_arr| {
+            let is_ours = entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
                 hooks_arr.iter().any(|h| {
                     if h.get("type").and_then(|t| t.as_str()) != Some("command") {
                         return false;
@@ -275,6 +275,8 @@ pub fn remove_hooks_from_file(
     let lock_path = settings_path.with_extension("json.lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        // Advisory lock file: flock'd, never written, so never truncated.
+        .truncate(false)
         .write(true)
         .open(&lock_path)?;
     let mut lock = fd_lock::RwLock::new(lock_file);
@@ -330,11 +332,11 @@ mod tests {
             let entries = settings["hooks"][event].as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
             let count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["type"] == "command"
                             && h["command"].as_str()
-                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                     })
                 })
             }).count();
@@ -348,11 +350,11 @@ mod tests {
             let entries = settings["hooks"][event].as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
             let count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["type"] == "command"
                             && h["command"].as_str()
-                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                     })
                 })
             }).count();
@@ -381,7 +383,7 @@ mod tests {
 
         // The foobar entry must still be present.
         let foobar_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
             })
         }).count();
@@ -389,7 +391,7 @@ mod tests {
 
         // The slopctl entry must also be present.
         let slopctl_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| h["command"].as_str() == Some("slopctl hook Stop"))
             })
         }).count();
@@ -417,10 +419,10 @@ mod tests {
 
             // Old path entry must be gone.
             let old_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["command"].as_str()
-                            .map_or(false, |c| c.contains("/home/claude/.local/bin/slopctl"))
+                            .is_some_and(|c| c.contains("/home/claude/.local/bin/slopctl"))
                     })
                 })
             }).count();
@@ -428,10 +430,10 @@ mod tests {
 
             // New entry must be present exactly once.
             let new_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["command"].as_str()
-                            .map_or(false, |c| c == &format!("slopctl hook {}", event))
+                            .is_some_and(|c| c == format!("slopctl hook {}", event))
                     })
                 })
             }).count();
@@ -446,7 +448,7 @@ mod tests {
 
         // Verify hooks were injected.
         for &event in HOOK_EVENTS {
-            assert!(settings["hooks"][event].as_array().unwrap().len() > 0);
+            assert!(!settings["hooks"][event].as_array().unwrap().is_empty());
         }
 
         remove_hooks(&mut settings);
@@ -456,11 +458,11 @@ mod tests {
             let entries = settings["hooks"][event].as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
             let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["type"] == "command"
                             && h["command"].as_str()
-                                .map_or(false, |c| c.contains("slopctl") && c.contains(event))
+                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
                     })
                 })
             }).count();
@@ -486,7 +488,7 @@ mod tests {
 
         let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
         let foobar_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().map_or(false, |hooks| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
                 hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
             })
         }).count();
@@ -504,10 +506,10 @@ mod tests {
             let entries = settings["hooks"][event].as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
             let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl"))
+                            .is_some_and(|c| c.contains("slopctl"))
                     })
                 })
             }).count();
@@ -539,7 +541,7 @@ mod tests {
         // Verify hooks exist.
         let contents = std::fs::read_to_string(&path).unwrap();
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert!(settings["hooks"]["SessionStart"].as_array().unwrap().len() > 0);
+        assert!(!settings["hooks"]["SessionStart"].as_array().unwrap().is_empty());
 
         remove_hooks_from_file(&path).unwrap();
 
@@ -661,10 +663,10 @@ mod tests {
             let entries = settings["hooks"][event].as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
             let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().map_or(false, |hooks| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|h| {
                         h["command"].as_str()
-                            .map_or(false, |c| c.contains("slopctl"))
+                            .is_some_and(|c| c.contains("slopctl"))
                     })
                 })
             }).count();
@@ -809,6 +811,8 @@ pub fn inject_hooks_into_file(
     let lock_path = settings_path.with_extension("json.lock");
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        // Advisory lock file: flock'd, never written, so never truncated.
+        .truncate(false)
         .write(true)
         .open(&lock_path)?;
     let mut lock = fd_lock::RwLock::new(lock_file);
@@ -844,17 +848,11 @@ pub struct SlopdConfig {
     pub claude_config_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SlopdTmuxConfig {
     pub socket: Option<PathBuf>,
     /// Run `tmux start-server` on startup (default: true when socket is not set).
     pub start_server: Option<bool>,
-}
-
-impl Default for SlopdTmuxConfig {
-    fn default() -> Self {
-        Self { socket: None, start_server: None }
-    }
 }
 
 impl SlopdTmuxConfig {
@@ -1295,6 +1293,9 @@ impl PaneState {
         }
     }
 
+    // Option-returning parser paired with `as_str`; deliberately not the std
+    // `FromStr` trait (which returns `Result`).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "booting_up" => Some(PaneState::BootingUp),
@@ -1333,6 +1334,9 @@ impl PaneDetailedState {
         }
     }
 
+    // Option-returning parser paired with `as_str`; deliberately not the std
+    // `FromStr` trait (which returns `Result`).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "booting_up" => Some(PaneDetailedState::BootingUp),
