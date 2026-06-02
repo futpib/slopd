@@ -7268,3 +7268,929 @@ fn wait_where_leading_dot_optional_end_to_end() {
     assert!(out_dot.status.success(), "wait --where .state=ready should succeed, got {:?}", out_dot.status);
     assert!(out_no_dot.status.success(), "wait --where state=ready should succeed, got {:?}", out_no_dot.status);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-account support
+// ---------------------------------------------------------------------------
+
+/// Switch a freshly-spawned mock_claude pane into always-submit mode so a plain
+/// tmux `send-keys` + Enter submits a prompt (no `slopctl send` needed). Mirrors
+/// the setup in `run_does_not_set_claude_config_dir_when_not_configured`.
+fn enable_always_submit(env: &TestEnv, pane_id: &str) {
+    // Give mock_claude a moment to enter raw mode before sending keys.
+    std::thread::sleep(Duration::from_millis(200));
+    // Two Enters: the first is literal (alternating-mode default), the second submits.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+}
+
+/// Ask a mock_claude pane (already in always-submit mode) to print one of its
+/// environment variables, returning the full `/env:VAR=value` line it emits
+/// ("UNSET" when the variable is absent). Polls the pane until the line appears.
+fn query_pane_env(env: &TestEnv, pane_id: &str, var: &str) -> String {
+    env.tmux.tmux()
+        .args(["send-keys", "-t", pane_id, &format!("/env {}", var), "Enter"])
+        .status().unwrap();
+    let needle = format!("/env:{}=", var);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // tmux may wrap long lines; join the full output before searching.
+        let joined = text.replace(['\n', '\r'], "");
+        if let Some(pos) = joined.find(&needle) {
+            return joined[pos..].split_whitespace().next().unwrap_or("").to_string();
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for /env {} output", var);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Return the account `slopctl ps` reports for `pane_id` (requires slopd alive).
+fn pane_account(env: &TestEnv, pane_id: &str) -> String {
+    let out = env.slopctl(&["ps", "--json"]);
+    assert!(out.status.success(), "ps --json failed: {:?}", out);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&out.stdout)
+        .expect("ps --json should parse");
+    panes.into_iter()
+        .find(|p| p.pane_id == pane_id)
+        .unwrap_or_else(|| panic!("pane {} not found in ps", pane_id))
+        .account
+}
+
+#[test]
+fn run_account_sets_config_dir_and_shows_in_ps() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run", "--account", "work"]);
+    assert!(run_out.status.success(), "run --account work failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let account = pane_account(&env, &pane_id);
+    enable_always_submit(&env, &pane_id);
+    let config_dir_line = query_pane_env(&env, &pane_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", work_dir.to_str().unwrap()),
+        "CLAUDE_CONFIG_DIR should point at the selected account's dir",
+    );
+    assert_eq!(account, "work", "ps should report the pane's account");
+}
+
+#[test]
+fn run_uses_default_account_without_flag() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        Some("work"),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // No --account flag: slopd's default_account should apply.
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let account = pane_account(&env, &pane_id);
+    enable_always_submit(&env, &pane_id);
+    let config_dir_line = query_pane_env(&env, &pane_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", work_dir.to_str().unwrap()),
+        "default_account should set CLAUDE_CONFIG_DIR",
+    );
+    assert_eq!(account, "work", "default_account should select the work account");
+}
+
+#[test]
+fn run_inherits_account_from_parent_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // A parent pane on the "work" account.
+    let parent_out = env.slopctl(&["run", "--account", "work"]);
+    assert!(parent_out.status.success(), "parent run failed: {:?}", parent_out);
+    let parent_id = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
+
+    // Spawn a child as if from inside the parent: TMUX_PANE points at the
+    // parent and no --account is given, so the daemon inherits the parent's
+    // account from its @slopd_account option.
+    let child_out = env.slopctl_raw_envs(&["run", "--no-wait"], &[("TMUX_PANE", parent_id.as_str())]);
+    assert!(child_out.status.success(), "child run failed: {:?}", child_out);
+    let child_id = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+
+    let child_account = pane_account(&env, &child_id);
+    enable_always_submit(&env, &child_id);
+    let config_dir_line = query_pane_env(&env, &child_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    assert_eq!(child_account, "work", "child should inherit the parent pane's account");
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", work_dir.to_str().unwrap()),
+        "inherited account should resolve to the parent's config dir",
+    );
+}
+
+#[test]
+fn run_account_flag_overrides_inherited_account() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // A parent pane on "work".
+    let parent_out = env.slopctl(&["run", "--account", "work"]);
+    assert!(parent_out.status.success(), "parent run failed: {:?}", parent_out);
+    let parent_id = String::from_utf8_lossy(&parent_out.stdout).trim().to_string();
+
+    // From inside the "work" parent, but with an explicit --account personal:
+    // the flag must win over the inherited account.
+    let child_out = env.slopctl_raw_envs(
+        &["run", "--no-wait", "--account", "personal"],
+        &[("TMUX_PANE", parent_id.as_str())],
+    );
+    assert!(child_out.status.success(), "run --account personal failed: {:?}", child_out);
+    let child_id = String::from_utf8_lossy(&child_out.stdout).trim().to_string();
+
+    let child_account = pane_account(&env, &child_id);
+    enable_always_submit(&env, &child_id);
+    let config_dir_line = query_pane_env(&env, &child_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    assert_eq!(child_account, "personal", "--account should override the inherited account");
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", personal_dir.to_str().unwrap()),
+        "--account should override the inherited account's dir",
+    );
+}
+
+#[test]
+fn run_unknown_account_fails_without_spawning() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let pane_count = |env: &TestEnv| -> usize {
+        let ps_out = env.slopctl(&["ps", "--json"]);
+        let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout)
+            .expect("ps --json should parse");
+        panes.len()
+    };
+
+    let before = pane_count(&env);
+    let run_out = env.slopctl_raw(&["run", "--no-wait", "--account", "ghost"]);
+    // The account is resolved before any tmux window is created, so a failed
+    // resolution must not change the pane count.
+    let after = pane_count(&env);
+
+    kill_slopd(slopd);
+
+    assert!(!run_out.status.success(), "run with an unknown account should fail: {:?}", run_out);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("unknown account"), "stderr should explain the failure: {}", stderr);
+    assert!(stderr.contains("ghost"), "stderr should name the bad account: {}", stderr);
+    assert!(stderr.contains("work"), "stderr should list configured accounts: {}", stderr);
+    assert_eq!(before, after, "no pane should be spawned for an unknown account");
+}
+
+#[test]
+fn run_account_injects_hooks_into_account_settings_only() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run", "--account", "work"]);
+    assert!(run_out.status.success(), "run --account work failed: {:?}", run_out);
+
+    // Read BEFORE shutting slopd down — shutdown removes the hooks again.
+    let work_settings = std::fs::read_to_string(work_dir.join("settings.json"))
+        .expect("work account settings.json should exist after run");
+    // The other account, never launched, must be left untouched.
+    let personal_exists = personal_dir.join("settings.json").exists();
+
+    kill_slopd(slopd);
+
+    assert!(
+        work_settings.contains("hook SessionStart"),
+        "hooks should be injected into the launched account's settings.json: {}",
+        work_settings,
+    );
+    assert!(!personal_exists,
+        "an account that was never launched should not have its settings.json touched");
+}
+
+#[test]
+fn run_default_account_maps_to_top_level_claude_config_dir() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // Top-level claude_config_dir, no [accounts]: it backs the "default" account.
+    let cc_root = tempfile::tempdir().unwrap();
+    let claude_config_dir = cc_root.path().join("claude-default");
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Explicit `--account default` resolves to the top-level claude_config_dir.
+    let run_out = env.slopctl(&["run", "--account", "default"]);
+    assert!(run_out.status.success(), "run --account default failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let account = pane_account(&env, &pane_id);
+    enable_always_submit(&env, &pane_id);
+    let config_dir_line = query_pane_env(&env, &pane_id, "CLAUDE_CONFIG_DIR");
+
+    kill_slopd(slopd);
+
+    assert_eq!(account, "default", "the pane should be on the default account");
+    assert_eq!(
+        config_dir_line,
+        format!("/env:CLAUDE_CONFIG_DIR={}", claude_config_dir.to_str().unwrap()),
+        "the default account should use the top-level claude_config_dir",
+    );
+}
+
+#[test]
+fn ps_shows_account_column() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run", "--account", "work"]);
+    assert!(run_out.status.success(), "run --account work failed: {:?}", run_out);
+
+    // The default table output (not --json) should carry an ACCOUNT column.
+    let ps_out = env.slopctl(&["ps"]);
+
+    kill_slopd(slopd);
+
+    assert!(ps_out.status.success(), "ps failed: {:?}", ps_out);
+    let stdout = String::from_utf8_lossy(&ps_out.stdout);
+    assert!(stdout.contains("ACCOUNT"), "ps header should include ACCOUNT:\n{}", stdout);
+    assert!(stdout.contains("work"), "ps should show the pane's account:\n{}", stdout);
+}
+
+#[test]
+fn transcript_discovered_and_tailed_for_non_default_account() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Subscribe to transcript user+assistant events BEFORE spawning the pane.
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--transcript", "user", "--transcript", "assistant"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn transcript listener");
+    {
+        let stdout = listener.stdout.as_mut().unwrap();
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            use std::io::Read;
+            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"));
+    }
+
+    // Spawn a pane on the "work" account and wait for SessionStart, whose hook
+    // payload carries the transcript_path (under work_dir) that triggers tailing.
+    let session_listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run", "--account", "work"]);
+    assert!(run_output.status.success(), "run --account work failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &pane_id);
+
+    // A prompt makes mock_claude write user + assistant records under
+    // CLAUDE_CONFIG_DIR (= work_dir).
+    let send_output = env.slopctl(&["send", &pane_id, "hello work account"]);
+    assert!(send_output.status.success(), "slopctl send failed: {:?}", send_output);
+
+    // Collect streamed transcript events — this proves slopd discovered and
+    // tailed the account's relocated JSONL, not a default-dir path.
+    let stdout = listener.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<serde_json::Value>>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = match line { Ok(l) => l, Err(_) => break };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("source").and_then(|s| s.as_str()) == Some("transcript")
+            {
+                events.push(v);
+                if events.len() >= 2 { let _ = tx.send(events); return; }
+            }
+        }
+        let _ = tx.send(events);
+    });
+    let events = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out waiting for transcript events from the account pane");
+
+    // ReadTranscript path too (slopctl transcript reads the stored path).
+    let transcript_out = env.slopctl(&["transcript", &pane_id]);
+    assert!(transcript_out.status.success(), "slopctl transcript failed: {:?}", transcript_out);
+    let transcript_json: serde_json::Value =
+        serde_json::from_slice(&transcript_out.stdout).expect("transcript output should be JSON");
+
+    kill_child(listener);
+    kill_slopd(slopd);
+
+    // Streamed events: a user + assistant record for this pane, carrying the prompt.
+    let types: Vec<&str> = events.iter()
+        .filter_map(|e| e.get("event_type").and_then(|t| t.as_str()))
+        .collect();
+    assert!(types.contains(&"user"), "missing 'user' transcript event, got: {:?}", types);
+    assert!(types.contains(&"assistant"), "missing 'assistant' transcript event, got: {:?}", types);
+    let user_event = events.iter().find(|e| e["event_type"] == "user").unwrap();
+    assert_eq!(user_event.get("pane_id").and_then(|p| p.as_str()), Some(pane_id.as_str()));
+    let user_content = user_event["payload"]["message"]["content"].as_str().unwrap_or("");
+    assert!(user_content.contains("hello work account"),
+        "streamed user record should contain the prompt, got: {:?}", user_content);
+
+    // The JSONL must physically live under the account dir, and not the default.
+    let records = read_transcript(&work_dir);
+    assert!(
+        records.iter().any(|r| r["type"] == "user"
+            && r["message"]["content"].as_str().is_some_and(|c| c.contains("hello work account"))),
+        "transcript under the account dir should contain the user record: {:?}", records,
+    );
+    let default_transcript = env.config_dir.path().join(".claude/projects/mock/mock-session-id-1234.jsonl");
+    assert!(!default_transcript.exists(),
+        "no transcript should be written under the default dir for an account pane");
+
+    // slopctl transcript (ReadTranscript) returned the records from the account dir too.
+    let read_records = transcript_json["records"].as_array().expect("records array");
+    assert!(read_records.iter().any(|r| r["event_type"] == "user"),
+        "slopctl transcript should return the account pane's user record: {:?}", read_records);
+}
+
+#[test]
+fn transcript_tailing_resumes_after_restart_for_non_default_account() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let session_listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run", "--account", "work"]);
+    assert!(run_output.status.success(), "run --account work failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &pane_id);
+
+    let send_output = env.slopctl(&["send", &pane_id, "before restart"]);
+    assert!(send_output.status.success(), "send before restart failed: {:?}", send_output);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // --- Restart slopd: recovery must re-establish tailing on the account's transcript. ---
+    kill_slopd(slopd);
+    let slopd2 = env.spawn_slopd();
+
+    // The transcript lives under the account dir. Fire SessionStart with that
+    // path so the recovered pane returns to ready (recovery resumes tailing from
+    // the pane's stored @slopd_transcript_path, which points under work_dir).
+    let transcript_path = work_dir.join("projects/mock/mock-session-id-1234.jsonl");
+    let session_start_payload = format!(
+        r#"{{"session_id":"mock-session-id-1234","hook_event_name":"SessionStart","transcript_path":"{}","cwd":"/tmp","source":"startup","model":"mock"}}"#,
+        transcript_path.display(),
+    );
+    let hook_out = fire_hook(&env, "SessionStart", &session_start_payload, Some(&pane_id));
+    assert!(hook_out.status.success(), "SessionStart after restart failed: {:?}", hook_out);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--transcript", "user", "--transcript", "assistant"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn transcript listener");
+    {
+        let stdout = listener.stdout.as_mut().unwrap();
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            use std::io::Read;
+            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"));
+    }
+
+    let send_output = env.slopctl(&["send", &pane_id, "after restart"]);
+    assert!(send_output.status.success(), "send after restart failed: {:?}", send_output);
+
+    let stdout = listener.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<serde_json::Value>>();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = match line { Ok(l) => l, Err(_) => break };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("source").and_then(|s| s.as_str()) == Some("transcript")
+            {
+                events.push(v);
+                if events.len() >= 2 { let _ = tx.send(events); return; }
+            }
+        }
+        let _ = tx.send(events);
+    });
+    let events = rx.recv_timeout(Duration::from_secs(10))
+        .expect("timed out waiting for transcript events after restart (account pane)");
+
+    kill_child(listener);
+    kill_slopd(slopd2);
+
+    assert!(
+        events.iter().filter(|e| e["event_type"] == "user").any(|e| {
+            e["payload"]["message"]["content"].as_str().is_some_and(|c| c.contains("after restart"))
+        }),
+        "tailing should resume on the account's transcript after restart, got: {:?}", events,
+    );
+}
+
+/// True iff `path` exists and still contains slopctl hook entries.
+fn settings_has_slopctl_hooks(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|c| c.contains("hook SessionStart"))
+}
+
+// #1 — two panes on different accounts at once: events route per pane, ps shows
+// the right account for each, and each transcript lands under its own dir.
+#[test]
+fn concurrent_panes_on_different_accounts_are_isolated() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let session_listener = env.spawn_session_start_listener();
+    let work_pane = String::from_utf8_lossy(&env.slopctl(&["run", "--account", "work"]).stdout).trim().to_string();
+    let personal_pane = String::from_utf8_lossy(&env.slopctl(&["run", "--account", "personal"]).stdout).trim().to_string();
+    assert!(!work_pane.is_empty() && !personal_pane.is_empty(), "both panes should spawn");
+    env.wait_for_session_starts(session_listener, &[&work_pane, &personal_pane]);
+
+    // A successful send waits for the UserPromptSubmit hook to round-trip, so it
+    // proves each account's settings.json hooks reach slopd, attributed per pane.
+    let send_work = env.slopctl(&["send", &work_pane, "from work"]);
+    assert!(send_work.status.success(), "send to work pane failed: {:?}", send_work);
+    let send_personal = env.slopctl(&["send", &personal_pane, "from personal"]);
+    assert!(send_personal.status.success(), "send to personal pane failed: {:?}", send_personal);
+
+    let work_account = pane_account(&env, &work_pane);
+    let personal_account = pane_account(&env, &personal_pane);
+
+    std::thread::sleep(Duration::from_millis(300));
+    let work_records = read_transcript(&work_dir);
+    let personal_records = read_transcript(&personal_dir);
+
+    kill_slopd(slopd);
+
+    assert_eq!(work_account, "work", "ps should attribute the work pane to 'work'");
+    assert_eq!(personal_account, "personal", "ps should attribute the personal pane to 'personal'");
+
+    let work_has = |needle: &str| work_records.iter().any(|r| r["type"] == "user"
+        && r["message"]["content"].as_str().is_some_and(|c| c.contains(needle)));
+    let personal_has = |needle: &str| personal_records.iter().any(|r| r["type"] == "user"
+        && r["message"]["content"].as_str().is_some_and(|c| c.contains(needle)));
+    assert!(work_has("from work"), "work transcript should hold its own prompt: {:?}", work_records);
+    assert!(personal_has("from personal"), "personal transcript should hold its own prompt: {:?}", personal_records);
+    // Cross-contamination check: neither account's transcript holds the other's prompt.
+    assert!(!work_has("from personal"), "work transcript leaked the personal prompt");
+    assert!(!personal_has("from work"), "personal transcript leaked the work prompt");
+}
+
+// #2 — after a restart, recovery re-injects hooks into the recovered pane's
+// account dir (and leaves a never-used account untouched).
+#[test]
+fn restart_reinjects_hooks_into_recovered_pane_account_dir() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let session_listener = env.spawn_session_start_listener();
+    let work_pane = String::from_utf8_lossy(&env.slopctl(&["run", "--account", "work"]).stdout).trim().to_string();
+    env.wait_for_session_start(session_listener, &work_pane);
+
+    assert!(settings_has_slopctl_hooks(&work_dir.join("settings.json")),
+        "work account should have hooks after run");
+
+    // Shutdown removes hooks from the account dir...
+    kill_slopd(slopd);
+    assert!(!settings_has_slopctl_hooks(&work_dir.join("settings.json")),
+        "shutdown should remove hooks from the account dir");
+
+    // ...and a restart's recovery re-injects them into the *account* dir, because
+    // the surviving pane records @slopd_account=work.
+    let slopd2 = env.spawn_slopd();
+
+    assert!(settings_has_slopctl_hooks(&work_dir.join("settings.json")),
+        "recovery should re-inject hooks into the recovered pane's account dir");
+    assert!(!personal_dir.join("settings.json").exists(),
+        "recovery should not touch an account with no recovered pane");
+
+    kill_slopd(slopd2);
+}
+
+// #3 — shutdown removes hooks from every account that had a pane, not just one.
+#[test]
+fn shutdown_removes_hooks_from_all_used_account_dirs() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let session_listener = env.spawn_session_start_listener();
+    let work_pane = String::from_utf8_lossy(&env.slopctl(&["run", "--account", "work"]).stdout).trim().to_string();
+    let personal_pane = String::from_utf8_lossy(&env.slopctl(&["run", "--account", "personal"]).stdout).trim().to_string();
+    env.wait_for_session_starts(session_listener, &[&work_pane, &personal_pane]);
+
+    assert!(settings_has_slopctl_hooks(&work_dir.join("settings.json")), "work should have hooks");
+    assert!(settings_has_slopctl_hooks(&personal_dir.join("settings.json")), "personal should have hooks");
+
+    kill_slopd(slopd);
+
+    assert!(!settings_has_slopctl_hooks(&work_dir.join("settings.json")),
+        "shutdown should clean the work account's settings.json");
+    assert!(!settings_has_slopctl_hooks(&personal_dir.join("settings.json")),
+        "shutdown should clean the personal account's settings.json");
+}
+
+// #4 — SIGHUP reload picks up a newly-added account.
+#[test]
+fn sighup_reload_picks_up_new_account() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    // Start with only "work" configured.
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        None,
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Before reload, "personal" is unknown.
+    let before = env.slopctl_raw(&["run", "--no-wait", "--account", "personal"]);
+    assert!(!before.status.success(), "personal should be unknown before reload");
+
+    // Add "personal" to the config, then SIGHUP and wait for the reload to land.
+    env.tmux.write_slopd_config_accounts(
+        &env.config_dir,
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path()), ("personal", personal_dir.as_path())],
+        None,
+    );
+    sighup_pid(slopd.id());
+    wait_for_config_generation_at_least(&env, 1, Duration::from_secs(5));
+
+    // After reload, "personal" resolves.
+    let after = env.slopctl(&["run", "--account", "personal"]);
+    assert!(after.status.success(), "personal should resolve after reload: {:?}", after);
+    let personal_pane = String::from_utf8_lossy(&after.stdout).trim().to_string();
+    let account = pane_account(&env, &personal_pane);
+
+    kill_slopd(slopd);
+
+    assert_eq!(account, "personal", "the reloaded account should be in effect");
+}
+
+// #5 — a default_account pointing at an unconfigured account fails the run clearly.
+#[test]
+fn run_fails_when_default_account_is_unknown() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+
+    // default_account names "ghost", which is not configured under [accounts].
+    let Some(env) = TestEnv::new_with_accounts(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        &[("work", work_dir.as_path())],
+        Some("ghost"),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // A plain run resolves to default_account ("ghost") and must fail.
+    let run_out = env.slopctl_raw(&["run", "--no-wait"]);
+
+    kill_slopd(slopd);
+
+    assert!(!run_out.status.success(), "run should fail when default_account is unknown: {:?}", run_out);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("unknown account"), "stderr should explain the failure: {}", stderr);
+    assert!(stderr.contains("ghost"), "stderr should name the missing default account: {}", stderr);
+}
+
+// #6 — `slopd uninject-hooks` cleans every configured account dir.
+#[test]
+fn uninject_hooks_cleans_all_account_dirs() {
+    build_bin("slopd");
+
+    let accounts_root = tempfile::tempdir().unwrap();
+    let work_dir = accounts_root.path().join("work");
+    let personal_dir = accounts_root.path().join("personal");
+
+    // Inject hooks directly into both account dirs (not via slopd, to avoid
+    // auto-cleanup on daemon exit).
+    libslop::inject_hooks_into_file(&work_dir.join("settings.json"), "slopctl").unwrap();
+    libslop::inject_hooks_into_file(&personal_dir.join("settings.json"), "slopctl").unwrap();
+    assert!(settings_has_slopctl_hooks(&work_dir.join("settings.json")));
+    assert!(settings_has_slopctl_hooks(&personal_dir.join("settings.json")));
+
+    // A config with both accounts (no tmux needed for uninject-hooks).
+    let config_dir = tempfile::tempdir().unwrap();
+    let slopd_config_dir = config_dir.path().join("slopd");
+    std::fs::create_dir_all(&slopd_config_dir).unwrap();
+    std::fs::write(
+        slopd_config_dir.join("config.toml"),
+        format!(
+            "[accounts]\nwork = {:?}\npersonal = {:?}\n",
+            work_dir.to_str().unwrap(),
+            personal_dir.to_str().unwrap(),
+        ),
+    ).unwrap();
+
+    let out = Command::new(cargo_bin("slopd"))
+        .args(["uninject-hooks"])
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("HOME", config_dir.path())
+        .output()
+        .expect("failed to run slopd uninject-hooks");
+    assert!(out.status.success(), "slopd uninject-hooks failed: {:?}", out);
+
+    assert!(!settings_has_slopctl_hooks(&work_dir.join("settings.json")),
+        "uninject-hooks should clean the work account dir");
+    assert!(!settings_has_slopctl_hooks(&personal_dir.join("settings.json")),
+        "uninject-hooks should clean the personal account dir");
+}

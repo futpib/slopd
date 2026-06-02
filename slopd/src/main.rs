@@ -516,10 +516,6 @@ impl ManagedPanes {
         self.inner.contains(pane_id)
     }
 
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
     /// Return a snapshot of the current pane IDs as an owned `Vec<String>`.
     ///
     /// This is the only way to iterate.  The shard guards used internally are
@@ -534,16 +530,42 @@ impl ManagedPanes {
 }
 
 /// Populate the managed-pane set from the `slopd` tmux session.
+/// Read the account a pane was launched under from its `@slopd_account` option.
+/// Returns `None` when the option is unset/empty or the pane can't be queried
+/// (e.g. the parent isn't a slopd-managed pane) — the caller then falls back to
+/// `default_account` / the default account.
+async fn read_pane_account(config: &libslop::SlopdConfig, pane_id: &str) -> Option<String> {
+    let out = tmux(config)
+        .args(["show-options", "-t", pane_id, "-p", "-v",
+               libslop::TmuxOption::SlopdAccount.as_str()])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if val.is_empty() { None } else { Some(val) }
+}
+
+/// Scan the slopd session for managed panes and return the distinct
+/// `settings.json` paths whose hooks must be re-injected — one per account a
+/// recovered pane belongs to (the unnamed default included).
+///
 /// Only panes that have the `@slopd_managed` pane option set are considered managed
 /// (i.e. were registered via `slopctl run`). For each recovered pane, replays the
 /// last N transcript records through the state reducer to recover the real state
 /// instead of leaving it stuck at BootingUp.
-async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) {
+async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) -> std::collections::HashSet<std::path::PathBuf> {
+    // Order matters: @slopd_account (no spaces) before @slopd_transcript_path,
+    // which is captured last so any spaces in a path stay intact.
     let format_str = format!(
-        "#{{pane_id}} #{{{}}} #{{{}}}",
+        "#{{pane_id}} #{{{}}} #{{{}}} #{{{}}}",
         libslop::TmuxOption::SlopdManaged.as_str(),
+        libslop::TmuxOption::SlopdAccount.as_str(),
         libslop::TmuxOption::SlopdTranscriptPath.as_str(),
     );
+    let mut settings_paths = std::collections::HashSet::new();
     let output = tmux(config)
         .args(["list-panes", "-s", "-t", "slopd", "-F", &format_str])
         .output()
@@ -551,14 +573,26 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
     if let Ok(out) = output
         && out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut parts = line.splitn(3, ' ');
+                let mut parts = line.splitn(4, ' ');
                 let pane_id = parts.next().unwrap_or("").trim();
                 let slopd_managed = parts.next().unwrap_or("").trim();
+                let account = parts.next().unwrap_or("").trim();
                 let transcript_path = parts.next().unwrap_or("").trim();
                 if pane_id.is_empty() || slopd_managed != "true" {
                     continue;
                 }
                 managed.insert(pane_id.to_string());
+
+                // Record where this pane's hooks live so we can re-inject them.
+                // An unresolvable account (removed from config, or a misconfigured
+                // default_account) falls back to the reserved default account,
+                // which always resolves — recovery must never crash startup.
+                let account = if account.is_empty() { None } else { Some(account) };
+                let resolved = config
+                    .resolve_account(account)
+                    .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
+                    .expect("the reserved default account always resolves");
+                settings_paths.insert(config.resolved_settings_path(&resolved));
 
                 // Replay the last N transcript records to recover the real state.
                 let recovered_state = if !transcript_path.is_empty() {
@@ -588,6 +622,7 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
                 }
             }
         }
+    settings_paths
 }
 
 /// Replay the last N records from a transcript file through the state reducer
@@ -960,12 +995,20 @@ async fn main() {
     apply_overrides(&mut config);
 
     if let Some(CliCommand::UninjectHooks) = cli.command {
-        let settings_path = config.claude_settings_path();
-        if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
-            error!("failed to remove hooks from {}: {}", settings_path.display(), e);
+        // Clean every dir slopd might have injected into: the default plus all
+        // configured accounts.
+        let mut failed = false;
+        for settings_path in config.all_settings_paths() {
+            if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
+                error!("failed to remove hooks from {}: {}", settings_path.display(), e);
+                failed = true;
+            } else {
+                info!("removed slopctl hooks from {}", settings_path.display());
+            }
+        }
+        if failed {
             std::process::exit(1);
         }
-        info!("removed slopctl hooks from {}", settings_path.display());
         return;
     }
 
@@ -1070,13 +1113,14 @@ async fn main() {
     // before a slopd restart are still recognized. This must happen before
     // binding the socket so that clients cannot create panes in the slopd
     // session while the scan is in progress.
-    load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
+    let recovered_settings_paths = load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
 
     // Re-inject hooks if there are recovered panes — the previous slopd instance
     // removed them on exit, but the Claude sessions are still running in tmux.
-    if !managed_panes.is_empty() {
-        let settings_path = config.claude_settings_path();
-        if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
+    // Each recovered pane reports its account, so we re-inject only the dirs that
+    // are actually in use rather than every configured account.
+    for settings_path in &recovered_settings_paths {
+        if let Err(e) = libslop::inject_hooks_into_file(settings_path, &config.run.slopctl) {
             warn!("failed to re-inject hooks into {}: {}", settings_path.display(), e);
         }
     }
@@ -1148,15 +1192,16 @@ async fn main() {
         }
     }
 
-    // Use the latest config for the shutdown hook cleanup. If claude_config_dir
+    // Use the latest config for the shutdown hook cleanup. If a config dir
     // changed at reload time hooks may linger in the previous path — that's a
     // documented limitation of mid-run config reloads.
     let shutdown_config = config_rx.borrow().clone();
-    let settings_path = shutdown_config.claude_settings_path();
-    if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
-        warn!("failed to remove hooks from {} on shutdown: {}", settings_path.display(), e);
-    } else {
-        info!("removed slopctl hooks from {}", settings_path.display());
+    for settings_path in shutdown_config.all_settings_paths() {
+        if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
+            warn!("failed to remove hooks from {} on shutdown: {}", settings_path.display(), e);
+        } else {
+            info!("removed slopctl hooks from {}", settings_path.display());
+        }
     }
 }
 
@@ -1393,6 +1438,8 @@ struct ParsedPaneOptions {
     tags: Vec<String>,
     detailed_state: Option<libslop::PaneDetailedState>,
     created_at: Option<u64>,
+    /// Account the pane was launched under (@slopd_account); None when unset.
+    account: Option<String>,
 }
 
 impl ParsedPaneOptions {
@@ -1409,6 +1456,7 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
     let mut tags = Vec::new();
     let mut detailed_state = None;
     let mut created_at = None;
+    let mut account = None;
     for opt_line in stdout.lines() {
         let mut words = opt_line.splitn(2, ' ');
         let key = words.next().unwrap_or("").trim();
@@ -1426,11 +1474,13 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
             detailed_state = libslop::PaneDetailedState::from_str(val);
         } else if key == libslop::TmuxOption::SlopdCreatedAt.as_str() {
             created_at = val.parse::<u64>().ok();
+        } else if key == libslop::TmuxOption::SlopdAccount.as_str() {
+            account = if val.is_empty() { None } else { Some(val.to_string()) };
         } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
             tags.push(tag.to_string());
         }
     }
-    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at }
+    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at, account }
 }
 
 /// Encode an ancestor list as a comma-separated string for tmux storage.
@@ -1567,6 +1617,9 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
         let detailed_state = raw.opts.detailed_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
         let state = detailed_state.to_simple();
         let created_at = raw.opts.created_at.unwrap_or(raw.last_active);
+        // A pane with no recorded account is on the default account (e.g. panes
+        // from before this option existed, or the session's idle pane).
+        let account = raw.opts.account.unwrap_or_else(|| libslop::DEFAULT_ACCOUNT.to_string());
         panes.push(libslop::PaneInfo {
             pane_id: raw.pane_id,
             created_at,
@@ -1577,6 +1630,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             state,
             detailed_state,
             working_dir: raw.working_dir,
+            account,
         });
     }
     Ok(panes)
@@ -1767,8 +1821,26 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env } => {
-            let settings_path = config.claude_settings_path();
+        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account } => {
+            // Pick the account: an explicit --account wins; otherwise inherit the
+            // parent pane's account (its @slopd_account option) so a pane spawned
+            // from another pane stays on the same account by default.
+            let requested_account = match account {
+                Some(name) => Some(name),
+                None => match parent_pane_id.as_deref() {
+                    Some(parent) => read_pane_account(config, parent).await,
+                    None => None,
+                },
+            };
+            // Resolve to the account's Claude config dir before doing anything
+            // else, so an unknown account fails fast without spawning.
+            let resolved = match config.resolve_account(requested_account.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(message) => return libslop::ResponseBody::Error { message },
+            };
+            // Inject hooks into the account's settings.json (the dir the new pane
+            // will actually read), not necessarily the default one.
+            let settings_path = config.resolved_settings_path(&resolved);
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
             }
@@ -1811,8 +1883,12 @@ async fn handle_request(
                     && let Some(dir_str) = dir.to_str() {
                         cmd.args(["-c", dir_str]);
                     }
-                if let Some(ref custom_dir) = c.claude_config_dir {
-                    cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", custom_dir.display())]);
+                // Point Claude at the resolved account's config dir. The account
+                // name itself isn't exported as an env var: it's recorded on the
+                // pane as @slopd_account (below) and inherited by children via the
+                // parent pane id.
+                if let Some(ref dir) = resolved.config_dir {
+                    cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
                 }
                 // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
                 // write their coverage data even when launched inside a tmux window.
@@ -1838,6 +1914,10 @@ async fn handle_request(
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
+                    // Record the account so `ps` can show it, child panes can
+                    // inherit it, and a slopd restart re-injects the right hooks
+                    // for this pane (see load_managed_panes).
+                    let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdAccount.as_str(), &resolved.name).await;
                     // Test hook: SLOPD_TEST_RUN_YIELD_MS adds an extra async sleep here so
                     // that concurrent hook tasks (e.g. SessionStart fired by mock_claude as
                     // soon as the tmux window opens) are guaranteed to be processed before we

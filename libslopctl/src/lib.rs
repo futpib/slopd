@@ -93,6 +93,12 @@ pub enum CommonCommand {
         /// Overrides entries from [run.env_files] / [run.env] in config.
         #[arg(long = "env-file", value_name = "PATH")]
         env_files: Vec<PathBuf>,
+        /// Named account to launch the pane under (configured in slopd's
+        /// config.toml under [accounts], or the reserved "default"). When
+        /// omitted, the pane inherits the current pane's account, then falls
+        /// back to slopd's default_account.
+        #[arg(short = 'a', long, value_name = "NAME")]
+        account: Option<String>,
         /// Don't wait for the new pane to become ready; print the pane id as soon
         /// as it is created (the historical fire-and-forget behaviour). By
         /// default `run` waits until the pane is ready, or fails if it dies or
@@ -251,6 +257,8 @@ pub enum CommonCommand {
 /// Context that differs between slopctl (local) and iroh-slopctl (remote).
 pub struct CommandContext {
     /// For `Run`: the parent pane ID. slopctl sets this to $TMUX_PANE, iroh sets None.
+    /// The daemon also uses it to inherit the parent pane's account when `--account`
+    /// is not given.
     pub parent_pane_id: Option<String>,
     /// For `Tags` when pane_id is None: fallback pane ID.
     pub fallback_pane_id: Option<String>,
@@ -401,43 +409,58 @@ pub fn resolve_pane_id_or_session(
 }
 
 /// Print a table of pane info to stdout.
-#[allow(clippy::type_complexity)] // the row tuple is a private formatting detail
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let now = std::time::SystemTime::now();
     let fmt = timeago::Formatter::new();
-    let rows: Vec<(String, String, String, String, String, String, String, String, String)> = panes.iter().map(|p| {
+    struct Row {
+        pane: String,
+        created: String,
+        last_active: String,
+        session: String,
+        parent: String,
+        account: String,
+        tags: String,
+        state: String,
+        detailed_state: String,
+        working_dir: String,
+    }
+    let rows: Vec<Row> = panes.iter().map(|p| {
         let epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let created = fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at)));
-        let last_active = fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active)));
-        let session = p.session_id.as_deref().unwrap_or("-").to_string();
-        let parent = p.parent_pane_id.as_deref().unwrap_or("-").to_string();
-        let tags = if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") };
-        let state = p.state.as_str().to_string();
-        let detailed_state = p.detailed_state.as_str().to_string();
-        let working_dir = p.working_dir.as_deref().unwrap_or("-").to_string();
-        (p.pane_id.clone(), created, last_active, session, parent, tags, state, detailed_state, working_dir)
+        Row {
+            pane: p.pane_id.clone(),
+            created: fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))),
+            last_active: fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))),
+            session: p.session_id.as_deref().unwrap_or("-").to_string(),
+            parent: p.parent_pane_id.as_deref().unwrap_or("-").to_string(),
+            account: p.account.clone(),
+            tags: if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") },
+            state: p.state.as_str().to_string(),
+            detailed_state: p.detailed_state.as_str().to_string(),
+            working_dir: p.working_dir.as_deref().unwrap_or("-").to_string(),
+        }
     }).collect();
 
-    let pane_w          = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
-    let created_w       = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(7);
-    let last_active_w   = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(11);
-    let session_w       = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(7);
-    let parent_w        = rows.iter().map(|r| r.4.len()).max().unwrap_or(0).max(6);
-    let tags_w          = rows.iter().map(|r| r.5.len()).max().unwrap_or(0).max(4);
-    let state_w         = rows.iter().map(|r| r.6.len()).max().unwrap_or(0).max(5);
-    let detailed_w      = rows.iter().map(|r| r.7.len()).max().unwrap_or(0).max(14);
-    let working_dir_w   = rows.iter().map(|r| r.8.len()).max().unwrap_or(0).max(11);
+    let pane_w          = rows.iter().map(|r| r.pane.len()).max().unwrap_or(0).max(4);
+    let created_w       = rows.iter().map(|r| r.created.len()).max().unwrap_or(0).max(7);
+    let last_active_w   = rows.iter().map(|r| r.last_active.len()).max().unwrap_or(0).max(11);
+    let session_w       = rows.iter().map(|r| r.session.len()).max().unwrap_or(0).max(7);
+    let parent_w        = rows.iter().map(|r| r.parent.len()).max().unwrap_or(0).max(6);
+    let account_w       = rows.iter().map(|r| r.account.len()).max().unwrap_or(0).max(7);
+    let tags_w          = rows.iter().map(|r| r.tags.len()).max().unwrap_or(0).max(4);
+    let state_w         = rows.iter().map(|r| r.state.len()).max().unwrap_or(0).max(5);
+    let detailed_w      = rows.iter().map(|r| r.detailed_state.len()).max().unwrap_or(0).max(14);
+    let working_dir_w   = rows.iter().map(|r| r.working_dir.len()).max().unwrap_or(0).max(11);
 
-    println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
-        "PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR",
+    println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<account_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
+        "PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "ACCOUNT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR",
         pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-        parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
+        parent_w=parent_w, account_w=account_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
 
-    for (pane_id, created, last_active, session, parent, tags, state, detailed_state, working_dir) in &rows {
-        println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
-            pane_id, created, last_active, session, parent, tags, state, detailed_state, working_dir,
+    for r in &rows {
+        println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<account_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
+            r.pane, r.created, r.last_active, r.session, r.parent, r.account, r.tags, r.state, r.detailed_state, r.working_dir,
             pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-            parent_w=parent_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
+            parent_w=parent_w, account_w=account_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
     }
 }
 
@@ -616,8 +639,9 @@ impl<
         extra_args: Vec<String>,
         start_directory: Option<PathBuf>,
         env: Vec<(String, String)>,
+        account: Option<String>,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env }).await? {
+        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account }).await? {
             libslop::ResponseBody::Run { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -1337,12 +1361,14 @@ fn run_died_error(pane_id: &str, reason: Option<&str>) -> Error {
 /// hooks, which broadcast to the same channel. The pane id isn't known at
 /// subscribe time, so we subscribe to the relevant event *types* across all
 /// panes and filter by pane id on the client side once Run returns.
+#[allow(clippy::too_many_arguments)] // mirrors the `run` CLI flag surface (+account)
 pub async fn execute_run<R, W>(
     client: &mut Client<R, W>,
     parent_pane_id: Option<String>,
     extra_args: Vec<String>,
     start_directory: Option<PathBuf>,
     env: Vec<(String, String)>,
+    account: Option<String>,
     no_wait: bool,
     ready_timeout_secs: u64,
 ) -> Result<(), Error>
@@ -1351,7 +1377,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     if no_wait {
-        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env).await?;
+        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
         println!("{}", pane_id);
         return Ok(());
     }
@@ -1375,7 +1401,7 @@ where
     ];
     let mut subscription = client.subscribe(filters).await?;
 
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env).await?;
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
 
     let overall_deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(ready_timeout_secs);
@@ -1481,14 +1507,17 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory, envs, env_files, no_wait, ready_timeout } => {
+        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
+            // Pass --account through verbatim; when it's None the daemon inherits
+            // the parent pane's account (via parent_pane_id), then default_account.
             execute_run(
                 client,
                 ctx.parent_pane_id.clone(),
                 extra_args,
                 start_directory,
                 env,
+                account,
                 no_wait,
                 ready_timeout,
             ).await?;
@@ -1630,6 +1659,7 @@ mod tests {
             state: state.to_simple(),
             detailed_state: state,
             working_dir: None,
+            account: libslop::DEFAULT_ACCOUNT.to_string(),
         }
     }
 

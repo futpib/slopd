@@ -106,6 +106,9 @@ pub enum TmuxOption {
     SlopdCreatedAt,
     /// Stores the transcript file path reported by SessionStart
     SlopdTranscriptPath,
+    /// Stores the account name the pane was launched under (empty/unset for the
+    /// unnamed default account). Used to re-inject the right hooks on recovery.
+    SlopdAccount,
 }
 
 impl TmuxOption {
@@ -118,6 +121,7 @@ impl TmuxOption {
             TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
             TmuxOption::SlopdCreatedAt => "@slopd_created_at",
             TmuxOption::SlopdTranscriptPath => "@slopd_transcript_path",
+            TmuxOption::SlopdAccount => "@slopd_account",
         }
     }
 }
@@ -793,6 +797,151 @@ mod tests {
         let v = serde_json::json!({"foo": "bar"});
         assert!(!path_matches(&v, &p("foo[].x"), "bar"));
     }
+
+    // --- account config + resolution tests ---
+
+    fn config_from_toml(s: &str) -> SlopdConfig {
+        toml::from_str(s).unwrap_or_else(|e| panic!("parse config {:?}: {}", s, e))
+    }
+
+    #[test]
+    fn account_config_accepts_bare_string() {
+        let cfg = config_from_toml("[accounts]\nwork = \"/srv/claude-work\"\n");
+        let acct = cfg.accounts.get("work").expect("work account missing");
+        assert_eq!(acct.claude_config_dir(), &PathBuf::from("/srv/claude-work"));
+    }
+
+    #[test]
+    fn account_config_accepts_table_form() {
+        let cfg = config_from_toml(
+            "[accounts.personal]\nclaude_config_dir = \"/srv/claude-personal\"\n",
+        );
+        let acct = cfg.accounts.get("personal").expect("personal account missing");
+        assert_eq!(acct.claude_config_dir(), &PathBuf::from("/srv/claude-personal"));
+    }
+
+    #[test]
+    fn resolve_account_named_returns_name_and_dir() {
+        let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
+        let resolved = cfg.resolve_account(Some("work")).unwrap();
+        assert_eq!(resolved.name, "work");
+        assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/work")));
+    }
+
+    #[test]
+    fn resolve_account_unknown_errors_and_lists_configured() {
+        let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
+        let err = cfg.resolve_account(Some("nope")).unwrap_err();
+        assert!(err.contains("nope"), "err should name the bad account: {}", err);
+        assert!(err.contains("work"), "err should list configured accounts: {}", err);
+        assert!(err.contains(DEFAULT_ACCOUNT), "err should list the default account: {}", err);
+    }
+
+    #[test]
+    fn resolve_account_none_uses_default_account() {
+        let cfg = config_from_toml("default_account = \"work\"\n[accounts]\nwork = \"/srv/work\"\n");
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.name, "work");
+        assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/work")));
+    }
+
+    #[test]
+    fn resolve_account_explicit_overrides_default_account() {
+        let cfg = config_from_toml(
+            "default_account = \"work\"\n[accounts]\nwork = \"/srv/work\"\npersonal = \"/srv/personal\"\n",
+        );
+        let resolved = cfg.resolve_account(Some("personal")).unwrap();
+        assert_eq!(resolved.name, "personal");
+        assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/personal")));
+    }
+
+    #[test]
+    fn resolve_account_default_uses_top_level_claude_config_dir() {
+        // Top-level claude_config_dir backs the reserved "default" account.
+        let cfg = config_from_toml("claude_config_dir = \"/srv/legacy\"\n");
+        for requested in [None, Some(DEFAULT_ACCOUNT)] {
+            let resolved = cfg.resolve_account(requested).unwrap();
+            assert_eq!(resolved.name, DEFAULT_ACCOUNT);
+            assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/legacy")));
+        }
+    }
+
+    #[test]
+    fn resolve_account_explicit_default_table_overrides_top_level() {
+        // [accounts.default] wins over the top-level claude_config_dir shorthand.
+        let cfg = config_from_toml(
+            "claude_config_dir = \"/srv/legacy\"\n[accounts]\ndefault = \"/srv/explicit\"\n",
+        );
+        let resolved = cfg.resolve_account(Some(DEFAULT_ACCOUNT)).unwrap();
+        assert_eq!(resolved.name, DEFAULT_ACCOUNT);
+        assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/explicit")));
+    }
+
+    #[test]
+    fn resolve_account_default_with_nothing_configured_has_no_dir() {
+        // Nothing configured: the default account resolves but exports no dir
+        // (Claude falls back to ~/.claude).
+        let cfg = SlopdConfig::default();
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.name, DEFAULT_ACCOUNT);
+        assert_eq!(resolved.config_dir, None);
+    }
+
+    #[test]
+    fn resolve_account_reserved_default_succeeds_even_with_bad_default_account() {
+        // A misconfigured default_account makes resolve_account(None) error, but
+        // the reserved DEFAULT_ACCOUNT must still resolve — startup recovery
+        // (load_managed_panes) relies on this to avoid crashing the daemon.
+        let cfg = config_from_toml("default_account = \"ghost\"\n[accounts]\nwork = \"/srv/work\"\n");
+        assert!(cfg.resolve_account(None).is_err(), "None resolves to the bad default_account and errors");
+        let resolved = cfg.resolve_account(Some(DEFAULT_ACCOUNT)).unwrap();
+        assert_eq!(resolved.name, DEFAULT_ACCOUNT);
+        assert_eq!(resolved.config_dir, None);
+    }
+
+    #[test]
+    fn resolve_account_expands_tilde_in_account_dir() {
+        let cfg = config_from_toml("[accounts]\nwork = \"~/claude-work\"\n");
+        let resolved = cfg.resolve_account(Some("work")).unwrap();
+        assert_eq!(resolved.config_dir, Some(home_dir().join("claude-work")));
+    }
+
+    #[test]
+    fn resolved_settings_path_uses_account_dir() {
+        let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
+        let resolved = cfg.resolve_account(Some("work")).unwrap();
+        assert_eq!(
+            cfg.resolved_settings_path(&resolved),
+            PathBuf::from("/srv/work/settings.json"),
+        );
+    }
+
+    #[test]
+    fn resolved_settings_path_default_matches_claude_settings_path() {
+        // For the unnamed default, resolved_settings_path must equal the legacy
+        // claude_settings_path so startup/shutdown hook management stays consistent.
+        let cfg = config_from_toml("claude_config_dir = \"/srv/legacy\"\n");
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(cfg.resolved_settings_path(&resolved), cfg.claude_settings_path());
+    }
+
+    #[test]
+    fn all_settings_paths_includes_default_and_accounts_deduped() {
+        let cfg = config_from_toml(
+            "claude_config_dir = \"/srv/legacy\"\n\
+             [accounts]\nwork = \"/srv/work\"\npersonal = \"/srv/legacy\"\n",
+        );
+        let paths = cfg.all_settings_paths();
+        assert!(paths.contains(&PathBuf::from("/srv/legacy/settings.json")));
+        assert!(paths.contains(&PathBuf::from("/srv/work/settings.json")));
+        // /srv/legacy is both the default dir and the "personal" account dir, but
+        // must appear only once.
+        let legacy_count = paths
+            .iter()
+            .filter(|p| *p == &PathBuf::from("/srv/legacy/settings.json"))
+            .count();
+        assert_eq!(legacy_count, 1, "duplicate dirs must be collapsed: {:?}", paths);
+    }
 }
 
 /// Read, inject, and write hooks to a Claude settings.json file. Idempotent.
@@ -844,8 +993,86 @@ pub struct SlopdConfig {
     pub tmux: SlopdTmuxConfig,
     #[serde(default)]
     pub run: SlopdRunConfig,
-    /// Override Claude's config directory (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude)
+    /// Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude) for the
+    /// reserved [`DEFAULT_ACCOUNT`] account — the one used when no account is
+    /// selected. Shorthand for `[accounts.default] claude_config_dir = ...`.
     pub claude_config_dir: Option<PathBuf>,
+    /// Named Claude accounts. Each maps an account name to its own configuration
+    /// (at minimum a Claude config dir, the per-account equivalent of
+    /// `claude_config_dir`). Select one for a pane with
+    /// `slopctl run --account <name>`; child panes inherit their parent's
+    /// account unless overridden. The name `default` is reserved (see
+    /// [`DEFAULT_ACCOUNT`]).
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, AccountConfig>,
+    /// Account used by `slopctl run` when no `--account` is given and none is
+    /// inherited from the parent pane. When unset, the [`DEFAULT_ACCOUNT`]
+    /// account is used.
+    pub default_account: Option<String>,
+}
+
+/// The reserved account name used when nothing else selects one. Its config dir
+/// comes from `[accounts.default]` if present, otherwise the top-level
+/// `claude_config_dir`, otherwise Claude's own `~/.claude`.
+pub const DEFAULT_ACCOUNT: &str = "default";
+
+/// Configuration for a single named account. Accepts either a bare string (the
+/// Claude config dir, the common case) or a table for richer per-account
+/// settings, so both of these are valid:
+///
+/// ```toml
+/// [accounts]
+/// work = "~/.config/claude-work"          # shorthand: just the dir
+///
+/// [accounts.personal]
+/// claude_config_dir = "~/.config/claude-personal"   # table form (extensible)
+/// ```
+///
+/// The table form is where future per-account options live (see
+/// [`AccountSettings`]); the bare-string form is sugar for a table with only
+/// `claude_config_dir` set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AccountConfig {
+    /// Shorthand: the account is just its Claude config directory.
+    Dir(PathBuf),
+    /// Full table form, extensible with further per-account keys over time.
+    Settings(AccountSettings),
+}
+
+/// The table form of a per-account configuration. New per-account options are
+/// added here as fields (give each a `#[serde(default)]` so the table stays
+/// backward-compatible), plus a matching accessor on [`AccountConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSettings {
+    /// The account's Claude config directory.
+    pub claude_config_dir: PathBuf,
+    // Future per-account options go here, e.g.:
+    //   #[serde(default)] pub executable: Option<Executable>,
+    //   #[serde(default)] pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl AccountConfig {
+    /// The account's Claude config directory, as written in config (unexpanded).
+    pub fn claude_config_dir(&self) -> &PathBuf {
+        match self {
+            AccountConfig::Dir(p) => p,
+            AccountConfig::Settings(s) => &s.claude_config_dir,
+        }
+    }
+}
+
+/// The outcome of resolving a requested account name against the config: the
+/// account that is in effect and the Claude config dir to hand the new pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAccount {
+    /// The account name in effect (always set; [`DEFAULT_ACCOUNT`] for the
+    /// default). Recorded on the pane as `@slopd_account` so it shows in `ps`
+    /// and child panes can inherit it.
+    pub name: String,
+    /// The Claude config dir to export as `CLAUDE_CONFIG_DIR`. `None` means
+    /// leave `CLAUDE_CONFIG_DIR` unset so Claude falls back to `~/.claude`.
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -989,6 +1216,85 @@ impl SlopdConfig {
 
     pub fn claude_settings_path(&self) -> PathBuf {
         self.claude_config_dir().join("settings.json")
+    }
+
+    /// Resolve a requested account name into the account in effect and the
+    /// Claude config dir to export for a new pane.
+    ///
+    /// The account name is `requested`, else `default_account`, else
+    /// [`DEFAULT_ACCOUNT`]. The dir is then:
+    /// - for [`DEFAULT_ACCOUNT`]: `[accounts.default]` if present, else the
+    ///   top-level `claude_config_dir`, else `None` (Claude's `~/.claude`);
+    /// - for any other name: `[accounts.<name>]`, or an error (listing the
+    ///   configured accounts) if it is not configured.
+    ///
+    /// Account config dirs are `~` / `$VAR`-expanded; the top-level
+    /// `claude_config_dir` is passed through verbatim (preserving prior behavior).
+    pub fn resolve_account(&self, requested: Option<&str>) -> Result<ResolvedAccount, String> {
+        let name = requested
+            .map(str::to_string)
+            .or_else(|| self.default_account.clone())
+            .unwrap_or_else(|| DEFAULT_ACCOUNT.to_string());
+
+        // The default account is backed by [accounts.default], then the
+        // top-level claude_config_dir, then ~/.claude (left unset).
+        if name == DEFAULT_ACCOUNT {
+            let config_dir = self
+                .accounts
+                .get(DEFAULT_ACCOUNT)
+                .map(|a| expand_path(a.claude_config_dir()))
+                .or_else(|| self.claude_config_dir.clone());
+            return Ok(ResolvedAccount { name, config_dir });
+        }
+
+        let account = self.accounts.get(&name).ok_or_else(|| {
+            let mut configured: Vec<&str> = self.accounts.keys().map(String::as_str).collect();
+            configured.push(DEFAULT_ACCOUNT);
+            format!(
+                "unknown account {:?} (configured accounts: {})",
+                name,
+                configured.join(", "),
+            )
+        })?;
+        Ok(ResolvedAccount {
+            name,
+            config_dir: Some(expand_path(account.claude_config_dir())),
+        })
+    }
+
+    /// The `settings.json` path where hooks are injected for a resolved account.
+    /// Falls back to `~/.claude/settings.json` when no dir is in effect, so it
+    /// always names a concrete file.
+    pub fn resolved_settings_path(&self, resolved: &ResolvedAccount) -> PathBuf {
+        resolved
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| home_dir().join(".claude"))
+            .join("settings.json")
+    }
+
+    /// Every distinct `settings.json` slopd may manage hooks in: the default
+    /// account plus every configured account, deduplicated. Used at startup
+    /// recovery, shutdown, and `uninject-hooks`, where the account of each
+    /// (possibly recovered) pane is not individually known.
+    pub fn all_settings_paths(&self) -> Vec<PathBuf> {
+        let mut names: std::collections::BTreeSet<&str> =
+            self.accounts.keys().map(String::as_str).collect();
+        names.insert(DEFAULT_ACCOUNT);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for name in names {
+            // resolve_account only errors for unknown named accounts; every name
+            // here comes from the config (or is DEFAULT_ACCOUNT), so this holds.
+            if let Ok(resolved) = self.resolve_account(Some(name)) {
+                let path = self.resolved_settings_path(&resolved);
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1216,6 +1522,11 @@ pub enum RequestBody {
         /// Merged after the daemon's `[run.env]` config; later pairs win.
         #[serde(default)]
         env: Vec<(String, String)>,
+        /// Named account to launch the pane under. The daemon resolves it to a
+        /// Claude config dir via `[accounts]`. `None` means the daemon default
+        /// (`default_account`, else the unnamed `claude_config_dir`).
+        #[serde(default)]
+        account: Option<String>,
     },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
@@ -1385,6 +1696,15 @@ pub struct PaneInfo {
     /// Current working directory of the pane (#{pane_current_path}).
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// The account the pane was launched under (from @slopd_account). Defaults
+    /// to [`DEFAULT_ACCOUNT`] for panes with no recorded account.
+    #[serde(default = "default_account_name")]
+    pub account: String,
+}
+
+/// Serde default for [`PaneInfo::account`]: the reserved default account name.
+fn default_account_name() -> String {
+    DEFAULT_ACCOUNT.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -153,6 +153,43 @@ impl TmuxServer {
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
+
+    /// Write a slopd config that defines named accounts. `accounts` maps an
+    /// account name to its Claude config dir; `default_account`, when set, is
+    /// written as the top-level `default_account` key.
+    pub fn write_slopd_config_accounts(
+        &self,
+        config_dir: &tempfile::TempDir,
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        accounts: &[(&str, &std::path::Path)],
+        default_account: Option<&str>,
+    ) {
+        let slopd_config_dir = config_dir.path().join("slopd");
+        std::fs::create_dir_all(&slopd_config_dir).unwrap();
+        let mut config = String::new();
+        // Top-level keys must precede any [table] header in TOML.
+        if let Some(name) = default_account {
+            config.push_str(&format!("default_account = {:?}\n\n", name));
+        }
+        config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
+        let has_run_section = executable.is_some() || slopctl.is_some();
+        if has_run_section {
+            config.push_str("\n[run]\n");
+            if let Some(exe) = executable {
+                let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+                config.push_str(&format!("executable = [{}]\n", toml_array.join(", ")));
+            }
+            if let Some(s) = slopctl {
+                config.push_str(&format!("slopctl = {:?}\n", s));
+            }
+        }
+        config.push_str("\n[accounts]\n");
+        for (name, dir) in accounts {
+            config.push_str(&format!("{} = {:?}\n", name, dir.to_str().unwrap()));
+        }
+        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+    }
 }
 
 impl Drop for TmuxServer {
@@ -201,6 +238,21 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_full(&config_dir, executable, None, None, Some(start_directory));
+        Some(TestEnv { tmux, runtime_dir, config_dir })
+    }
+
+    /// Like `new_full` but configures named `[accounts]` and an optional
+    /// `default_account` instead of a single `claude_config_dir`.
+    pub fn new_with_accounts(
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        accounts: &[(&str, &std::path::Path)],
+        default_account: Option<&str>,
+    ) -> Option<Self> {
+        let tmux = TmuxServer::start()?;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        tmux.write_slopd_config_accounts(&config_dir, executable, slopctl, accounts, default_account);
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 
@@ -302,19 +354,29 @@ impl TestEnv {
     /// Like [`TestEnv::slopctl`] but passes `args` verbatim, without the legacy
     /// `--no-wait` injection. Use this to exercise `run`'s wait-for-ready default.
     pub fn slopctl_raw(&self, args: &[&str]) -> std::process::Output {
-        Command::new(cargo_bin("slopctl"))
-            .args(args)
+        self.slopctl_raw_envs(args, &[])
+    }
+
+    /// Like [`TestEnv::slopctl_raw`] but also sets the given environment
+    /// variables on the slopctl process (e.g. `TMUX_PANE` to exercise account
+    /// inheritance from a parent pane). Args are passed verbatim.
+    pub fn slopctl_raw_envs(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let mut cmd = Command::new(cargo_bin("slopctl"));
+        cmd.args(args)
             // Don't leak the ambient tmux context (e.g. when the test runner is
             // itself inside a tmux pane). slopctl reads $TMUX_PANE for the `run`
             // parent and the `tags` fallback, so an inherited value would point
             // at a pane that doesn't exist in the test's isolated tmux server.
+            // Tests that need a specific parent pane set TMUX_PANE via `envs`.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
-            .output()
-            .expect("failed to run slopctl")
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("failed to run slopctl")
     }
 
     pub fn socket_path(&self) -> PathBuf {

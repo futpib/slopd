@@ -124,9 +124,23 @@ File: `~/.config/slopd/config.toml`
 All defaults are fine for most setups. The only key you are likely to want to set is `claude_config_dir` if Claude's config lives somewhere other than `~/.claude`.
 
 ```toml
-# Override the directory Claude uses for its config (mirrors CLAUDE_CONFIG_DIR).
-# Uncomment if Claude is configured somewhere other than ~/.claude.
+# Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude). This sets
+# the dir for the reserved "default" account — the one used when no account is
+# selected. Equivalent to writing [accounts.default].
 # claude_config_dir = "~/.claude"
+
+# Account used by `slopctl run` when no --account is given and none is inherited
+# from the current pane. Omit to fall back to the "default" account above.
+# default_account = "work"
+
+# Named accounts: each maps an account name to its own config (at minimum a
+# Claude config dir). Pick one per pane with `slopctl run --account <name>`.
+# Both forms below are accepted; the table form leaves room for future
+# per-account options.
+# [accounts]
+# work = "~/.config/claude-work"            # shorthand: just the dir
+# [accounts.personal]
+# claude_config_dir = "~/.config/claude-personal"
 
 # [tmux]
 # Path to a custom tmux socket. When omitted slopd uses its default server.
@@ -156,6 +170,33 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # CLI `--env` / `--env-file` override these.
 # env_files = ["~/.config/slopd/pane.env"]
 ```
+
+#### Multiple accounts
+
+Run different panes under different Claude config dirs. There is always a
+reserved account named `default`, backed by the top-level `claude_config_dir`
+(or `~/.claude`); define additional ones under `[accounts]`, each mapping a name
+to its own config (at minimum a config dir). The table form
+(`[accounts.<name>]`) is extensible — future per-account options live there.
+
+Launch a pane under a specific account with `slopctl run --account <name>`:
+slopd points the pane at the account's config dir (exporting `CLAUDE_CONFIG_DIR`)
+and injects its hooks there. Every managed pane carries its account, shown in
+the `ACCOUNT` column of `slopctl ps`.
+
+slopd records the account on the pane itself, so a pane that spawns more panes
+with `slopctl run` passes its own account down by default — the child inherits
+it from the parent pane, no need to repeat `--account` (and no extra environment
+variable to manage). Resolution order for each `run`:
+
+1. an explicit `--account <name>` flag;
+2. otherwise the account inherited from the current pane;
+3. otherwise slopd's `default_account`;
+4. otherwise the `default` account (`claude_config_dir`, or Claude's `~/.claude`).
+
+An unknown account name fails the `run` with an error listing the configured
+accounts, before any pane is spawned. Account config dirs support `~` and
+`$VAR` / `${VAR}` expansion.
 
 ### slopctl config
 
@@ -201,7 +242,7 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run [--no-wait] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+### `slopctl run [--no-wait] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
@@ -222,6 +263,12 @@ PANE=$(slopctl run --no-wait)
 ```
 
 If called from within a tmux pane (i.e. `$TMUX_PANE` is set), the new pane automatically records that pane as its parent.
+
+Use `-a` / `--account NAME` to launch the pane under a named account from `[accounts]` (or the reserved `default`; see [Multiple accounts](#multiple-accounts)). Without the flag, the account is inherited from the current pane, then slopd's `default_account`:
+
+```bash
+PANE=$(slopctl run --account work)
+```
 
 Use `-c` / `--start-directory` to set the working directory for this session, overriding the global `[run] start_directory` from config:
 
