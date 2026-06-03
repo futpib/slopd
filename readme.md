@@ -147,6 +147,9 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Path to a custom tmux socket. When omitted slopd uses its default server.
 # Supports ~ and $VAR / ${VAR} expansion.
 # socket = "/run/user/1000/tmux-slopd.sock"
+# Name of the tmux session slopd manages (default: "slopd"). Mainly useful for
+# running more than one slopd instance against the same tmux server.
+# session = "slopd"
 
 # [run]
 # Command used to launch Claude. Can be a string or an array.
@@ -223,7 +226,7 @@ Only used by `slopctl run --interactive` (see below):
 # interactive_type = "exec"
 ```
 
-The session name is not configurable (slopd always manages a session named `slopd`); `{{session}}` is provided so commands can stay symbolic. The default command picks up slopd's `[tmux] socket` automatically, so it works whether or not a custom socket is configured.
+The default command picks up slopd's `[tmux] socket` and `[tmux] session` automatically, so it works whether or not a custom socket or session name is configured. `{{session}}` lets custom commands stay symbolic rather than hardcoding the session name.
 
 ---
 

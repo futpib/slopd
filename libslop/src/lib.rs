@@ -1004,6 +1004,13 @@ mod tests {
     }
 
     #[test]
+    fn tmux_session_defaults_and_is_configurable() {
+        assert_eq!(SlopdTmuxConfig::default().session(), SLOPD_TMUX_SESSION);
+        let cfg = config_from_toml("[tmux]\nsession = \"work-slopd\"\n");
+        assert_eq!(cfg.tmux.session(), "work-slopd");
+    }
+
+    #[test]
     fn resolved_settings_path_uses_account_dir() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
         let resolved = cfg.resolve_account(Some("work")).unwrap();
@@ -1178,6 +1185,10 @@ pub struct SlopdTmuxConfig {
     /// Path to a custom tmux socket (`tmux -S`). Supports `~` and `$VAR` /
     /// `${VAR}` expansion.
     pub socket: Option<PathBuf>,
+    /// Name of the tmux session slopd manages its panes in (default:
+    /// [`SLOPD_TMUX_SESSION`]). Usually only worth changing to run more than one
+    /// slopd instance against the same tmux server/socket.
+    pub session: Option<String>,
     /// Run `tmux start-server` on startup (default: true when socket is not set).
     pub start_server: Option<bool>,
 }
@@ -1186,6 +1197,11 @@ impl SlopdTmuxConfig {
     /// Whether slopd should run `tmux start-server` on startup.
     pub fn should_start_server(&self) -> bool {
         self.start_server.unwrap_or(self.socket.is_none())
+    }
+
+    /// The tmux session name slopd manages (configured, else [`SLOPD_TMUX_SESSION`]).
+    pub fn session(&self) -> String {
+        self.session.clone().unwrap_or_else(|| SLOPD_TMUX_SESSION.to_string())
     }
 }
 

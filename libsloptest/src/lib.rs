@@ -154,6 +154,32 @@ impl TmuxServer {
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
 
+    /// Write a slopd config with a custom tmux `session` name (plus the test
+    /// socket and the given executable/slopctl).
+    pub fn write_slopd_config_with_session(
+        &self,
+        config_dir: &tempfile::TempDir,
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        session: &str,
+    ) {
+        let slopd_config_dir = config_dir.path().join("slopd");
+        std::fs::create_dir_all(&slopd_config_dir).unwrap();
+        let mut config = format!(
+            "[tmux]\nsocket = {:?}\nsession = {:?}\n\n[run]\n",
+            self.socket.to_str().unwrap(),
+            session,
+        );
+        if let Some(exe) = executable {
+            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+            config.push_str(&format!("executable = [{}]\n", toml_array.join(", ")));
+        }
+        if let Some(s) = slopctl {
+            config.push_str(&format!("slopctl = {:?}\n", s));
+        }
+        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+    }
+
     /// Write a slopd config that defines named accounts. `accounts` maps an
     /// account name to its Claude config dir; `default_account`, when set, is
     /// written as the top-level `default_account` key.
@@ -253,6 +279,19 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_accounts(&config_dir, executable, slopctl, accounts, default_account);
+        Some(TestEnv { tmux, runtime_dir, config_dir })
+    }
+
+    /// Like `new_full` but configures a custom tmux `[tmux] session` name.
+    pub fn new_with_tmux_session(
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        session: &str,
+    ) -> Option<Self> {
+        let tmux = TmuxServer::start()?;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        tmux.write_slopd_config_with_session(&config_dir, executable, slopctl, session);
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 

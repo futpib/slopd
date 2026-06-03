@@ -132,16 +132,17 @@ async fn main() {
             .as_deref()
             .map(libslop::expand_path)
             .map(|p| p.to_string_lossy().into_owned());
-        let session = libslop::SLOPD_TMUX_SESSION;
+        let session = slopd_config.tmux.session();
+        let command = config.interactive_command(socket.as_deref(), &session);
         let ctx = libslopctl::CommandContext {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
             fallback_pane_id: std::env::var("TMUX_PANE").ok(),
             interactive: Some(libslopctl::InteractiveRun {
-                command: config.interactive_command(socket.as_deref(), session),
+                command,
                 run_type: config.run.interactive_type,
                 vars: vec![
                     ("socket".to_string(), socket.unwrap_or_default()),
-                    ("session".to_string(), session.to_string()),
+                    ("session".to_string(), session),
                 ],
             }),
         };

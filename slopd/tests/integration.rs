@@ -8350,3 +8350,45 @@ fn run_interactive_forking_spawns_viewer_and_prints_pane_id() {
 
     assert_eq!(recorded, printed, "the backgrounded viewer should see the same pane id slopctl printed");
 }
+
+// slopd honors a configured [tmux] session name: panes land in it, and the
+// default "slopd" session is never created.
+#[test]
+fn slopd_uses_configured_tmux_session_name() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_with_tmux_session(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        "custom-slopd",
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // The configured session exists; the default "slopd" session does not.
+    let has_custom = env.tmux.tmux().args(["has-session", "-t", "custom-slopd"]).status().unwrap();
+    let has_default = env.tmux.tmux().args(["has-session", "-t", "slopd"]).status().unwrap();
+
+    // The pane is tracked normally (ps works regardless of session name).
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+
+    kill_slopd(slopd);
+
+    assert!(has_custom.success(), "slopd should create the configured 'custom-slopd' session");
+    assert!(!has_default.success(),
+        "slopd should not create the default 'slopd' session when a custom one is configured");
+    assert!(panes.iter().any(|p| p.pane_id == pane_id), "the pane should be tracked: {:?}", panes);
+}

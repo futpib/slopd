@@ -567,8 +567,9 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         libslop::TmuxOption::SlopdTranscriptPath.as_str(),
     );
     let mut settings_paths = std::collections::HashSet::new();
+    let session = config.tmux.session();
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", &format_str])
+        .args(["list-panes", "-s", "-t", &session, "-F", &format_str])
         .output()
         .await;
     if let Ok(out) = output
@@ -719,10 +720,11 @@ fn tmux_hook_command(slopctl: &str, hook_name: &str, include_pane_id: bool) -> S
 /// from a previous slopctl path.
 async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
     let slopctl = &config.run.slopctl;
+    let session = config.tmux.session();
 
     // Read existing hooks.
     let existing = match tmux(config)
-        .args(["show-hooks", "-t", "slopd"])
+        .args(["show-hooks", "-t", &session])
         .output()
         .await
     {
@@ -771,14 +773,14 @@ async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
         for &idx in stale_indices.iter().rev() {
             let indexed_name = format!("{}[{}]", hook_name, idx);
             let _ = tmux(config)
-                .args(["set-hook", "-u", "-t", "slopd", &indexed_name])
+                .args(["set-hook", "-u", "-t", &session, &indexed_name])
                 .output()
                 .await;
         }
 
         // Append our hook.
         if let Err(e) = tmux(config)
-            .args(["set-hook", "-a", "-t", "slopd", hook_name, &our_command])
+            .args(["set-hook", "-a", "-t", &session, hook_name, &our_command])
             .status()
             .await
         {
@@ -804,8 +806,9 @@ async fn recreate_slopd_session(config: &libslop::SlopdConfig, session_lock: &Se
     }
 
     // Check again under the lock — another task may have already recreated it.
+    let session = config.tmux.session();
     let has_session = tmux(config)
-        .args(["has-session", "-t", "slopd"])
+        .args(["has-session", "-t", &session])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -816,13 +819,13 @@ async fn recreate_slopd_session(config: &libslop::SlopdConfig, session_lock: &Se
 
     info!("slopd tmux session is gone, recreating");
     let _ = tmux(config)
-        .args(["new-session", "-d", "-s", "slopd"])
+        .args(["new-session", "-d", "-s", &session])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .await;
     let _ = tmux(config)
-        .args(["set-option", "-t", "slopd", libslop::TmuxOption::SlopdManaged.as_str(), "true"])
+        .args(["set-option", "-t", &session, libslop::TmuxOption::SlopdManaged.as_str(), "true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -864,8 +867,9 @@ async fn reconcile_panes(
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
 ) {
+    let session = config.tmux.session();
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", "slopd", "-F", "#{pane_id}"])
+        .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id}"])
         .output()
         .await;
     let live_ids: std::collections::HashSet<String> = match output {
@@ -1047,8 +1051,9 @@ async fn main() {
     }
 
     // Create the slopd session if it doesn't exist
+    let session = config.tmux.session();
     let has_session = tmux(&config)
-        .args(["has-session", "-t", "slopd"])
+        .args(["has-session", "-t", &session])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1056,7 +1061,7 @@ async fn main() {
         .expect("failed to run tmux has-session");
     if !has_session.success() {
         tmux(&config)
-            .args(["new-session", "-d", "-s", "slopd"])
+            .args(["new-session", "-d", "-s", &session])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1066,7 +1071,7 @@ async fn main() {
 
     // Mark the session with a user option so it can be identified
     tmux(&config)
-        .args(["set-option", "-t", "slopd", libslop::TmuxOption::SlopdManaged.as_str(), "true"])
+        .args(["set-option", "-t", &session, libslop::TmuxOption::SlopdManaged.as_str(), "true"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1879,7 +1884,8 @@ async fn handle_request(
             merged_env.extend(env.iter().cloned());
             let output = tmux_session_output(config, session_lock, |c| {
                 let mut cmd = tmux(c);
-                cmd.args(["new-window", "-t", "slopd", "-P", "-F", "#{pane_id}"])
+                let session = c.tmux.session();
+                cmd.args(["new-window", "-t", &session, "-P", "-F", "#{pane_id}"])
                     .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
                     .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
                 if let Some(ref dir) = effective_start_dir
