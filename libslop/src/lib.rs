@@ -927,26 +927,32 @@ mod tests {
     // --- slopctl interactive-run config ---
 
     #[test]
-    fn slopctl_config_defaults_to_exec_tmux_attach() {
+    fn slopctl_config_defaults_to_grouped_exec_viewer() {
         let cfg = SlopctlConfig::default();
         assert_eq!(cfg.run.interactive_type, RunType::Exec);
-        // Default socket → no -S.
+        // Default socket → no -S; isolated grouped view focused on the new pane.
         assert_eq!(
             cfg.interactive_command(None, SLOPD_TMUX_SESSION),
-            vec!["tmux", "attach", "-t", "slopd"],
+            vec!["tmux", "new-session", "-t", "slopd", ";",
+                 "set-option", "destroy-unattached", "on", ";",
+                 "select-window", "-t", "{{pane_id}}"],
         );
     }
 
     #[test]
     fn default_interactive_command_honors_socket() {
         assert_eq!(
-            default_interactive_command(Some("/run/user/1000/tmux-slopd.sock"), SLOPD_TMUX_SESSION),
-            vec!["tmux", "-S", "/run/user/1000/tmux-slopd.sock", "attach", "-t", "slopd"],
+            default_interactive_command(Some("/run/x.sock"), SLOPD_TMUX_SESSION),
+            vec!["tmux", "-S", "/run/x.sock", "new-session", "-t", "slopd", ";",
+                 "set-option", "destroy-unattached", "on", ";",
+                 "select-window", "-t", "{{pane_id}}"],
         );
+        // No socket → no -S prefix.
         assert_eq!(
-            default_interactive_command(None, SLOPD_TMUX_SESSION),
-            vec!["tmux", "attach", "-t", "slopd"],
+            default_interactive_command(None, SLOPD_TMUX_SESSION).first().map(String::as_str),
+            Some("tmux"),
         );
+        assert!(!default_interactive_command(None, SLOPD_TMUX_SESSION).iter().any(|a| a == "-S"));
     }
 
     #[test]
@@ -1426,8 +1432,8 @@ pub struct SlopctlRunConfig {
     /// Command for `slopctl run --interactive`, run once the new pane exists.
     /// `{{pane_id}}`, `{{socket}}` (slopd tmux socket, empty if default), and
     /// `{{session}}` placeholders in each argument are substituted. When unset,
-    /// defaults to [`default_interactive_command`] (attach to the slopd tmux
-    /// session on its socket).
+    /// defaults to [`default_interactive_command`] (attach an isolated grouped
+    /// view of the slopd session focused on the new pane).
     pub interactive_command: Option<Vec<String>>,
     /// How to run the interactive command (a subset of systemd's `Type=`):
     /// `exec` (default) replaces the slopctl process with it; `forking` runs it
@@ -1453,18 +1459,28 @@ pub enum RunType {
 /// The tmux session name slopd manages all of its panes in.
 pub const SLOPD_TMUX_SESSION: &str = "slopd";
 
-/// Default `slopctl run --interactive` command: `tmux [-S <socket>] attach -t
-/// <session>` — attach to the slopd tmux session (where the new pane's window
-/// is already the active one), honoring slopd's `[tmux] socket` if set.
+/// Default `slopctl run --interactive` command. Attaches to an isolated,
+/// *grouped* view of the slopd session and focuses the new pane:
+///
+/// ```text
+/// tmux [-S <socket>] new-session -t <session> ; set destroy-unattached on ; select-window -t {{pane_id}}
+/// ```
+///
+/// A grouped session shares the slopd session's windows but keeps its own
+/// current window, so focusing the new pane here does not move other clients
+/// watching the session. `destroy-unattached on` makes the throwaway view
+/// session clean itself up when you detach. Honors slopd's `[tmux] socket`.
 pub fn default_interactive_command(socket: Option<&str>, session: &str) -> Vec<String> {
     let mut cmd = vec!["tmux".to_string()];
     if let Some(socket) = socket {
         cmd.push("-S".to_string());
         cmd.push(socket.to_string());
     }
-    cmd.push("attach".to_string());
-    cmd.push("-t".to_string());
-    cmd.push(session.to_string());
+    for arg in ["new-session", "-t", session, ";",
+                "set-option", "destroy-unattached", "on", ";",
+                "select-window", "-t", "{{pane_id}}"] {
+        cmd.push(arg.to_string());
+    }
     cmd
 }
 

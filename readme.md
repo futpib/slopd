@@ -216,9 +216,11 @@ Only used by `slopctl run --interactive` (see below):
 #   {{pane_id}}  the new pane id
 #   {{socket}}   slopd's [tmux] socket (empty when the default socket is used)
 #   {{session}}  slopd's tmux session name ("slopd")
-# When unset, the default attaches to slopd's tmux session and honors its
-# configured socket: `tmux [-S <socket>] attach -t <session>`.
-# interactive_command = ["tmux", "attach", "-t", "{{session}}"]
+# When unset, the default attaches an *isolated grouped view* of slopd's tmux
+# session and focuses the new pane, so other clients watching the session aren't
+# moved (honoring slopd's [tmux] socket):
+#   tmux [-S <socket>] new-session -t <session> ';' set destroy-unattached on ';' select-window -t {{pane_id}}
+# interactive_command = ["tmux", "attach", "-t", "{{session}}"]   # simpler: shared view
 #
 # How to run it (a subset of systemd's Type=):
 #   "exec"    (default) replace the slopctl process with the command
@@ -226,7 +228,7 @@ Only used by `slopctl run --interactive` (see below):
 # interactive_type = "exec"
 ```
 
-The default command picks up slopd's `[tmux] socket` and `[tmux] session` automatically, so it works whether or not a custom socket or session name is configured. `{{session}}` lets custom commands stay symbolic rather than hardcoding the session name.
+The default command picks up slopd's `[tmux] socket` and `[tmux] session` automatically. It uses a *grouped session* — which shares the slopd session's windows but keeps its own current window — so focusing the new pane doesn't pull other clients off what they're viewing; `destroy-unattached on` makes that throwaway view clean itself up on detach. `{{session}}` lets custom commands stay symbolic rather than hardcoding the session name.
 
 ---
 
@@ -268,7 +270,7 @@ slopctl ps --json
 
 ### `slopctl run [--no-wait] [-i] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
-Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
+Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout. The pane's window is created in the **background** (`tmux new-window -d`), so spawning a pane never yanks clients already watching the session to it — use `--interactive` (below) when you do want to land on the new pane.
 
 ```bash
 PANE=$(slopctl run)
@@ -313,7 +315,7 @@ Use `--env-file PATH` (repeatable) to load environment variables from a dotenv-s
 PANE=$(slopctl run --env-file ~/.config/slopd/pane.env --env DEBUG=1)
 ```
 
-Use `-i` / `--interactive` to drop straight into the new pane instead of waiting for it to become ready. As soon as the pane exists, slopctl runs the command from `[run] interactive_command` in [slopctl config](#slopctl-config) — default `tmux [-S <socket>] attach -t <session>` — with the `{{pane_id}}`, `{{socket}}`, and `{{session}}` placeholders substituted:
+Use `-i` / `--interactive` to drop straight into the new pane instead of waiting for it to become ready. As soon as the pane exists, slopctl runs the command from `[run] interactive_command` in [slopctl config](#slopctl-config) — by default it attaches an *isolated grouped view* of the session focused on the new pane (so other clients aren't moved) — with the `{{pane_id}}`, `{{socket}}`, and `{{session}}` placeholders substituted:
 
 ```bash
 slopctl run --interactive        # tmux attach into the slopd session, on the new pane

@@ -8392,3 +8392,104 @@ fn slopd_uses_configured_tmux_session_name() {
         "slopd should not create the default 'slopd' session when a custom one is configured");
     assert!(panes.iter().any(|p| p.pane_id == pane_id), "the pane should be tracked: {:?}", panes);
 }
+
+// `slopctl run` creates the pane's window in the background (`new-window -d`),
+// so it doesn't steal focus from clients already watching the session.
+#[test]
+fn run_creates_background_window_without_stealing_focus() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let window_of = |target: &str| -> String {
+        let out = env.tmux.tmux()
+            .args(["display-message", "-t", target, "-p", "#{window_index}"])
+            .output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let pane_window = window_of(&pane_id);
+    let session_current = window_of("slopd");
+
+    kill_slopd(slopd);
+
+    assert!(!pane_window.is_empty(), "should resolve the new pane's window");
+    assert_ne!(
+        session_current, pane_window,
+        "a backgrounded run should not make the new pane's window the session's current window",
+    );
+}
+
+// The grouped-session mechanism the default `--interactive` command relies on:
+// focusing a pane in a grouped view doesn't move the shared session, and a
+// `destroy-unattached` view disposes itself without killing the shared panes.
+#[test]
+fn grouped_interactive_view_is_isolated_and_self_cleaning() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let tmux_status = |args: &[&str]| env.tmux.tmux().args(args).status().unwrap();
+    let window_index = |target: &str| -> String {
+        let o = env.tmux.tmux()
+            .args(["display-message", "-t", target, "-p", "#{window_index}"])
+            .output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+
+    let pane_window = window_index(&pane_id);
+    let slopd_current_before = window_index("slopd");
+
+    // Build a grouped view of the slopd session (what `--interactive` attaches to).
+    assert!(tmux_status(&["new-session", "-d", "-s", "view", "-t", "slopd"]).success());
+
+    // Isolation: focusing the pane's window in the VIEW must not move the shared
+    // session's current window (so other clients aren't disturbed).
+    assert!(tmux_status(&["select-window", "-t", &format!("view:{}", pane_window)]).success());
+    let view_current = window_index("view");
+    let slopd_current_after = window_index("slopd");
+
+    // Self-cleaning: an unattached view with destroy-unattached disposes itself…
+    assert!(tmux_status(&["set-option", "-t", "view", "destroy-unattached", "on"]).success());
+    std::thread::sleep(Duration::from_millis(300));
+    let view_gone = !env.tmux.tmux().args(["has-session", "-t", "view"]).status().unwrap().success();
+
+    // …without taking the shared Claude pane down with it.
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+
+    kill_slopd(slopd);
+
+    assert_eq!(view_current, pane_window, "the grouped view should focus the new pane's window");
+    assert_eq!(slopd_current_after, slopd_current_before,
+        "focusing the pane in the grouped view must not move the shared session's current window");
+    assert!(view_gone, "an unattached view with destroy-unattached should self-destruct");
+    assert!(panes.iter().any(|p| p.pane_id == pane_id),
+        "destroying the throwaway view must not kill the shared Claude pane: {:?}", panes);
+}

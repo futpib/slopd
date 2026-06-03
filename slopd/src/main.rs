@@ -1885,7 +1885,9 @@ async fn handle_request(
             let output = tmux_session_output(config, session_lock, |c| {
                 let mut cmd = tmux(c);
                 let session = c.tmux.session();
-                cmd.args(["new-window", "-t", &session, "-P", "-F", "#{pane_id}"])
+                // `-d`: create the window in the background so spawning a pane
+                // doesn't yank clients already watching the session to it.
+                cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"])
                     .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
                     .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
                 if let Some(ref dir) = effective_start_dir
