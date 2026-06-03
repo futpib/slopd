@@ -54,7 +54,7 @@ async fn main() {
             std::process::exit(2);
         }
 
-    let _config = libslop::SlopctlConfig::load();
+    let config = libslop::SlopctlConfig::load();
 
     let socket_path = libslop::socket_path();
     debug!("connecting to {}", socket_path.display());
@@ -122,9 +122,28 @@ async fn main() {
     let mut client = libslopctl::Client::new(reader, writer);
 
     if let Command::Common(cmd) = cli.command {
+        // The interactive viewer attaches to slopd's tmux, so resolve its socket
+        // (from slopd's config) and session name to build the default command and
+        // expose them as {{socket}} / {{session}} substitutions.
+        let slopd_config = libslop::SlopdConfig::load();
+        let socket = slopd_config
+            .tmux
+            .socket
+            .as_deref()
+            .map(libslop::expand_path)
+            .map(|p| p.to_string_lossy().into_owned());
+        let session = libslop::SLOPD_TMUX_SESSION;
         let ctx = libslopctl::CommandContext {
             parent_pane_id: std::env::var("TMUX_PANE").ok(),
             fallback_pane_id: std::env::var("TMUX_PANE").ok(),
+            interactive: Some(libslopctl::InteractiveRun {
+                command: config.interactive_command(socket.as_deref(), session),
+                run_type: config.run.interactive_type,
+                vars: vec![
+                    ("socket".to_string(), socket.unwrap_or_default()),
+                    ("session".to_string(), session.to_string()),
+                ],
+            }),
         };
         libslopctl::execute_command(&mut client, cmd, &ctx)
             .await.unwrap_or_else(|e| libslopctl::die_err(e));

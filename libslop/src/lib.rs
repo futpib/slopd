@@ -924,6 +924,85 @@ mod tests {
         assert_eq!(cfg.claude_config_dir(), PathBuf::from("/tmp/cc/sub"));
     }
 
+    // --- slopctl interactive-run config ---
+
+    #[test]
+    fn slopctl_config_defaults_to_exec_tmux_attach() {
+        let cfg = SlopctlConfig::default();
+        assert_eq!(cfg.run.interactive_type, RunType::Exec);
+        // Default socket → no -S.
+        assert_eq!(
+            cfg.interactive_command(None, SLOPD_TMUX_SESSION),
+            vec!["tmux", "attach", "-t", "slopd"],
+        );
+    }
+
+    #[test]
+    fn default_interactive_command_honors_socket() {
+        assert_eq!(
+            default_interactive_command(Some("/run/user/1000/tmux-slopd.sock"), SLOPD_TMUX_SESSION),
+            vec!["tmux", "-S", "/run/user/1000/tmux-slopd.sock", "attach", "-t", "slopd"],
+        );
+        assert_eq!(
+            default_interactive_command(None, SLOPD_TMUX_SESSION),
+            vec!["tmux", "attach", "-t", "slopd"],
+        );
+    }
+
+    #[test]
+    fn slopctl_config_parses_interactive_command_and_type() {
+        let cfg: SlopctlConfig = toml::from_str(
+            "[run]\ninteractive_command = [\"kitty\", \"--\", \"tmux\", \"attach\", \"-t\", \"slopd\"]\ninteractive_type = \"forking\"\n",
+        ).unwrap();
+        assert_eq!(cfg.run.interactive_type, RunType::Forking);
+        // A configured command is returned as-is, ignoring socket/session.
+        assert_eq!(
+            cfg.interactive_command(Some("/ignored.sock"), "ignored"),
+            vec!["kitty", "--", "tmux", "attach", "-t", "slopd"],
+        );
+    }
+
+    #[test]
+    fn substitute_replaces_all_named_placeholders() {
+        let cmd: Vec<String> = ["sh", "-c", "echo {{pane_id}} > /tmp/{{pane_id}}.log"]
+            .iter().map(|s| s.to_string()).collect();
+        let out = SlopctlConfig::substitute(&cmd, &[("pane_id", "%42")]);
+        assert_eq!(out, vec!["sh", "-c", "echo %42 > /tmp/%42.log"]);
+    }
+
+    #[test]
+    fn substitute_supports_multiple_variables() {
+        // Future-proofing: more than one named variable.
+        let cmd: Vec<String> = vec!["{{account}}:{{pane_id}}".to_string()];
+        let out = SlopctlConfig::substitute(&cmd, &[("pane_id", "%7"), ("account", "work")]);
+        assert_eq!(out, vec!["work:%7"]);
+    }
+
+    #[test]
+    fn substitute_fills_socket_and_session() {
+        let cmd: Vec<String> = ["tmux", "-S", "{{socket}}", "attach", "-t", "{{session}}"]
+            .iter().map(|s| s.to_string()).collect();
+        let out = SlopctlConfig::substitute(
+            &cmd,
+            &[("pane_id", "%9"), ("socket", "/run/x.sock"), ("session", "slopd")],
+        );
+        assert_eq!(out, vec!["tmux", "-S", "/run/x.sock", "attach", "-t", "slopd"]);
+    }
+
+    #[test]
+    fn substitute_does_not_touch_tmux_format_strings() {
+        // `#{pane_id}` is a tmux format; double-brace placeholders must leave it intact.
+        let cmd: Vec<String> = ["tmux", "display", "-p", "#{pane_id}"]
+            .iter().map(|s| s.to_string()).collect();
+        let out = SlopctlConfig::substitute(&cmd, &[("pane_id", "%42")]);
+        assert_eq!(out, vec!["tmux", "display", "-p", "#{pane_id}"]);
+    }
+
+    #[test]
+    fn run_type_default_is_exec() {
+        assert_eq!(RunType::default(), RunType::Exec);
+    }
+
     #[test]
     fn resolved_settings_path_uses_account_dir() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
@@ -1321,12 +1400,90 @@ impl SlopdConfig {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct SlopctlConfig {}
+pub struct SlopctlConfig {
+    #[serde(default)]
+    pub run: SlopctlRunConfig,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SlopctlRunConfig {
+    /// Command for `slopctl run --interactive`, run once the new pane exists.
+    /// `{{pane_id}}`, `{{socket}}` (slopd tmux socket, empty if default), and
+    /// `{{session}}` placeholders in each argument are substituted. When unset,
+    /// defaults to [`default_interactive_command`] (attach to the slopd tmux
+    /// session on its socket).
+    pub interactive_command: Option<Vec<String>>,
+    /// How to run the interactive command (a subset of systemd's `Type=`):
+    /// `exec` (default) replaces the slopctl process with it; `forking` runs it
+    /// detached in the background and slopctl prints the pane id and exits.
+    #[serde(default)]
+    pub interactive_type: RunType,
+}
+
+/// How `slopctl run --interactive` runs its command. Named after the relevant
+/// subset of systemd's service `Type=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunType {
+    /// Replace the slopctl process with the command (e.g. `tmux attach` takes
+    /// over the terminal). slopctl does not return.
+    #[default]
+    Exec,
+    /// Run the command detached in the background; slopctl prints the pane id
+    /// and exits.
+    Forking,
+}
+
+/// The tmux session name slopd manages all of its panes in.
+pub const SLOPD_TMUX_SESSION: &str = "slopd";
+
+/// Default `slopctl run --interactive` command: `tmux [-S <socket>] attach -t
+/// <session>` — attach to the slopd tmux session (where the new pane's window
+/// is already the active one), honoring slopd's `[tmux] socket` if set.
+pub fn default_interactive_command(socket: Option<&str>, session: &str) -> Vec<String> {
+    let mut cmd = vec!["tmux".to_string()];
+    if let Some(socket) = socket {
+        cmd.push("-S".to_string());
+        cmd.push(socket.to_string());
+    }
+    cmd.push("attach".to_string());
+    cmd.push("-t".to_string());
+    cmd.push(session.to_string());
+    cmd
+}
 
 impl SlopctlConfig {
     pub fn load() -> Self {
         let path = config_dir().join("slopctl/config.toml");
         load_config(path)
+    }
+
+    /// The effective interactive command: the configured one, else the default
+    /// built from the slopd tmux `socket`/`session`.
+    pub fn interactive_command(&self, socket: Option<&str>, session: &str) -> Vec<String> {
+        self.run
+            .interactive_command
+            .clone()
+            .unwrap_or_else(|| default_interactive_command(socket, session))
+    }
+
+    /// Substitute `{{name}}` placeholders in an interactive command template.
+    /// `vars` maps placeholder names to values; every `{{name}}` occurrence in
+    /// each argument is replaced. Double braces (handlebars-style) are used so
+    /// the tokens never collide with tmux `#{...}` format strings. Variables
+    /// today are `pane_id`, `socket` (the slopd tmux socket, empty if default),
+    /// and `session`; the slice form leaves room for more.
+    pub fn substitute(command: &[String], vars: &[(&str, &str)]) -> Vec<String> {
+        command
+            .iter()
+            .map(|arg| {
+                let mut out = arg.clone();
+                for (name, value) in vars {
+                    out = out.replace(&["{{", name, "}}"].concat(), value);
+                }
+                out
+            })
+            .collect()
     }
 }
 

@@ -8235,3 +8235,118 @@ fn run_expands_tilde_in_top_level_claude_config_dir() {
         "~ in claude_config_dir should be expanded before reaching the pane",
     );
 }
+
+// ---------------------------------------------------------------------------
+// run --interactive
+// ---------------------------------------------------------------------------
+
+/// Write a slopctl config under `config_dir/slopctl/config.toml` selecting an
+/// interactive command + type. `sh_cmd` is the `sh -c` script (use `{}` for the
+/// pane id). Returns nothing; point XDG_CONFIG_HOME at config_dir to load it.
+fn write_slopctl_interactive_config(config_dir: &std::path::Path, sh_cmd: &str, run_type: &str) {
+    let dir = config_dir.join("slopctl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[run]\ninteractive_command = [\"sh\", \"-c\", {:?}]\ninteractive_type = {:?}\n",
+            sh_cmd, run_type,
+        ),
+    ).unwrap();
+}
+
+#[test]
+fn run_interactive_exec_runs_viewer_with_substituted_pane_id() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Benign exec viewer: record the substituted pane id to a marker file
+    // (instead of `tmux attach`, which would block).
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("exec-marker");
+    write_slopctl_interactive_config(
+        env.config_dir.path(),
+        &format!("echo {} > {}", "{{pane_id}}", marker.display()),
+        "exec",
+    );
+
+    let slopd = env.spawn_slopd();
+
+    let xdg_config = env.config_dir.path().to_str().unwrap();
+    let run_out = env.slopctl_raw_envs(&["run", "--interactive"], &[("XDG_CONFIG_HOME", xdg_config)]);
+
+    // exec replaced slopctl with the viewer (`sh`), which exits 0.
+    assert!(run_out.status.success(), "interactive exec run failed: {:?}", run_out);
+
+    let recorded = std::fs::read_to_string(&marker)
+        .expect("viewer should have written the marker file")
+        .trim()
+        .to_string();
+    assert!(recorded.starts_with('%'), "marker should hold a tmux pane id, got {:?}", recorded);
+
+    // The recorded pane id must be a real, created pane.
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+    kill_slopd(slopd);
+
+    assert!(panes.iter().any(|p| p.pane_id == recorded),
+        "the substituted pane id {:?} should be a live pane: {:?}", recorded, panes);
+}
+
+#[test]
+fn run_interactive_forking_spawns_viewer_and_prints_pane_id() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("fork-marker");
+    write_slopctl_interactive_config(
+        env.config_dir.path(),
+        &format!("echo {} > {}", "{{pane_id}}", marker.display()),
+        "forking",
+    );
+
+    let slopd = env.spawn_slopd();
+
+    let xdg_config = env.config_dir.path().to_str().unwrap();
+    let run_out = env.slopctl_raw_envs(&["run", "--interactive"], &[("XDG_CONFIG_HOME", xdg_config)]);
+
+    // Forking mode: slopctl spawns the viewer in the background and returns,
+    // printing the pane id (like --no-wait).
+    assert!(run_out.status.success(), "interactive forking run failed: {:?}", run_out);
+    let printed = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(printed.starts_with('%'), "slopctl should print the pane id, got {:?}", printed);
+
+    // The detached viewer writes the same (substituted) pane id; poll for it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recorded = loop {
+        if let Ok(s) = std::fs::read_to_string(&marker) {
+            let s = s.trim().to_string();
+            if !s.is_empty() { break s; }
+        }
+        assert!(Instant::now() < deadline, "background viewer never wrote the marker");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    kill_slopd(slopd);
+
+    assert_eq!(recorded, printed, "the backgrounded viewer should see the same pane id slopctl printed");
+}

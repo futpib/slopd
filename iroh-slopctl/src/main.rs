@@ -217,6 +217,9 @@ async fn main() {
         let ctx = libslopctl::CommandContext {
             parent_pane_id: None,
             fallback_pane_id: None,
+            // Interactive run attaches to a local tmux; meaningless for a remote
+            // endpoint, so it's unsupported here (errors if --interactive is used).
+            interactive: None,
         };
         if let Err(e) = libslopctl::execute_command(&mut client, cmd, &ctx).await {
             check_unauthorized(connection.close_reason().as_ref(), &client_id);

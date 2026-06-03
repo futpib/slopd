@@ -100,6 +100,14 @@ pub enum CommonCommand {
         /// back to slopd's default_account.
         #[arg(short = 'a', long, value_name = "NAME")]
         account: Option<String>,
+        /// Instead of waiting for the pane to become ready, hand off to a viewer
+        /// once it exists: run slopctl's configured [run] interactive_command
+        /// (default `tmux attach -t slopd`), with `{{pane_id}}` replaced by the
+        /// new pane id. `exec`s by default (replacing slopctl); set [run]
+        /// interactive_type = "forking" to run it in the background instead.
+        /// Local slopctl only.
+        #[arg(short = 'i', long)]
+        interactive: bool,
         /// Don't wait for the new pane to become ready; print the pane id as soon
         /// as it is created (the historical fire-and-forget behaviour). By
         /// default `run` waits until the pane is ready, or fails if it dies or
@@ -263,6 +271,19 @@ pub struct CommandContext {
     pub parent_pane_id: Option<String>,
     /// For `Tags` when pane_id is None: fallback pane ID.
     pub fallback_pane_id: Option<String>,
+    /// For `run --interactive`: how to launch the viewer command. `None` means
+    /// interactive run is unsupported here (remote iroh — can't attach to a
+    /// remote tmux). slopctl populates it from its config.
+    pub interactive: Option<InteractiveRun>,
+}
+
+/// Resolved `run --interactive` settings: the command template (with `{{name}}`
+/// placeholders), how to run it, and the substitution variables known ahead of
+/// time (e.g. `socket`, `session`). `pane_id` is added once the pane exists.
+pub struct InteractiveRun {
+    pub command: Vec<String>,
+    pub run_type: libslop::RunType,
+    pub vars: Vec<(String, String)>,
 }
 
 pub fn die(msg: &str) -> ! {
@@ -1469,6 +1490,66 @@ where
     }
 }
 
+/// Run for `run --interactive`: create the pane (without waiting for it to
+/// become ready), then hand off to the viewer command — its `{}` placeholders
+/// replaced with the new pane id — per the configured run type.
+#[allow(clippy::too_many_arguments)] // mirrors the `run` CLI flag surface
+pub async fn execute_run_interactive<R, W>(
+    client: &mut Client<R, W>,
+    parent_pane_id: Option<String>,
+    extra_args: Vec<String>,
+    start_directory: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    account: Option<String>,
+    viewer: &InteractiveRun,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
+    // Pre-resolved vars (socket, session, …) plus the now-known pane id.
+    let mut vars: Vec<(&str, &str)> = viewer.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    vars.push(("pane_id", &pane_id));
+    let argv = libslop::SlopctlConfig::substitute(&viewer.command, &vars);
+    run_viewer_command(&argv, viewer.run_type, &pane_id)
+}
+
+/// Launch the (already pane-id-substituted) viewer command. `Exec` replaces this
+/// process with it (only returns on failure); `Forking` runs it detached in the
+/// background, prints the pane id, and returns.
+fn run_viewer_command(argv: &[String], run_type: libslop::RunType, pane_id: &str) -> Result<(), Error> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(Error::RunFailed("interactive_command is empty".to_string()));
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    match run_type {
+        libslop::RunType::Exec => {
+            use std::os::unix::process::CommandExt;
+            // Replaces the slopctl process on success; only returns on error.
+            let err = cmd.exec();
+            Err(Error::RunFailed(format!(
+                "failed to exec interactive command {:?}: {}", argv, err,
+            )))
+        }
+        libslop::RunType::Forking => {
+            use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+            // Detach: a fresh process group + null stdio so it survives slopctl
+            // exiting and doesn't fight over the terminal.
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.process_group(0);
+            cmd.spawn().map_err(|e| Error::RunFailed(format!(
+                "failed to spawn interactive command {:?}: {}", argv, e,
+            )))?;
+            // Background mode reports the pane id like `run --no-wait` does.
+            println!("{}", pane_id);
+            Ok(())
+        }
+    }
+}
+
 /// Execute a CommonCommand against the given client.
 pub async fn execute_command<R, W>(
     client: &mut Client<R, W>,
@@ -1510,20 +1591,37 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, no_wait, ready_timeout } => {
+        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, interactive, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
             // Pass --account through verbatim; when it's None the daemon inherits
             // the parent pane's account (via parent_pane_id), then default_account.
-            execute_run(
-                client,
-                ctx.parent_pane_id.clone(),
-                extra_args,
-                start_directory,
-                env,
-                account,
-                no_wait,
-                ready_timeout,
-            ).await?;
+            if interactive {
+                let Some(viewer) = ctx.interactive.as_ref() else {
+                    return Err(Error::RunFailed(
+                        "`run --interactive` is not supported for remote endpoints".to_string(),
+                    ));
+                };
+                execute_run_interactive(
+                    client,
+                    ctx.parent_pane_id.clone(),
+                    extra_args,
+                    start_directory,
+                    env,
+                    account,
+                    viewer,
+                ).await?;
+            } else {
+                execute_run(
+                    client,
+                    ctx.parent_pane_id.clone(),
+                    extra_args,
+                    start_directory,
+                    env,
+                    account,
+                    no_wait,
+                    ready_timeout,
+                ).await?;
+            }
         }
         CommonCommand::Kill { pane_id } => {
             let pane_id = client.kill(pane_id).await?;

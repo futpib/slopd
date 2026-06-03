@@ -204,7 +204,26 @@ accounts, before any pane is spawned. Account config dirs support `~` and
 
 File: `~/.config/slopctl/config.toml`
 
-Currently unused; reserved for future options.
+Only used by `slopctl run --interactive` (see below):
+
+```toml
+# [run]
+# Command run by `slopctl run --interactive` once the new pane exists. These
+# placeholders are substituted in each argument:
+#   {{pane_id}}  the new pane id
+#   {{socket}}   slopd's [tmux] socket (empty when the default socket is used)
+#   {{session}}  slopd's tmux session name ("slopd")
+# When unset, the default attaches to slopd's tmux session and honors its
+# configured socket: `tmux [-S <socket>] attach -t <session>`.
+# interactive_command = ["tmux", "attach", "-t", "{{session}}"]
+#
+# How to run it (a subset of systemd's Type=):
+#   "exec"    (default) replace the slopctl process with the command
+#   "forking" run it detached in the background; slopctl prints the pane id and exits
+# interactive_type = "exec"
+```
+
+The session name is not configurable (slopd always manages a session named `slopd`); `{{session}}` is provided so commands can stay symbolic. The default command picks up slopd's `[tmux] socket` automatically, so it works whether or not a custom socket is configured.
 
 ---
 
@@ -244,7 +263,7 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run [--no-wait] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+### `slopctl run [--no-wait] [-i] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout.
 
@@ -290,6 +309,22 @@ Use `--env-file PATH` (repeatable) to load environment variables from a dotenv-s
 ```bash
 PANE=$(slopctl run --env-file ~/.config/slopd/pane.env --env DEBUG=1)
 ```
+
+Use `-i` / `--interactive` to drop straight into the new pane instead of waiting for it to become ready. As soon as the pane exists, slopctl runs the command from `[run] interactive_command` in [slopctl config](#slopctl-config) — default `tmux [-S <socket>] attach -t <session>` — with the `{{pane_id}}`, `{{socket}}`, and `{{session}}` placeholders substituted:
+
+```bash
+slopctl run --interactive        # tmux attach into the slopd session, on the new pane
+```
+
+By default this `exec`s — slopctl is replaced by the command, so e.g. `tmux attach` takes over the terminal. Set `interactive_type = "forking"` to instead launch the command detached in the background (slopctl prints the pane id and returns), e.g. to pop the pane open in a new terminal window:
+
+```toml
+[run]
+interactive_command = ["kitty", "tmux", "attach", "-t", "{{session}}"]
+interactive_type = "forking"
+```
+
+`--interactive` is a local-slopctl feature (it attaches to slopd's tmux); `iroh-slopctl run --interactive` errors.
 
 ### `slopctl kill <PANE_ID>`
 
