@@ -101,6 +101,30 @@ slopd
 
 Verbosity can be increased with `-v` / `-vv` / `-vvv` (maps to INFO / DEBUG / TRACE).
 
+### Config file location
+
+By default slopd reads `$XDG_CONFIG_HOME/slopd/config.toml`. Point it at any file with `--config`:
+
+```bash
+slopd --config /path/to/other.toml
+```
+
+The path supports `~` and `$VAR` expansion. `slopctl --config <path>` reads the same file for the slopd settings it needs (the `[tmux]` socket/session used by `run --interactive`), so a single file can configure both. SIGHUP reloads from the `--config` path too. All four binaries (`slopd`, `slopctl`, `iroh-slopd`, `iroh-slopctl`) accept `--config`.
+
+#### Running a second instance
+
+`--config` is what lets a second slopd run alongside the first without touching it. Give the second instance its own **tmux** socket/session (via `[tmux] socket` / `session`) and its own **control** socket. The control socket lives at `$XDG_RUNTIME_DIR/slopd/slopd.sock` — it is *not* read from the config file — so isolate it by pointing `XDG_RUNTIME_DIR` somewhere else for both the daemon and the `slopctl` commands that talk to it:
+
+```bash
+# second daemon (own config + own control socket)
+XDG_RUNTIME_DIR=/run/user/1000/slopd-b slopd --config ~/.config/slopd/b.toml
+
+# talk to it
+XDG_RUNTIME_DIR=/run/user/1000/slopd-b slopctl ps
+```
+
+With a custom `[tmux] socket`, set `[tmux] start_server = true` if no tmux server is already listening on it.
+
 ### Reloading config
 
 `SIGHUP` re-reads `config.toml` without restarting:

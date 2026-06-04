@@ -213,9 +213,13 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
                     if !cmd.ends_with(&stale_suffix) || cmd == command {
                         return false;
                     }
-                    // Only remove entries whose executable is slopctl (plain or absolute path).
+                    // Only remove entries whose executable is slopctl (plain or
+                    // absolute path). Match the first token so a command that
+                    // carries args (e.g. `slopctl --socket <path> hook ...`) is
+                    // still recognized as ours.
                     let prefix = &cmd[..cmd.len() - stale_suffix.len()];
-                    prefix == "slopctl" || prefix.ends_with("/slopctl")
+                    let exe = prefix.split_whitespace().next().unwrap_or("");
+                    exe == "slopctl" || exe.ends_with("/slopctl")
                 })
             });
             !is_stale
@@ -258,8 +262,11 @@ pub fn remove_hooks(settings: &mut serde_json::Value) {
                     if !cmd.ends_with(&suffix) {
                         return false;
                     }
+                    // Match the first token so `slopctl --socket <path> hook ...`
+                    // entries are removed too, not just the bare form.
                     let prefix = &cmd[..cmd.len() - suffix.len()];
-                    prefix == "slopctl" || prefix.ends_with("/slopctl")
+                    let exe = prefix.split_whitespace().next().unwrap_or("");
+                    exe == "slopctl" || exe.ends_with("/slopctl")
                 })
             });
             !is_ours
@@ -443,6 +450,42 @@ mod tests {
             }).count();
             assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
         }
+    }
+
+    #[test]
+    fn inject_hooks_with_socket_prefix_is_idempotent_and_swaps_stale() {
+        // A `slopctl --socket <path>` command prefix (what SlopdConfig::hook_slopctl
+        // produces under `--socket`) is written verbatim and is idempotent.
+        let mut settings = serde_json::json!({});
+        let with_sock = "slopctl --socket /run/x/slopd.sock";
+        inject_hooks(&mut settings, with_sock);
+        inject_hooks(&mut settings, with_sock);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "re-injecting the same --socket command must not duplicate");
+        assert_eq!(stop[0]["hooks"][0]["command"], "slopctl --socket /run/x/slopd.sock hook Stop");
+
+        // Switching back to the bare command removes the stale --socket entry
+        // (first-token match), leaving exactly the bare one.
+        inject_hooks(&mut settings, "slopctl");
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "stale --socket entry should be replaced, not kept alongside");
+        assert_eq!(stop[0]["hooks"][0]["command"], "slopctl hook Stop");
+
+        // A foreign tool's entry is never touched by either transition.
+        if let Some(arr) = settings["hooks"]["Stop"].as_array_mut() {
+            arr.push(serde_json::json!({"matcher": "", "hooks": [{"type": "command", "command": "claudex hook Stop"}]}));
+        }
+        inject_hooks(&mut settings, "slopctl --socket /run/y.sock");
+        let has_foreign = settings["hooks"]["Stop"].as_array().unwrap().iter().any(|e| {
+            e["hooks"].as_array().is_some_and(|h| h.iter().any(|x| x["command"] == "claudex hook Stop"))
+        });
+        assert!(has_foreign, "foreign (claudex) hook entry must be preserved across --socket re-injection");
+
+        // remove_hooks strips a --socket entry too (but leaves the foreign one).
+        remove_hooks(&mut settings);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "only the foreign entry should remain");
+        assert_eq!(stop[0]["hooks"][0]["command"], "claudex hook Stop");
     }
 
     #[test]
@@ -1120,6 +1163,13 @@ pub struct SlopdConfig {
     /// inherited from the parent pane. When unset, the [`DEFAULT_ACCOUNT`]
     /// account is used.
     pub default_account: Option<String>,
+    /// Control socket this slopd instance listens on, from the `--socket` CLI
+    /// override. Not read from the config file (so it never serializes); a
+    /// `None` means the default [`socket_path`] (`$XDG_RUNTIME_DIR/slopd/slopd.sock`).
+    /// When set, slopd bakes `--socket <path>` into the `slopctl` hook commands
+    /// it injects so spawned panes report back to *this* instance.
+    #[serde(skip)]
+    pub control_socket: Option<PathBuf>,
 }
 
 /// The reserved account name used when nothing else selects one. Its config dir
@@ -1311,9 +1361,35 @@ impl SlopdConfig {
         load_config(path)
     }
 
+    /// Like [`SlopdConfig::load`], but read from `path` instead of the default
+    /// [`config_path`]. Backs the `--config` CLI override; warns and defaults on
+    /// a missing or unparseable file, just like `load`.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        load_config(path.to_path_buf())
+    }
+
     /// Path to the slopd config file (`$XDG_CONFIG_HOME/slopd/config.toml`).
     pub fn config_path() -> PathBuf {
         config_dir().join("slopd/config.toml")
+    }
+
+    /// The control socket this instance listens on: the `--socket` override
+    /// ([`control_socket`](Self::control_socket)) if set, else the default
+    /// [`socket_path`].
+    pub fn control_socket_path(&self) -> PathBuf {
+        self.control_socket.clone().unwrap_or_else(socket_path)
+    }
+
+    /// The `slopctl` command prefix baked into injected hook commands. With a
+    /// `--socket` override it becomes `<slopctl> --socket <path>` so panes (and
+    /// tmux hooks) report back to *this* instance rather than whichever socket
+    /// `$XDG_RUNTIME_DIR` happens to point at; otherwise just the plain
+    /// `run.slopctl` value, keeping the default instance's hooks byte-identical.
+    pub fn hook_slopctl(&self) -> String {
+        match &self.control_socket {
+            Some(sock) => format!("{} --socket {}", self.run.slopctl, sock.display()),
+            None => self.run.slopctl.clone(),
+        }
     }
 
     /// Load and parse the config from `path`, propagating I/O and parse errors
@@ -1488,6 +1564,14 @@ impl SlopctlConfig {
     pub fn load() -> Self {
         let path = config_dir().join("slopctl/config.toml");
         load_config(path)
+    }
+
+    /// Like [`SlopctlConfig::load`], but read from `path` instead of the default
+    /// `$XDG_CONFIG_HOME/slopctl/config.toml`. Backs the `--config` CLI
+    /// override: a single file can configure both slopctl and slopd, since each
+    /// struct ignores fields it does not recognize.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        load_config(path.to_path_buf())
     }
 
     /// The effective interactive command: the configured one, else the default

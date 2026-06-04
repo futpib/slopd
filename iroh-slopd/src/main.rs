@@ -20,6 +20,16 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     addr_file: Option<PathBuf>,
 
+    /// Read configuration from this file instead of the default
+    /// `$XDG_CONFIG_HOME/iroh-slopd/config.toml`. Supports `~` and `$VAR` expansion.
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
+
+    /// Bridge this slopd control socket instead of the default
+    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR` expansion.
+    #[arg(long, value_name = "PATH", global = true)]
+    socket: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -49,12 +59,15 @@ struct Config {
     secret_key: Option<String>,
     #[serde(default)]
     authorized_clients: Vec<String>,
+    /// The file this config was loaded from / is saved to. Not serialized;
+    /// populated by [`Config::load`] so `save` honors the `--config` override.
+    #[serde(skip)]
+    path: PathBuf,
 }
 
 impl Config {
-    fn load() -> Self {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
+    fn load(path: PathBuf) -> Self {
+        let mut config = match std::fs::read_to_string(&path) {
             Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
                 eprintln!("warning: failed to parse {}: {}", path.display(), e);
                 Config::default()
@@ -64,11 +77,13 @@ impl Config {
                 eprintln!("warning: failed to read {}: {}", path.display(), e);
                 Config::default()
             }
-        }
+        };
+        config.path = path;
+        config
     }
 
     fn save(&self) {
-        let path = config_path();
+        let path = &self.path;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap_or_else(|e| {
                 eprintln!("failed to create config dir: {}", e);
@@ -76,7 +91,7 @@ impl Config {
             });
         }
         let contents = toml::to_string_pretty(self).unwrap();
-        std::fs::write(&path, contents).unwrap_or_else(|e| {
+        std::fs::write(path, contents).unwrap_or_else(|e| {
             eprintln!("failed to write config: {}", e);
             std::process::exit(1);
         });
@@ -154,7 +169,12 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut config = Config::load();
+    let config_path = cli
+        .config
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(config_path);
+    let mut config = Config::load(config_path);
 
     match cli.command {
         Some(Command::Authorize { endpoint_id }) => {
@@ -225,7 +245,11 @@ async fn main() {
         });
     }
 
-    let socket_path = libslop::socket_path();
+    let socket_path = cli
+        .socket
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(libslop::socket_path);
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),

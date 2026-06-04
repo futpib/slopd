@@ -382,6 +382,34 @@ impl TestEnv {
         child
     }
 
+    /// Spawn slopd with `--socket <socket>` (control-socket override) and wait
+    /// until it is listening on *that* socket instead of the default
+    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Used to exercise `--socket`.
+    pub fn spawn_slopd_with_socket(&self, socket: &std::path::Path) -> Child {
+        let mut cmd = Command::new(cargo_bin("slopd"));
+        cmd.args(["--socket", socket.to_str().unwrap()])
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env("HOME", self.config_dir.path())
+            .env_remove("TMUX")
+            .env_remove("TMUX_TMPDIR")
+            .env_remove("TMPDIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd.spawn().expect("failed to spawn slopd");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for slopd to listen on {}", socket.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
     /// Run slopctl against the test env. For `run`, `--no-wait` is injected (see
     /// [`legacy_run_args`]) so pre-existing tests keep their fire-and-forget
     /// expectations; use [`TestEnv::slopctl_raw`] to exercise run's

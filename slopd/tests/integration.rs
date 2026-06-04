@@ -8445,6 +8445,120 @@ fn slopd_uses_configured_tmux_session_name() {
     assert!(panes.iter().any(|p| p.pane_id == pane_id), "the pane should be tracked: {:?}", panes);
 }
 
+// `--config <path>` makes slopd read its config from an arbitrary location
+// instead of `$XDG_CONFIG_HOME/slopd/config.toml`, and that override wins over a
+// config present at the default location. This is what lets a second slopd
+// instance run from its own config file (with its own tmux socket/session)
+// without touching the primary one.
+#[test]
+fn config_flag_overrides_config_file_location() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // The harness writes a default-location config naming session "default-loc".
+    // slopd must ignore it once we point --config at a different file.
+    let Some(env) = TestEnv::new_with_tmux_session(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        "default-loc",
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // An alternate config at a non-default path, with a distinct session name
+    // (so the override is observable) but the same test tmux socket (so the
+    // instance is actually functional).
+    let alt_config = env.config_dir.path().join("alt-config.toml");
+    std::fs::write(
+        &alt_config,
+        format!(
+            "[tmux]\nsocket = {:?}\nsession = \"from-flag\"\n\n[run]\nexecutable = [{:?}]\nslopctl = {:?}\n",
+            env.tmux.socket.to_str().unwrap(),
+            mock_claude_path,
+            slopctl_path,
+        ),
+    )
+    .unwrap();
+
+    let slopd = env.spawn_slopd_with_args(&["--config", alt_config.to_str().unwrap()]);
+
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    // The session from the --config file exists; the default-location one does not.
+    let has_flag = env.tmux.tmux().args(["has-session", "-t", "from-flag"]).status().unwrap();
+    let has_default = env.tmux.tmux().args(["has-session", "-t", "default-loc"]).status().unwrap();
+
+    let ps_out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+
+    kill_slopd(slopd);
+
+    assert!(has_flag.success(), "slopd should use the session from the --config file ('from-flag')");
+    assert!(!has_default.success(),
+        "slopd should ignore the default-location config when --config is given");
+    assert!(panes.iter().any(|p| p.pane_id == pane_id), "the pane should be tracked: {:?}", panes);
+}
+
+// `--socket <path>` moves slopd's control socket off the default and bakes
+// `--socket <path>` into the hook commands it injects, so a second instance is
+// reachable only via the matching `slopctl --socket <path>` and its panes report
+// back to *it* (not whichever socket `$XDG_RUNTIME_DIR` points at).
+#[test]
+fn socket_flag_overrides_control_socket_and_is_carried_into_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // A control socket off the default `$XDG_RUNTIME_DIR/slopd/slopd.sock`.
+    let custom_socket = env.config_dir.path().join("custom-slopd.sock");
+    let slopd = env.spawn_slopd_with_socket(&custom_socket);
+    let custom = custom_socket.to_str().unwrap();
+
+    // slopd did not bind the default socket, and slopctl without --socket (which
+    // resolves the default) cannot reach the instance.
+    let default_exists = env.socket_path().exists();
+    let ps_default = env.slopctl_raw(&["ps", "--json"]);
+
+    // With --socket, ps works and run spawns a tracked pane.
+    let run_out = env.slopctl_raw(&["--socket", custom, "run", "--no-wait"]);
+    assert!(run_out.status.success(), "run --socket failed: {:?}", run_out);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+
+    let ps_out = env.slopctl_raw(&["--socket", custom, "ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+
+    // The hooks injected for the spawned pane carry `--socket <custom>` so the
+    // pane's `slopctl hook` calls report back to this instance.
+    let settings_path = env.config_dir.path().join(".claude/settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings.json should exist")).unwrap();
+    let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap_or("").to_string();
+
+    kill_slopd(slopd);
+
+    assert!(!default_exists, "slopd must not bind the default socket when --socket is given");
+    assert!(!ps_default.status.success(), "slopctl without --socket must not reach the --socket instance");
+    assert!(panes.iter().any(|p| p.pane_id == pane_id), "pane should be tracked: {:?}", panes);
+    assert!(stop_cmd.contains(&format!("--socket {}", custom)),
+        "injected hook command should carry --socket; got {:?}", stop_cmd);
+    assert!(stop_cmd.ends_with(" hook Stop"), "injected hook command malformed: {:?}", stop_cmd);
+}
+
 // `slopctl run` creates the pane's window in the background (`new-window -d`),
 // so it doesn't steal focus from clients already watching the session.
 #[test]

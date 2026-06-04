@@ -16,6 +16,11 @@ const SLOPCTL_ONLY_COMMANDS: &[&str] = &["hook", "tmux-hook"];
 /// Commands that only make sense for the remote iroh client.
 const IROH_ONLY_COMMANDS: &[&str] = &["info"];
 
+/// Global options that only make sense locally. `--socket` overrides the local
+/// Unix control socket; iroh-slopctl reaches slopd over a remote endpoint
+/// (`--endpoint` / `--addr-file`), so it has no local socket to point at.
+const SLOPCTL_ONLY_OPTIONS: &[&str] = &["socket"];
+
 /// Run `<bin> --help` and return stdout.
 fn help_output(bin: &str, args: &[&str]) -> String {
     let output = Command::new(cargo_bin(bin))
@@ -175,14 +180,29 @@ fn iroh_slopctl_is_superset_of_slopctl() {
     let missing_global: BTreeSet<_> = slopctl_global
         .keys()
         .filter(|k| !iroh_global.contains_key(*k))
+        .filter(|k| !SLOPCTL_ONLY_OPTIONS.contains(&k.as_str()))
         .collect();
     assert!(
         missing_global.is_empty(),
-        "global options in slopctl but missing from iroh-slopctl: {:?}\nslopctl:      {:?}\niroh-slopctl: {:?}",
+        "global options in slopctl but missing from iroh-slopctl: {:?}\n\
+         (if intentional, add to SLOPCTL_ONLY_OPTIONS)\nslopctl:      {:?}\niroh-slopctl: {:?}",
         missing_global,
         slopctl_global.keys().collect::<Vec<_>>(),
         iroh_global.keys().collect::<Vec<_>>(),
     );
+    // Validate the option allowlist (no stale entries), mirroring the command checks.
+    for &opt in SLOPCTL_ONLY_OPTIONS {
+        assert!(
+            slopctl_global.contains_key(opt),
+            "SLOPCTL_ONLY_OPTIONS lists {:?} but slopctl doesn't have it",
+            opt
+        );
+        assert!(
+            !iroh_global.contains_key(opt),
+            "SLOPCTL_ONLY_OPTIONS lists {:?} but iroh-slopctl also has it — remove from allowlist",
+            opt
+        );
+    }
 
     // --- Check per-subcommand options ---
     let shared_cmds: BTreeSet<_> = slopctl_cmds
@@ -199,6 +219,9 @@ fn iroh_slopctl_is_superset_of_slopctl() {
         let missing: BTreeSet<_> = slopctl_opts
             .keys()
             .filter(|k| !iroh_opts.contains_key(*k))
+            // `--socket` is global, so it also shows under each subcommand's help;
+            // it's intentionally slopctl-only (see SLOPCTL_ONLY_OPTIONS).
+            .filter(|k| !SLOPCTL_ONLY_OPTIONS.contains(&k.as_str()))
             .collect();
         if !missing.is_empty() {
             failures.push(format!(

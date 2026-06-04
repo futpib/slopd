@@ -15,6 +15,20 @@ struct Cli {
     /// Specify the program and optional arguments, e.g. --executable claude --foo --bar
     #[arg(long, num_args = 1.., allow_hyphen_values = true)]
     executable: Option<Vec<String>>,
+    /// Read configuration from this file instead of the default
+    /// `$XDG_CONFIG_HOME/slopd/config.toml`. Supports `~` and `$VAR` expansion.
+    /// Lets a second slopd instance run from its own config (give it a distinct
+    /// `[tmux] socket`/`session`, and `--socket` for the control socket).
+    #[arg(long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+    /// Listen on this control socket instead of the default
+    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR` expansion.
+    /// `slopctl` must be given the same `--socket` to reach this instance;
+    /// injected hook commands carry it automatically so spawned panes report
+    /// back here. This is the clean way to isolate a second instance's control
+    /// socket without juggling `$XDG_RUNTIME_DIR`.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -719,7 +733,7 @@ fn tmux_hook_command(slopctl: &str, hook_name: &str, include_pane_id: bool) -> S
 /// Appends our hook commands if not already present; removes stale entries
 /// from a previous slopctl path.
 async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
-    let slopctl = &config.run.slopctl;
+    let slopctl = config.hook_slopctl();
     let session = config.tmux.session();
 
     // Read existing hooks.
@@ -735,7 +749,7 @@ async fn register_tmux_hooks(config: &libslop::SlopdConfig) {
     };
 
     for &(hook_name, include_pane_id) in TMUX_HOOKS {
-        let our_command = tmux_hook_command(slopctl, hook_name, include_pane_id);
+        let our_command = tmux_hook_command(&slopctl, hook_name, include_pane_id);
 
         // Check if our exact command is already present.
         let already_present = existing.lines().any(|line| {
@@ -971,7 +985,14 @@ async fn pane_is_still_alive(config: &libslop::SlopdConfig, pane_id: &str) -> bo
 async fn main() {
     let cli = Cli::parse();
 
-    let mut config = libslop::SlopdConfig::load();
+    // Resolve the config file path once (CLI override or default) so the initial
+    // load and every SIGHUP reload read the same file.
+    let config_path = cli
+        .config
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(libslop::SlopdConfig::config_path);
+    let mut config = libslop::SlopdConfig::load_from(&config_path);
 
     let verbosity = cli.verbose.max(config.verbose);
     let level = libslop::verbosity_to_level(verbosity);
@@ -987,6 +1008,7 @@ async fn main() {
     // config; capture as a closure so SIGHUP can re-apply the same massaging
     // to a freshly-loaded config.
     let executable_override = cli.executable.clone();
+    let socket_override = cli.socket.as_deref().map(libslop::expand_path);
     let apply_overrides = move |cfg: &mut libslop::SlopdConfig| {
         if let Some(executable) = executable_override.clone() {
             cfg.run.executable = if executable.len() == 1 {
@@ -996,6 +1018,7 @@ async fn main() {
             };
         }
         cfg.run.slopctl = libslop::resolve_slopctl(&cfg.run.slopctl);
+        cfg.control_socket = socket_override.clone();
     };
     apply_overrides(&mut config);
 
@@ -1080,7 +1103,7 @@ async fn main() {
 
     register_tmux_hooks(&config).await;
 
-    let socket_path = libslop::socket_path();
+    let socket_path = config.control_socket_path();
     let socket_dir = socket_path.parent().unwrap();
 
     tokio::fs::create_dir_all(&socket_dir).await.unwrap();
@@ -1126,7 +1149,7 @@ async fn main() {
     // Each recovered pane reports its account, so we re-inject only the dirs that
     // are actually in use rather than every configured account.
     for settings_path in &recovered_settings_paths {
-        if let Err(e) = libslop::inject_hooks_into_file(settings_path, &config.run.slopctl) {
+        if let Err(e) = libslop::inject_hooks_into_file(settings_path, &config.hook_slopctl()) {
             warn!("failed to re-inject hooks into {}: {}", settings_path.display(), e);
         }
     }
@@ -1182,7 +1205,7 @@ async fn main() {
                 break;
             }
             _ = sighup.recv() => {
-                let path = libslop::SlopdConfig::config_path();
+                let path = config_path.clone();
                 match libslop::SlopdConfig::try_load_from(&path) {
                     Ok(mut new_config) => {
                         apply_overrides(&mut new_config);
@@ -1847,7 +1870,7 @@ async fn handle_request(
             // Inject hooks into the account's settings.json (the dir the new pane
             // will actually read), not necessarily the default one.
             let settings_path = config.resolved_settings_path(&resolved);
-            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.run.slopctl) {
+            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
             }
             let xdg_runtime_dir = libslop::runtime_dir();

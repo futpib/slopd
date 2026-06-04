@@ -8,6 +8,19 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity (-v INFO, -vv DEBUG, -vvv TRACE)")]
     verbose: u8,
 
+    /// Read configuration from this file instead of the default slopctl and
+    /// slopd config files. A single file can configure both (each reads only the
+    /// keys it knows). Supports `~` and `$VAR` expansion.
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<std::path::PathBuf>,
+
+    /// Connect to this slopd control socket instead of the default
+    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock` — use the same value the target
+    /// slopd was started with. This is how you talk to a second instance.
+    /// Supports `~` and `$VAR` expansion.
+    #[arg(long, value_name = "PATH", global = true)]
+    socket: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -54,9 +67,20 @@ async fn main() {
             std::process::exit(2);
         }
 
-    let config = libslop::SlopctlConfig::load();
+    // A single `--config` file (when given) configures both slopctl and the
+    // slopd bits read below for the interactive viewer; each struct ignores keys
+    // it does not recognize.
+    let config_override = cli.config.as_deref().map(libslop::expand_path);
+    let config = match &config_override {
+        Some(p) => libslop::SlopctlConfig::load_from(p),
+        None => libslop::SlopctlConfig::load(),
+    };
 
-    let socket_path = libslop::socket_path();
+    let socket_path = cli
+        .socket
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(libslop::socket_path);
     debug!("connecting to {}", socket_path.display());
 
     // Hook must never exit 2 — that would block the Claude action.
@@ -125,7 +149,10 @@ async fn main() {
         // The interactive viewer attaches to slopd's tmux, so resolve its socket
         // (from slopd's config) and session name to build the default command and
         // expose them as {{socket}} / {{session}} substitutions.
-        let slopd_config = libslop::SlopdConfig::load();
+        let slopd_config = match &config_override {
+            Some(p) => libslop::SlopdConfig::load_from(p),
+            None => libslop::SlopdConfig::load(),
+        };
         let socket = slopd_config
             .tmux
             .socket
