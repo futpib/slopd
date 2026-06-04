@@ -624,6 +624,58 @@ fn run_fails_when_pane_dies_before_ready() {
         "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
 }
 
+/// Failure case: the pane dies with NO hook ever firing — no SessionStart and
+/// no SessionEnd — e.g. the Claude binary crashes on launch or the configured
+/// executable isn't found (the common real-world cause: slopd runs the
+/// executable inside a tmux window whose PATH may not contain it). slopd only
+/// learns the pane is gone via its reconciler and emits PaneDestroyed, so `run`
+/// must surface a non-zero exit with the "died before becoming ready" message
+/// and NO "(session ended: …)" reason suffix, printing no pane id. This is the
+/// bare PaneDestroyed path, distinct from `run_fails_when_pane_dies_before_ready`
+/// (which exercises the SessionStart→SessionEnd "(session ended: …)" path).
+#[test]
+fn run_fails_when_pane_dies_without_any_hook() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // mock_claude --exit-immediately exits before firing ANY hook, simulating a
+    // Claude binary that dies on launch (or an executable tmux can't find).
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path, "--exit-immediately"]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "15"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(),
+        "run should fail when the pane dies before becoming ready: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("died before becoming ready"),
+        "stderr should explain the pane died; got: {}", stderr);
+    // No SessionEnd fired, so there is no "(session ended: …)" suffix — this is
+    // exactly the reason-less message users hit when claude can't start.
+    assert!(!stderr.contains("session ended"),
+        "no SessionEnd fired, so there should be no reason suffix; got: {}", stderr);
+    // Nothing usable to return, so no pane id on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
+}
+
 /// Success case: a healthy pane reaches ready and survives the settle window.
 /// `run` exits 0 and prints the pane id, exactly like the old behaviour.
 #[test]

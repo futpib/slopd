@@ -318,7 +318,7 @@ fn handle_prompt(prompt: &str, ctx: Option<&SessionContext>) -> PromptResult {
     PromptResult::Unhandled
 }
 
-const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks", "--exit-after-start"];
+const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks", "--exit-after-start", "--exit-immediately"];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -328,6 +328,15 @@ fn main() {
     // Failure-injection mode: fire SessionStart then SessionEnd and exit early,
     // simulating Claude bailing right after bootstrap (see the exit block below).
     let exit_after_start = args.iter().any(|a| a == "--exit-after-start");
+    // Failure-injection mode: exit before firing ANY hook, simulating a Claude
+    // binary that dies on launch (or an executable tmux can't find). The pane
+    // dies with no SessionStart/SessionEnd, so slopd only learns of it via the
+    // reconciler and emits PaneDestroyed — the bare "died before becoming ready"
+    // path with no session-ended reason. Distinct from --exit-after-start, which
+    // fires SessionStart→SessionEnd first.
+    if args.iter().any(|a| a == "--exit-immediately") {
+        std::process::exit(1);
+    }
 
     if print_mode {
         // In --print mode, treat the last non-flag argument as the prompt,
