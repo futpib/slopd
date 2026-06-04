@@ -9,6 +9,7 @@ atomic-write-file = "0.3.0"
 dirs = "6.0.0"
 dotenvy = "0.15.7"
 fd-lock = "4.0.4"
+libc = "0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shellexpand = { version = "3.1.2", features = ["full"] }

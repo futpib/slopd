@@ -15,8 +15,78 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("slopd/slopd.sock")
 }
 
+/// The XDG runtime directory (`$XDG_RUNTIME_DIR`), where slopd keeps its control
+/// socket. When the variable is unset — cron jobs, non-login ssh, containers —
+/// the XDG Base Directory spec says to fall back to a replacement directory with
+/// similar capabilities and warn, rather than fail. We prefer `/run/user/<uid>`
+/// if it already exists (what a login session would use), else a private `0700`
+/// dir under the temp dir. slopd and slopctl share this function, so they agree
+/// on the location either way.
 pub fn runtime_dir() -> PathBuf {
-    dirs::runtime_dir().expect("could not determine XDG runtime dir")
+    if let Some(dir) = dirs::runtime_dir() {
+        return dir;
+    }
+    let uid = current_uid();
+    let run_user_exists = std::path::Path::new(&format!("/run/user/{uid}")).is_dir();
+    let (dir, source) = resolve_runtime_fallback(uid, run_user_exists, &std::env::temp_dir());
+    warn_runtime_fallback(&dir);
+    if source == RuntimeDirSource::Temp {
+        // Our own fallback must satisfy the spec's owner-only (0700) requirement,
+        // since it holds the control socket and may live in a shared temp dir.
+        if let Err(e) = ensure_private_dir(&dir) {
+            eprintln!("warning: failed to create runtime dir {}: {}", dir.display(), e);
+        }
+    }
+    dir
+}
+
+/// Which fallback [`runtime_dir`] resolved to, used to decide whether slopd must
+/// create the directory itself.
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeDirSource {
+    /// `/run/user/<uid>` already exists (e.g. a login session whose
+    /// `XDG_RUNTIME_DIR` simply wasn't exported into this process).
+    RunUser,
+    /// A private directory under the temp dir, which slopd creates `0700`.
+    Temp,
+}
+
+/// Pure fallback decision for [`runtime_dir`] (no I/O), split out so it can be
+/// unit-tested deterministically.
+fn resolve_runtime_fallback(
+    uid: u32,
+    run_user_exists: bool,
+    temp_dir: &std::path::Path,
+) -> (PathBuf, RuntimeDirSource) {
+    if run_user_exists {
+        (PathBuf::from(format!("/run/user/{uid}")), RuntimeDirSource::RunUser)
+    } else {
+        (temp_dir.join(format!("slopd-{uid}")), RuntimeDirSource::Temp)
+    }
+}
+
+fn current_uid() -> u32 {
+    // getuid() always succeeds and has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+/// Warn once per process that `$XDG_RUNTIME_DIR` is unset and we fell back.
+fn warn_runtime_fallback(dir: &std::path::Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: $XDG_RUNTIME_DIR is not set; falling back to {} (per the XDG Base Directory spec)",
+            dir.display()
+        );
+    });
+}
+
+/// Create `dir` (and parents) with `0700` perms, enforcing the mode even if it
+/// already exists with looser permissions.
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 pub fn config_dir() -> PathBuf {
@@ -312,6 +382,20 @@ pub fn remove_hooks_from_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_fallback_prefers_run_user_then_private_temp() {
+        let temp = std::path::Path::new("/tmp");
+        // /run/user/<uid> present -> use it (what a login session would).
+        let (dir, src) = resolve_runtime_fallback(1000, true, temp);
+        assert_eq!(dir, PathBuf::from("/run/user/1000"));
+        assert_eq!(src, RuntimeDirSource::RunUser);
+        // No /run/user/<uid> -> a per-uid private dir under the temp dir, so two
+        // users on one host don't collide on the control socket.
+        let (dir, src) = resolve_runtime_fallback(4242, false, temp);
+        assert_eq!(dir, PathBuf::from("/tmp/slopd-4242"));
+        assert_eq!(src, RuntimeDirSource::Temp);
+    }
 
     #[test]
     fn inject_hooks_into_file_concurrent_no_duplicate_entries() {
