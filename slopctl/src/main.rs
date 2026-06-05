@@ -172,6 +172,9 @@ async fn main() {
                     ("session".to_string(), session),
                 ],
             }),
+            // slopctl talks to a local slopd over a Unix socket: same filesystem,
+            // so a relative --start-directory resolves against slopctl's cwd.
+            local: true,
         };
         libslopctl::execute_command(&mut client, cmd, &ctx)
             .await.unwrap_or_else(|e| libslopctl::die_err(e));

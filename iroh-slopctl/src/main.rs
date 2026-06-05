@@ -235,6 +235,9 @@ async fn main() {
             // Interactive run attaches to a local tmux; meaningless for a remote
             // endpoint, so it's unsupported here (errors if --interactive is used).
             interactive: None,
+            // Remote endpoint: the client's cwd is meaningless on the server, so
+            // a relative --start-directory is rejected rather than misinterpreted.
+            local: false,
         };
         if let Err(e) = libslopctl::execute_command(&mut client, cmd, &ctx).await {
             check_unauthorized(connection.close_reason().as_ref(), &client_id);

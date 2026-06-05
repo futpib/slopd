@@ -78,7 +78,9 @@ pub enum CommonCommand {
     /// Open a new Claude pane in the slopd tmux session.
     Run {
         /// Working directory for the new pane. A relative path (e.g. `.`) is
-        /// resolved against slopctl's current directory. Supports ~ and $VAR /
+        /// resolved against slopctl's current directory (local slopctl only; over
+        /// a remote iroh connection a relative path is rejected, since the
+        /// client's cwd has no meaning on the server). Supports ~ and $VAR /
         /// ${VAR} expansion (applied by slopd, so a quoted ~ works and resolves
         /// against the daemon's home). Overrides [run] start_directory from
         /// config.toml.
@@ -277,6 +279,11 @@ pub struct CommandContext {
     /// interactive run is unsupported here (remote iroh — can't attach to a
     /// remote tmux). slopctl populates it from its config.
     pub interactive: Option<InteractiveRun>,
+    /// Whether slopd is reached over a local Unix socket (same filesystem). When
+    /// true, client-relative paths like `--start-directory` are resolved here;
+    /// when false (remote iroh), the client's cwd is meaningless on the server,
+    /// so a relative path is rejected rather than silently misinterpreted.
+    pub local: bool,
 }
 
 /// Resolved `run --interactive` settings: the command template (with `{{name}}`
@@ -1378,14 +1385,38 @@ fn run_died_error(pane_id: &str, reason: Option<&str>) -> Error {
 /// slopd expands those against *its* environment, so a quoted `~` resolves to
 /// the daemon's (possibly remote) home. Already-absolute paths pass through
 /// unchanged.
-fn resolve_local_start_directory(path: PathBuf) -> PathBuf {
+/// Whether a `--start-directory` is left for slopd to interpret rather than
+/// resolved by the client: `~`/`$VAR` (expanded against slopd's environment) and
+/// already-absolute paths. Anything else is relative to the caller's cwd.
+fn start_directory_deferred_to_daemon(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
-    if s.starts_with('~') || s.contains('$') || path.is_absolute() {
+    s.starts_with('~') || s.contains('$') || path.is_absolute()
+}
+
+fn resolve_local_start_directory(path: PathBuf) -> PathBuf {
+    if start_directory_deferred_to_daemon(&path) {
         return path;
     }
     match std::env::current_dir() {
         Ok(cwd) => cwd.join(path),
         Err(_) => path,
+    }
+}
+
+/// Validate a `--start-directory` for a *remote* (iroh) connection, where the
+/// client's cwd is meaningless on the server. `~`/`$VAR` and absolute paths defer
+/// to the remote (resolved there); a relative path is ambiguous and rejected so
+/// it can't silently resolve against the wrong machine's filesystem.
+fn check_remote_start_directory(path: &std::path::Path) -> Result<(), Error> {
+    if start_directory_deferred_to_daemon(path) {
+        Ok(())
+    } else {
+        Err(Error::RunFailed(format!(
+            "relative --start-directory {:?} is ambiguous over a remote connection \
+             (it would resolve on the client, not the server); use an absolute path \
+             or one starting with ~ or $VAR",
+            path
+        )))
     }
 }
 
@@ -1618,9 +1649,18 @@ where
         }
         CommonCommand::Run { extra_args, start_directory, envs, env_files, account, interactive, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
-            // A relative --start-directory must resolve against slopctl's cwd, not
-            // the daemon's; do it here before the value leaves this process.
-            let start_directory = start_directory.map(resolve_local_start_directory);
+            // Resolve / validate --start-directory before the value leaves this
+            // process. Over a local socket a relative path resolves against
+            // slopctl's cwd; over a remote (iroh) connection the client's cwd is
+            // meaningless on the server, so a relative path is rejected instead.
+            let start_directory = if ctx.local {
+                start_directory.map(resolve_local_start_directory)
+            } else {
+                if let Some(ref dir) = start_directory {
+                    check_remote_start_directory(dir)?;
+                }
+                start_directory
+            };
             // Pass --account through verbatim; when it's None the daemon inherits
             // the parent pane's account (via parent_pane_id), then default_account.
             if interactive {
@@ -1696,6 +1736,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_remote_start_directory_rejects_relative_only() {
+        use std::path::Path;
+        // Relative paths are ambiguous over a remote link -> rejected.
+        assert!(check_remote_start_directory(Path::new(".")).is_err());
+        assert!(check_remote_start_directory(Path::new("foo/bar")).is_err());
+        // `~`/`$VAR`/absolute defer to the remote -> accepted.
+        assert!(check_remote_start_directory(Path::new("~/proj")).is_ok());
+        assert!(check_remote_start_directory(Path::new("$HOME/proj")).is_ok());
+        assert!(check_remote_start_directory(Path::new("/abs/path")).is_ok());
+        // The rejection names the path and explains the remote ambiguity.
+        if let Err(Error::RunFailed(msg)) = check_remote_start_directory(Path::new(".")) {
+            assert!(
+                msg.contains("relative") && msg.contains("remote"),
+                "message should explain the relative/remote ambiguity; got: {}", msg
+            );
+        } else {
+            panic!("a relative --start-directory should be rejected as RunFailed");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_command_rejects_relative_start_directory_over_remote() {
+        // A remote (iroh) connection: ctx.local == false. A relative
+        // --start-directory is rejected *before* any request is sent, so the
+        // dummy empty/sink client is never actually driven.
+        let mut client = Client::new(tokio::io::empty(), tokio::io::sink());
+        let ctx = CommandContext {
+            parent_pane_id: None,
+            fallback_pane_id: None,
+            interactive: None,
+            local: false,
+        };
+        let run = CommonCommand::Run {
+            start_directory: Some(std::path::PathBuf::from(".")),
+            envs: vec![],
+            env_files: vec![],
+            account: None,
+            interactive: false,
+            no_wait: true,
+            ready_timeout: 30,
+            extra_args: vec![],
+        };
+        match execute_command(&mut client, run, &ctx).await {
+            Err(Error::RunFailed(msg)) => assert!(
+                msg.contains("relative") && msg.contains("remote"),
+                "should explain the relative/remote ambiguity; got: {}", msg
+            ),
+            Ok(()) => panic!("relative --start-directory over a remote connection must be rejected"),
+            Err(_) => panic!("expected RunFailed for a relative remote --start-directory"),
+        }
+    }
 
     #[test]
     fn looks_like_uuid_accepts_canonical_uuid() {
