@@ -118,6 +118,14 @@ pub fn expand_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(expanded.as_ref())
 }
 
+/// Whether `program` resolves to an executable, searching `path` (a PATH-style
+/// value) and resolving relative names against `cwd` — mirroring how a spawned
+/// pane looks it up. Lets `run` fail fast with a clear message when the
+/// configured executable is missing, instead of spawning a pane that just dies.
+pub fn executable_exists(program: &str, path: &std::ffi::OsStr, cwd: &std::path::Path) -> bool {
+    which::which_in(program, Some(path), cwd).is_ok()
+}
+
 /// Expand `$VAR` / `${VAR}` references in a string against the current process
 /// environment. Missing variables are an error (unlike `expand_path`, which
 /// leaves them as-is for path-like values).
@@ -395,6 +403,24 @@ mod tests {
         let (dir, src) = resolve_runtime_fallback(4242, false, temp);
         assert_eq!(dir, PathBuf::from("/tmp/slopd-4242"));
         assert_eq!(src, RuntimeDirSource::Temp);
+    }
+
+    #[test]
+    fn executable_exists_finds_path_binaries_not_bogus_names() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap();
+        // `sh` is on PATH on any unix host the tests run on.
+        assert!(executable_exists("sh", &path, &cwd), "sh should resolve on PATH");
+        // A bogus name resolves nowhere.
+        assert!(
+            !executable_exists("slopd-no-such-binary-zzz", &path, &cwd),
+            "a name that isn't on PATH must not resolve"
+        );
+        // An absolute path to a real binary resolves regardless of PATH.
+        assert!(
+            executable_exists("/bin/sh", std::ffi::OsStr::new(""), &cwd),
+            "an absolute path to a real binary should resolve"
+        );
     }
 
     #[test]

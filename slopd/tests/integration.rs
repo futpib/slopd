@@ -676,6 +676,43 @@ fn run_fails_when_pane_dies_without_any_hook() {
         "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
 }
 
+/// Failure case: the configured executable doesn't exist. A typo'd or
+/// uninstalled `[run] executable` is the most common misconfiguration, and
+/// `tmux new-window <missing>` still returns a pane id — so without an explicit
+/// check, `run` only fails much later with the generic "died before becoming
+/// ready" (or a ready timeout), naming nothing useful. `run` must instead fail
+/// fast with a message that NAMES the missing executable and prints no pane id.
+#[test]
+fn run_fails_clearly_when_executable_does_not_exist() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    // A name that is definitely not on PATH.
+    let missing = "slopd-no-such-executable-9f3a";
+
+    let Some(env) = TestEnv::new_full(Some(&[missing]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "6"]);
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(),
+        "run must fail when the configured executable is missing: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(missing),
+        "error should name the missing executable {:?}; got: {}", missing, stderr);
+    assert!(stderr.to_lowercase().contains("not found"),
+        "error should say the executable wasn't found; got: {}", stderr);
+    // Nothing spawned, so no pane id on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "no pane id for a run that never spawned; got: {:?}", stdout);
+}
+
 /// Success case: a healthy pane reaches ready and survives the settle window.
 /// `run` exits 0 and prints the pane id, exactly like the old behaviour.
 #[test]
@@ -5570,6 +5607,55 @@ fn slopd_removes_hooks_on_sigint() {
     }
 }
 
+/// An absolute-path `[run] executable` is honored even when its directory is
+/// NOT on the pane's PATH — the pre-spawn existence check resolves absolute
+/// paths directly (the libslop unit test covers the resolver; this covers the
+/// Run-handler wiring end-to-end). Without absolute handling, `run` would
+/// wrongly reject a perfectly valid `executable = "/abs/path/..."`.
+#[test]
+fn run_accepts_absolute_path_executable_not_on_path() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+
+    // Absolute path to a real binary (`sleep`); the pane stays alive on it.
+    let sleep_abs = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p)
+            .map(|d| d.join("sleep"))
+            .find(|p| p.exists()))
+        .expect("sleep must be installed for tests");
+    let sleep_abs = sleep_abs.to_str().unwrap().to_string();
+
+    // Sandbox PATH with only tmux — crucially NOT sleep's directory, so `sleep`
+    // resolves *only* via the absolute path we pass as the executable.
+    let path_dir = tempfile::tempdir().unwrap();
+    let tmux_path = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p)
+            .map(|d| d.join("tmux"))
+            .find(|p| p.exists()))
+        .expect("tmux must be installed for tests");
+    std::os::unix::fs::symlink(&tmux_path, path_dir.path().join("tmux"))
+        .expect("failed to symlink tmux into sandbox PATH");
+
+    let Some(env) = TestEnv::new_full(Some(&[&sleep_abs, "infinity"]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd_with_envs(&[("PATH", path_dir.path().to_str().unwrap())]);
+    // Legacy `--no-wait`: we only need it to spawn — the absolute executable must
+    // pass the existence check despite its directory not being on PATH.
+    let out = env.slopctl(&["run"]);
+    kill_slopd(slopd);
+
+    assert!(out.status.success(),
+        "run with an absolute-path executable (dir off PATH) should succeed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(pane_id.starts_with('%'),
+        "should print a pane id; got stdout: {:?}", String::from_utf8_lossy(&out.stdout));
+}
+
 #[test]
 fn run_injects_hooks_with_absolute_slopctl_path_when_not_on_path() {
     build_bin("slopd");
@@ -5595,6 +5681,16 @@ fn run_injects_hooks_with_absolute_slopctl_path_when_not_on_path() {
         .expect("tmux must be installed for tests");
     std::os::unix::fs::symlink(&tmux_path, path_dir.path().join("tmux"))
         .expect("failed to symlink tmux into sandbox PATH");
+    // The executable ("sleep") must be resolvable too, now that `run` pre-checks
+    // it exists before spawning; only slopctl is intentionally kept off this PATH
+    // so the sibling-resolution branch is still exercised.
+    let sleep_path = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p)
+            .map(|d| d.join("sleep"))
+            .find(|p| p.exists()))
+        .expect("sleep must be installed for tests");
+    std::os::unix::fs::symlink(&sleep_path, path_dir.path().join("sleep"))
+        .expect("failed to symlink sleep into sandbox PATH");
 
     let Some(env) = TestEnv::new_full(
         Some(&["sleep", "infinity"]),

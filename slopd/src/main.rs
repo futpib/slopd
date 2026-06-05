@@ -1905,6 +1905,35 @@ async fn handle_request(
                 }
             }
             merged_env.extend(env.iter().cloned());
+
+            // Fail fast with a clear message if the configured executable can't be
+            // found, instead of spawning a pane that dies immediately and surfaces
+            // only the generic "died before becoming ready". `tmux new-window`
+            // returns a pane id even for a missing command, so this is the only
+            // place we can catch the most common misconfiguration (a typo'd or
+            // uninstalled `[run] executable`). Resolve against the pane's effective
+            // PATH (a [run.env]/env-file PATH wins, else slopd's) and working
+            // directory, matching exactly what the spawned pane will use.
+            let program = config.run.executable.program();
+            let lookup_path = merged_env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| std::ffi::OsString::from(v))
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            let lookup_cwd = effective_start_dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            if !libslop::executable_exists(program, &lookup_path, &lookup_cwd) {
+                return libslop::ResponseBody::Error {
+                    message: format!(
+                        "configured executable {:?} not found — check `[run] executable` (or --executable) and the pane's PATH",
+                        program
+                    ),
+                };
+            }
+
             let output = tmux_session_output(config, session_lock, |c| {
                 let mut cmd = tmux(c);
                 let session = c.tmux.session();
