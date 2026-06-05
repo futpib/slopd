@@ -349,6 +349,53 @@ fn run_uses_start_directory_from_flag() {
     );
 }
 
+/// A relative `-c` path (e.g. `.`) must resolve against the directory where
+/// `slopctl` was invoked, not against slopd's cwd/home. Regression test for
+/// `slopctl run -c .` landing the pane in `~` instead of the caller's cwd.
+#[test]
+fn run_resolves_relative_start_directory_against_slopctl_cwd() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Invoke `slopctl run -c .` with slopctl's working directory set to work_dir,
+    // so `.` should resolve to work_dir — not slopd's cwd/home.
+    let output = Command::new(cargo_bin("slopctl"))
+        .args(["run", "--no-wait", "-c", "."])
+        .current_dir(work_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl");
+    assert!(output.status.success(), "slopctl run failed: {:?}", output);
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
+
+    enable_always_submit(&env, &pane_id);
+    let cwd = query_pane_cwd(&env, &pane_id);
+
+    kill_slopd(slopd);
+
+    assert_eq!(
+        std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone().into()),
+        std::fs::canonicalize(work_dir.path()).unwrap(),
+        "mock_claude cwd should match the relative -c path resolved against slopctl's cwd"
+    );
+}
+
 #[test]
 fn kill_terminates_pane() {
     build_bin("slopd");
@@ -7454,6 +7501,30 @@ fn query_pane_env(env: &TestEnv, pane_id: &str, var: &str) -> String {
             return joined[pos..].split_whitespace().next().unwrap_or("").to_string();
         }
         assert!(Instant::now() < deadline, "timed out waiting for /env {} output", var);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Ask a mock_claude pane (already in always-submit mode) to print its current
+/// working directory, returning the path from the `/cwd:<path>` line it emits.
+/// Polls the pane until the line appears.
+fn query_pane_cwd(env: &TestEnv, pane_id: &str) -> String {
+    env.tmux.tmux()
+        .args(["send-keys", "-t", pane_id, "/cwd", "Enter"])
+        .status().unwrap();
+    let needle = "/cwd:";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out = env.tmux.tmux()
+            .args(["capture-pane", "-t", pane_id, "-p"])
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        // tmux may wrap long paths; join the full output before searching.
+        let joined = text.replace(['\n', '\r'], "");
+        if let Some(pos) = joined.find(needle) {
+            return joined[pos + needle.len()..].split_whitespace().next().unwrap_or("").to_string();
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for /cwd output; pane: {:?}", text);
         std::thread::sleep(Duration::from_millis(50));
     }
 }

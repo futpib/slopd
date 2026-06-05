@@ -77,9 +77,11 @@ pub enum CommonCommand {
     },
     /// Open a new Claude pane in the slopd tmux session.
     Run {
-        /// Working directory for the new pane. Supports ~ and $VAR / ${VAR}
-        /// expansion (applied by slopd, so a quoted ~ works and resolves against
-        /// the daemon's home). Overrides [run] start_directory from config.toml.
+        /// Working directory for the new pane. A relative path (e.g. `.`) is
+        /// resolved against slopctl's current directory. Supports ~ and $VAR /
+        /// ${VAR} expansion (applied by slopd, so a quoted ~ works and resolves
+        /// against the daemon's home). Overrides [run] start_directory from
+        /// config.toml.
         #[arg(short = 'c', long, value_name = "DIR")]
         start_directory: Option<PathBuf>,
         /// Extra environment variables for the new pane (repeatable).
@@ -1364,6 +1366,29 @@ fn run_died_error(pane_id: &str, reason: Option<&str>) -> Error {
     }
 }
 
+/// Resolve a `--start-directory` value before sending it to slopd.
+///
+/// slopd is a daemon with its own (arbitrary) working directory, so a *relative*
+/// path like `.` is meaningless by the time it arrives there: slopd would
+/// resolve it against the daemon's cwd, not the directory the user ran `slopctl`
+/// from. Make relative paths absolute against slopctl's own cwd so they mean
+/// what the caller expects.
+///
+/// Paths beginning with `~` or containing `$VAR` are left untouched on purpose:
+/// slopd expands those against *its* environment, so a quoted `~` resolves to
+/// the daemon's (possibly remote) home. Already-absolute paths pass through
+/// unchanged.
+fn resolve_local_start_directory(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with('~') || s.contains('$') || path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
 /// Run the Run command. By default this waits for the freshly-spawned pane to
 /// become ready before returning, turning a silently-dead pane into a visible
 /// failure:
@@ -1593,6 +1618,9 @@ where
         }
         CommonCommand::Run { extra_args, start_directory, envs, env_files, account, interactive, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
+            // A relative --start-directory must resolve against slopctl's cwd, not
+            // the daemon's; do it here before the value leaves this process.
+            let start_directory = start_directory.map(resolve_local_start_directory);
             // Pass --account through verbatim; when it's None the daemon inherits
             // the parent pane's account (via parent_pane_id), then default_account.
             if interactive {

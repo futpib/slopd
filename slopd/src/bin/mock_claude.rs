@@ -249,7 +249,7 @@ fn fire_stop(
 }
 
 /// Fire UserPromptSubmit + Stop for an accepted prompt that produces no model
-/// turn — the mock test-harness control commands (/echo, /sleep, /env,
+/// turn — the mock test-harness control commands (/echo, /sleep, /env, /cwd,
 /// /newline-mode). This is how `slopctl send` of such a command is confirmed,
 /// mirroring that the input was accepted. (Real client-local slash commands
 /// like /model fire NO hooks and are confirmed via the transcript
@@ -303,6 +303,13 @@ fn handle_prompt(prompt: &str, ctx: Option<&SessionContext>) -> PromptResult {
         let val = std::env::var(key.trim())
             .unwrap_or_else(|_| "UNSET".to_string());
         println!("/env:{}={}", key.trim(), val);
+        return PromptResult::Handled;
+    }
+    if prompt.trim() == "/cwd" {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "UNKNOWN".to_string());
+        println!("/cwd:{}", cwd);
         return PromptResult::Handled;
     }
     if let Some(code) = prompt.strip_prefix("/exit ") {
