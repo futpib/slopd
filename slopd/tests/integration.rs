@@ -8826,3 +8826,146 @@ fn grouped_interactive_view_is_isolated_and_self_cleaning() {
     assert!(panes.iter().any(|p| p.pane_id == pane_id),
         "destroying the throwaway view must not kill the shared Claude pane: {:?}", panes);
 }
+
+// --- backup / restore across reboot ---------------------------------------
+//
+// slopd persists the managed-pane set to $XDG_STATE_HOME/slopd/panes.json and,
+// on a fresh start into a brand-new tmux session (the post-reboot signal),
+// re-spawns each recorded pane with `claude --resume <session_id>`. This drives
+// the full round trip: run a pane, snapshot it on clean shutdown, wipe the tmux
+// session to simulate a reboot, restart slopd, and assert the pane comes back
+// with its session id and tags intact under a fresh tmux pane id.
+#[test]
+fn backup_restore_round_trip_across_reboot() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // --- first boot: run a pane, tag it, snapshot on clean shutdown ---
+    let slopd1 = env.spawn_slopd();
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    let session_id = env.wait_for_session_start(listener, &pane_id);
+    assert_eq!(session_id, "mock-session-id-1234");
+
+    let tag_output = env.slopctl(&["tag", &pane_id, "mytag"]);
+    assert!(tag_output.status.success(), "slopctl tag failed: {:?}", tag_output);
+
+    // SIGINT triggers a clean shutdown, which writes the final snapshot.
+    sigint_child(slopd1);
+
+    // The manifest should now exist under $HOME/.local/state (HOME is the slopd
+    // config dir in the test harness) and record our pane.
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .unwrap_or_else(|e| panic!("manifest not written to {}: {}", manifest_path.display(), e));
+    let manifest: Vec<libslop::PaneInfo> = serde_json::from_slice(&manifest_bytes)
+        .expect("manifest is not valid JSON");
+    let entry = manifest.iter()
+        .find(|p| p.session_id.as_deref() == Some("mock-session-id-1234"))
+        .expect("snapshot should contain the running pane");
+    assert!(entry.tags.contains(&"mytag".to_string()),
+        "snapshot should preserve tags; got {:?}", entry.tags);
+    assert_eq!(entry.account, "default");
+
+    // --- simulate a reboot: destroy the slopd tmux session (and its panes).
+    // The harness tmux server keeps running via its own "test" session, so the
+    // next slopd start sees no "slopd" session and treats it as a fresh boot.
+    let kill = env.tmux.tmux().args(["kill-session", "-t", "slopd"]).status().unwrap();
+    assert!(kill.success(), "failed to kill slopd tmux session");
+
+    // --- second boot: slopd restores the pane from the manifest ---
+    let slopd2 = env.spawn_slopd();
+
+    // Restore runs before the socket binds, so the pane should already be
+    // present; poll briefly to be robust against scheduling.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let restored = loop {
+        let out = env.slopctl(&["ps", "--json"]);
+        let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        if let Some(p) = panes.into_iter().find(|p| p.session_id.as_deref() == Some("mock-session-id-1234")) {
+            break p;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("restored pane did not appear within timeout");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    assert!(restored.tags.contains(&"mytag".to_string()),
+        "restored pane should keep its tags; got {:?}", restored.tags);
+    assert_eq!(restored.account, "default");
+    // The restored pane gets a fresh tmux id (the old one died with the session).
+    assert_ne!(restored.pane_id, pane_id, "restored pane should have a new tmux id");
+
+    kill_slopd(slopd2);
+}
+
+// A daemon restart against a *surviving* tmux session must NOT restore from the
+// manifest — load_managed_panes already recovers the live panes, so restoring
+// would duplicate them. This guards the session-existed gate.
+#[test]
+fn restart_with_surviving_session_does_not_duplicate_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Clean shutdown writes a manifest, but the tmux session (and its pane)
+    // survive — this is a daemon restart, not a reboot.
+    sigint_child(slopd1);
+
+    let slopd2 = env.spawn_slopd();
+
+    // The single original pane should be recovered from tmux, not duplicated by
+    // a manifest restore. Give any erroneous restore time to spawn a second pane.
+    std::thread::sleep(Duration::from_millis(500));
+    let out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let claude_panes: Vec<_> = panes.iter()
+        .filter(|p| p.session_id.as_deref() == Some("mock-session-id-1234"))
+        .collect();
+    assert_eq!(claude_panes.len(), 1,
+        "a surviving-session restart must not duplicate panes; got {:?}", panes);
+    assert_eq!(claude_panes[0].pane_id, pane_id,
+        "the recovered pane should keep its original tmux id");
+
+    kill_slopd(slopd2);
+}
