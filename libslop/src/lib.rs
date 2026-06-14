@@ -97,6 +97,23 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().expect("could not determine home dir")
 }
 
+/// The XDG state directory (`$XDG_STATE_HOME`, default `~/.local/state`), where
+/// slopd keeps state that should persist across reboots — unlike the runtime
+/// dir (the socket), which is wiped on reboot. Used for the pane backup manifest.
+pub fn state_dir() -> PathBuf {
+    dirs::state_dir().unwrap_or_else(|| home_dir().join(".local/state"))
+}
+
+/// Path to the pane backup manifest (`$XDG_STATE_HOME/slopd/panes.json`).
+///
+/// slopd writes the set of managed panes here so they can be re-spawned with
+/// `claude --resume` after a reboot, when the tmux server (which otherwise holds
+/// this state in pane options) is gone. The default location can be overridden
+/// via `[backup] path` in the config.
+pub fn panes_manifest_path() -> PathBuf {
+    state_dir().join("slopd/panes.json")
+}
+
 /// Expand `~` and `$VAR` / `${VAR}` references in a path.
 ///
 /// - A leading `~` (alone or followed by `/`) is replaced with the current
@@ -1256,6 +1273,8 @@ pub struct SlopdConfig {
     pub tmux: SlopdTmuxConfig,
     #[serde(default)]
     pub run: SlopdRunConfig,
+    #[serde(default)]
+    pub backup: SlopdBackupConfig,
     /// Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude) for the
     /// reserved [`DEFAULT_ACCOUNT`] account — the one used when no account is
     /// selected. Shorthand for `[accounts.default] claude_config_dir = ...`.
@@ -1462,6 +1481,58 @@ impl Default for SlopdRunConfig {
             env: std::collections::BTreeMap::new(),
             env_files: Vec::new(),
         }
+    }
+}
+
+/// Backup/restore of the managed-pane set across reboots.
+///
+/// slopd normally keeps each pane's identity (Claude session id, account, tags,
+/// ancestry) in tmux pane options, which it re-reads on a daemon restart. A
+/// *reboot* destroys the tmux server along with those options and the Claude
+/// processes, so slopd also writes the set of panes to a manifest on disk
+/// ([`panes_manifest_path`]). On the next startup into a freshly-created tmux
+/// session, it re-spawns each pane with `claude --resume <session_id>`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SlopdBackupConfig {
+    /// Whether to snapshot the pane set to disk and restore it on a fresh start
+    /// (default: true). Set to false to disable backup/restore entirely.
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    /// Manifest path. Defaults to [`panes_manifest_path`]
+    /// (`$XDG_STATE_HOME/slopd/panes.json`). Supports `~` and `$VAR` expansion.
+    pub path: Option<PathBuf>,
+    /// How often (seconds) to snapshot the pane set while running (default: 30).
+    /// A snapshot is also taken on clean shutdown regardless of this interval.
+    #[serde(default = "default_backup_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_backup_enabled() -> bool {
+    true
+}
+
+fn default_backup_interval_secs() -> u64 {
+    30
+}
+
+impl Default for SlopdBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            path: None,
+            interval_secs: default_backup_interval_secs(),
+        }
+    }
+}
+
+impl SlopdBackupConfig {
+    /// Resolve the manifest path: the configured `path` (with `~`/`$VAR`
+    /// expansion) if set, else the default [`panes_manifest_path`].
+    pub fn manifest_path(&self) -> PathBuf {
+        self.path
+            .as_deref()
+            .map(expand_path)
+            .unwrap_or_else(panes_manifest_path)
     }
 }
 
