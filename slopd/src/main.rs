@@ -1730,6 +1730,12 @@ async fn snapshot_panes(
             return;
         }
     };
+    // Only panes with a recorded Claude session id are restorable. Recording the
+    // rest — the session's idle shell (which inherits @slopd_managed from the
+    // session option), or a pane still booting before its first SessionStart —
+    // would just be skipped on restore, so keep the manifest to resumable panes.
+    let panes: Vec<libslop::PaneInfo> =
+        panes.into_iter().filter(|p| p.session_id.is_some()).collect();
     let json = match serde_json::to_string_pretty(&panes) {
         Ok(j) => j,
         Err(e) => {
