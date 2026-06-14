@@ -17,6 +17,7 @@
 - [Configuration](#configuration)
   - [slopd](#slopd-config)
   - [slopctl](#slopctl-config)
+- [Backup and restore](#backup-and-restore)
 - [slopctl commands](#slopctl-commands)
 - [Claude hook integration](#claude-hook-integration)
 - [Event system](#event-system)
@@ -198,6 +199,17 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Paths support ~ and $VAR expansion. Files loaded in order; later entries win.
 # CLI `--env` / `--env-file` override these.
 # env_files = ["~/.config/slopd/pane.env"]
+
+# [backup]
+# Snapshot the managed-pane set to disk and restore it on a fresh start after a
+# reboot (see "Backup and restore"). Defaults are fine for most setups.
+# Whether backup/restore is active at all (default: true).
+# enabled = true
+# Manifest path (default: $XDG_STATE_HOME/slopd/panes.json). Supports ~ / $VAR.
+# path = "~/.local/state/slopd/panes.json"
+# How often (seconds) to snapshot while running (default: 30). A snapshot is
+# also taken on clean shutdown regardless of this interval.
+# interval_secs = 30
 ```
 
 #### Multiple accounts
@@ -253,6 +265,22 @@ Only used by `slopctl run --interactive` (see below):
 ```
 
 The default command picks up slopd's `[tmux] socket` and `[tmux] session` automatically. It uses a *grouped session* — which shares the slopd session's windows but keeps its own current window — so focusing the new pane doesn't pull other clients off what they're viewing; `destroy-unattached on` makes that throwaway view clean itself up on detach. `{{session}}` lets custom commands stay symbolic rather than hardcoding the session name.
+
+---
+
+## Backup and restore
+
+slopd keeps each pane's identity — Claude session id, account, tags, ancestry, working directory — in tmux pane options, and rebuilds its in-memory state from them whenever the daemon restarts. That makes a daemon restart transparent: the Claude processes keep running in tmux and slopd re-adopts them.
+
+A **reboot** is the one case that breaks: it destroys the whole tmux server, taking those pane options *and* the Claude processes with it. The conversations themselves are safe — Claude writes each session to a transcript on disk and `claude --resume <id>` continues it — but slopd's record of *which* sessions were running, and how, is gone with tmux. Backup/restore closes that gap by keeping a copy on durable storage.
+
+**Backup.** While running, slopd snapshots the managed-pane set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every `[backup] interval_secs` seconds, and once more on clean shutdown. Writes are atomic (temp file + rename), so a crash mid-write never corrupts the manifest. The manifest lives in the XDG **state** dir, which survives reboot — unlike the runtime dir that holds the control socket.
+
+**Restore.** On startup, when slopd finds it has to create its tmux session from scratch — the signature of a fresh server after a reboot — it reads the manifest and re-spawns each recorded pane with `claude --resume <session_id>` in its original working directory and account, restoring tags and parent/child ancestry (remapped to the new tmux pane ids). If the tmux session already exists (an ordinary daemon restart), slopd skips the manifest entirely and recovers panes from tmux as usual, so panes are never duplicated.
+
+Restore is best-effort: a pane whose session can no longer be resumed (e.g. its transcript was deleted) simply fails to come up and is cleaned up by the reconciler, without affecting the others. Panes that had not yet recorded a Claude session id (still booting at snapshot time) are skipped, since there is nothing to resume.
+
+Because plain `--resume` continues the *same* session id and appends to the *same* transcript, a restored pane keeps its identity, and subsequent snapshots stay valid across repeated reboots. Set `[backup] enabled = false` to turn the whole mechanism off.
 
 ---
 
