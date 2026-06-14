@@ -1082,6 +1082,12 @@ async fn main() {
         .status()
         .await
         .expect("failed to run tmux has-session");
+    // Whether slopd's tmux session already existed. False means we are starting
+    // into a fresh tmux server (the common case after a reboot, which wipes the
+    // server) — the trigger for restoring panes from the on-disk manifest. True
+    // means a daemon restart against a surviving server, where load_managed_panes
+    // already recovers panes from tmux and restoring from disk would duplicate them.
+    let session_existed = has_session.success();
     if !has_session.success() {
         tmux(&config)
             .args(["new-session", "-d", "-s", &session])
@@ -1138,6 +1144,13 @@ async fn main() {
     let (event_tx, _) = tokio::sync::broadcast::channel::<libslop::Record>(256);
     let event_tx: EventTx = Arc::new(event_tx);
 
+    // Serializes tmux session-mutating operations (new-window, restore spawns).
+    let session_lock: SessionLock = Arc::new(Mutex::new(()));
+
+    // Backup/restore configuration, resolved once from the initial config.
+    let backup_enabled = config.backup.enabled;
+    let manifest_path = config.backup.manifest_path();
+
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized. This must happen before
     // binding the socket so that clients cannot create panes in the slopd
@@ -1151,6 +1164,21 @@ async fn main() {
     for settings_path in &recovered_settings_paths {
         if let Err(e) = libslop::inject_hooks_into_file(settings_path, &config.hook_slopctl()) {
             warn!("failed to re-inject hooks into {}: {}", settings_path.display(), e);
+        }
+    }
+
+    // Restore panes from the on-disk manifest after a reboot. Gate on the tmux
+    // session having been freshly created: a surviving session means a mere
+    // daemon restart, where load_managed_panes already recovered the live panes
+    // from tmux and restoring from disk would duplicate them. A fresh session
+    // (the post-reboot case) is where the manifest is the only surviving record.
+    if backup_enabled && !session_existed {
+        let manifest = read_pane_manifest(&manifest_path).await;
+        if manifest.is_empty() {
+            debug!("backup: fresh session, no manifest to restore from {}", manifest_path.display());
+        } else {
+            info!("backup: fresh tmux session; restoring {} pane(s) from {}", manifest.len(), manifest_path.display());
+            restore_panes(&config, &managed_panes, &panes, &event_tx, &pane_registered, &session_lock, manifest).await;
         }
     }
 
@@ -1173,7 +1201,6 @@ async fn main() {
     // panes to detect panes that exited without going through slopctl kill.
     // This catches cases that tmux session-scope hooks cannot (e.g. process
     // exit, which only fires pane-scope hooks).
-    let session_lock: SessionLock = Arc::new(Mutex::new(()));
     let reconcile_config_rx = config_rx.clone();
     let reconcile_panes_map = panes.clone();
     let reconcile_managed = managed_panes.clone();
@@ -1188,8 +1215,19 @@ async fn main() {
         }
     });
 
+    // Periodic backup snapshot. Driven from the main select loop (not a spawned
+    // task) so it can never run concurrently with the shutdown snapshot, keeping
+    // the temp-file write in snapshot_panes race-free.
+    let mut snapshot_interval = tokio::time::interval(
+        std::time::Duration::from_secs(config.backup.interval_secs.max(1)),
+    );
+
     loop {
         tokio::select! {
+            _ = snapshot_interval.tick(), if backup_enabled => {
+                let config_snapshot = config_rx.borrow().clone();
+                snapshot_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+            }
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
@@ -1219,6 +1257,14 @@ async fn main() {
                 }
             }
         }
+    }
+
+    // Final backup snapshot on clean shutdown, so the manifest reflects the very
+    // latest pane set rather than being up to interval_secs stale. Runs only
+    // after the select loop has exited, so it never races the periodic snapshot.
+    if backup_enabled {
+        let config_snapshot = config_rx.borrow().clone();
+        snapshot_panes(&config_snapshot, &managed_panes, &manifest_path).await;
     }
 
     // Use the latest config for the shutdown hook cleanup. If a config dir
@@ -1663,6 +1709,237 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
         });
     }
     Ok(panes)
+}
+
+/// Serialize the current managed-pane set to the backup manifest on disk.
+///
+/// Writes to a temp file and atomically renames it into place, so a crash
+/// mid-write can never leave a torn manifest. A transient failure to enumerate
+/// panes is logged and skipped rather than clobbering a good manifest. Callers
+/// must serialize their calls (the daemon does, by snapshotting only from the
+/// main select loop and once on shutdown) so the shared temp path is safe.
+async fn snapshot_panes(
+    config: &libslop::SlopdConfig,
+    managed_panes: &ManagedPanes,
+    manifest_path: &std::path::Path,
+) {
+    let panes = match list_panes(config, managed_panes).await {
+        Ok(panes) => panes,
+        Err(e) => {
+            warn!("backup: failed to enumerate panes, skipping snapshot: {}", e);
+            return;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&panes) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("backup: failed to serialize pane manifest: {}", e);
+            return;
+        }
+    };
+    if let Some(parent) = manifest_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await {
+            warn!("backup: failed to create manifest dir {}: {}", parent.display(), e);
+            return;
+        }
+    // Temp file beside the manifest so the rename stays on one filesystem (atomic).
+    let tmp_path = manifest_path.with_extension("json.tmp");
+    if let Err(e) = tokio::fs::write(&tmp_path, json.as_bytes()).await {
+        warn!("backup: failed to write {}: {}", tmp_path.display(), e);
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, manifest_path).await {
+        warn!("backup: failed to rename into {}: {}", manifest_path.display(), e);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return;
+    }
+    debug!("backup: snapshotted {} pane(s) to {}", panes.len(), manifest_path.display());
+}
+
+/// Read the backup manifest from disk, returning the panes recorded there.
+/// A missing file yields an empty list (nothing to restore); a present-but-
+/// unreadable or malformed file is logged and treated as empty.
+async fn read_pane_manifest(manifest_path: &std::path::Path) -> Vec<libslop::PaneInfo> {
+    let bytes = match tokio::fs::read(manifest_path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!("backup: failed to read manifest {}: {}", manifest_path.display(), e);
+            return Vec::new();
+        }
+    };
+    match serde_json::from_slice::<Vec<libslop::PaneInfo>>(&bytes) {
+        Ok(panes) => panes,
+        Err(e) => {
+            warn!("backup: manifest {} is malformed ({}); ignoring", manifest_path.display(), e);
+            Vec::new()
+        }
+    }
+}
+
+/// Re-spawn the panes recorded in `manifest` after a reboot, each via
+/// `claude --resume <session_id>` in its original working dir and account.
+///
+/// Panes are restored parents-first so that ancestry can be remapped from the
+/// old (pre-reboot) tmux pane ids to the freshly-assigned ones. Panes with no
+/// recorded session id are skipped (nothing to resume). Each spawn is
+/// best-effort: a pane whose session can no longer be resumed (e.g. its
+/// transcript was deleted) just dies and is cleaned up by the reconciler; it
+/// does not abort the rest of the batch.
+async fn restore_panes(
+    config: &Arc<libslop::SlopdConfig>,
+    managed_panes: &ManagedPanes,
+    panes: &PaneMap,
+    event_tx: &EventTx,
+    pane_registered: &PaneRegistered,
+    session_lock: &SessionLock,
+    manifest: Vec<libslop::PaneInfo>,
+) {
+    let total = manifest.len();
+    // Only panes with a Claude session id can be resumed.
+    let (resumable, skipped): (Vec<libslop::PaneInfo>, Vec<libslop::PaneInfo>) =
+        manifest.into_iter().partition(|p| p.session_id.is_some());
+    for p in &skipped {
+        info!("backup: skipping pane {} (no recorded session id, nothing to resume)", p.pane_id);
+    }
+
+    // Pre-compute each pane's depth in the ancestor tree so we can restore
+    // parents before children (owned keys so the sort below doesn't conflict
+    // with borrows into the vec).
+    let id_set: std::collections::HashSet<String> =
+        resumable.iter().map(|p| p.pane_id.clone()).collect();
+    let parent_of: std::collections::HashMap<String, String> = resumable.iter()
+        .filter_map(|p| p.parent_pane_id.clone().map(|par| (p.pane_id.clone(), par)))
+        .collect();
+    let depth_of: std::collections::HashMap<String, usize> = resumable.iter().map(|p| {
+        let mut depth = 0usize;
+        let mut cur = p.pane_id.as_str();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(par) = parent_of.get(cur) {
+            // Stop at an ancestor that isn't itself being restored, or a cycle.
+            if !id_set.contains(par) || !seen.insert(par.clone()) {
+                break;
+            }
+            depth += 1;
+            cur = par.as_str();
+        }
+        (p.pane_id.clone(), depth)
+    }).collect();
+    let mut ordered = resumable;
+    ordered.sort_by_key(|p| depth_of.get(&p.pane_id).copied().unwrap_or(0));
+
+    // Maps from the manifest's (old) pane ids to the new ids we spawn, and each
+    // new pane's remapped ancestor chain (so children can prepend their parent).
+    let mut old_to_new: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut ancestors_of_new: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut restored = 0usize;
+
+    for p in ordered {
+        let old_id = p.pane_id;
+        let account = p.account;
+        let created_at = p.created_at;
+        let tags = p.tags;
+        let parent = p.parent_pane_id;
+        let session_id = p.session_id.expect("resumable panes have a session id");
+        let working_dir = p.working_dir;
+
+        // Resolve the account (falling back to default if it was removed from
+        // config) and inject its hooks before spawning, like the run handler.
+        let resolved = config
+            .resolve_account(Some(account.as_str()))
+            .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
+            .expect("the reserved default account always resolves");
+        let settings_path = config.resolved_settings_path(&resolved);
+        if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
+            warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
+        }
+
+        let xdg_runtime_dir = libslop::runtime_dir();
+        let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
+        let resolved_config_dir = resolved.config_dir.clone();
+
+        let output = tmux_session_output(config, session_lock, |c| {
+            let mut cmd = tmux(c);
+            let session = c.tmux.session();
+            cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"])
+                .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
+                .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
+            if let Some(ref dir) = working_dir {
+                cmd.args(["-c", dir]);
+            }
+            if let Some(ref dir) = resolved_config_dir {
+                cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
+            }
+            if let Some(ref pf) = profile_file {
+                cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
+            }
+            cmd.arg(c.run.executable.program())
+                .args(c.run.executable.args())
+                .args(["--resume", &session_id]);
+            cmd
+        }).await;
+
+        let new_id = match output {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            Ok(out) => {
+                warn!("backup: failed to restore pane {} (session {}): tmux new-window exited {}: {}",
+                    old_id, session_id, out.status, String::from_utf8_lossy(&out.stderr).trim());
+                continue;
+            }
+            Err(e) => {
+                warn!("backup: failed to restore pane {} (session {}): {}", old_id, session_id, e);
+                continue;
+            }
+        };
+
+        managed_panes.insert(new_id.clone());
+        // Wake any hook handler that arrived before the insert (the resumed pane
+        // fires SessionStart as soon as the window opens).
+        pane_registered.notify_waiters();
+
+        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
+        // Preserve the original creation time so pane age/ordering survives reboot.
+        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &created_at.to_string()).await;
+        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdAccount.as_str(), &resolved.name).await;
+        // Set the session id directly so `ps` is correct immediately; the
+        // SessionStart hook will re-set the same id once the session resumes
+        // (plain --resume continues the session rather than forking it).
+        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), &session_id).await;
+
+        // Remap ancestry: the parent's new id, prepended to the parent's own
+        // (already-remapped) chain. Truncates at any ancestor that wasn't
+        // restored, matching reconcile-time reparenting.
+        let new_ancestors: Vec<String> = match parent.as_deref().and_then(|par| old_to_new.get(par)) {
+            Some(new_parent) => {
+                let mut chain = vec![new_parent.clone()];
+                if let Some(rest) = ancestors_of_new.get(new_parent) {
+                    chain.extend(rest.iter().cloned());
+                }
+                chain
+            }
+            None => Vec::new(),
+        };
+        if !new_ancestors.is_empty() {
+            let encoded = encode_ancestors(&new_ancestors);
+            let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdAncestorPanes.as_str(), &encoded).await;
+        }
+        ancestors_of_new.insert(new_id.clone(), new_ancestors);
+
+        // Re-apply tags.
+        for tag in &tags {
+            let opt = format!("{}{}", libslop::TAG_OPTION_PREFIX, tag);
+            let _ = tmux_set_pane_option(config, &new_id, &opt, "1").await;
+        }
+
+        // Initial state; the resumed session's hooks advance it from here.
+        set_pane_detailed_state(config, &new_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+
+        old_to_new.insert(old_id.clone(), new_id.clone());
+        restored += 1;
+        info!("backup: restored pane {} -> {} (session {})", old_id, new_id, session_id);
+    }
+
+    info!("backup: restored {}/{} recorded pane(s)", restored, total);
 }
 
 async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Result<(), libslop::ResponseBody> {
