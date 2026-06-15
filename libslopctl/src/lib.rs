@@ -265,6 +265,11 @@ pub enum CommonCommand {
         /// Tmux pane ID (e.g. %42). Defaults to $TMUX_PANE if omitted.
         pane_id: Option<String>,
     },
+    /// Write the backup manifest now (regardless of the `auto_backup` setting).
+    Backup,
+    /// Re-spawn panes from the backup manifest now (regardless of `auto_restore`).
+    /// Sessions already running are skipped, so this is safe on a live daemon.
+    Restore,
 }
 
 /// Context that differs between slopctl (local) and iroh-slopctl (remote).
@@ -662,6 +667,23 @@ impl<
     pub async fn ps(&mut self) -> Result<Vec<libslop::PaneInfo>, Error> {
         match self.request(libslop::RequestBody::Ps).await? {
             libslop::ResponseBody::Ps { panes } => Ok(panes),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Write the backup manifest now; returns the number of panes recorded.
+    pub async fn backup(&mut self) -> Result<usize, Error> {
+        match self.request(libslop::RequestBody::Backup).await? {
+            libslop::ResponseBody::BackedUp { count } => Ok(count),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Restore panes from the manifest now; returns the number re-spawned
+    /// (sessions already running are skipped and not counted).
+    pub async fn restore(&mut self) -> Result<usize, Error> {
+        match self.request(libslop::RequestBody::Restore).await? {
+            libslop::ResponseBody::Restored { restored } => Ok(restored),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -1728,6 +1750,14 @@ where
         }
         CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout } => {
             execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout).await?;
+        }
+        CommonCommand::Backup => {
+            let count = client.backup().await?;
+            println!("backed up {} pane(s)", count);
+        }
+        CommonCommand::Restore => {
+            let restored = client.restore().await?;
+            println!("restored {} pane(s)", restored);
         }
     }
     Ok(())

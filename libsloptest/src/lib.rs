@@ -450,6 +450,23 @@ impl TestEnv {
         self.runtime_dir.path().join("slopd/slopd.sock")
     }
 
+    /// Path to the slopd config file this env wrote.
+    pub fn config_path(&self) -> PathBuf {
+        self.config_dir.path().join("slopd/config.toml")
+    }
+
+    /// Append raw TOML to the slopd config file (a new section or keys). Used by
+    /// tests that need config the `write_slopd_config_*` helpers don't cover,
+    /// e.g. a `[backup]` section.
+    pub fn append_config(&self, toml: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.config_path())
+            .expect("failed to open slopd config for append");
+        write!(f, "\n{}\n", toml).expect("failed to append to slopd config");
+    }
+
     /// Spawn a `slopctl listen --hook SessionStart` subscriber and wait until
     /// the subscription is confirmed. Call this before `slopctl run` to
     /// guarantee no race where the event fires before we subscribe.

@@ -1147,8 +1147,11 @@ async fn main() {
     // Serializes tmux session-mutating operations (new-window, restore spawns).
     let session_lock: SessionLock = Arc::new(Mutex::new(()));
 
-    // Backup/restore configuration, resolved once from the initial config.
-    let backup_enabled = config.backup.enabled;
+    // Backup/restore configuration, resolved once from the initial config. The
+    // two automatic behaviours are independent; manual backup/restore (via the
+    // RPC) ignore them.
+    let auto_backup = config.backup.auto_backup;
+    let auto_restore = config.backup.auto_restore;
     let manifest_path = config.backup.manifest_path();
 
     // Recover managed pane IDs from the tmux session so panes that existed
@@ -1172,7 +1175,7 @@ async fn main() {
     // daemon restart, where load_managed_panes already recovered the live panes
     // from tmux and restoring from disk would duplicate them. A fresh session
     // (the post-reboot case) is where the manifest is the only surviving record.
-    if backup_enabled && !session_existed {
+    if auto_restore && !session_existed {
         let manifest = read_pane_manifest(&manifest_path).await;
         if manifest.is_empty() {
             debug!("backup: fresh session, no manifest to restore from {}", manifest_path.display());
@@ -1215,18 +1218,18 @@ async fn main() {
         }
     });
 
-    // Periodic backup snapshot. Driven from the main select loop (not a spawned
-    // task) so it can never run concurrently with the shutdown snapshot, keeping
-    // the temp-file write in snapshot_panes race-free.
-    let mut snapshot_interval = tokio::time::interval(
+    // Periodic auto-backup. Driven from the main select loop (not a spawned task)
+    // so it can never run concurrently with the shutdown backup, keeping the
+    // temp-file write in backup_panes race-free.
+    let mut backup_interval = tokio::time::interval(
         std::time::Duration::from_secs(config.backup.interval_secs.max(1)),
     );
 
     loop {
         tokio::select! {
-            _ = snapshot_interval.tick(), if backup_enabled => {
+            _ = backup_interval.tick(), if auto_backup => {
                 let config_snapshot = config_rx.borrow().clone();
-                snapshot_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+                backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
             }
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
@@ -1259,12 +1262,12 @@ async fn main() {
         }
     }
 
-    // Final backup snapshot on clean shutdown, so the manifest reflects the very
+    // Final auto-backup on clean shutdown, so the manifest reflects the very
     // latest pane set rather than being up to interval_secs stale. Runs only
-    // after the select loop has exited, so it never races the periodic snapshot.
-    if backup_enabled {
+    // after the select loop has exited, so it never races the periodic backup.
+    if auto_backup {
         let config_snapshot = config_rx.borrow().clone();
-        snapshot_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+        backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
     }
 
     // Use the latest config for the shutdown hook cleanup. If a config dir
@@ -1711,23 +1714,24 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
     Ok(panes)
 }
 
-/// Serialize the current managed-pane set to the backup manifest on disk.
+/// Write the current managed-pane set to the backup manifest on disk, returning
+/// the number of panes recorded.
 ///
 /// Writes to a temp file and atomically renames it into place, so a crash
 /// mid-write can never leave a torn manifest. A transient failure to enumerate
 /// panes is logged and skipped rather than clobbering a good manifest. Callers
-/// must serialize their calls (the daemon does, by snapshotting only from the
+/// must serialize their calls (the daemon does, by auto-backing-up only from the
 /// main select loop and once on shutdown) so the shared temp path is safe.
-async fn snapshot_panes(
+async fn backup_panes(
     config: &libslop::SlopdConfig,
     managed_panes: &ManagedPanes,
     manifest_path: &std::path::Path,
-) {
+) -> usize {
     let panes = match list_panes(config, managed_panes).await {
         Ok(panes) => panes,
         Err(e) => {
-            warn!("backup: failed to enumerate panes, skipping snapshot: {}", e);
-            return;
+            warn!("backup: failed to enumerate panes, skipping backup: {}", e);
+            return 0;
         }
     };
     // Only panes with a recorded Claude session id are restorable. Recording the
@@ -1740,26 +1744,27 @@ async fn snapshot_panes(
         Ok(j) => j,
         Err(e) => {
             warn!("backup: failed to serialize pane manifest: {}", e);
-            return;
+            return 0;
         }
     };
     if let Some(parent) = manifest_path.parent()
         && let Err(e) = tokio::fs::create_dir_all(parent).await {
             warn!("backup: failed to create manifest dir {}: {}", parent.display(), e);
-            return;
+            return 0;
         }
     // Temp file beside the manifest so the rename stays on one filesystem (atomic).
     let tmp_path = manifest_path.with_extension("json.tmp");
     if let Err(e) = tokio::fs::write(&tmp_path, json.as_bytes()).await {
         warn!("backup: failed to write {}: {}", tmp_path.display(), e);
-        return;
+        return 0;
     }
     if let Err(e) = tokio::fs::rename(&tmp_path, manifest_path).await {
         warn!("backup: failed to rename into {}: {}", manifest_path.display(), e);
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        return;
+        return 0;
     }
-    debug!("backup: snapshotted {} pane(s) to {}", panes.len(), manifest_path.display());
+    debug!("backup: wrote {} pane(s) to {}", panes.len(), manifest_path.display());
+    panes.len()
 }
 
 /// Read the backup manifest from disk, returning the panes recorded there.
@@ -1800,7 +1805,7 @@ async fn restore_panes(
     pane_registered: &PaneRegistered,
     session_lock: &SessionLock,
     manifest: Vec<libslop::PaneInfo>,
-) {
+) -> usize {
     let total = manifest.len();
     // Only panes with a Claude session id can be resumed.
     let (resumable, skipped): (Vec<libslop::PaneInfo>, Vec<libslop::PaneInfo>) =
@@ -1838,6 +1843,19 @@ async fn restore_panes(
     // new pane's remapped ancestor chain (so children can prepend their parent).
     let mut old_to_new: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut ancestors_of_new: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    // Session ids we must not (re-)spawn. Seeded with the sessions of panes
+    // already running, so a manual `slopctl restore` on a live daemon never puts
+    // a second Claude on an already-open session (for auto-restore into a fresh
+    // tmux session there are none). Two manifest entries can also share a session
+    // id — e.g. an in-pane `claude --resume` overwrites a pane's
+    // @slopd_claude_session_id — so we also add each as we restore it, resuming
+    // every session at most once.
+    let mut seen_sessions: std::collections::HashSet<String> = list_panes(config, managed_panes)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| p.session_id)
+        .collect();
     let mut restored = 0usize;
 
     for p in ordered {
@@ -1848,6 +1866,11 @@ async fn restore_panes(
         let parent = p.parent_pane_id;
         let session_id = p.session_id.expect("resumable panes have a session id");
         let working_dir = p.working_dir;
+
+        if !seen_sessions.insert(session_id.clone()) {
+            info!("backup: skipping pane {} — session {} already running or restored", old_id, session_id);
+            continue;
+        }
 
         // Resolve the account (falling back to default if it was removed from
         // config) and inject its hooks before spawning, like the run handler.
@@ -1946,6 +1969,7 @@ async fn restore_panes(
     }
 
     info!("backup: restored {}/{} recorded pane(s)", restored, total);
+    restored
 }
 
 async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Result<(), libslop::ResponseBody> {
@@ -2535,6 +2559,25 @@ async fn handle_request(
                 Ok(panes) => libslop::ResponseBody::Ps { panes },
                 Err(e) => libslop::ResponseBody::Error { message: e },
             }
+        }
+
+        libslop::RequestBody::Backup => {
+            // Manual backup: write the manifest now, regardless of auto_backup.
+            let manifest_path = config.backup.manifest_path();
+            let count = backup_panes(config, managed_panes, &manifest_path).await;
+            libslop::ResponseBody::BackedUp { count }
+        }
+
+        libslop::RequestBody::Restore => {
+            // Manual restore: re-spawn from the manifest now, regardless of
+            // auto_restore. restore_panes seeds its dedup set with the sessions
+            // of currently-running panes, so this won't double a live session.
+            let manifest_path = config.backup.manifest_path();
+            let manifest = read_pane_manifest(&manifest_path).await;
+            let restored = restore_panes(
+                config, managed_panes, panes, event_tx, pane_registered, session_lock, manifest,
+            ).await;
+            libslop::ResponseBody::Restored { restored }
         }
 
         libslop::RequestBody::ReadTranscript { pane_id, before_cursor, limit } => {

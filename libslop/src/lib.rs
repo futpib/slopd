@@ -1484,30 +1484,41 @@ impl Default for SlopdRunConfig {
     }
 }
 
-/// Backup/restore of the managed-pane set across reboots.
+/// Backup and restore of the managed-pane set across reboots (the `[backup]`
+/// config section).
 ///
 /// slopd normally keeps each pane's identity (Claude session id, account, tags,
 /// ancestry) in tmux pane options, which it re-reads on a daemon restart. A
 /// *reboot* destroys the tmux server along with those options and the Claude
-/// processes, so slopd also writes the set of panes to a manifest on disk
-/// ([`panes_manifest_path`]). On the next startup into a freshly-created tmux
-/// session, it re-spawns each pane with `claude --resume <session_id>`.
+/// processes, so slopd can also write the set of panes to a manifest on disk
+/// ([`panes_manifest_path`]) and re-spawn them with `claude --resume` afterwards.
+///
+/// The two automatic behaviours are independent toggles, and all four
+/// combinations are valid. Manual `slopctl backup` and `slopctl restore` are
+/// always available regardless of these — the toggles only control what slopd
+/// does on its own.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdBackupConfig {
-    /// Whether to snapshot the pane set to disk and restore it on a fresh start
-    /// (default: true). Set to false to disable backup/restore entirely.
-    #[serde(default = "default_backup_enabled")]
-    pub enabled: bool,
+    /// Automatically write the manifest on a timer and on clean shutdown
+    /// (default: true). `slopctl backup` triggers a write on demand regardless.
+    #[serde(default = "default_auto_backup")]
+    pub auto_backup: bool,
+    /// Automatically re-spawn the recorded panes (via `claude --resume`) on the
+    /// next startup into a freshly-created tmux session, i.e. after a reboot
+    /// (default: false, so a reboot doesn't resurrect panes unless asked).
+    /// `slopctl restore` triggers a restore on demand regardless.
+    #[serde(default)]
+    pub auto_restore: bool,
     /// Manifest path. Defaults to [`panes_manifest_path`]
     /// (`$XDG_STATE_HOME/slopd/panes.json`). Supports `~` and `$VAR` expansion.
     pub path: Option<PathBuf>,
-    /// How often (seconds) to snapshot the pane set while running (default: 30).
-    /// A snapshot is also taken on clean shutdown regardless of this interval.
+    /// How often (seconds) to auto-back-up while running (default: 30). A backup
+    /// is also taken on clean shutdown regardless of this interval.
     #[serde(default = "default_backup_interval_secs")]
     pub interval_secs: u64,
 }
 
-fn default_backup_enabled() -> bool {
+fn default_auto_backup() -> bool {
     true
 }
 
@@ -1518,7 +1529,8 @@ fn default_backup_interval_secs() -> u64 {
 impl Default for SlopdBackupConfig {
     fn default() -> Self {
         Self {
-            enabled: default_backup_enabled(),
+            auto_backup: default_auto_backup(),
+            auto_restore: false,
             path: None,
             interval_secs: default_backup_interval_secs(),
         }
@@ -2024,6 +2036,13 @@ pub enum RequestBody {
     Tags { pane_id: String },
     /// List all panes in the slopd session.
     Ps,
+    /// Write the backup manifest to disk now (manual `slopctl backup`),
+    /// independent of the `auto_backup` setting.
+    Backup,
+    /// Re-spawn panes from the backup manifest now (manual `slopctl restore`),
+    /// independent of `auto_restore`. Sessions already running are skipped, so
+    /// this is safe to run against a live daemon.
+    Restore,
     /// Cancel a subscription previously created by Subscribe or SubscribeTranscript.
     /// The `id` field in the outer Request identifies the Unsubscribe request itself;
     /// `subscription_id` is the `id` of the original Subscribe/SubscribeTranscript request.
@@ -2056,6 +2075,11 @@ pub enum ResponseBody {
     Untagged { pane_id: String, tag: String },
     Tags { pane_id: String, tags: Vec<String> },
     Ps { panes: Vec<PaneInfo> },
+    /// Response to Backup: number of panes written to the manifest.
+    BackedUp { count: usize },
+    /// Response to Restore: number of panes re-spawned (sessions already running
+    /// are skipped and not counted).
+    Restored { restored: usize },
     /// Confirms that a subscription has been cancelled.
     Unsubscribed { subscription_id: u64 },
     Error { message: String },

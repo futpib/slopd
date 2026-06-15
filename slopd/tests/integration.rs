@@ -8854,6 +8854,8 @@ fn backup_restore_round_trip_across_reboot() {
         eprintln!("skipping: tmux not found");
         return;
     };
+    // Restore is opt-in; enable it for this test.
+    env.append_config("[backup]\nauto_restore = true");
 
     // --- first boot: run a pane, tag it, snapshot on clean shutdown ---
     let slopd1 = env.spawn_slopd();
@@ -8940,6 +8942,9 @@ fn restart_with_surviving_session_does_not_duplicate_panes() {
         eprintln!("skipping: tmux not found");
         return;
     };
+    // Restore enabled — the point of this test is that the session-existed gate
+    // still prevents duplication even with restore turned on.
+    env.append_config("[backup]\nauto_restore = true");
 
     let slopd1 = env.spawn_slopd();
     let listener = env.spawn_session_start_listener();
@@ -8966,6 +8971,193 @@ fn restart_with_surviving_session_does_not_duplicate_panes() {
         "a surviving-session restart must not duplicate panes; got {:?}", panes);
     assert_eq!(claude_panes[0].pane_id, pane_id,
         "the recovered pane should keep its original tmux id");
+
+    kill_slopd(slopd2);
+}
+
+// mock_claude always reports this fixed session id, so any number of mock panes
+// share one session — handy for exercising dedup.
+const MOCK_SID: &str = "mock-session-id-1234";
+
+/// Build the bins and a TestEnv wired to mock_claude, with `backup_toml` appended
+/// to the slopd config. Returns the env plus the home tempdir it borrows (kept
+/// alive by the caller). `None` if tmux is unavailable.
+fn backup_env(backup_toml: &str) -> Option<(TestEnv, tempfile::TempDir)> {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    )?;
+    env.append_config(backup_toml);
+    Some((env, home_dir))
+}
+
+/// Count managed panes whose session id is `sid`.
+fn count_panes_with_session(env: &TestEnv, sid: &str) -> usize {
+    let out = env.slopctl(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    panes.iter().filter(|p| p.session_id.as_deref() == Some(sid)).count()
+}
+
+/// Simulate a reboot: destroy the slopd tmux session (and its panes). The
+/// harness tmux server stays up via its own "test" session, so the next slopd
+/// start sees a fresh session.
+fn reboot_tmux(env: &TestEnv) {
+    let ok = env.tmux.tmux().args(["kill-session", "-t", "slopd"]).status().unwrap();
+    assert!(ok.success(), "failed to kill slopd tmux session");
+}
+
+/// Run a pane and wait for its SessionStart so the session id is recorded.
+fn run_and_wait(env: &TestEnv) -> String {
+    let listener = env.spawn_session_start_listener();
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success(), "slopctl run failed: {:?}", out);
+    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+    pane_id
+}
+
+// `slopctl backup` / `slopctl restore` work on demand even with both automatic
+// behaviours off: a manual backup persists the manifest, and after a reboot a
+// manual restore brings the pane back.
+#[test]
+fn manual_backup_and_restore_commands() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_backup = false\nauto_restore = false") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+
+    // Nothing is written automatically; a manual backup persists the pane.
+    let out = env.slopctl(&["backup"]);
+    assert!(out.status.success(), "slopctl backup failed: {:?}", out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("backed up 1"),
+        "expected 'backed up 1'; got {:?}", String::from_utf8_lossy(&out.stdout));
+
+    sigint_child(slopd1);
+    reboot_tmux(&env);
+
+    // auto_restore is off, so the restart leaves the manifest alone...
+    let slopd2 = env.spawn_slopd();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 0,
+        "auto_restore=false must not restore on startup");
+
+    // ...until we ask for it manually.
+    let out = env.slopctl(&["restore"]);
+    assert!(out.status.success(), "slopctl restore failed: {:?}", out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("restored 1"),
+        "expected 'restored 1'; got {:?}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 1,
+        "manual restore should bring the pane back");
+
+    kill_slopd(slopd2);
+}
+
+// A manual restore against a live daemon must not double a session that is
+// already running — the dedup set is seeded with the running panes' session ids.
+#[test]
+fn manual_restore_skips_already_running_session() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_backup = false") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    run_and_wait(&env);
+
+    // Capture the running pane into the manifest, then restore with it still alive.
+    let out = env.slopctl(&["backup"]);
+    assert!(out.status.success(), "slopctl backup failed: {:?}", out);
+
+    let out = env.slopctl(&["restore"]);
+    assert!(out.status.success(), "slopctl restore failed: {:?}", out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("restored 0"),
+        "restore must skip the already-running session; got {:?}",
+        String::from_utf8_lossy(&out.stdout));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 1,
+        "the already-running session must not be duplicated");
+
+    kill_slopd(slopd);
+}
+
+// Repeated reboots must not accumulate duplicates: a session restored once stays
+// a single pane across a second reboot+restore.
+#[test]
+fn repeated_restore_does_not_duplicate() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = true") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+
+    // Reboot #1 → restore.
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while count_panes_with_session(&env, MOCK_SID) == 0 {
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("first restore did not bring the pane back");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    sigint_child(slopd2);
+
+    // Reboot #2 → restore again. The already-restored session must not double.
+    reboot_tmux(&env);
+    let slopd3 = env.spawn_slopd();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 1,
+        "a repeated reboot+restore must not duplicate an already-restored session");
+
+    kill_slopd(slopd3);
+}
+
+// A manifest with two entries that share a session id (possible when
+// @slopd_claude_session_id is overwritten by an in-pane resume) must restore to
+// a single pane, not two Claudes on one transcript. Two mock panes share the
+// fixed mock session id, so a backup of both produces exactly such a manifest.
+#[test]
+fn restore_dedups_duplicate_sessions_in_manifest() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = true") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    let listener = env.spawn_session_start_listener();
+    let p1 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    let p2 = String::from_utf8_lossy(&env.slopctl(&["run"]).stdout).trim().to_string();
+    env.wait_for_session_starts(listener, &[&p1, &p2]);
+
+    // Both panes report the same mock session id, so the shutdown backup writes a
+    // manifest with two entries sharing it.
+    sigint_child(slopd1);
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let manifest: Vec<libslop::PaneInfo> = serde_json::from_slice(
+        &std::fs::read(&manifest_path).expect("manifest written"),
+    ).expect("valid manifest");
+    let dup = manifest.iter().filter(|p| p.session_id.as_deref() == Some(MOCK_SID)).count();
+    assert_eq!(dup, 2, "precondition: manifest should hold two entries with the shared session id; got {:?}", manifest);
+
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 1,
+        "duplicate session ids in the manifest must restore to a single pane");
 
     kill_slopd(slopd2);
 }
