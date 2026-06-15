@@ -201,13 +201,17 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # env_files = ["~/.config/slopd/pane.env"]
 
 # [backup]
-# Snapshot the managed-pane set to disk and restore it on a fresh start after a
-# reboot (see "Backup and restore"). Defaults are fine for most setups.
-# Whether backup/restore is active at all (default: true).
-# enabled = true
+# Back up the managed-pane set to disk and restore it after a reboot (see
+# "Backup and restore"). The two automatic behaviours are independent; manual
+# `slopctl backup` / `slopctl restore` work regardless of them.
+# Automatically write the manifest on a timer and on clean shutdown (default: true).
+# auto_backup = true
+# Automatically re-spawn the recorded panes after a reboot (default: false, so a
+# reboot does not resurrect panes unless you ask).
+# auto_restore = false
 # Manifest path (default: $XDG_STATE_HOME/slopd/panes.json). Supports ~ / $VAR.
 # path = "~/.local/state/slopd/panes.json"
-# How often (seconds) to snapshot while running (default: 30). A snapshot is
+# How often (seconds) to auto-back-up while running (default: 30). A backup is
 # also taken on clean shutdown regardless of this interval.
 # interval_secs = 30
 ```
@@ -274,13 +278,20 @@ slopd keeps each pane's identity — Claude session id, account, tags, ancestry,
 
 A **reboot** is the one case that breaks: it destroys the whole tmux server, taking those pane options *and* the Claude processes with it. The conversations themselves are safe — Claude writes each session to a transcript on disk and `claude --resume <id>` continues it — but slopd's record of *which* sessions were running, and how, is gone with tmux. Backup/restore closes that gap by keeping a copy on durable storage.
 
-**Backup.** While running, slopd snapshots the managed-pane set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every `[backup] interval_secs` seconds, and once more on clean shutdown. Writes are atomic (temp file + rename), so a crash mid-write never corrupts the manifest. The manifest lives in the XDG **state** dir, which survives reboot — unlike the runtime dir that holds the control socket.
+Backup and restore each have an **automatic** toggle plus an always-available **manual** command, and the two automatic toggles are independent — all four combinations are valid:
 
-**Restore.** On startup, when slopd finds it has to create its tmux session from scratch — the signature of a fresh server after a reboot — it reads the manifest and re-spawns each recorded pane with `claude --resume <session_id>` in its original working directory and account, restoring tags and parent/child ancestry (remapped to the new tmux pane ids). If the tmux session already exists (an ordinary daemon restart), slopd skips the manifest entirely and recovers panes from tmux as usual, so panes are never duplicated.
+| | `auto_restore = false` (default) | `auto_restore = true` |
+|---|---|---|
+| **`auto_backup = true`** (default) | back up automatically; restore only on demand | full reboot survival |
+| **`auto_backup = false`** | drive both by hand | restore on reboot from manifests you write by hand |
 
-Restore is best-effort: a pane whose session can no longer be resumed (e.g. its transcript was deleted) simply fails to come up and is cleaned up by the reconciler, without affecting the others. Panes that had not yet recorded a Claude session id (still booting at snapshot time) are skipped, since there is nothing to resume.
+**Backup.** With `auto_backup` on (the default), slopd writes the managed-pane set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every `[backup] interval_secs` seconds and once more on clean shutdown; `slopctl backup` writes it on demand at any time. Writes are atomic (temp file + rename), so a crash mid-write never corrupts the manifest, and only panes that have recorded a Claude session id — the ones that can actually be resumed — are written. The manifest lives in the XDG **state** dir, which survives reboot, unlike the runtime dir that holds the control socket.
 
-Because plain `--resume` continues the *same* session id and appends to the *same* transcript, a restored pane keeps its identity, and subsequent snapshots stay valid across repeated reboots. Set `[backup] enabled = false` to turn the whole mechanism off.
+**Restore.** With `auto_restore` on, slopd restores when it finds it had to create its tmux session from scratch — the signature of a fresh server after a reboot: it re-spawns each recorded pane with `claude --resume <session_id>` in its original working directory and account, restoring tags and parent/child ancestry (remapped to the new tmux pane ids). On an ordinary daemon restart the tmux session still exists, so slopd recovers panes from tmux as usual and does not touch the manifest — panes are never duplicated. `slopctl restore` does the same on demand; it is safe on a live daemon because it skips any session that is already running.
+
+Restore never starts two Claude processes on one session: it skips a session id that is already running *or* that it has already restored in this pass (a manifest can legitimately contain the same session id twice). It is otherwise best-effort — a pane whose session can no longer be resumed (e.g. its transcript was deleted) simply fails to come up and is reconciled away, without affecting the others.
+
+Because plain `--resume` continues the *same* session id and appends to the *same* transcript, a restored pane keeps its identity and the manifest stays valid across repeated reboots. The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup but does not resurrect panes on reboot unless you opt in or run `slopctl restore`.
 
 ---
 
@@ -435,6 +446,24 @@ Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
 
 ```bash
 slopctl interrupt %1
+```
+
+### `slopctl backup`
+
+Write the backup manifest now, regardless of the `[backup] auto_backup` setting. Prints how many panes were recorded. See [Backup and restore](#backup-and-restore).
+
+```bash
+slopctl backup
+# backed up 3 pane(s)
+```
+
+### `slopctl restore`
+
+Re-spawn panes from the backup manifest now, regardless of `[backup] auto_restore`. Sessions that are already running are skipped, so this is safe to run against a live daemon (e.g. to pull back panes that died, or to restore after a reboot when `auto_restore` is off). Prints how many panes were re-spawned.
+
+```bash
+slopctl restore
+# restored 2 pane(s)
 ```
 
 ### `slopctl hook <EVENT>`
