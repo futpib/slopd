@@ -9161,3 +9161,33 @@ fn restore_dedups_duplicate_sessions_in_manifest() {
 
     kill_slopd(slopd2);
 }
+
+// Regression: slopd marks its tmux session with an @slopd_managed option (at the
+// SESSION level) so the session can be identified. A `#{@slopd_managed}` format
+// resolves user options hierarchically, so the session's idle shell pane — which
+// has no pane-level value — inherits the session marker's "true". load_managed_panes
+// must read the option pane-scoped (`show-options -p`, no inheritance) instead,
+// or it adopts the idle shell as a phantom managed pane. A fresh session must
+// therefore show no managed panes.
+#[test]
+fn idle_shell_not_adopted_on_fresh_start() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    // No `run`: the session's only pane is the idle shell created by
+    // `tmux new-session`. It is not pane-level managed and must not be adopted.
+    let out = env.slopctl(&["ps", "--json"]);
+    assert!(out.status.success(), "slopctl ps failed: {:?}", out);
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&out.stdout).expect("valid ps json");
+    assert!(panes.is_empty(),
+        "a fresh slopd session must adopt no panes; the idle shell inherits the \
+         session-level @slopd_managed marker but is not pane-managed. got: {:?}", panes);
+
+    kill_slopd(slopd);
+}

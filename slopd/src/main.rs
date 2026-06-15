@@ -572,72 +572,71 @@ async fn read_pane_account(config: &libslop::SlopdConfig, pane_id: &str) -> Opti
 /// last N transcript records through the state reducer to recover the real state
 /// instead of leaving it stuck at BootingUp.
 async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) -> std::collections::HashSet<std::path::PathBuf> {
-    // Order matters: @slopd_account (no spaces) before @slopd_transcript_path,
-    // which is captured last so any spaces in a path stay intact.
-    let format_str = format!(
-        "#{{pane_id}} #{{{}}} #{{{}}} #{{{}}}",
-        libslop::TmuxOption::SlopdManaged.as_str(),
-        libslop::TmuxOption::SlopdAccount.as_str(),
-        libslop::TmuxOption::SlopdTranscriptPath.as_str(),
-    );
     let mut settings_paths = std::collections::HashSet::new();
     let session = config.tmux.session();
+    // Enumerate the session's pane ids, then read each pane's options with
+    // `show-options -p` (pane scope, *no* inheritance).
+    //
+    // We must NOT detect managed panes via a `#{@slopd_managed}` format on
+    // `list-panes`: a format resolves user options hierarchically, so the
+    // session's idle shell — which has no pane-level value — would inherit the
+    // session-level @slopd_managed marker (set in main) and be wrongly adopted.
+    // The per-pane `-p` read returns only options actually set on the pane, so
+    // it sees @slopd_managed only on real managed panes (cf. pane_is_still_alive).
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", &session, "-F", &format_str])
+        .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id}"])
         .output()
         .await;
-    if let Ok(out) = output
-        && out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut parts = line.splitn(4, ' ');
-                let pane_id = parts.next().unwrap_or("").trim();
-                let slopd_managed = parts.next().unwrap_or("").trim();
-                let account = parts.next().unwrap_or("").trim();
-                let transcript_path = parts.next().unwrap_or("").trim();
-                if pane_id.is_empty() || slopd_managed != "true" {
-                    continue;
-                }
-                managed.insert(pane_id.to_string());
-
-                // Record where this pane's hooks live so we can re-inject them.
-                // An unresolvable account (removed from config, or a misconfigured
-                // default_account) falls back to the reserved default account,
-                // which always resolves — recovery must never crash startup.
-                let account = if account.is_empty() { None } else { Some(account) };
-                let resolved = config
-                    .resolve_account(account)
-                    .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
-                    .expect("the reserved default account always resolves");
-                settings_paths.insert(config.resolved_settings_path(&resolved));
-
-                // Replay the last N transcript records to recover the real state.
-                let recovered_state = if !transcript_path.is_empty() {
-                    recover_state_from_transcript(transcript_path).await
-                } else {
-                    None
-                };
-
-                let initial_state = recovered_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
-                set_pane_detailed_state(config, pane_id, &initial_state, None, event_tx, panes).await;
-
-                // Start the transcript tailer if we have a path.
-                if !transcript_path.is_empty() {
-                    let state = panes.get_or_insert(pane_id);
-                    let new_cancel = tokio_util::sync::CancellationToken::new();
-                    *state.transcript_cancel.lock().unwrap() = new_cancel.clone();
-                    *state.transcript_path.lock().unwrap() = Some(transcript_path.to_string());
-                    tokio::spawn(tail_transcript(
-                        std::path::PathBuf::from(transcript_path),
-                        pane_id.to_string(),
-                        state.clone(),
-                        config.clone(),
-                        panes.clone(),
-                        event_tx.clone(),
-                        new_cancel,
-                    ));
-                }
-            }
+    let Ok(out) = output else { return settings_paths };
+    if !out.status.success() {
+        return settings_paths;
+    }
+    for pane_id in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let opts = match tmux(config).args(["show-options", "-t", pane_id, "-p"]).output().await {
+            Ok(o) if o.status.success() => parse_pane_options(&String::from_utf8_lossy(&o.stdout)),
+            _ => continue,
+        };
+        if !opts.slopd_managed {
+            continue;
         }
+        managed.insert(pane_id.to_string());
+
+        // Record where this pane's hooks live so we can re-inject them.
+        // An unresolvable account (removed from config, or a misconfigured
+        // default_account) falls back to the reserved default account, which
+        // always resolves — recovery must never crash startup.
+        let resolved = config
+            .resolve_account(opts.account.as_deref())
+            .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
+            .expect("the reserved default account always resolves");
+        settings_paths.insert(config.resolved_settings_path(&resolved));
+
+        // Replay the last N transcript records to recover the real state.
+        let transcript_path = opts.transcript_path;
+        let recovered_state = match transcript_path.as_deref() {
+            Some(path) => recover_state_from_transcript(path).await,
+            None => None,
+        };
+        let initial_state = recovered_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
+        set_pane_detailed_state(config, pane_id, &initial_state, None, event_tx, panes).await;
+
+        // Start the transcript tailer if we have a path.
+        if let Some(transcript_path) = transcript_path {
+            let state = panes.get_or_insert(pane_id);
+            let new_cancel = tokio_util::sync::CancellationToken::new();
+            *state.transcript_cancel.lock().unwrap() = new_cancel.clone();
+            *state.transcript_path.lock().unwrap() = Some(transcript_path.clone());
+            tokio::spawn(tail_transcript(
+                std::path::PathBuf::from(transcript_path),
+                pane_id.to_string(),
+                state.clone(),
+                config.clone(),
+                panes.clone(),
+                event_tx.clone(),
+                new_cancel,
+            ));
+        }
+    }
     settings_paths
 }
 
@@ -1518,6 +1517,8 @@ struct ParsedPaneOptions {
     created_at: Option<u64>,
     /// Account the pane was launched under (@slopd_account); None when unset.
     account: Option<String>,
+    /// Path to the pane's Claude transcript (@slopd_transcript_path); None unset.
+    transcript_path: Option<String>,
 }
 
 impl ParsedPaneOptions {
@@ -1535,6 +1536,7 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
     let mut detailed_state = None;
     let mut created_at = None;
     let mut account = None;
+    let mut transcript_path = None;
     for opt_line in stdout.lines() {
         let mut words = opt_line.splitn(2, ' ');
         let key = words.next().unwrap_or("").trim();
@@ -1554,11 +1556,13 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
             created_at = val.parse::<u64>().ok();
         } else if key == libslop::TmuxOption::SlopdAccount.as_str() {
             account = if val.is_empty() { None } else { Some(val.to_string()) };
+        } else if key == libslop::TmuxOption::SlopdTranscriptPath.as_str() {
+            transcript_path = if val.is_empty() { None } else { Some(val.to_string()) };
         } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
             tags.push(tag.to_string());
         }
     }
-    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at, account }
+    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at, account, transcript_path }
 }
 
 /// Encode an ancestor list as a comma-separated string for tmux storage.
