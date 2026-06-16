@@ -1546,6 +1546,18 @@ impl SlopdBackupConfig {
             .map(expand_path)
             .unwrap_or_else(panes_manifest_path)
     }
+
+    /// Path to the pending-restore marker, a sibling of the manifest
+    /// (`<manifest>.pending`). Its presence means a restore was pending and not
+    /// yet resolved; slopd writes it when it enters the pending state and removes
+    /// it on resolve, so the pending state survives a daemon restart (not just a
+    /// reboot) — without it, a restart would resume auto-backup and clobber the
+    /// preserved manifest.
+    pub fn pending_marker_path(&self) -> PathBuf {
+        let mut s = self.manifest_path().into_os_string();
+        s.push(".pending");
+        s.into()
+    }
 }
 
 impl SlopdConfig {

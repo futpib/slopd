@@ -9271,3 +9271,45 @@ fn pending_restore_resolved_by_slopctl_restore() {
 
     kill_slopd(slopd2);
 }
+
+// The pending state must survive a *daemon* restart (not just a reboot), or a
+// crash/restart in the pending window would resume auto-backup and clobber the
+// preserved manifest. A `.pending` marker persists it: the restarted daemon
+// re-enters pending even though the tmux session survived.
+#[test]
+fn pending_restore_survives_daemon_restart() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = false\ninterval_secs = 1") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // Boot 1: a pane captured into the manifest.
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let before = std::fs::read(&manifest_path).expect("manifest written");
+    assert!(before != b"[]" && !before.is_empty(), "precondition: manifest holds the pane");
+
+    // Reboot → pending.
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    assert!(String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).contains("pending_restore: 1"),
+        "should be pending after reboot");
+
+    // Daemon restart (tmux session survives) before resolving: kill slopd, then
+    // start a new one against the same surviving session.
+    sigint_child(slopd2);
+    let slopd3 = env.spawn_slopd();
+    std::thread::sleep(Duration::from_millis(2500)); // past several backup ticks
+
+    // The marker must have made the new daemon re-enter pending, so the manifest
+    // is preserved (not clobbered by resumed auto-backup) and status still shows it.
+    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    assert_eq!(before, after,
+        "a daemon restart during a pending restore must not clobber the manifest");
+    assert!(String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).contains("pending_restore: 1"),
+        "pending must persist across a daemon restart");
+
+    kill_slopd(slopd3);
+}

@@ -1176,27 +1176,45 @@ async fn main() {
         }
     }
 
-    // Handle the on-disk manifest after a fresh start. Gate on the tmux session
-    // having been freshly created: a surviving session means a mere daemon
-    // restart, where load_managed_panes already recovered the live panes from
-    // tmux (restoring from disk would duplicate them). A fresh session is the
-    // post-reboot case, where the manifest is the only surviving record.
-    if !session_existed {
-        let manifest = read_pane_manifest(&manifest_path).await;
-        if manifest.is_empty() {
-            debug!("backup: fresh session, nothing in manifest {}", manifest_path.display());
-        } else if auto_restore {
-            info!("backup: fresh tmux session; restoring {} pane(s) from {}", manifest.len(), manifest_path.display());
+    // Decide what to do with the on-disk manifest on this start.
+    //
+    // `!session_existed` (we had to create the tmux session) is the post-reboot
+    // case, where the manifest is the only surviving record: auto_restore
+    // re-spawns the panes, otherwise we hold a *pending restore*. A surviving
+    // session is a mere daemon restart — load_managed_panes already recovered
+    // the live panes, so we don't restore — EXCEPT when a pending restore was
+    // left unresolved before this restart: the `.pending` marker tells us to
+    // re-enter the pending state so the preserved manifest isn't clobbered by
+    // auto-backup resuming. (Without the marker, the in-memory pending flag would
+    // be lost on a daemon restart.)
+    let marker_path = config.backup.pending_marker_path();
+    let marker_exists = tokio::fs::metadata(&marker_path).await.is_ok();
+    let manifest = read_pane_manifest(&manifest_path).await;
+    let count = manifest.len();
+    let enter_pending = if count == 0 {
+        false
+    } else if !session_existed {
+        if auto_restore {
+            info!("backup: fresh tmux session; restoring {} pane(s) from {}", count, manifest_path.display());
             restore_panes(&config, &managed_panes, &panes, &event_tx, &pane_registered, &session_lock, manifest).await;
+            false
         } else {
-            // auto_restore is off: don't resurrect, but mark the manifest as a
-            // pending restore. This suspends auto-backup (below) so the restore
-            // point is preserved through any post-reboot activity until the user
-            // runs `slopctl restore` (consume) or `slopctl backup` (replace).
-            let count = manifest.len();
-            *pending_restore.lock().unwrap() = Some(count);
-            info!("backup: {} pane(s) from a previous session can be restored — run `slopctl restore` (auto-backup paused until then; see `slopctl status`)", count);
+            true
         }
+    } else {
+        // Daemon restart: only pending if a previous pending was unresolved.
+        marker_exists
+    };
+
+    if enter_pending {
+        *pending_restore.lock().unwrap() = Some(count);
+        if let Err(e) = tokio::fs::write(&marker_path, count.to_string()).await {
+            warn!("backup: failed to persist pending-restore marker {}: {}", marker_path.display(), e);
+        }
+        info!("backup: {} pane(s) from a previous session can be restored — run `slopctl restore` (auto-backup paused until then; see `slopctl status`)", count);
+    } else {
+        // Not pending — clear any stale marker (restored, empty, or resolved).
+        let _ = tokio::fs::remove_file(&marker_path).await;
     }
 
     let _ = tokio::fs::remove_file(&socket_path).await;
@@ -2597,6 +2615,7 @@ async fn handle_request(
             let manifest_path = config.backup.manifest_path();
             let count = backup_panes(config, managed_panes, &manifest_path).await;
             *pending_restore.lock().unwrap() = None;
+            let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
             libslop::ResponseBody::BackedUp { count }
         }
 
@@ -2611,6 +2630,7 @@ async fn handle_request(
             ).await;
             // The pending restore (if any) has now been consumed; resume auto-backup.
             *pending_restore.lock().unwrap() = None;
+            let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
             libslop::ResponseBody::Restored { restored }
         }
 
