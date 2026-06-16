@@ -289,6 +289,8 @@ Backup and restore each have an **automatic** toggle plus an always-available **
 
 **Restore.** With `auto_restore` on, slopd restores when it finds it had to create its tmux session from scratch — the signature of a fresh server after a reboot: it re-spawns each recorded pane with `claude --resume <session_id>` in its original working directory and account, restoring tags and parent/child ancestry (remapped to the new tmux pane ids). On an ordinary daemon restart the tmux session still exists, so slopd recovers panes from tmux as usual and does not touch the manifest — panes are never duplicated. `slopctl restore` does the same on demand; it is safe on a live daemon because it skips any session that is already running.
 
+**Pending restore (with `auto_restore` off).** When slopd starts into a fresh session and `auto_restore` is off, it does *not* resurrect the panes — but it does mark the manifest as a **pending restore**: the count shows in `slopctl status`, and **auto-backup is suspended** so the restore point is preserved. This matters because otherwise auto-backup would immediately overwrite the manifest with the empty (or, once you start working, diverged) post-reboot pane set, destroying it before you could use it. With the pending hold, you can reboot, start working, and run `slopctl restore` whenever you remember — the pre-reboot set is still there. The pending state is resolved by `slopctl restore` (bring the panes back) or `slopctl backup` (replace the restore point with the current state); either one resumes normal auto-backup.
+
 Restore never starts two Claude processes on one session: it skips a session id that is already running *or* that it has already restored in this pass (a manifest can legitimately contain the same session id twice). It is otherwise best-effort — a pane whose session can no longer be resumed (e.g. its transcript was deleted) simply fails to come up and is reconciled away, without affecting the others.
 
 Because plain `--resume` continues the *same* session id and appends to the *same* transcript, a restored pane keeps its identity and the manifest stays valid across repeated reboots. The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup but does not resurrect panes on reboot unless you opt in or run `slopctl restore`.
@@ -307,6 +309,15 @@ Print daemon uptime and state.
 uptime: 5025s
 subscribers: 3
 config_generation: 1
+```
+
+After a reboot with `auto_restore` off, a `pending_restore` line appears while panes from the previous session await a `slopctl restore` (see [Backup and restore](#backup-and-restore)):
+
+```
+uptime: 12s
+subscribers: 0
+config_generation: 0
+pending_restore: 7 pane(s) — run `slopctl restore`
 ```
 
 ### `slopctl ps [--filter KEY=VALUE] [--json]`
