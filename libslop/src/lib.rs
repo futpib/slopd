@@ -2221,4 +2221,10 @@ pub struct DaemonState {
     /// do not advance this counter.
     #[serde(default)]
     pub config_generation: u64,
+    /// Set after a reboot when `auto_restore` is off and the on-disk manifest
+    /// holds panes that have not been restored yet: the number of panes awaiting
+    /// a `slopctl restore`. While pending, auto-backup is suspended so the
+    /// manifest is preserved. `None` when there is nothing pending.
+    #[serde(default)]
+    pub pending_restore: Option<usize>,
 }

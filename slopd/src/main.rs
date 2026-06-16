@@ -665,6 +665,12 @@ async fn recover_state_from_transcript(
 
 type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
 type PaneRegistered = Arc<tokio::sync::Notify>;
+/// After a reboot with `auto_restore` off, holds `Some(n)` while `n` panes from
+/// the on-disk manifest await a `slopctl restore`; `None` when nothing is
+/// pending. While `Some`, auto-backup is suspended so the manifest (the restore
+/// point) is preserved through any post-reboot activity until the user resolves
+/// it via `slopctl restore` (consume) or `slopctl backup` (replace).
+type PendingRestore = Arc<std::sync::Mutex<Option<usize>>>;
 
 /// How long to wait for a pane to be registered before concluding that a hook
 /// came from a genuinely unmanaged (external) pane.  The race window is
@@ -1152,6 +1158,7 @@ async fn main() {
     let auto_backup = config.backup.auto_backup;
     let auto_restore = config.backup.auto_restore;
     let manifest_path = config.backup.manifest_path();
+    let pending_restore: PendingRestore = Arc::new(std::sync::Mutex::new(None));
 
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized. This must happen before
@@ -1169,18 +1176,26 @@ async fn main() {
         }
     }
 
-    // Restore panes from the on-disk manifest after a reboot. Gate on the tmux
-    // session having been freshly created: a surviving session means a mere
-    // daemon restart, where load_managed_panes already recovered the live panes
-    // from tmux and restoring from disk would duplicate them. A fresh session
-    // (the post-reboot case) is where the manifest is the only surviving record.
-    if auto_restore && !session_existed {
+    // Handle the on-disk manifest after a fresh start. Gate on the tmux session
+    // having been freshly created: a surviving session means a mere daemon
+    // restart, where load_managed_panes already recovered the live panes from
+    // tmux (restoring from disk would duplicate them). A fresh session is the
+    // post-reboot case, where the manifest is the only surviving record.
+    if !session_existed {
         let manifest = read_pane_manifest(&manifest_path).await;
         if manifest.is_empty() {
-            debug!("backup: fresh session, no manifest to restore from {}", manifest_path.display());
-        } else {
+            debug!("backup: fresh session, nothing in manifest {}", manifest_path.display());
+        } else if auto_restore {
             info!("backup: fresh tmux session; restoring {} pane(s) from {}", manifest.len(), manifest_path.display());
             restore_panes(&config, &managed_panes, &panes, &event_tx, &pane_registered, &session_lock, manifest).await;
+        } else {
+            // auto_restore is off: don't resurrect, but mark the manifest as a
+            // pending restore. This suspends auto-backup (below) so the restore
+            // point is preserved through any post-reboot activity until the user
+            // runs `slopctl restore` (consume) or `slopctl backup` (replace).
+            let count = manifest.len();
+            *pending_restore.lock().unwrap() = Some(count);
+            info!("backup: {} pane(s) from a previous session can be restored — run `slopctl restore` (auto-backup paused until then; see `slopctl status`)", count);
         }
     }
 
@@ -1227,14 +1242,19 @@ async fn main() {
     loop {
         tokio::select! {
             _ = backup_interval.tick(), if auto_backup => {
-                let config_snapshot = config_rx.borrow().clone();
-                backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+                // Skip while a restore is pending so the preserved manifest (the
+                // restore point) isn't clobbered by the empty/diverged live set.
+                let pending = pending_restore.lock().unwrap().is_some();
+                if !pending {
+                    let config_snapshot = config_rx.borrow().clone();
+                    backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+                }
             }
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
                 let config_snapshot = config_rx.borrow().clone();
-                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -1264,7 +1284,10 @@ async fn main() {
     // Final auto-backup on clean shutdown, so the manifest reflects the very
     // latest pane set rather than being up to interval_secs stale. Runs only
     // after the select loop has exited, so it never races the periodic backup.
-    if auto_backup {
+    // Skipped while a restore is pending, so an unresolved restore point survives
+    // another shutdown (e.g. a second reboot before the user restored).
+    let restore_pending = pending_restore.lock().unwrap().is_some();
+    if auto_backup && !restore_pending {
         let config_snapshot = config_rx.borrow().clone();
         backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
     }
@@ -1364,6 +1387,7 @@ async fn handle_connection(
     pane_registered: PaneRegistered,
     session_lock: SessionLock,
     config_generation: Arc<std::sync::atomic::AtomicU64>,
+    pending_restore: PendingRestore,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -1497,7 +1521,7 @@ async fn handle_connection(
             }
 
             body => {
-                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock, &config_generation).await;
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock, &config_generation, &pending_restore).await;
                 if write_response(&writer, req.id, body).await.is_err() {
                     break;
                 }
@@ -1995,6 +2019,7 @@ async fn handle_request(
     pane_registered: &PaneRegistered,
     session_lock: &SessionLock,
     config_generation: &Arc<std::sync::atomic::AtomicU64>,
+    pending_restore: &PendingRestore,
 ) -> libslop::ResponseBody {
     match body {
 
@@ -2008,6 +2033,7 @@ async fn handle_request(
                     uptime_secs: now.saturating_sub(start_time),
                     subscriber_count: event_tx.receiver_count() as u64,
                     config_generation: config_generation.load(std::sync::atomic::Ordering::Relaxed),
+                    pending_restore: *pending_restore.lock().unwrap(),
                 },
             }
         }
@@ -2566,8 +2592,11 @@ async fn handle_request(
 
         libslop::RequestBody::Backup => {
             // Manual backup: write the manifest now, regardless of auto_backup.
+            // This explicitly replaces the restore point with the current state,
+            // so it resolves any pending restore and lets auto-backup resume.
             let manifest_path = config.backup.manifest_path();
             let count = backup_panes(config, managed_panes, &manifest_path).await;
+            *pending_restore.lock().unwrap() = None;
             libslop::ResponseBody::BackedUp { count }
         }
 
@@ -2580,6 +2609,8 @@ async fn handle_request(
             let restored = restore_panes(
                 config, managed_panes, panes, event_tx, pane_registered, session_lock, manifest,
             ).await;
+            // The pending restore (if any) has now been consumed; resume auto-backup.
+            *pending_restore.lock().unwrap() = None;
             libslop::ResponseBody::Restored { restored }
         }
 

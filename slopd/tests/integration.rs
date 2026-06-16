@@ -9191,3 +9191,83 @@ fn idle_shell_not_adopted_on_fresh_start() {
 
     kill_slopd(slopd);
 }
+
+// With auto_restore off, a reboot must NOT silently lose the restore point.
+// The manifest becomes a "pending restore": auto-backup is suspended so it is
+// preserved through post-reboot activity (the "reboot, start working, THEN
+// remember to restore" case), instead of being clobbered by the new live set.
+#[test]
+fn pending_restore_preserves_manifest_across_activity() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = false\ninterval_secs = 1") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    // First boot: a pane, captured into the manifest on clean shutdown.
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let before = std::fs::read(&manifest_path).expect("manifest written on shutdown");
+    assert!(!before.is_empty() && before != b"[]", "precondition: manifest holds the pane");
+
+    // Reboot: fresh session, auto_restore off → pending, nothing restored.
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    let status = String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).into_owned();
+    assert!(status.contains("pending_restore: 1 pane"),
+        "status should surface the pending restore; got {:?}", status);
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 0, "nothing restored yet");
+
+    // The edge case: create a pane before restoring. auto-backup must stay
+    // suspended so the restore point is preserved, not overwritten by the new
+    // (smaller) live set. Wait past several periodic backup ticks (interval=1s).
+    let out = env.slopctl(&["run"]);
+    assert!(out.status.success(), "run failed: {:?}", out);
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    assert_eq!(before, after,
+        "while a restore is pending, auto-backup must not overwrite the manifest, \
+         even after new panes are created post-reboot");
+
+    kill_slopd(slopd2);
+}
+
+// `slopctl restore` consumes the pending restore: it brings the panes back and
+// clears the pending state (resuming normal auto-backup).
+#[test]
+fn pending_restore_resolved_by_slopctl_restore() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = false") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    assert!(String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).contains("pending_restore: 1"),
+        "should be pending after a fresh reboot with auto_restore off");
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 0);
+
+    // Resolve it on demand.
+    let out = env.slopctl(&["restore"]);
+    assert!(out.status.success(), "restore failed: {:?}", out);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while count_panes_with_session(&env, MOCK_SID) == 0 {
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("restore did not bring the pane back");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let status = String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).into_owned();
+    assert!(!status.contains("pending_restore"),
+        "pending must be cleared once restored; got {:?}", status);
+
+    kill_slopd(slopd2);
+}

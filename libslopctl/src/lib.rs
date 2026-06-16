@@ -1658,6 +1658,9 @@ where
             println!("uptime: {}s", state.uptime_secs);
             println!("subscribers: {}", state.subscriber_count);
             println!("config_generation: {}", state.config_generation);
+            if let Some(n) = state.pending_restore {
+                println!("pending_restore: {} pane(s) — run `slopctl restore`", n);
+            }
         }
         CommonCommand::Ps { filters, json } => {
             let parsed = parse_filters(filters)?;
