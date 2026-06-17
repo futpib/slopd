@@ -135,12 +135,26 @@ pub fn expand_path(path: &std::path::Path) -> PathBuf {
     PathBuf::from(expanded.as_ref())
 }
 
-/// Whether `program` resolves to an executable, searching `path` (a PATH-style
-/// value) and resolving relative names against `cwd` — mirroring how a spawned
-/// pane looks it up. Lets `run` fail fast with a clear message when the
-/// configured executable is missing, instead of spawning a pane that just dies.
+/// Resolve `program` to an absolute executable path, searching `path` (a
+/// PATH-style value) and resolving relative names against `cwd` — mirroring how
+/// a spawned pane looks it up. `None` if it can't be found.
+///
+/// slopd spawns Claude panes with this *absolute* path rather than the bare
+/// program name, so a pane never depends on its own inherited PATH to locate
+/// the executable. That is what made restore silently fail after a reboot:
+/// systemd user services start with a minimal PATH that omits `~/.local/bin`
+/// (where `claude` lives), so every restored pane's `claude` was not found and
+/// the pane died instantly. Resolving up front against slopd's PATH removes the
+/// dependency entirely.
+pub fn resolve_executable(program: &str, path: &std::ffi::OsStr, cwd: &std::path::Path) -> Option<PathBuf> {
+    which::which_in(program, Some(path), cwd).ok()
+}
+
+/// Whether `program` resolves to an executable (see [`resolve_executable`]).
+/// Lets `run` fail fast with a clear message when the configured executable is
+/// missing, instead of spawning a pane that just dies.
 pub fn executable_exists(program: &str, path: &std::ffi::OsStr, cwd: &std::path::Path) -> bool {
-    which::which_in(program, Some(path), cwd).is_ok()
+    resolve_executable(program, path, cwd).is_some()
 }
 
 /// Expand `$VAR` / `${VAR}` references in a string against the current process
@@ -438,6 +452,19 @@ mod tests {
             executable_exists("/bin/sh", std::ffi::OsStr::new(""), &cwd),
             "an absolute path to a real binary should resolve"
         );
+    }
+
+    #[test]
+    fn resolve_executable_returns_an_absolute_path() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap();
+        // A bare name on PATH resolves to its absolute location — so slopd can
+        // spawn that path and the pane never needs the program on its own PATH
+        // (the architectural fix for the post-reboot restore failure).
+        let resolved = resolve_executable("sh", &path, &cwd).expect("sh should resolve on PATH");
+        assert!(resolved.is_absolute(), "resolved executable must be absolute; got {:?}", resolved);
+        // A bogus name resolves nowhere.
+        assert!(resolve_executable("slopd-no-such-binary-zzz", &path, &cwd).is_none());
     }
 
     #[test]

@@ -1194,12 +1194,23 @@ async fn main() {
     let enter_pending = if count == 0 {
         false
     } else if !session_existed {
-        if auto_restore {
+        if !auto_restore {
+            true
+        } else if !restore_executable_available(&config) {
+            // Don't spawn panes that will die instantly and let the empty live
+            // set clobber the manifest. Preserve the restore point and tell the
+            // user how to fix it. (The post-reboot PATH failure mode.)
+            error!(
+                "backup: cannot auto-restore {} pane(s) — configured executable {:?} not found on slopd's PATH. \
+                 systemd user services start with a minimal PATH (no ~/.local/bin); add a PATH drop-in for slopd.service. \
+                 Manifest preserved and auto-backup paused — fix PATH, then run `slopctl restore`.",
+                count, config.run.executable.program(),
+            );
+            true
+        } else {
             info!("backup: fresh tmux session; restoring {} pane(s) from {}", count, manifest_path.display());
             restore_panes(&config, &managed_panes, &panes, &event_tx, &pane_registered, &session_lock, manifest).await;
             false
-        } else {
-            true
         }
     } else {
         // Daemon restart: only pending if a previous pending was unresolved.
@@ -1833,6 +1844,123 @@ async fn read_pane_manifest(manifest_path: &std::path::Path) -> Vec<libslop::Pan
     }
 }
 
+/// Everything that differs between the two ways slopd launches a Claude pane
+/// (`run` and restore). Everything they *share* — resolving the executable to
+/// an absolute path and building the `tmux new-window` command — lives in
+/// [`spawn_claude_pane`], the single chokepoint both go through.
+#[derive(Default)]
+struct SpawnSpec {
+    /// `-c` working directory for the new pane (also the cwd a relative
+    /// executable resolves against). `None` → tmux default.
+    working_dir: Option<String>,
+    /// `CLAUDE_CONFIG_DIR` for the resolved account, if any.
+    config_dir: Option<std::path::PathBuf>,
+    /// Extra `-e KEY=VALUE` for the pane (run only; a PATH entry here also
+    /// drives executable resolution). Empty for restore.
+    extra_env: Vec<(String, String)>,
+    /// Args appended after the configured executable's own args (run: the
+    /// user's extra args; restore: `--resume <session_id>`).
+    trailing_args: Vec<String>,
+}
+
+/// The single place slopd launches a Claude pane in its tmux session. Resolves
+/// the configured executable to an ABSOLUTE path and spawns *that*, so the new
+/// pane never depends on its own inherited PATH to find `claude`. That
+/// dependency is exactly what made restore silently fail after a reboot
+/// (systemd user services start with a minimal PATH that omits `~/.local/bin`,
+/// so every restored pane's bare `claude` was not found and it died instantly).
+/// Routing both `run` and restore through here means the resolution can't be
+/// present on one spawn path and forgotten on the other.
+///
+/// Returns the new pane id, or an error string if the executable can't be
+/// resolved (so the caller can surface it / preserve the manifest) or tmux
+/// fails.
+async fn spawn_claude_pane(
+    config: &Arc<libslop::SlopdConfig>,
+    session_lock: &SessionLock,
+    spec: &SpawnSpec,
+) -> Result<String, String> {
+    // Resolve against the pane's effective PATH (a spec PATH override wins, else
+    // slopd's) and working dir, matching what the spawned pane would see.
+    let lookup_path = spec
+        .extra_env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let lookup_cwd = spec
+        .working_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let program = config.run.executable.program();
+    let resolved = libslop::resolve_executable(program, &lookup_path, &lookup_cwd).ok_or_else(|| {
+        format!(
+            "configured executable {:?} not found — check `[run] executable` (or --executable) and slopd's PATH \
+             (systemd user services start with a minimal PATH that omits ~/.local/bin, where `claude` usually lives)",
+            program
+        )
+    })?;
+
+    let xdg_runtime_dir = libslop::runtime_dir();
+    let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
+
+    let output = tmux_session_output(config, session_lock, |c| {
+        let mut cmd = tmux(c);
+        let session = c.tmux.session();
+        // `-d`: create the window in the background so spawning a pane doesn't
+        // yank clients already watching the session to it.
+        cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"])
+            .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
+            .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
+        if let Some(ref dir) = spec.working_dir {
+            cmd.args(["-c", dir]);
+        }
+        if let Some(ref dir) = spec.config_dir {
+            cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
+        }
+        // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g.
+        // mock_claude) write coverage data even when launched in a tmux window.
+        if let Some(ref pf) = profile_file {
+            cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
+        }
+        for (k, v) in &spec.extra_env {
+            cmd.args(["-e", &format!("{}={}", k, v)]);
+        }
+        // Spawn the resolved absolute path, not the bare program name, so the
+        // launch never depends on the pane's own PATH.
+        cmd.arg(&resolved)
+            .args(c.run.executable.args())
+            .args(&spec.trailing_args);
+        cmd
+    })
+    .await;
+
+    match output {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        Ok(out) => Err(format!(
+            "tmux new-window exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("tmux new-window failed: {}", e)),
+    }
+}
+
+/// Whether the configured Claude executable resolves on slopd's PATH. Used as a
+/// pre-flight for the startup restore decision: if it can't be resolved we keep
+/// the manifest as a pending restore (rather than spawn panes that fail) until
+/// the user fixes their PATH. The actual spawn in [`spawn_claude_pane`] resolves
+/// it again to an absolute path, so this only gates *whether* to attempt a
+/// restore, never how the executable is located.
+fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    libslop::executable_exists(config.run.executable.program(), &path, &cwd)
+}
+
 /// Re-spawn the panes recorded in `manifest` after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
@@ -1928,38 +2056,13 @@ async fn restore_panes(
             warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
         }
 
-        let xdg_runtime_dir = libslop::runtime_dir();
-        let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
-        let resolved_config_dir = resolved.config_dir.clone();
-
-        let output = tmux_session_output(config, session_lock, |c| {
-            let mut cmd = tmux(c);
-            let session = c.tmux.session();
-            cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"])
-                .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
-            if let Some(ref dir) = working_dir {
-                cmd.args(["-c", dir]);
-            }
-            if let Some(ref dir) = resolved_config_dir {
-                cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
-            }
-            if let Some(ref pf) = profile_file {
-                cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
-            }
-            cmd.arg(c.run.executable.program())
-                .args(c.run.executable.args())
-                .args(["--resume", &session_id]);
-            cmd
-        }).await;
-
-        let new_id = match output {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-            Ok(out) => {
-                warn!("backup: failed to restore pane {} (session {}): tmux new-window exited {}: {}",
-                    old_id, session_id, out.status, String::from_utf8_lossy(&out.stderr).trim());
-                continue;
-            }
+        let new_id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
+            working_dir: working_dir.clone(),
+            config_dir: resolved.config_dir.clone(),
+            extra_env: Vec::new(),
+            trailing_args: vec!["--resume".to_string(), session_id.clone()],
+        }).await {
+            Ok(id) => id,
             Err(e) => {
                 warn!("backup: failed to restore pane {} (session {}): {}", old_id, session_id, e);
                 continue;
@@ -2227,7 +2330,6 @@ async fn handle_request(
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
                 warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
             }
-            let xdg_runtime_dir = libslop::runtime_dir();
             // Resolve start directory: per-session flag takes precedence over config default.
             // Both are `~` / `$VAR`-expanded here (against slopd's environment), so a
             // quoted `~` works and a remote `~` resolves to the remote home.
@@ -2235,7 +2337,6 @@ async fn handle_request(
                 .as_deref()
                 .map(libslop::expand_path)
                 .or_else(|| config.run.start_directory.as_ref().map(|p| libslop::expand_path(p)));
-            let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
             // Merge env: config env_files (in order) → config env → request env.
             // Later entries override earlier ones (tmux applies -e left-to-right).
             let mut merged_env: Vec<(String, String)> = Vec::new();
@@ -2260,69 +2361,17 @@ async fn handle_request(
             }
             merged_env.extend(env.iter().cloned());
 
-            // Fail fast with a clear message if the configured executable can't be
-            // found, instead of spawning a pane that dies immediately and surfaces
-            // only the generic "died before becoming ready". `tmux new-window`
-            // returns a pane id even for a missing command, so this is the only
-            // place we can catch the most common misconfiguration (a typo'd or
-            // uninstalled `[run] executable`). Resolve against the pane's effective
-            // PATH (a [run.env]/env-file PATH wins, else slopd's) and working
-            // directory, matching exactly what the spawned pane will use.
-            let program = config.run.executable.program();
-            let lookup_path = merged_env
-                .iter()
-                .rev()
-                .find(|(k, _)| k == "PATH")
-                .map(|(_, v)| std::ffi::OsString::from(v))
-                .or_else(|| std::env::var_os("PATH"))
-                .unwrap_or_default();
-            let lookup_cwd = effective_start_dir
-                .clone()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            if !libslop::executable_exists(program, &lookup_path, &lookup_cwd) {
-                return libslop::ResponseBody::Error {
-                    message: format!(
-                        "configured executable {:?} not found — check `[run] executable` (or --executable) and the pane's PATH",
-                        program
-                    ),
-                };
-            }
-
-            let output = tmux_session_output(config, session_lock, |c| {
-                let mut cmd = tmux(c);
-                let session = c.tmux.session();
-                // `-d`: create the window in the background so spawning a pane
-                // doesn't yank clients already watching the session to it.
-                cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"])
-                    .args(["-e", &format!("XDG_RUNTIME_DIR={}", xdg_runtime_dir.display())])
-                    .args(["-e", &format!("SLOPCTL={}", c.run.slopctl)]);
-                if let Some(ref dir) = effective_start_dir
-                    && let Some(dir_str) = dir.to_str() {
-                        cmd.args(["-c", dir_str]);
-                    }
-                // Point Claude at the resolved account's config dir. The account
-                // name itself isn't exported as an env var: it's recorded on the
-                // pane as @slopd_account (below) and inherited by children via the
-                // parent pane id.
-                if let Some(ref dir) = resolved.config_dir {
-                    cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
-                }
-                // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g. mock_claude)
-                // write their coverage data even when launched inside a tmux window.
-                if let Some(ref pf) = profile_file {
-                    cmd.args(["-e", &format!("LLVM_PROFILE_FILE={}", pf)]);
-                }
-                for (k, v) in &merged_env {
-                    cmd.args(["-e", &format!("{}={}", k, v)]);
-                }
-                cmd.arg(c.run.executable.program())
-                    .args(c.run.executable.args())
-                    .args(&extra_args);
-                cmd
+            // Spawn through the shared chokepoint, which resolves the executable
+            // to an absolute path (so the pane can't fail to find it on its PATH)
+            // and surfaces a clear error if it's missing.
+            let output = spawn_claude_pane(config, session_lock, &SpawnSpec {
+                working_dir: effective_start_dir.as_ref().and_then(|d| d.to_str().map(str::to_string)),
+                config_dir: resolved.config_dir.clone(),
+                extra_env: merged_env,
+                trailing_args: extra_args,
             }).await;
             match output {
-                Ok(out) if out.status.success() => {
-                    let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                Ok(pane_id) => {
                     debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
                     managed_panes.insert(pane_id.clone());
                     // Wake any hook handlers that arrived before managed_panes.insert()
@@ -2395,11 +2444,7 @@ async fn handle_request(
                     });
                     libslop::ResponseBody::Run { pane_id }
                 }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    libslop::ResponseBody::Error { message: stderr }
-                }
-                Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                Err(message) => libslop::ResponseBody::Error { message },
             }
         }
 

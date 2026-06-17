@@ -9313,3 +9313,77 @@ fn pending_restore_survives_daemon_restart() {
 
     kill_slopd(slopd3);
 }
+
+// The architectural guard against the post-reboot PATH failure. slopd launches
+// every Claude pane through one chokepoint that resolves the executable to an
+// absolute path. If it can't be resolved when a reboot would auto-restore (the
+// real incident: systemd's minimal PATH omitted ~/.local/bin, so bare `claude`
+// wasn't found and every restored pane died instantly, letting the empty live
+// set clobber the manifest), slopd must NOT spawn doomed panes. It keeps the
+// manifest as a pending restore so the restore point survives until the
+// executable is back, then `slopctl restore` brings the panes up.
+#[test]
+fn missing_executable_preserves_manifest_instead_of_clobbering() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    // A private copy of mock_claude we can delete to simulate the executable
+    // becoming unresolvable on the second boot (the minimal-PATH / uninstall case).
+    let shim = home_dir.path().join("claude-shim");
+    std::fs::copy(cargo_bin("mock_claude"), &shim).unwrap();
+    let shim_path = shim.to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&shim_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    env.append_config("[backup]\nauto_restore = true\ninterval_secs = 1");
+
+    // Boot 1: a pane, captured into the manifest on clean shutdown.
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let before = std::fs::read(&manifest_path).expect("manifest written on shutdown");
+    assert!(before != b"[]" && !before.is_empty(), "precondition: manifest holds the pane");
+
+    // The executable disappears.
+    std::fs::remove_file(&shim).unwrap();
+
+    // Boot 2 (reboot): auto_restore is on, but the executable can't be resolved.
+    // Must enter pending and preserve the manifest, not spawn doomed panes.
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    let status = String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).into_owned();
+    assert!(status.contains("pending_restore: 1 pane"),
+        "a missing executable must enter pending, not silently fail; got {:?}", status);
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 0, "nothing should have been spawned");
+    // Past several periodic backup ticks (interval=1s): the manifest must survive.
+    std::thread::sleep(Duration::from_millis(2500));
+    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    assert_eq!(before, after, "a failed restore must not clobber the manifest");
+
+    // Recovery: with the executable back, `slopctl restore` brings the pane up,
+    // proving the spawn resolves it through the shared chokepoint.
+    std::fs::copy(cargo_bin("mock_claude"), &shim).unwrap();
+    let out = env.slopctl(&["restore"]);
+    assert!(out.status.success(), "restore failed: {:?}", out);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while count_panes_with_session(&env, MOCK_SID) == 0 {
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("pane did not come back after the executable was restored");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    kill_slopd(slopd2);
+}
