@@ -1383,16 +1383,40 @@ where
 /// the instant `ready` is observed — we must outlast that failure window.
 const RUN_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Build the user-facing error for a pane that died during the readiness wait,
-/// including the SessionEnd `reason` when we observed it.
-fn run_died_error(pane_id: &str, reason: Option<&str>) -> Error {
-    match reason {
-        Some(r) => Error::RunFailed(format!(
-            "pane {} died before becoming ready (session ended: {})",
-            pane_id, r,
-        )),
-        None => Error::RunFailed(format!("pane {} died before becoming ready", pane_id)),
+/// Optional diagnostics about why a pane died, used to enrich the `run` error.
+/// The two death paths populate different fields: the SessionEnd hook carries a
+/// `reason`; slopd's reconciler-emitted PaneDestroyed carries the captured
+/// `output` (the pane's final screen) and the process `exit_status`.
+#[derive(Default)]
+struct PaneDeathDiagnostics<'a> {
+    /// SessionEnd `reason` (hook path), e.g. `prompt_input_exit`.
+    reason: Option<&'a str>,
+    /// Process exit status from tmux's `pane_dead_status` (PaneDestroyed path).
+    exit_status: Option<i64>,
+    /// Tail of the pane's final screen captured at death (PaneDestroyed path).
+    output: Option<&'a str>,
+}
+
+/// Build the user-facing error for a pane that died during the readiness wait.
+/// Beyond the bare "died before becoming ready", this folds in whatever
+/// diagnostics we observed — the SessionEnd reason, the process exit status, and
+/// the pane's captured final output — so the caller learns *why* it died instead
+/// of just *that* it died.
+fn run_died_error(pane_id: &str, diag: PaneDeathDiagnostics) -> Error {
+    let mut msg = format!("pane {} died before becoming ready", pane_id);
+    // A parenthetical qualifier: prefer the SessionEnd reason, else the exit code.
+    if let Some(r) = diag.reason {
+        msg.push_str(&format!(" (session ended: {})", r));
+    } else if let Some(code) = diag.exit_status {
+        msg.push_str(&format!(" (exit status {})", code));
     }
+    // The captured final screen, if any — this is the actual error the process
+    // (e.g. claude) printed on its way out.
+    if let Some(out) = diag.output.map(str::trim_end).filter(|s| !s.is_empty()) {
+        msg.push_str("\n--- last output from the pane ---\n");
+        msg.push_str(out);
+    }
+    Error::RunFailed(msg)
 }
 
 /// Resolve a `--start-directory` value before sending it to slopd.
@@ -1539,10 +1563,22 @@ where
                 match (record.source.as_str(), record.event_type.as_str()) {
                     ("hook", "SessionEnd") => {
                         let reason = record.payload.get("reason").and_then(|v| v.as_str());
-                        return Err(run_died_error(&pane_id, reason));
+                        return Err(run_died_error(&pane_id, PaneDeathDiagnostics {
+                            reason,
+                            ..Default::default()
+                        }));
                     }
                     ("slopd", "PaneDestroyed") => {
-                        return Err(run_died_error(&pane_id, None));
+                        // slopd's reconciler enriches this with the dead pane's
+                        // exit status and captured final screen (when remain-on-exit
+                        // let it linger long enough to read). Surface both.
+                        let exit_status = record.payload.get("exit_status").and_then(|v| v.as_i64());
+                        let output = record.payload.get("output").and_then(|v| v.as_str());
+                        return Err(run_died_error(&pane_id, PaneDeathDiagnostics {
+                            exit_status,
+                            output,
+                            ..Default::default()
+                        }));
                     }
                     ("slopd", "DetailedStateChange") => {
                         let live = record
@@ -1769,6 +1805,63 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn died_msg(diag: PaneDeathDiagnostics) -> String {
+        match run_died_error("%28", diag) {
+            Error::RunFailed(m) => m,
+            other => panic!("expected RunFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_died_error_bare_when_no_diagnostics() {
+        assert_eq!(died_msg(PaneDeathDiagnostics::default()),
+            "pane %28 died before becoming ready");
+    }
+
+    #[test]
+    fn run_died_error_includes_session_end_reason() {
+        let msg = died_msg(PaneDeathDiagnostics { reason: Some("prompt_input_exit"), ..Default::default() });
+        assert_eq!(msg, "pane %28 died before becoming ready (session ended: prompt_input_exit)");
+    }
+
+    #[test]
+    fn run_died_error_includes_exit_status_and_output() {
+        let msg = died_msg(PaneDeathDiagnostics {
+            exit_status: Some(1),
+            output: Some("Error: invalid setting in .claude/settings.json\n"),
+            ..Default::default()
+        });
+        assert!(msg.contains("pane %28 died before becoming ready (exit status 1)"), "got: {}", msg);
+        assert!(msg.contains("--- last output from the pane ---"), "got: {}", msg);
+        assert!(msg.contains("Error: invalid setting in .claude/settings.json"), "got: {}", msg);
+        // Trailing newline in the captured output is trimmed, not doubled.
+        assert!(msg.ends_with("settings.json"), "got: {:?}", msg);
+    }
+
+    #[test]
+    fn run_died_error_reason_wins_over_exit_status() {
+        // The SessionEnd path has a reason but no exit status; if both were ever
+        // present, the human-readable reason takes the parenthetical.
+        let msg = died_msg(PaneDeathDiagnostics {
+            reason: Some("other"),
+            exit_status: Some(2),
+            ..Default::default()
+        });
+        assert!(msg.contains("(session ended: other)"), "got: {}", msg);
+        assert!(!msg.contains("exit status"), "got: {}", msg);
+    }
+
+    #[test]
+    fn run_died_error_omits_empty_output_block() {
+        // Whitespace-only captured output adds no "last output" block.
+        let msg = died_msg(PaneDeathDiagnostics {
+            exit_status: Some(37),
+            output: Some("   \n  \n"),
+            ..Default::default()
+        });
+        assert_eq!(msg, "pane %28 died before becoming ready (exit status 37)");
+    }
 
     #[test]
     fn check_remote_start_directory_rejects_relative_only() {
