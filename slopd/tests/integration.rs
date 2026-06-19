@@ -9387,3 +9387,72 @@ fn missing_executable_preserves_manifest_instead_of_clobbering() {
 
     kill_slopd(slopd2);
 }
+
+// Issue #3 regression: a pane's working_dir (#{pane_current_path}) drifts when
+// the agent `cd`s, but `claude --resume <id>` finds the session via the project
+// dir of its LAUNCH cwd (the dir Claude was started in, recorded in the
+// transcript). Restore must launch from the transcript's recorded cwd, not the
+// drifted working_dir — otherwise claude searches the wrong project, can't find
+// the session, and the pane dies. Here working_dir points to an unrelated dir
+// while the transcript records the real launch cwd; the restored pane must come
+// up in the launch cwd.
+#[test]
+fn restore_uses_transcript_launch_cwd_over_drifted_working_dir() {
+    let Some((env, home)) = backup_env("[backup]\nauto_restore = true") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    // Where Claude was really launched (its transcript records this cwd)...
+    let launch_dir = home.path().join("launch");
+    std::fs::create_dir_all(&launch_dir).unwrap();
+    // ...vs an unrelated dir we plant in working_dir to simulate the agent
+    // having cd'd away. Restore must NOT launch here.
+    let drifted_dir = home.path().join("drifted");
+    std::fs::create_dir_all(&drifted_dir).unwrap();
+    // A transcript recording the launch cwd, like real Claude. The first record
+    // has no cwd (mirroring the real leading "mode" record) to exercise the scan.
+    let transcript = home.path().join("session-transcript.jsonl");
+    std::fs::write(&transcript, format!(
+        "{{\"type\":\"mode\"}}\n{{\"type\":\"user\",\"cwd\":{:?}}}\n",
+        launch_dir.to_str().unwrap(),
+    )).unwrap();
+
+    // Boot 1: a pane so a manifest is written, then clean shutdown.
+    let slopd1 = env.spawn_slopd();
+    run_and_wait(&env);
+    sigint_child(slopd1);
+
+    // Plant the drift: working_dir → the unrelated dir, transcript_path → our
+    // transcript recording the real launch cwd.
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let mut manifest: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    for p in &mut manifest {
+        if p.session_id.as_deref() == Some(MOCK_SID) {
+            p.working_dir = Some(drifted_dir.to_str().unwrap().to_string());
+            p.transcript_path = Some(transcript.to_str().unwrap().to_string());
+        }
+    }
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    // Reboot → restore. The restored pane must be launched in launch_dir.
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let restored = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        if let Some(p) = panes.into_iter().find(|p| p.session_id.as_deref() == Some(MOCK_SID)) {
+            break p;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("pane was not restored");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(restored.working_dir.as_deref(), launch_dir.to_str(),
+        "restore must launch from the transcript's recorded launch cwd, not the drifted working_dir");
+
+    kill_slopd(slopd2);
+}

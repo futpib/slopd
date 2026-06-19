@@ -1765,6 +1765,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             state,
             detailed_state,
             working_dir: raw.working_dir,
+            transcript_path: raw.opts.transcript_path,
             account,
         });
     }
@@ -1961,6 +1962,30 @@ fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
     libslop::executable_exists(config.run.executable.program(), &path, &cwd)
 }
 
+/// The launch cwd recorded in a Claude transcript: the first record's `cwd`,
+/// i.e. the directory Claude was *started* in, which determines the project dir
+/// the session is stored under (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`).
+/// Restore must `claude --resume` from this dir, not the pane's drifted
+/// `pane_current_path`, or claude searches the wrong project and can't find the
+/// session (it then starts a fresh one and the pane dies). `None` if the file
+/// is unreadable or has no cwd in its first records.
+fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(transcript_path).ok()?;
+    // The cwd appears in the earliest records; scan a bounded prefix so a huge
+    // transcript is never read end-to-end.
+    for line in std::io::BufReader::new(file).lines().take(50) {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
 /// Re-spawn the panes recorded in `manifest` after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
@@ -2039,6 +2064,7 @@ async fn restore_panes(
         let parent = p.parent_pane_id;
         let session_id = p.session_id.expect("resumable panes have a session id");
         let working_dir = p.working_dir;
+        let transcript_path = p.transcript_path;
 
         if !seen_sessions.insert(session_id.clone()) {
             info!("backup: skipping pane {} — session {} already running or restored", old_id, session_id);
@@ -2056,8 +2082,16 @@ async fn restore_panes(
             warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
         }
 
+        // `claude --resume` finds the session via the project dir of its launch
+        // cwd (the dir Claude was started in). `working_dir` is pane_current_path,
+        // which drifts when the agent `cd`s, so prefer the transcript's recorded
+        // launch cwd; fall back to working_dir when there's no transcript.
+        let launch_dir = transcript_path
+            .as_deref()
+            .and_then(transcript_launch_cwd)
+            .or_else(|| working_dir.clone());
         let new_id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
-            working_dir: working_dir.clone(),
+            working_dir: launch_dir,
             config_dir: resolved.config_dir.clone(),
             extra_env: Vec::new(),
             trailing_args: vec!["--resume".to_string(), session_id.clone()],

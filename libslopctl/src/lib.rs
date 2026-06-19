@@ -1914,6 +1914,7 @@ mod tests {
             state: state.to_simple(),
             detailed_state: state,
             working_dir: None,
+            transcript_path: None,
             account: libslop::DEFAULT_ACCOUNT.to_string(),
         }
     }

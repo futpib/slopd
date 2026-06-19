@@ -2232,9 +2232,17 @@ pub struct PaneInfo {
     pub state: PaneState,
     /// Detailed pane state.
     pub detailed_state: PaneDetailedState,
-    /// Current working directory of the pane (#{pane_current_path}).
+    /// Current working directory of the pane (#{pane_current_path}). Note this
+    /// drifts as the agent `cd`s and is NOT necessarily the launch cwd; restore
+    /// uses [`Self::transcript_path`] to recover the launch cwd instead.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Path to the pane's Claude transcript (@slopd_transcript_path), if known.
+    /// Restore reads the session's launch cwd from it: `claude --resume`
+    /// resolves the session from the project dir of its launch cwd, which is the
+    /// dir Claude was *started* in — not the drift-prone `working_dir`.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
     /// The account the pane was launched under (from @slopd_account). Defaults
     /// to [`DEFAULT_ACCOUNT`] for panes with no recorded account.
     #[serde(default = "default_account_name")]
