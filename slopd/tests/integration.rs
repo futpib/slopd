@@ -717,7 +717,70 @@ fn run_fails_when_pane_dies_without_any_hook() {
     // exactly the reason-less message users hit when claude can't start.
     assert!(!stderr.contains("session ended"),
         "no SessionEnd fired, so there should be no reason suffix; got: {}", stderr);
+    // But slopd's dead-pane capture reads the exit code (mock_claude --exit-immediately
+    // exits 1) off the lingering pane and surfaces it, so even this no-hook crash
+    // is no longer contentless.
+    assert!(stderr.contains("exit status 1"),
+        "stderr should include the captured exit status; got: {}", stderr);
     // Nothing usable to return, so no pane id on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
+}
+
+/// The headline win: when claude prints a startup error and dies before any hook
+/// fires (the real-world case where a project-local config makes it bail on
+/// launch), `slopctl run` must surface that error text AND the exit status — not
+/// the contentless "died before becoming ready". slopd sets remain-on-exit on the
+/// spawned pane, so the crashed process lingers as a DEAD pane with its final
+/// screen frozen; the reconciler captures that screen + exit code into the
+/// PaneDestroyed event and `run` prints both.
+#[test]
+fn run_surfaces_crash_output_and_exit_status() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    // mock_claude --crash-output prints a recognizable line to the terminal and
+    // exits 37 before firing any hook — standing in for claude choking on a
+    // project-local .claude config and dying with a visible error.
+    let marker = "FATAL: project-local config rejected by claude";
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path, "--crash-output", marker]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let out = env.slopctl_raw(&["run", "--ready-timeout", "15"]);
+
+    kill_slopd(slopd);
+
+    assert!(!out.status.success(),
+        "run should fail when the pane crashes at startup: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The captured startup error is surfaced verbatim...
+    assert!(stderr.contains(marker),
+        "stderr should include the captured startup error; got: {}", stderr);
+    // ...along with the process exit status...
+    assert!(stderr.contains("exit status 37"),
+        "stderr should include the captured exit status; got: {}", stderr);
+    // ...under the still-present base message.
+    assert!(stderr.contains("died before becoming ready"),
+        "stderr should still carry the base death message; got: {}", stderr);
+    // No SessionEnd hook fired, so no reason suffix.
+    assert!(!stderr.contains("session ended"),
+        "no SessionEnd fired; there should be no reason suffix; got: {}", stderr);
+    // No usable pane id to return.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.trim().is_empty(),
         "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
@@ -2188,28 +2251,27 @@ fn run_extra_args_print_exits_immediately() {
 
     let slopd = env.spawn_slopd();
 
-    // Set remain-on-exit so we can inspect the pane after mock_claude exits.
-    env.tmux.tmux()
-        .args(["set-option", "-t", "slopd", "-g", "remain-on-exit", "on"])
-        .status().unwrap();
+    // Subscribe before spawning so we can't miss the event. If `--print hello` is
+    // forwarded, mock_claude runs in print mode and exits immediately, and slopd's
+    // reconciler emits PaneDestroyed for the pane. If the args were NOT forwarded,
+    // mock_claude would stay in its interactive loop and no PaneDestroyed would
+    // fire (the wait below would then time out and fail).
+    //
+    // (Previously this test set a global remain-on-exit and polled capture-pane
+    // for "Pane is dead". slopd now sets remain-on-exit per pane itself and its
+    // reconciler kills the dead husk after capturing it, which raced that poll;
+    // observing PaneDestroyed is the race-free equivalent.)
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
 
     let run_out = env.slopctl(&["run", "--", "--print", "hello"]);
     assert!(run_out.status.success(), "slopctl run failed: {:?}", run_out);
     let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
 
-    // mock_claude --print should exit quickly. Poll until the pane is dead.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let out = env.tmux.tmux()
-            .args(["capture-pane", "-t", &pane_id, "-p"])
-            .output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        if text.contains("Pane is dead") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for pane to exit");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+    assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
 
     kill_slopd(slopd);
 }
@@ -5012,6 +5074,11 @@ fn pane_destroyed_on_crash_without_hooks() {
 
     assert_eq!(event["source"], "slopd");
     assert_eq!(event["payload"]["pane_id"], pane_id.as_str());
+    // The dead pane lingered (remain-on-exit) long enough for the reconciler to
+    // read its exit code off pane_dead_status and enrich the event. mock_claude
+    // here exits 1 via `--print '/exit 1'`.
+    assert_eq!(event["payload"]["exit_status"], 1,
+        "PaneDestroyed should carry the captured exit status; got: {}", event);
 
     // The pane should no longer appear in ps output.
     let ps_output = env.slopctl(&["ps", "--json"]);

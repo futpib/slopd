@@ -887,17 +887,17 @@ async fn reconcile_panes(
     event_tx: &EventTx,
 ) {
     let session = config.tmux.session();
+    // Pull pane_dead/pane_dead_status alongside the id: a pane we set
+    // remain-on-exit on does NOT vanish when its process exits — it lingers as a
+    // DEAD pane (still listed here) with its final screen frozen. We must tell
+    // that apart from a pane tmux no longer lists at all.
     let output = tmux(config)
-        .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id}"])
+        .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id} #{pane_dead} #{pane_dead_status}"])
         .output()
         .await;
-    let live_ids: std::collections::HashSet<String> = match output {
+    let (present_ids, dead_panes): (std::collections::HashSet<String>, std::collections::HashMap<String, Option<i64>>) = match output {
         Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+            parse_list_panes(&String::from_utf8_lossy(&out.stdout))
         }
         Ok(out) if {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -905,7 +905,7 @@ async fn reconcile_panes(
                 || stderr.contains("can't find session:")
         } => {
             // Server or session is gone — all managed panes are dead.
-            std::collections::HashSet::new()
+            (std::collections::HashSet::new(), std::collections::HashMap::new())
         }
         _ => return,
     };
@@ -913,15 +913,31 @@ async fn reconcile_panes(
     // Test hook: simulate the production failure mode where `tmux list-panes`
     // transiently returned without our managed panes.  Used by the reconcile
     // false-positive regression test.
-    let live_ids = if std::env::var("SLOPD_TEST_RECONCILE_FORCE_EMPTY").is_ok() {
-        std::collections::HashSet::new()
+    let (present_ids, dead_panes) = if std::env::var("SLOPD_TEST_RECONCILE_FORCE_EMPTY").is_ok() {
+        (std::collections::HashSet::new(), std::collections::HashMap::new())
     } else {
-        live_ids
+        (present_ids, dead_panes)
     };
 
-    let candidates: Vec<String> = managed_panes.snapshot()
+    let managed = managed_panes.snapshot();
+
+    // Path 1: managed panes that exited and are lingering as DEAD panes (thanks
+    // to the remain-on-exit we set at spawn). Capture their frozen final screen
+    // and exit status to explain the death, emit an enriched PaneDestroyed, then
+    // kill-pane to clear the husk.
+    for pane_id in &managed {
+        if let Some(exit_status) = dead_panes.get(pane_id).copied() {
+            handle_dead_pane(config, panes, managed_panes, event_tx, pane_id, exit_status).await;
+        }
+    }
+
+    // Path 2: managed panes tmux no longer lists at all. This is the original
+    // vanished-pane path — a pane that disappeared without lingering (force-killed,
+    // remain-on-exit somehow unset, or the whole server/session gone). Dead panes
+    // are in `present_ids`, so they are excluded here and handled in Path 1 above.
+    let candidates: Vec<String> = managed
         .into_iter()
-        .filter(|id| !live_ids.contains(id))
+        .filter(|id| !present_ids.contains(id))
         .collect();
 
     for pane_id in candidates {
@@ -955,6 +971,132 @@ async fn reconcile_panes(
             cursor: None,
         });
     }
+}
+
+/// Parse `list-panes -F '#{pane_id} #{pane_dead} #{pane_dead_status}'` output
+/// into (every listed pane id, map of dead pane id -> exit status). A pane id
+/// never contains whitespace and the two flags are integers, so splitting on
+/// whitespace is unambiguous. `pane_dead_status` is empty for a live pane and is
+/// only read when `pane_dead` is 1.
+fn parse_list_panes(
+    stdout: &str,
+) -> (std::collections::HashSet<String>, std::collections::HashMap<String, Option<i64>>) {
+    let mut present = std::collections::HashSet::new();
+    let mut dead = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(id) = parts.next() else { continue };
+        present.insert(id.to_string());
+        if parts.next() == Some("1") {
+            let status = parts.next().and_then(|s| s.parse::<i64>().ok());
+            dead.insert(id.to_string(), status);
+        }
+    }
+    (present, dead)
+}
+
+/// Handle a managed pane that exited and is lingering as a DEAD pane because we
+/// set remain-on-exit on it at spawn. Capture its frozen final screen and exit
+/// status — the whole point of remain-on-exit — emit an enriched PaneDestroyed
+/// carrying them so `slopctl run` can explain WHY the pane died, then kill-pane
+/// to clear the husk. Mirrors the vanished-pane cleanup (reparent children,
+/// cancel the transcript tail, drop from both maps) so internal state stays
+/// consistent regardless of which death path fired.
+async fn handle_dead_pane(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    managed_panes: &ManagedPanes,
+    event_tx: &EventTx,
+    pane_id: &str,
+    exit_status: Option<i64>,
+) {
+    // Capture the final screen BEFORE killing the pane. remain-on-exit froze it
+    // at the instant the process exited, so this is exactly what the user would
+    // have seen — typically the startup error claude printed before bailing.
+    //
+    // Crucially we include scrollback (`-S -200`): when a pane dies, tmux renders
+    // its own "Pane is dead" line on the visible screen and the process's actual
+    // final output ends up just above it in history. Capturing only the visible
+    // screen loses the very lines we want; the scrollback window recovers them.
+    // `dead_pane_output_tail` then trims the padding/footer down to the tail.
+    let captured = tmux(config)
+        .args(["capture-pane", "-t", pane_id, "-p", "-S", "-200"])
+        .output()
+        .await;
+    let output_tail = match captured {
+        Ok(out) if out.status.success() => {
+            dead_pane_output_tail(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => String::new(),
+    };
+
+    info!(
+        "managed pane {} exited (status {:?}); emitting PaneDestroyed with {} bytes of captured output",
+        pane_id, exit_status, output_tail.len(),
+    );
+    reparent_children_of(config, managed_panes, pane_id).await;
+    if let Some(state) = panes.remove(pane_id) {
+        state.transcript_cancel.lock().unwrap().cancel();
+    }
+    managed_panes.remove(pane_id);
+
+    let mut payload = serde_json::json!({ "pane_id": pane_id });
+    if let Some(code) = exit_status {
+        payload["exit_status"] = serde_json::json!(code);
+    }
+    if !output_tail.is_empty() {
+        payload["output"] = serde_json::json!(output_tail);
+    }
+    let _ = event_tx.send(libslop::Record {
+        source: "slopd".to_string(),
+        event_type: "PaneDestroyed".to_string(),
+        pane_id: Some(pane_id.to_string()),
+        payload,
+        cursor: None,
+    });
+
+    // Clear the husk now that we've captured everything we need from it.
+    let _ = tmux(config)
+        .args(["kill-pane", "-t", pane_id])
+        .output()
+        .await;
+}
+
+/// Reduce tmux's `capture-pane -p` dump of a dead pane to a small, meaningful
+/// tail for the PaneDestroyed payload. capture-pane returns the whole visible
+/// grid (mostly blank padding) plus tmux's own "Pane is dead (status N, <date>)"
+/// footer; drop that footer (the exit status is reported separately) and the
+/// blank padding, then bound the result to `MAX_LINES`/`MAX_BYTES` so the
+/// broadcast Record stays small.
+fn dead_pane_output_tail(captured: &str) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_BYTES: usize = 4096;
+    let lines: Vec<&str> = captured
+        .lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim_start().starts_with("Pane is dead (status "))
+        .collect();
+    let (Some(first), Some(last)) = (
+        lines.iter().position(|l| !l.is_empty()),
+        lines.iter().rposition(|l| !l.is_empty()),
+    ) else {
+        return String::new();
+    };
+    let meaningful = &lines[first..=last];
+    let tail = if meaningful.len() > MAX_LINES {
+        &meaningful[meaningful.len() - MAX_LINES..]
+    } else {
+        meaningful
+    };
+    let mut out = tail.join("\n");
+    if out.len() > MAX_BYTES {
+        // Keep the most recent output (the tail end). Advance to a char boundary
+        // so we never slice through a multi-byte sequence.
+        let cut = out.len() - MAX_BYTES;
+        let cut = (cut..=out.len()).find(|&i| out.is_char_boundary(i)).unwrap_or(out.len());
+        out = out[cut..].to_string();
+    }
+    out
 }
 
 /// Confirm that `pane_id` is still alive in tmux and still flagged as
@@ -1940,7 +2082,17 @@ async fn spawn_claude_pane(
     .await;
 
     match output {
-        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        Ok(out) if out.status.success() => {
+            let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // Keep the pane alive as a DEAD pane after its process exits, scoped to
+            // THIS pane only (`-p`) so it never leaks onto the user's other windows
+            // on the shared default tmux server. A claude that crashes at startup
+            // then lingers with its final screen intact for reconcile_panes to
+            // capture — that capture is what lets `slopctl run` explain *why* the
+            // pane died instead of reporting a contentless death.
+            let _ = tmux_set_pane_option(config, &pane_id, "remain-on-exit", "on").await;
+            Ok(pane_id)
+        }
         Ok(out) => Err(format!(
             "tmux new-window exited {}: {}",
             out.status,
@@ -2759,5 +2911,56 @@ async fn handle_request(
             // Handled in handle_connection before reaching here.
             unreachable!("Subscribe/SubscribeTranscript/Unsubscribe should be handled before handle_request")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_list_panes_separates_live_and_dead() {
+        // Live panes report pane_dead=0 (status field empty); a dead pane reports
+        // pane_dead=1 and its exit code in pane_dead_status.
+        let out = "%26 0 \n%27 1 1\n%28 1 37\n";
+        let (present, dead) = parse_list_panes(out);
+        assert!(present.contains("%26") && present.contains("%27") && present.contains("%28"));
+        // Dead panes are still listed (present), but also recorded with status.
+        assert_eq!(dead.len(), 2);
+        assert_eq!(dead.get("%27"), Some(&Some(1)));
+        assert_eq!(dead.get("%28"), Some(&Some(37)));
+        assert!(!dead.contains_key("%26"), "a live pane must not be marked dead");
+    }
+
+    #[test]
+    fn parse_list_panes_tolerates_blank_and_missing_status() {
+        // Blank lines are skipped; a dead pane with no parsable status maps to None.
+        let (present, dead) = parse_list_panes("\n%1 1\n  \n");
+        assert_eq!(present.len(), 1);
+        assert_eq!(dead.get("%1"), Some(&None));
+    }
+
+    #[test]
+    fn dead_pane_output_tail_strips_padding_and_footer() {
+        // capture-pane returns the error, blank padding, then tmux's own footer.
+        let captured = "claude: cannot start\nfatal: bad config\n\n\n\nPane is dead (status 1, Fri Jun 19 18:54:16 2026)";
+        let tail = dead_pane_output_tail(captured);
+        assert_eq!(tail, "claude: cannot start\nfatal: bad config");
+    }
+
+    #[test]
+    fn dead_pane_output_tail_empty_when_only_blanks_and_footer() {
+        let captured = "\n\n\nPane is dead (status 0, Fri Jun 19 18:54:16 2026)\n\n";
+        assert_eq!(dead_pane_output_tail(captured), "");
+    }
+
+    #[test]
+    fn dead_pane_output_tail_keeps_last_lines_when_long() {
+        // More than MAX_LINES (40) lines: only the most recent are kept.
+        let captured: String = (0..100).map(|i| format!("line{}\n", i)).collect();
+        let tail = dead_pane_output_tail(&captured);
+        assert!(tail.ends_with("line99"));
+        assert!(!tail.contains("line0\n"), "oldest lines should be dropped");
+        assert!(tail.contains("line99") && tail.contains("line60"));
     }
 }
