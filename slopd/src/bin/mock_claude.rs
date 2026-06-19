@@ -345,6 +345,25 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Failure-injection mode: print a diagnostic line to the terminal (as Claude
+    // does for a startup error) then exit non-zero before firing ANY hook —
+    // simulating Claude choking on project-local config and dying with a visible
+    // error. The pane lingers (slopd sets remain-on-exit) so the reconciler can
+    // capture this text and the exit code and surface them through `slopctl run`.
+    //
+    // The brief pause before exiting mirrors real Claude, whose Node startup takes
+    // ~100ms+ before it could reach a crash — comfortably longer than slopd's
+    // set-option round-trip. Exiting in microseconds (as a bare Rust binary
+    // otherwise would) is unrealistic and would race slopd's remain-on-exit,
+    // making the pane vanish before it can be marked to linger.
+    if let Some(pos) = args.iter().position(|a| a == "--crash-output") {
+        let msg = args.get(pos + 1).map(String::as_str)
+            .unwrap_or("mock_claude: simulated startup crash");
+        println!("{}", msg);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::process::exit(37);
+    }
+
     if print_mode {
         // In --print mode, treat the last non-flag argument as the prompt,
         // process it, and exit immediately (no interactive loop).
