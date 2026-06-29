@@ -216,6 +216,37 @@ impl TmuxServer {
         }
         std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
     }
+
+    /// Write a slopd config with auto-continue on StopFailure enabled.
+    /// Allows customizing the retry parameters.
+    pub fn write_slopd_config_with_auto_continue(
+        &self,
+        config_dir: &tempfile::TempDir,
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        max_attempts: u32,
+        initial_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) {
+        let slopd_config_dir = config_dir.path().join("slopd");
+        std::fs::create_dir_all(&slopd_config_dir).unwrap();
+        let mut config = format!(
+            "[tmux]\nsocket = {:?}\n\n[run]\n",
+            self.socket.to_str().unwrap(),
+        );
+        if let Some(exe) = executable {
+            let toml_array: Vec<String> = exe.iter().map(|s| format!("{:?}", s)).collect();
+            config.push_str(&format!("executable = [{}]\n", toml_array.join(", ")));
+        }
+        if let Some(s) = slopctl {
+            config.push_str(&format!("slopctl = {:?}\n", s));
+        }
+        config.push_str("auto_continue_on_failure = true\n");
+        config.push_str(&format!("max_retry_attempts = {}\n", max_attempts));
+        config.push_str(&format!("initial_backoff_ms = {}\n", initial_backoff_ms));
+        config.push_str(&format!("max_backoff_ms = {}\n", max_backoff_ms));
+        std::fs::write(slopd_config_dir.join("config.toml"), config).unwrap();
+    }
 }
 
 impl Drop for TmuxServer {
@@ -292,6 +323,22 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_with_session(&config_dir, executable, slopctl, session);
+        Some(TestEnv { tmux, runtime_dir, config_dir })
+    }
+
+    /// Create a test environment with auto-continue on StopFailure enabled.
+    /// Uses the given retry parameters.
+    pub fn new_with_auto_continue(
+        executable: Option<&[&str]>,
+        slopctl: Option<&str>,
+        max_attempts: u32,
+        initial_backoff_ms: u64,
+        max_backoff_ms: u64,
+    ) -> Option<Self> {
+        let tmux = TmuxServer::start()?;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        tmux.write_slopd_config_with_auto_continue(&config_dir, executable, slopctl, max_attempts, initial_backoff_ms, max_backoff_ms);
         Some(TestEnv { tmux, runtime_dir, config_dir })
     }
 

@@ -9523,3 +9523,203 @@ fn restore_uses_transcript_launch_cwd_over_drifted_working_dir() {
 
     kill_slopd(slopd2);
 }
+
+/// When a turn ends with StopFailure (e.g. an API 500), slopd auto-continues it
+/// by sending "continue" after a backoff — without the user having to. We assert
+/// this end-to-end by watching the durable `slopctl listen` event stream for the
+/// auto-injected `continue` UserPromptSubmit, rather than racing the pane's
+/// transient busy_processing state (the mock's continue-turn ends in a few ms,
+/// far faster than any ps poll could observe).
+#[test]
+fn auto_continue_on_stop_failure() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    // Fast retry settings for the test: 100ms initial backoff, max 200ms, 2 attempts.
+    let Some(env) = TestEnv::new_with_auto_continue(
+        Some(&[cargo_bin("mock_claude").to_str().unwrap()]),
+        None,
+        2,  // max_attempts
+        100,  // initial_backoff_ms
+        200,  // max_backoff_ms
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn a pane.
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for the pane to be ready (SessionStart fired).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("pane did not become ready; detailed_state: {:?}", detailed);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Subscribe to the event stream BEFORE triggering the failure so we can't
+    // miss the auto-injected "continue" prompt (the stream has no replay).
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let stdout = listen.stdout.take().unwrap();
+    let (subscribed_line, reader) = read_line_timeout(stdout, Duration::from_secs(10))
+        .expect("timed out reading subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
+
+    // Switch to always-submit mode so a single Enter submits the next line.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Trigger a failed turn: mock_claude fires UserPromptSubmit → StopFailure.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/stop-failure", "Enter"])
+        .status()
+        .unwrap();
+
+    // The first UserPromptSubmit we see is for "/stop-failure" itself; the second
+    // must be the auto-injected "continue" — proof that slopd recovered the
+    // failed turn on its own.
+    let mut reader: Box<dyn std::io::Read + Send> = reader;
+    let mut saw_continue = false;
+    let overall_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < overall_deadline {
+        let (ev, next_reader) = read_next_hook_event(reader);
+        reader = next_reader;
+        let prompt = ev["payload"]["prompt"].as_str().unwrap_or("");
+        if prompt == "continue" {
+            saw_continue = true;
+            break;
+        }
+    }
+
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    assert!(saw_continue, "slopd did not auto-continue the failed turn with a 'continue' prompt");
+}
+
+/// A turn that keeps failing must NOT be auto-continued forever: slopd gives up
+/// after `max_retry_attempts`. Regression guard for the bug where the injected
+/// "continue"'s own UserPromptSubmit reset the retry counter, so the cap was
+/// never reached. With max_attempts=2 we expect exactly two injected "continue"
+/// prompts, then silence.
+#[test]
+fn auto_continue_gives_up_after_max_attempts() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let Some(env) = TestEnv::new_with_auto_continue(
+        Some(&[cargo_bin("mock_claude").to_str().unwrap()]),
+        None,
+        2,   // max_attempts
+        50,  // initial_backoff_ms
+        100, // max_backoff_ms
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for the pane to be ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("pane did not become ready; detailed_state: {:?}", detailed);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Subscribe before triggering so we catch every injected "continue".
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let stdout = listen.stdout.take().unwrap();
+    let (subscribed_line, reader) = read_line_timeout(stdout, Duration::from_secs(10))
+        .expect("timed out reading subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
+
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Turn on persistent-failure mode, then trigger the first failing turn.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/always-fail", "Enter"])
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "trigger", "Enter"])
+        .status()
+        .unwrap();
+
+    // Count injected "continue" prompts. With max_attempts=2 and fast backoff
+    // (50/100ms), all retries finish well within the collection window. We read
+    // for a fixed budget and assert the count stops at exactly 2 — proof the cap
+    // holds and it isn't retrying forever.
+    let mut reader: Box<dyn std::io::Read + Send> = reader;
+    let mut continue_count = 0;
+    let collect_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < collect_deadline {
+        // Bounded per-line wait so we stop reading once retries cease.
+        match read_line_timeout(reader, Duration::from_millis(500)) {
+            Ok((line, next_reader)) => {
+                reader = next_reader;
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v["source"] == "hook" && v["payload"]["prompt"].as_str() == Some("continue") {
+                    continue_count += 1;
+                }
+            }
+            // No event for 500ms — retries have stopped.
+            Err(_) => break,
+        }
+    }
+
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    assert_eq!(continue_count, 2,
+        "expected exactly max_retry_attempts (2) auto-continue prompts, got {}", continue_count);
+}
+
+

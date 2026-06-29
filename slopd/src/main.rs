@@ -205,6 +205,71 @@ async fn set_pane_detailed_state(
     });
 }
 
+/// Exponential-backoff policy for auto-continue retries. A plain copy of the
+/// three relevant `[run]` config knobs, so the retry decision logic stays pure
+/// and unit-testable without constructing a whole `SlopdConfig`.
+#[derive(Clone, Copy, Debug)]
+struct BackoffPolicy {
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
+}
+
+impl BackoffPolicy {
+    fn from_config(cfg: &libslop::SlopdRunConfig) -> Self {
+        Self {
+            max_attempts: cfg.max_retry_attempts,
+            initial_backoff_ms: cfg.initial_backoff_ms,
+            max_backoff_ms: cfg.max_backoff_ms,
+        }
+    }
+
+    /// Delay before the `attempt`-th retry (1-based): `initial * 2^(attempt-1)`,
+    /// capped at `max_backoff_ms`. The exponent is clamped to avoid overflow on a
+    /// pathological streak of failures.
+    fn delay_ms(&self, attempt: u32) -> u64 {
+        self.initial_backoff_ms
+            .saturating_mul(2_u64.pow(attempt.saturating_sub(1).min(20)))
+            .min(self.max_backoff_ms)
+    }
+}
+
+/// Retry state for auto-continue on StopFailure.
+#[derive(Clone, Debug)]
+struct RetryState {
+    attempt_count: u32,
+    next_send_at: tokio::time::Instant,
+}
+
+impl RetryState {
+    /// Given the previous retry state (if any) and the backoff policy, compute
+    /// the next retry to schedule — or `None` once the attempt cap is exceeded.
+    /// Pure aside from the injected `now`, so the whole backoff-and-give-up
+    /// policy is unit-testable without a clock or any I/O.
+    fn next(
+        prev: Option<&RetryState>,
+        policy: &BackoffPolicy,
+        now: tokio::time::Instant,
+    ) -> Option<RetryState> {
+        let attempt = prev.map_or(1, |s| s.attempt_count + 1);
+        if attempt > policy.max_attempts {
+            return None;
+        }
+        Some(RetryState {
+            attempt_count: attempt,
+            next_send_at: now + tokio::time::Duration::from_millis(policy.delay_ms(attempt)),
+        })
+    }
+
+    /// Whether this state still matches a retry that was scheduled for
+    /// (`attempt`, `at`). A manual prompt or a clean Stop replaces/clears the
+    /// per-pane retry state, so a delayed sender uses this to detect that its
+    /// scheduled retry was superseded and bail out.
+    fn matches(&self, attempt: u32, at: tokio::time::Instant) -> bool {
+        self.attempt_count == attempt && self.next_send_at == at
+    }
+}
+
 /// Per-pane state shared across connection handlers.
 struct PaneState {
     /// Serialises the type-then-enter sequence so two concurrent sends don't interleave.
@@ -217,6 +282,13 @@ struct PaneState {
     transcript_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     /// The transcript path currently being tailed (if any).
     transcript_path: std::sync::Mutex<Option<String>>,
+    /// Auto-continue retry state (when a turn fails with StopFailure).
+    retry_state: std::sync::Mutex<Option<RetryState>>,
+    /// Set just before slopd injects its own "continue" prompt, so the
+    /// UserPromptSubmit that prompt triggers is not mistaken for the user
+    /// manually taking over (which would reset the retry counter and let a
+    /// persistently-failing turn retry forever, defeating max_retry_attempts).
+    expecting_auto_continue: std::sync::atomic::AtomicBool,
 }
 
 impl PaneState {
@@ -227,6 +299,8 @@ impl PaneState {
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
             transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             transcript_path: std::sync::Mutex::new(None),
+            retry_state: std::sync::Mutex::new(None),
+            expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2468,7 +2542,18 @@ async fn handle_request(
                 }
             if event == "UserPromptSubmit" {
                 debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
-                panes.get_or_insert(pane).prompt_submitted.notify_waiters();
+                let pane_state = panes.get_or_insert(pane);
+                pane_state.prompt_submitted.notify_waiters();
+                // A manual prompt means the user has taken over — reset the retry
+                // counter so the next failure starts a fresh backoff sequence. But
+                // slopd's OWN injected "continue" also fires UserPromptSubmit; that
+                // one must NOT reset the counter, or max_retry_attempts could never
+                // be reached and a persistently-failing turn would retry forever.
+                if pane_state.expecting_auto_continue.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    debug!("UserPromptSubmit: pane {} is slopd's auto-continue, preserving retry counter", pane);
+                } else {
+                    *pane_state.retry_state.lock().unwrap() = None;
+                }
             }
 
             // Unified state transition via reducer.
@@ -2479,6 +2564,88 @@ async fn handle_request(
                     notification_type: payload.get("notification_type").and_then(|v| v.as_str()),
                 }) {
                     set_pane_detailed_state(config, pane, &new_state, Some(&current), event_tx, panes).await;
+                }
+            }
+
+            // Handle retry state: reset on clean Stop, schedule retry on StopFailure.
+            if event == "Stop" {
+                // Turn completed successfully — reset retry state.
+                *panes.get_or_insert(pane).retry_state.lock().unwrap() = None;
+            } else if event == "StopFailure" && config.run.auto_continue_on_failure {
+                // Turn failed — decide whether to auto-retry and when.
+                let pane_state = panes.get_or_insert(pane);
+                let mut retry_guard = pane_state.retry_state.lock().unwrap();
+
+                let policy = BackoffPolicy::from_config(&config.run);
+                let next = RetryState::next(retry_guard.as_ref(), &policy, tokio::time::Instant::now());
+
+                if let Some(next_state) = next {
+                    // Schedule auto-continue.
+                    let attempt = next_state.attempt_count;
+                    let next_send_instant = next_state.next_send_at;
+                    *retry_guard = Some(next_state);
+
+                    // Spawn a task to send "continue" after the backoff.
+                    let pane_id = pane.to_string();
+                    let config_clone = config.clone();
+                    let panes_clone = panes.clone();
+
+                    tokio::spawn(async move {
+                        let delay = next_send_instant.saturating_duration_since(tokio::time::Instant::now());
+                        if !delay.is_zero() {
+                            debug!("StopFailure: pane {} will auto-continue in {:?}", pane_id, delay);
+                            tokio::time::sleep(delay).await;
+                        }
+
+                        // Check if retry state is still valid (may have been reset by manual prompt or Stop).
+                        let should_send = panes_clone.get(&pane_id)
+                            .map(|state| {
+                                let guard = state.retry_state.lock().unwrap();
+                                guard.as_ref().is_some_and(|s| s.matches(attempt, next_send_instant))
+                            })
+                            .unwrap_or(false);
+
+                        if !should_send {
+                            debug!("StopFailure: pane {} retry state changed, cancelling auto-continue", pane_id);
+                            return;
+                        }
+
+                        debug!("StopFailure: sending auto-continue to pane {}", pane_id);
+
+                        // Mark the upcoming UserPromptSubmit as ours so its handler
+                        // doesn't reset the retry counter (which would defeat
+                        // max_retry_attempts for a persistently-failing turn).
+                        if let Some(pane_obj) = panes_clone.get(&pane_id) {
+                            pane_obj.expecting_auto_continue.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+
+                        // Type "continue" into the pane.
+                        let _ = tmux(&config_clone)
+                            .args(["send-keys", "-t", &pane_id, "continue"])
+                            .status()
+                            .await;
+
+                        // Small delay before Enter to ensure the text lands.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+                        // Send Enter and wait for UserPromptSubmit.
+                        if let Some(pane_obj) = panes_clone.get(&pane_id) {
+                            let _ = tmux(&config_clone)
+                                .args(["send-keys", "-t", &pane_id, "Enter"])
+                                .status()
+                                .await;
+                            let notified = pane_obj.prompt_submitted.notified();
+                            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), notified).await;
+                            debug!("StopFailure: auto-continue submitted to pane {}", pane_id);
+                        } else {
+                            warn!("StopFailure: failed to send auto-continue to pane {} (pane disappeared)", pane_id);
+                        }
+                    });
+                } else {
+                    // Attempt cap exceeded — give up and clear retry state so a
+                    // later failure starts a fresh backoff sequence.
+                    *retry_guard = None;
+                    debug!("StopFailure: pane {} exceeded max attempts ({}), giving up", pane, config.run.max_retry_attempts);
                 }
             }
 
@@ -2917,6 +3084,65 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> BackoffPolicy {
+        BackoffPolicy { max_attempts, initial_backoff_ms, max_backoff_ms }
+    }
+
+    #[test]
+    fn backoff_delay_doubles_then_caps() {
+        let p = policy(10, 100, 1000);
+        assert_eq!(p.delay_ms(1), 100);  // 100 * 2^0
+        assert_eq!(p.delay_ms(2), 200);  // 100 * 2^1
+        assert_eq!(p.delay_ms(3), 400);  // 100 * 2^2
+        assert_eq!(p.delay_ms(4), 800);  // 100 * 2^3
+        assert_eq!(p.delay_ms(5), 1000); // 1600 capped at 1000
+        assert_eq!(p.delay_ms(6), 1000); // stays capped
+    }
+
+    #[test]
+    fn backoff_delay_does_not_overflow_on_huge_attempt() {
+        // A pathological streak must not panic via shift/mul overflow; it just caps.
+        let p = policy(u32::MAX, 1000, 30_000);
+        assert_eq!(p.delay_ms(u32::MAX), 30_000);
+        assert_eq!(p.delay_ms(1_000_000), 30_000);
+    }
+
+    #[test]
+    fn retry_next_increments_attempt_until_cap_then_stops() {
+        let p = policy(2, 100, 1000);
+        let now = tokio::time::Instant::now();
+
+        // First failure → attempt 1.
+        let s1 = RetryState::next(None, &p, now).expect("attempt 1 should schedule");
+        assert_eq!(s1.attempt_count, 1);
+        assert_eq!(s1.next_send_at, now + tokio::time::Duration::from_millis(100));
+
+        // Second failure → attempt 2 (still within cap of 2).
+        let s2 = RetryState::next(Some(&s1), &p, now).expect("attempt 2 should schedule");
+        assert_eq!(s2.attempt_count, 2);
+        assert_eq!(s2.next_send_at, now + tokio::time::Duration::from_millis(200));
+
+        // Third failure → attempt 3 exceeds cap → give up.
+        assert!(RetryState::next(Some(&s2), &p, now).is_none(),
+            "attempt 3 must exceed max_attempts=2 and return None");
+    }
+
+    #[test]
+    fn retry_next_with_zero_max_attempts_never_schedules() {
+        let p = policy(0, 100, 1000);
+        assert!(RetryState::next(None, &p, tokio::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn retry_matches_only_its_own_scheduled_attempt() {
+        let now = tokio::time::Instant::now();
+        let at = now + tokio::time::Duration::from_millis(100);
+        let s = RetryState { attempt_count: 1, next_send_at: at };
+        assert!(s.matches(1, at), "must match its own (attempt, time)");
+        assert!(!s.matches(2, at), "different attempt must not match");
+        assert!(!s.matches(1, now), "different scheduled time must not match");
+    }
 
     #[test]
     fn parse_list_panes_separates_live_and_dead() {

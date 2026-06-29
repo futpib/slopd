@@ -1470,6 +1470,39 @@ pub struct SlopdRunConfig {
     /// override all of these.
     #[serde(default)]
     pub env_files: Vec<PathBuf>,
+    /// Whether to automatically send "continue" when a turn ends with StopFailure
+    /// (e.g., API errors like 500). Uses exponential backoff.
+    #[serde(default = "default_auto_continue_on_failure")]
+    pub auto_continue_on_failure: bool,
+    /// Maximum number of auto-continue attempts before giving up.
+    #[serde(default = "default_max_retry_attempts")]
+    pub max_retry_attempts: u32,
+    /// Initial backoff in milliseconds before the first auto-continue retry.
+    #[serde(default = "default_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff in milliseconds for exponential backoff.
+    #[serde(default = "default_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+}
+
+fn default_auto_continue_on_failure() -> bool {
+    true
+}
+
+fn default_max_retry_attempts() -> u32 {
+    // ~5 minutes of total retrying. With initial=1s doubling to a 30s cap, the
+    // delays run 1,2,4,8,16,30,30,…s; 14 attempts sum to ~301s (a fast burst in
+    // the first ~30s for transient blips, then steady 30s polling to ride out a
+    // longer outage unattended).
+    14
+}
+
+fn default_initial_backoff_ms() -> u64 {
+    1000
+}
+
+fn default_max_backoff_ms() -> u64 {
+    30000
 }
 
 fn default_slopctl() -> String {
@@ -1507,6 +1540,10 @@ impl Default for SlopdRunConfig {
             start_directory: None,
             env: std::collections::BTreeMap::new(),
             env_files: Vec::new(),
+            auto_continue_on_failure: default_auto_continue_on_failure(),
+            max_retry_attempts: default_max_retry_attempts(),
+            initial_backoff_ms: default_initial_backoff_ms(),
+            max_backoff_ms: default_max_backoff_ms(),
         }
     }
 }

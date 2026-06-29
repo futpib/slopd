@@ -248,6 +248,22 @@ fn fire_stop(
     })));
 }
 
+/// Fire StopFailure instead of Stop, simulating a turn that failed to complete
+/// (e.g., API error 500). Used to test slopd's auto-continue functionality.
+fn fire_stop_failure(
+    no_hooks: bool,
+    settings: &serde_json::Value,
+    session_id: &str,
+    cwd: &std::path::Path,
+    transcript_path: &PathBuf,
+) {
+    fire_hooks(no_hooks, settings, "StopFailure", &hook_payload("StopFailure", session_id, cwd, transcript_path));
+    write_transcript_record(transcript_path, &transcript_record("system", session_id, serde_json::json!({
+        "subtype": "turn_duration",
+        "durationMs": 0,
+    })));
+}
+
 /// Fire UserPromptSubmit + Stop for an accepted prompt that produces no model
 /// turn — the mock test-harness control commands (/echo, /sleep, /env, /cwd,
 /// /newline-mode). This is how `slopctl send` of such a command is confirmed,
@@ -452,6 +468,10 @@ fn main() {
     let mut byte = [0u8; 1];
     let mut newline_mode = NewlineMode::Alternating;
     let mut newline_count: u64 = 0;
+    // When set (via /always-fail), every subsequent submitted prompt — including
+    // slopd's own injected "continue" — ends in StopFailure, simulating a
+    // persistent API outage. Used to test the auto-continue retry cap.
+    let mut always_fail = false;
 
     loop {
         match stdin.read(&mut byte) {
@@ -713,6 +733,31 @@ fn main() {
                 if let Some(event) = prompt.strip_prefix("/hook ") {
                     fire_hooks(no_hooks, &settings, event.trim(), &hook_payload(event.trim(), session_id, &cwd, &transcript_path));
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
+                }
+
+                // Toggle persistent-failure mode: every subsequent prompt fails.
+                if prompt == "/always-fail" {
+                    always_fail = true;
+                    fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
+                    continue;
+                }
+
+                // Simulate a turn that failed with StopFailure (e.g., API error 500).
+                // Used to test slopd's auto-continue functionality. In always_fail
+                // mode any prompt (including slopd's injected "continue") fails the
+                // same way, simulating a persistent outage.
+                if prompt == "/stop-failure" || always_fail {
+                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                        "message": { "role": "user", "content": &prompt },
+                    })));
+                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
+                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                        "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
+                    })));
+                    fire_stop_failure(no_hooks, &settings, session_id, &cwd, &transcript_path);
+                    continue;
                 }
 
                 if prompt == "/break-stdin" {
