@@ -48,17 +48,6 @@ impl OpencodeClient {
         r
     }
 
-    /// `GET /global/health` — light liveness check. Errors as `String` (status + body).
-    #[allow(dead_code)] // part of the client API; used for ad-hoc liveness probing
-    pub async fn health(&self) -> Result<Value, String> {
-        let resp = self.req(reqwest::Method::GET, "/global/health").send().await.map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("health {}: {}", status, resp.text().await.unwrap_or_default()));
-        }
-        resp.json::<Value>().await.map_err(|e| e.to_string())
-    }
-
     /// Create the session slopd will drive and return its id, via `POST /session`.
     ///
     /// We deliberately do NOT adopt a *discovered* session here. A freshly-booted
@@ -119,21 +108,6 @@ impl OpencodeClient {
             .into_iter()
             .filter_map(|s| s.get("id").and_then(|i| i.as_str()).map(str::to_string))
             .collect())
-    }
-
-    /// `GET /session` → the most recent session id (highest creation time), if any.
-    /// No longer on the spawn path (slopd POSTs its own session — see
-    /// `ensure_session`), but kept as a correct, tested discovery primitive for
-    /// callers that need to find an existing session rather than create one.
-    #[allow(dead_code)]
-    pub async fn latest_session(&self) -> Result<Option<String>, String> {
-        let resp = self.req(reqwest::Method::GET, "/session").send().await.map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("GET /session {}: {}", status, resp.text().await.unwrap_or_default()));
-        }
-        let arr = resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?;
-        Ok(latest_session_id(&arr).map(str::to_string))
     }
 
     /// `GET /session/status` → the status object for one session. `Ok(None)` if the
@@ -234,18 +208,6 @@ pub fn alloc_port() -> Result<u16, String> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .map(|l| l.local_addr().map(|a| a.port()).unwrap_or(0))
         .map_err(|e| e.to_string())
-}
-
-/// Generate a random per-pane auth token. Currently unused: the opencode TUI's
-/// internal client can't authenticate to its own embedded server, so TUI panes
-/// run without a password (server open on 127.0.0.1). Reserved for a future
-/// headless `opencode serve` mode, which does support `OPENCODE_SERVER_PASSWORD`.
-#[allow(dead_code)]
-pub fn random_token() -> String {
-    // 128 bits of randomness; good enough for a local secret.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("{:032x}", nanos.wrapping_mul(2654435761))
 }
 
 /// Map an opencode session-status object onto a slopd [`PaneDetailedState`].
@@ -354,29 +316,6 @@ pub fn session_created_parent(event: &Value) -> Option<&str> {
         .and_then(|p| p.get("info"))
         .and_then(|i| i.get("parentID"))
         .and_then(|v| v.as_str())
-}
-
-/// Creation timestamp of a session object from `GET /session`. opencode 1.17.x
-/// nests it at `time.created`; older/other shapes used a top-level `timeCreated`,
-/// kept as a fallback. Returns 0 when neither is present (so such sessions sort
-/// oldest rather than poisoning the comparison).
-pub fn session_created_time(session: &Value) -> u64 {
-    session
-        .get("time")
-        .and_then(|t| t.get("created"))
-        .and_then(|v| v.as_u64())
-        .or_else(|| session.get("timeCreated").and_then(|v| v.as_u64()))
-        .unwrap_or(0)
-}
-
-/// The id of the most recently created session in a `GET /session` array, or None
-/// if empty. Split out (and pure) so the "which session did slopd pick" logic is
-/// unit-testable without an HTTP round-trip.
-pub fn latest_session_id(sessions: &[Value]) -> Option<&str> {
-    sessions
-        .iter()
-        .max_by_key(|s| session_created_time(s))
-        .and_then(|s| s.get("id").and_then(|i| i.as_str()))
 }
 
 /// For a `tui.session.select` event, the session id the TUI navigated to
@@ -543,13 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn random_token_is_nonempty_and_hex() {
-        let t = random_token();
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "token not hex: {}", t);
-        assert!(t.len() >= 16);
-    }
-
-    #[test]
     fn status_to_detailed_idle_states() {
         for s in ["idle", "ready", "waiting", "completed"] {
             assert_eq!(status_to_detailed(&json!({"status": s})), Some(PaneDetailedState::Ready), "{}", s);
@@ -693,33 +625,6 @@ mod tests {
         assert_eq!(session_created_parent(&top), None);
         // Non-session.created events → None.
         assert_eq!(session_created_parent(&ev("session.idle", "s")), None);
-    }
-
-    #[test]
-    fn session_created_time_reads_nested_then_legacy_field() {
-        // opencode 1.17.x nests creation time at time.created.
-        let nested = json!({"id":"ses_a","time":{"created":1782677883868u64,"updated":9}});
-        assert_eq!(session_created_time(&nested), 1782677883868);
-        // Legacy/alternate top-level timeCreated is the fallback.
-        let legacy = json!({"id":"ses_b","timeCreated":42});
-        assert_eq!(session_created_time(&legacy), 42);
-        // Neither present → 0 (sorts oldest, never poisons max_by_key).
-        assert_eq!(session_created_time(&json!({"id":"ses_c"})), 0);
-        // The bug this guards: keying on the absent top-level `timeCreated`
-        // scored every real-shaped session 0, making discovery arbitrary.
-        assert_eq!(session_created_time(&json!({"id":"ses_d","time":{"created":7}})), 7);
-    }
-
-    #[test]
-    fn latest_session_id_picks_newest_by_created() {
-        let sessions = vec![
-            json!({"id":"ses_old","time":{"created":100}}),
-            json!({"id":"ses_new","time":{"created":300}}),
-            json!({"id":"ses_mid","time":{"created":200}}),
-        ];
-        assert_eq!(latest_session_id(&sessions), Some("ses_new"));
-        // Empty → None.
-        assert_eq!(latest_session_id(&[]), None);
     }
 
     #[test]

@@ -86,8 +86,9 @@ pub fn sighup_pid(pid: u32) {
 }
 
 pub struct TmuxServer {
-    #[allow(dead_code)]
-    tmpdir: tempfile::TempDir,
+    /// Held only so its `Drop` removes the temp dir when the server is dropped;
+    /// the leading underscore marks it as never read directly.
+    _tmpdir: tempfile::TempDir,
     pub socket: PathBuf,
 }
 
@@ -106,7 +107,7 @@ impl TmuxServer {
             Err(e) => panic!("failed to start tmux: {}", e),
             Ok(status) => assert!(status.success(), "failed to start tmux server"),
         }
-        Some(TmuxServer { tmpdir, socket })
+        Some(TmuxServer { _tmpdir: tmpdir, socket })
     }
 
     pub fn tmux(&self) -> Command {
