@@ -2688,17 +2688,15 @@ async fn restore_panes(
                     continue;
                 }
             };
-            let token = opencode::random_token();
-            let env = vec![
-                ("OPENCODE_SERVER_PASSWORD".to_string(), token.clone()),
-                ("OPENCODE_SERVER_USERNAME".to_string(), "opencode".to_string()),
-            ];
+            // No OPENCODE_SERVER_PASSWORD: the opencode TUI's internal client
+            // can't auth to its own server and would crash on startup (verified
+            // against real opencode). The server is open on 127.0.0.1.
             let id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
                 working_dir: working_dir.clone(),
                 config_dir: resolved.config_dir.clone(),
                 backend: resolved.backend,
                 executable: resolved.executable.clone(),
-                extra_env: env,
+                extra_env: Vec::new(),
                 trailing_args: vec![
                     "-s".to_string(),
                     session_id.clone(),
@@ -2716,8 +2714,7 @@ async fn restore_panes(
             };
             let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdBackend.as_str(), "opencode").await;
             let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
-            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdOpencodeToken.as_str(), &token).await;
-            let client = opencode::OpencodeClient::new(port, Some(token));
+            let client = opencode::OpencodeClient::new(port, None);
             let driver_cancel = tokio_util::sync::CancellationToken::new();
             let pane_state = panes.get_or_insert(&id);
             *pane_state.opencode.lock().unwrap() = Some(OpencodeState {
@@ -3179,11 +3176,9 @@ async fn handle_request(
             } else {
                 None
             };
-            let opencode_token = opencode_port.map(|_| opencode::random_token());
-
             let mut trailing = extra_args;
-            let mut spawn_env = merged_env;
-            if let (Some(port), Some(token)) = (opencode_port, opencode_token.as_ref()) {
+            let spawn_env = merged_env;
+            if let Some(port) = opencode_port {
                 let mut v = trailing.clone();
                 v.extend([
                     "--port".to_string(),
@@ -3192,8 +3187,13 @@ async fn handle_request(
                     "127.0.0.1".to_string(),
                 ]);
                 trailing = v;
-                spawn_env.push(("OPENCODE_SERVER_PASSWORD".to_string(), token.clone()));
-                spawn_env.push(("OPENCODE_SERVER_USERNAME".to_string(), "opencode".to_string()));
+                // NOTE: deliberately do NOT set OPENCODE_SERVER_PASSWORD. The
+                // opencode TUI is itself a client of its embedded server, and its
+                // internal client does not authenticate — setting a password makes
+                // the TUI 401 against its own server (`GET /config/providers`) and
+                // crash on startup (verified against real opencode 1.17.x). The
+                // server is therefore open on 127.0.0.1, which is the local-only
+                // threat model slopd already assumes.
             }
 
             // Spawn through the shared chokepoint, which resolves the executable
@@ -3228,26 +3228,25 @@ async fn handle_request(
                     // and rely on the SessionStart hook + jsonl tailer instead.
                     if resolved.backend == libslop::Backend::Opencode {
                         let port = opencode_port.expect("opencode port allocated above");
-                        let token = opencode_token.clone().expect("opencode token allocated above");
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdBackend.as_str(), "opencode").await;
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
-                        let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdOpencodeToken.as_str(), &token).await;
 
-                        let client = opencode::OpencodeClient::new(port, Some(token.clone()));
-                        // opencode creates the session on startup; poll /session until
-                        // one appears (bounded, so a pane that never starts a session
-                        // doesn't hang slopd's run handler indefinitely).
+                        let client = opencode::OpencodeClient::new(port, None);
+                        // Discover or create the session slopd will drive. A fresh
+                        // TUI has no session until the first message, so create one
+                        // (POST /session) if none exists. Bounded so a pane that
+                        // never boots its server doesn't hang the run handler.
                         let session_id = match tokio::time::timeout(std::time::Duration::from_secs(20), async {
                             loop {
-                                if let Ok(Some(id)) = client.latest_session().await {
-                                    return id;
+                                match client.ensure_session().await {
+                                    Ok(id) if !id.is_empty() => return id,
+                                    _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             }
                         }).await {
                             Ok(id) => id,
                             Err(_) => {
-                                warn!("opencode pane {}: timed out discovering session id; state tracking will be limited", pane_id);
+                                warn!("opencode pane {}: timed out creating/discovering a session; state tracking will be limited", pane_id);
                                 String::new()
                             }
                         };

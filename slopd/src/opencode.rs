@@ -59,6 +59,31 @@ impl OpencodeClient {
         resp.json::<Value>().await.map_err(|e| e.to_string())
     }
 
+    /// Return the session id slopd should drive: the latest existing one, or — if
+    /// the server has none (a freshly-booted TUI creates no session until the
+    /// first message) — create one via `POST /session`. Verified against real
+    /// opencode 1.17.x.
+    pub async fn ensure_session(&self) -> Result<String, String> {
+        if let Some(id) = self.latest_session().await? {
+            return Ok(id);
+        }
+        let resp = self
+            .req(reqwest::Method::POST, "/session")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("POST /session {}: {}", status, resp.text().await.unwrap_or_default()));
+        }
+        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "POST /session returned no id".to_string())
+    }
+
     /// `GET /session` → every session id (used to tell "idle but exists" from
     /// "still booting", since idle sessions are absent from `/session/status`).
     pub async fn session_ids(&self) -> Result<Vec<String>, String> {
@@ -189,8 +214,11 @@ pub fn alloc_port() -> Result<u16, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Generate a random per-pane auth token. Cheap defense on top of 127.0.0.1
-/// binding: if the port ever leaks, the token still gates the server.
+/// Generate a random per-pane auth token. Currently unused: the opencode TUI's
+/// internal client can't authenticate to its own embedded server, so TUI panes
+/// run without a password (server open on 127.0.0.1). Reserved for a future
+/// headless `opencode serve` mode, which does support `OPENCODE_SERVER_PASSWORD`.
+#[allow(dead_code)]
 pub fn random_token() -> String {
     // 128 bits of randomness; good enough for a local secret.
     use std::time::{SystemTime, UNIX_EPOCH};

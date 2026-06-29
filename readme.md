@@ -635,7 +635,9 @@ slopctl tags %1
 
 slopd can drive either [Claude Code](https://claude.com/claude-code) or [OpenCode](https://opencode.ai) panes. Each pane's backend is selected by its account (default `claude`).
 
-OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drives an opencode pane over that API — no Claude-style hooks, no transcript file tailing. slopd spawns the pane with a pinned `--port` on `127.0.0.1` (plus a per-pane auth token), then polls `GET /session/status` to track state, `POST /prompt_async` to send, `POST /abort` to interrupt, and `GET /message` for transcripts. opencode's signals normalize onto slopd's existing state machine, so the daemon core stays agent-agnostic.
+OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drives an opencode pane over that API — no Claude-style hooks, no transcript file tailing. slopd spawns the pane with a pinned `--port` on `127.0.0.1`, then subscribes to the `GET /event` SSE stream (with a `/session/status` + `/session` poll as backstop) to track state, `POST /prompt_async` to send, `POST /abort` to interrupt, and `GET /message` for transcripts. opencode's signals normalize onto slopd's existing state machine, so the daemon core stays agent-agnostic.
+
+> **No server password.** slopd deliberately does **not** set `OPENCODE_SERVER_PASSWORD`: the opencode TUI is itself a client of its embedded server, and its internal client does not authenticate — setting a password makes the TUI `401` against its own server and crash on startup (verified against real opencode 1.17.x). The embedded server is therefore open on `127.0.0.1`, which matches the local-only threat model slopd already assumes. (Headless `opencode serve` does support a password; slopd uses TUI mode.)
 
 ### Configuring an OpenCode account
 
@@ -664,8 +666,8 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `claude_con
 
 ### Current limitations
 
-- **State fidelity**: opencode's `/session/status` is mapped onto slopd's states best-effort; some granular Claude states (e.g. `busy_subagent`, `awaiting_input_elicitation`) may collapse to the nearest equivalent until finer opencode signals are confirmed against a real server.
-- **Live transcript streaming**: `slopctl transcript` (pull) works; live `listen --transcript` streaming for opencode is pending (SSE `GET /event`).
+- **State fidelity**: opencode's `/session/status` + SSE events are mapped onto slopd's states; the common path (idle/busy via `session.idle`/`session.status`, tool use, permission, compaction) is verified against real opencode 1.17.x. Rarer Claude states with no opencode signal (e.g. `busy_subagent`, `awaiting_input_elicitation`) simply don't occur for opencode panes.
+- **`listen --hook`**: opencode publishes a bus, not Claude-style hooks, so `slopctl listen --hook` is a no-op for opencode panes — use `listen --transcript` / `listen --event` instead.
 
 ---
 
