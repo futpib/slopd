@@ -631,6 +631,45 @@ slopctl tags %1
 
 ---
 
+## Multi-backend support (OpenCode)
+
+slopd can drive either [Claude Code](https://claude.com/claude-code) or [OpenCode](https://opencode.ai) panes. Each pane's backend is selected by its account (default `claude`).
+
+OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drives an opencode pane over that API — no Claude-style hooks, no transcript file tailing. slopd spawns the pane with a pinned `--port` on `127.0.0.1` (plus a per-pane auth token), then polls `GET /session/status` to track state, `POST /prompt_async` to send, `POST /abort` to interrupt, and `GET /message` for transcripts. opencode's signals normalize onto slopd's existing state machine, so the daemon core stays agent-agnostic.
+
+### Configuring an OpenCode account
+
+```toml
+[accounts.oc]
+backend = "opencode"                      # selects the opencode backend
+claude_config_dir = "~/.config/opencode"  # agent config dir (exported as OPENCODE_CONFIG_DIR)
+```
+
+```bash
+slopctl run --account oc
+```
+
+The `backend` and the executable resolve bidirectionally ("each implies the other"):
+
+- `backend = "opencode"` alone → spawns `opencode` (its canonical binary).
+- `executable = "opencode"` (no `backend`) → infers the opencode backend.
+- `backend = "claude"` + `executable = "opencode"` → **error** (contradiction).
+- `executable = "/path/to/my-opencode-fork"` (unrecognized name) → treated as an executable override under the configured `backend` (default `claude`); set `backend = "opencode"` explicitly to drive a fork.
+
+Named accounts do **not** inherit the top-level `backend` (mirroring `claude_config_dir`); set it on each `[accounts.<name>]`.
+
+### What works identically
+
+`send`, `interrupt`, `listen`, `wait`, `transcript`, `tag`, `kill`, `ps`, and the iroh remote path are all agent-agnostic. An opencode pane's state (`ready` / `busy_processing` / …) means the same as a Claude pane's. `send` is in fact more reliable for opencode (HTTP POST, not keystroke-the-TUI-and-hope).
+
+### Current limitations
+
+- **State fidelity**: opencode's `/session/status` is mapped onto slopd's states best-effort; some granular Claude states (e.g. `busy_subagent`, `awaiting_input_elicitation`) may collapse to the nearest equivalent until finer opencode signals are confirmed against a real server.
+- **Reboot restore**: opencode panes are tracked live and survive a *daemon* restart, but are **not** auto-respawned after a reboot yet (`opencode -s <id>` restore is pending). The session survives in the opencode DB and can be resumed manually.
+- **Live transcript streaming**: `slopctl transcript` (pull) works; live `listen --transcript` streaming for opencode is pending (SSE `GET /event`).
+
+---
+
 ## Claude hook integration
 
 When slopd starts a Claude pane it automatically injects `slopctl hook <event>` entries into `~/.claude/settings.json` for **all** supported lifecycle events:

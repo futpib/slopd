@@ -2438,6 +2438,14 @@ async fn restore_panes(
             .resolve_account(Some(account.as_str()))
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
+        // OpenCode reboot-restore is not yet wired (it needs a fresh port/token
+        // allocation + `-s <id>` spawn + driver re-attach, not `--resume`). Skip
+        // rather than mis-spawn; the session survives in the opencode DB and can
+        // be resumed manually with `opencode -s <id>`.
+        if resolved.backend == libslop::Backend::Opencode {
+            warn!("backup: skipping opencode pane {} (session {}) — reboot-restore for opencode is not yet supported", old_id, session_id);
+            continue;
+        }
         let settings_path = config.resolved_settings_path(&resolved);
         if resolved.backend.uses_injected_hooks() {
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
