@@ -10004,4 +10004,68 @@ fn wait_until_ready(env: &TestEnv, pane_id: &str, timeout: Duration) {
     }
 }
 
+#[test]
+fn opencode_listen_transcript_streams_live_over_sse() {
+    // Live transcript streaming: the SSE driver broadcasts `source:transcript`
+    // records as the opencode turn produces them, so `slopctl listen` sees the
+    // turn content in real time (not just via pull `slopctl transcript`).
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run --backend opencode failed");
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // Subscribe to the pane's live event stream BEFORE sending.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", &pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn slopctl listen");
+    // Consume the {"subscribed":true} confirmation line.
+    {
+        use std::io::Read;
+        let stdout = listen.stdout.as_mut().expect("listener stdout");
+        let mut buf = [0u8; 1];
+        let mut line = Vec::new();
+        loop {
+            stdout.read_exact(&mut buf).expect("read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"), "unexpected first line: {:?}", line);
+    }
+
+    assert!(env.slopctl(&["send", &pane_id, "ping"]).status.success(), "slopctl send failed");
+
+    // Read streamed lines until the assistant's "echo: ping" transcript record arrives.
+    let stdout = listen.stdout.take().expect("listener stdout gone");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().flatten() {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut found = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.contains("echo: ping") => { found = true; break; }
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    kill_child(listen);
+    assert!(found, "live transcript stream did not deliver the opencode turn record");
+    kill_slopd(slopd);
+}
+
 

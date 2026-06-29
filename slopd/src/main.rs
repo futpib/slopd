@@ -333,11 +333,13 @@ impl PaneState {
     }
 }
 
-/// OpenCode pane driver: poll the pane's embedded server for session status and
-/// translate it into slopd detailed-state transitions via the shared
-/// [`set_pane_detailed_state`] path (the same one Claude's hook handler uses).
-/// This is the opencode analogue of Claude's `slopctl hook` socket + jsonl
-/// tailer, collapsed into one HTTP poll loop.
+/// OpenCode pane driver. Real-time state + transcript come from the server's SSE
+/// stream (`GET /event`); a slow `/session` + `/session/status` poll is a backstop
+/// and also drives initial readiness — a freshly-spawned opencode session is idle
+/// and therefore absent from `/session/status`, so readiness is "session exists in
+/// `/session` and is not busy". opencode events normalize onto slopd's existing
+/// state machine via the shared [`set_pane_detailed_state`] path (the same one
+/// Claude's hook handler uses).
 async fn run_opencode_driver(
     client: opencode::OpencodeClient,
     session_id: String,
@@ -347,27 +349,159 @@ async fn run_opencode_driver(
     event_tx: EventTx,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(700));
+    // Initial reconcile so the pane reaches Ready quickly after spawn.
+    reconcile_opencode_status(&client, &session_id, &pane_id, &config, &panes, &event_tx).await;
+
+    // SSE reader (reconnects with backoff). Shares the cancel token so it stops
+    // when the pane is killed.
+    {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        let pane_id = pane_id.clone();
+        let config = config.clone();
+        let panes = panes.clone();
+        let event_tx = event_tx.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_opencode_sse(client, session_id, pane_id, config, panes, event_tx, cancel).await
+        });
+    }
+
+    // Backstop poll every 3s: re-reconciles state if SSE drops or an event is
+    // missed, and is the authority on initial readiness.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // first tick is immediate; we already reconciled, so absorb it
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = interval.tick() => {}
+            _ = interval.tick() => {
+                reconcile_opencode_status(&client, &session_id, &pane_id, &config, &panes, &event_tx).await;
+            }
         }
-        match client.session_status(&session_id).await {
-            Ok(Some(status)) => {
-                if let Some(new) = opencode::status_to_detailed(&status) {
-                    let current = panes.get_or_insert(&pane_id).detailed_state.lock().unwrap().clone();
-                    if new != current {
-                        set_pane_detailed_state(&config, &pane_id, &new, Some(&current), &event_tx, &panes).await;
-                    }
+    }
+}
+
+/// Reconcile an opencode pane's state from the HTTP API: busy via
+/// `/session/status`; ready via "session exists in `/session` and is not busy".
+/// Leaves state unchanged when the session isn't listed yet (still booting).
+async fn reconcile_opencode_status(
+    client: &opencode::OpencodeClient,
+    session_id: &str,
+    pane_id: &str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+    event_tx: &EventTx,
+) {
+    let target = match client.session_status(session_id).await {
+        Ok(Some(status)) => opencode::status_to_detailed(&status),
+        Ok(None) => match client.session_ids().await {
+            // Idle sessions are absent from /session/status; confirm existence → Ready.
+            Ok(ids) if ids.iter().any(|id| id == session_id) => Some(libslop::PaneDetailedState::Ready),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    if let Some(new) = target {
+        let current = panes.get_or_insert(pane_id).detailed_state.lock().unwrap().clone();
+        if new != current {
+            set_pane_detailed_state(config, pane_id, &new, Some(&current), event_tx, panes).await;
+        }
+    }
+}
+
+/// SSE reader: connect `GET /event`, parse `data:` payloads, apply state +
+/// transcript updates for this pane's session. Reconnects with backoff on error.
+async fn run_opencode_sse(
+    client: opencode::OpencodeClient,
+    session_id: String,
+    pane_id: String,
+    config: Arc<libslop::SlopdConfig>,
+    panes: PaneMap,
+    event_tx: EventTx,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        match client.events().send().await {
+            Ok(resp) => {
+                backoff = std::time::Duration::from_secs(1);
+                if let Err(e) = read_opencode_sse(resp, &session_id, &pane_id, &config, &panes, &event_tx, &cancel).await {
+                    debug!("opencode SSE stream for {} ended: {}", pane_id, e);
                 }
             }
-            Ok(None) => {
-                // Session not listed yet (pane still booting); leave state as-is.
-            }
-            Err(e) => debug!("opencode status poll failed for {}: {}", pane_id, e),
+            Err(e) => debug!("opencode SSE connect failed for {}: {}", pane_id, e),
         }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(15));
+    }
+}
+
+/// Read one SSE connection to completion, dispatching each session-scoped event.
+async fn read_opencode_sse(
+    mut resp: reqwest::Response,
+    session_id: &str,
+    pane_id: &str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+    event_tx: &EventTx,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    let mut buf = String::new();
+    loop {
+        let chunk = tokio::select! {
+            c = resp.chunk() => c.map_err(|e| e.to_string())?,
+            _ = cancel.cancelled() => return Ok(()),
+        };
+        let Some(chunk) = chunk else { return Ok(()); };
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE events are separated by a blank line.
+        while let Some(idx) = buf.find("\n\n") {
+            let block: String = buf.drain(..idx + 2).collect();
+            let Some(payload) = extract_sse_data(&block) else { continue };
+            let Some(event) = opencode::event_from_line(&payload) else { continue };
+            if !opencode::event_session_id(&event).is_some_and(|sid| sid == session_id) {
+                continue;
+            }
+            // State transition.
+            if let Some(new) = opencode::event_to_detailed(&event) {
+                let current = panes.get_or_insert(pane_id).detailed_state.lock().unwrap().clone();
+                if new != current {
+                    set_pane_detailed_state(config, pane_id, &new, Some(&current), event_tx, panes).await;
+                }
+            }
+            // Transcript record (live `listen --transcript`).
+            if let Some((rtype, payload)) = opencode::event_to_transcript(&event) {
+                let _ = event_tx.send(libslop::Record {
+                    source: "transcript".to_string(),
+                    event_type: rtype,
+                    pane_id: Some(pane_id.to_string()),
+                    payload,
+                    cursor: None,
+                });
+            }
+        }
+    }
+}
+
+/// Concatenate the `data:` lines of one SSE event block into its payload.
+fn extract_sse_data(block: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for line in block.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            parts.push(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
     }
 }
 

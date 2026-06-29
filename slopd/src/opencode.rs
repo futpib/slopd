@@ -59,6 +59,21 @@ impl OpencodeClient {
         resp.json::<Value>().await.map_err(|e| e.to_string())
     }
 
+    /// `GET /session` → every session id (used to tell "idle but exists" from
+    /// "still booting", since idle sessions are absent from `/session/status`).
+    pub async fn session_ids(&self) -> Result<Vec<String>, String> {
+        let resp = self.req(reqwest::Method::GET, "/session").send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("GET /session {}: {}", status, resp.text().await.unwrap_or_default()));
+        }
+        let arr = resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?;
+        Ok(arr
+            .into_iter()
+            .filter_map(|s| s.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect())
+    }
+
     /// `GET /session` → the most recent session id (highest `timeCreated`), if any.
     /// Used to discover the session id of a freshly-spawned opencode pane.
     pub async fn latest_session(&self) -> Result<Option<String>, String> {
@@ -156,6 +171,13 @@ impl OpencodeClient {
         }
         resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())
     }
+
+    /// `GET /event` as a prepared SSE request. The driver reads the response
+    /// body chunk-by-chunk and parses `data:` lines (see [`event_from_line`]).
+    pub fn events(&self) -> reqwest::RequestBuilder {
+        self.req(reqwest::Method::GET, "/event")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+    }
 }
 
 /// Bind 127.0.0.1:0 and return the kernel-assigned port for an opencode pane to
@@ -176,18 +198,19 @@ pub fn random_token() -> String {
     format!("{:032x}", nanos.wrapping_mul(2654435761))
 }
 
-/// Map an opencode `SessionStatus` object onto a slopd [`PaneDetailedState`].
+/// Map an opencode session-status object onto a slopd [`PaneDetailedState`].
 ///
-/// The exact `SessionStatus` shape isn't pinned in the public spec, so this is
-/// deliberately tolerant: it accepts a `status`/`state` string with common
-/// spellings, and falls back to a few boolean flags. Returns `None` when nothing
-/// recognized is present (caller leaves state unchanged). Verified against
-/// `mock_opencode`'s status shape; real-opencode confirmation is a smoke-test
-/// step (see the opencode plan notes).
+/// Verified shape (real opencode 1.17.x): a busy session is present in
+/// `GET /session/status` as `{"<sessionID>":{"type":"busy"}}`; an idle session is
+/// **absent** from the map. So this maps the per-session value's `type` field
+/// (`busy`, …). `status`/`state` are also accepted for tolerance. Returns `None`
+/// when nothing recognized is present (caller leaves state unchanged).
 pub fn status_to_detailed(status: &Value) -> Option<PaneDetailedState> {
+    // Real opencode uses `type`; accept `status`/`state` as aliases.
     let s = status
-        .get("status")
+        .get("type")
         .and_then(|v| v.as_str())
+        .or_else(|| status.get("status").and_then(|v| v.as_str()))
         .or_else(|| status.get("state").and_then(|v| v.as_str()))
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
@@ -237,6 +260,91 @@ pub fn messages_to_records(messages: &[Value]) -> Vec<TranscriptRecord> {
         out.push((role, payload));
     }
     out
+}
+
+// --- SSE event mapping (verified against real opencode 1.17.x) ---
+//
+// Events arrive as `data: {"id":"evt_…","type":"<name>","properties":{…}}\n\n`.
+// Session-scoped events carry `properties.sessionID`; server-lifecycle events
+// (server.connected, server.heartbeat, plugin.added, catalog.updated, …) do not.
+
+/// Parse one SSE `data:` payload into a JSON value. Returns None for blanks/comments.
+pub fn event_from_line(payload: &str) -> Option<Value> {
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(payload).ok()
+}
+
+/// The session id an event pertains to (from `properties.sessionID`/`sessionId`),
+/// or None for server-lifecycle events.
+pub fn event_session_id(event: &Value) -> Option<&str> {
+    event
+        .get("properties")
+        .and_then(|p| p.get("sessionID").or_else(|| p.get("sessionId")))
+        .and_then(|v| v.as_str())
+}
+
+/// The event `type` (e.g. `session.idle`, `message.part.updated`).
+pub fn event_type(event: &Value) -> Option<&str> {
+    event.get("type").and_then(|v| v.as_str())
+}
+
+/// Map an SSE event to a detailed-state transition, if it implies one.
+///
+/// Verified mappings: `session.idle`→Ready, `session.status{type:busy}`→busy,
+/// `message.*`/`step-*`→BusyProcessing. Documented (not yet smoke-observed):
+/// `tool.execute.before`→BusyToolUse, `tool.execute.after`→BusyProcessing,
+/// `permission.asked`→AwaitingInputPermission, `session.compacted`→BusyCompacting.
+pub fn event_to_detailed(event: &Value) -> Option<PaneDetailedState> {
+    let t = event_type(event)?;
+    let props = event.get("properties").unwrap_or(&Value::Null);
+    match t {
+        "session.idle" => Some(PaneDetailedState::Ready),
+        // session.status carries the status object in properties.status.
+        "session.status" => props.get("status").and_then(|s| status_to_detailed(s)),
+        // A message is being produced → the agent is working.
+        "message.updated" | "message.part.updated" | "message.removed" | "message.part.removed" => {
+            Some(PaneDetailedState::BusyProcessing)
+        }
+        "step-start" | "step-finish" => Some(PaneDetailedState::BusyProcessing),
+        "tool.execute.before" => Some(PaneDetailedState::BusyToolUse),
+        "tool.execute.after" => Some(PaneDetailedState::BusyProcessing),
+        "permission.asked" => Some(PaneDetailedState::AwaitingInputPermission),
+        "session.compacted" => Some(PaneDetailedState::BusyCompacting),
+        // A failed turn leaves the agent idle (opencode doesn't always follow
+        // session.error with session.idle); recover to Ready so the pane isn't
+        // stuck busy. (Auto-RETRY of the failed turn is a future enhancement.)
+        "session.error" => Some(PaneDetailedState::Ready),
+        _ => None,
+    }
+}
+
+/// Map an SSE event to a transcript record (type, payload), if it carries
+/// conversation content. `message.updated` → a message record (role from
+/// `properties.info.role`); `message.part.updated` → a part record.
+pub fn event_to_transcript(event: &Value) -> Option<TranscriptRecord> {
+    let t = event_type(event)?;
+    let props = event.get("properties").unwrap_or(&Value::Null);
+    match t {
+        "message.updated" => {
+            let role = props.get("info").and_then(|i| i.get("role")).and_then(|r| r.as_str()).unwrap_or("user").to_string();
+            Some((role, props.clone()))
+        }
+        "message.part.updated" => {
+            // A part (text/tool/etc.). Type it by the part's own type if present.
+            let part_type = props.get("part").and_then(|p| p.get("type")).and_then(|v| v.as_str()).unwrap_or("part").to_string();
+            Some((part_type, props.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether an SSE event signals a turn failure (for auto-continue). opencode
+/// emits `session.error` when a turn errors.
+pub fn event_is_failure(event: &Value) -> bool {
+    event_type(event) == Some("session.error")
 }
 
 #[cfg(test)]

@@ -2,26 +2,31 @@
 //!
 //! slopd spawns the agent binary in a tmux pane and (for the opencode backend)
 //! passes `--port <P> --hostname 127.0.0.1` plus `OPENCODE_SERVER_PASSWORD`. This
-//! mock binds that port and serves the small HTTP API subset slopd's
-//! [`OpencodeClient`](../../src/opencode.rs) uses, simulating turn state
-//! transitions (idle → busy on prompt → idle) so the daemon's status-poll driver
-//! has something real to observe.
+//! mock binds that port and serves the HTTP API subset slopd's [`OpencodeClient`]
+//! uses, with the REAL opencode shapes (busy = present in `/session/status` as
+//! `{"<sid>":{"type":"busy"}}`; idle = absent; an SSE `/event` stream carrying
+//! `session.status` / `message.*` / `session.idle`). It simulates a turn
+//! (idle → busy → idle) so the SSE driver has something real to observe.
 //!
-//! It blocks on `incoming()` so the tmux pane stays alive for the test, exactly
-//! like a real long-running agent process.
+//! Blocks on `incoming()` so the tmux pane stays alive for the test, like a real
+//! long-running agent. Connections are handled one-per-thread so a long-lived SSE
+//! stream doesn't block other API calls.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const SID: &str = "ses_mock";
 
-#[derive(Default)]
 struct MockState {
     busy: bool,
     /// (role, text) pairs — the conversation.
     messages: Vec<(String, String)>,
+    /// SSE event broadcast (JSON strings). Only one subscriber (the driver).
+    event_rx: Option<mpsc::Receiver<String>>,
+    event_tx: mpsc::Sender<String>,
 }
 
 fn main() {
@@ -38,12 +43,15 @@ fn main() {
     let port = port.expect("mock_opencode: --port is required");
 
     let listener = TcpListener::bind((hostname.as_str(), port)).expect("mock_opencode: bind failed");
-    // Accept quickly so slopd's session discovery (GET /session) doesn't time out.
-    listener
-        .set_nonblocking(false)
-        .ok();
+    listener.set_nonblocking(false).ok();
 
-    let state: Arc<Mutex<MockState>> = Arc::new(Mutex::new(MockState::default()));
+    let (event_tx, event_rx) = mpsc::channel::<String>();
+    let state: Arc<Mutex<MockState>> = Arc::new(Mutex::new(MockState {
+        busy: false,
+        messages: Vec::new(),
+        event_rx: Some(event_rx),
+        event_tx,
+    }));
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -51,9 +59,13 @@ fn main() {
             Err(_) => continue,
         };
         let st = state.clone();
-        // Single-threaded handling is fine — test traffic is tiny and serial.
-        handle(st, stream);
+        std::thread::spawn(move || handle(st, stream));
     }
+}
+
+fn emit(state: &Arc<Mutex<MockState>>, event_json: String) {
+    // Ignore send errors (no SSE subscriber connected yet).
+    let _ = state.lock().unwrap().event_tx.send(event_json);
 }
 
 fn handle(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
@@ -65,6 +77,12 @@ fn handle(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
+
+    if path == "/event" {
+        // SSE stream — long-lived, handled in its own thread.
+        stream_sse(state, stream);
+        return;
+    }
 
     let mut content_len: usize = 0;
     loop {
@@ -91,6 +109,38 @@ fn handle(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
     let _ = stream.flush();
 }
 
+/// Serve the SSE event stream until the client disconnects.
+fn stream_sse(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
+    // Write the response headers, then stream events.
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    if stream.write_all(header.as_bytes()).is_err() {
+        return;
+    }
+    let rx = match state.lock().unwrap().event_rx.take() {
+        Some(rx) => rx,
+        None => return, // another subscriber already took it
+    };
+    // server.connected first, matching real opencode.
+    let _ = stream.write_all(b"event: server.connected\ndata: {\"type\":\"server.connected\",\"properties\":{}}\n\n");
+    loop {
+        match rx.recv_timeout(Duration::from_millis(800)) {
+            Ok(json) => {
+                let msg = format!("data: {json}\n\n");
+                if stream.write_all(msg.as_bytes()).is_err() {
+                    return; // client gone
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Heartbeat comment keeps the connection alive.
+                if stream.write_all(b": heartbeat\n\n").is_err() {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> String {
     let (status, body_out) = match (method, path) {
         ("GET", "/global/health") => (200, r#"{"healthy":true,"version":"mock"}"#.to_string()),
@@ -101,9 +151,13 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
         ),
 
         ("GET", "/session/status") => {
+            // REAL shape: busy sessions present with {"type":"busy"}; idle absent.
             let busy = state.lock().unwrap().busy;
-            let st = if busy { "busy" } else { "idle" };
-            (200, format!(r#"{{"{SID}":{{"status":"{st}"}}}}"#))
+            if busy {
+                (200, format!(r#"{{"{SID}":{{"type":"busy"}}}}"#))
+            } else {
+                (200, "{}".to_string())
+            }
         }
 
         ("POST", p) if p == format!("/session/{SID}/prompt_async") => {
@@ -114,12 +168,19 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 s.messages.push(("user".to_string(), text.clone()));
                 s.messages.push(("assistant".to_string(), format!("echo: {text}")));
             }
-            // Simulate a turn: busy briefly, then idle (the driver observes the
-            // transition back to ready).
+            // Stream a realistic turn over SSE: busy → user msg → assistant msg
+            // → (after a beat) idle.
+            emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
+            emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"user"}}}}}}"#));
+            emit(&state, part_updated_event(SID, "user", &text));
+            emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"assistant"}}}}}}"#));
             let st = state.clone();
+            let echo = format!("echo: {text}");
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(300));
+                emit(&st, part_updated_event(SID, "assistant", &echo));
                 st.lock().unwrap().busy = false;
+                emit(&st, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
             });
             (204, String::new())
         }
@@ -128,6 +189,7 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
 
         ("POST", p) if p == format!("/session/{SID}/abort") => {
             state.lock().unwrap().busy = false;
+            emit(&state, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
             (200, "{}".to_string())
         }
 
@@ -137,9 +199,11 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 .iter()
                 .map(|(role, text)| {
                     let text_json = serde_json::Value::String(text.clone()).to_string();
-                    format!(r#"{{"info":{{"role":{}}},"parts":[{{"type":"text","text":{}}}]}}"#,
+                    format!(
+                        r#"{{"info":{{"role":{}}},"parts":[{{"type":"text","text":{}}}]}}"#,
                         serde_json::Value::String(role.clone()).to_string(),
-                        text_json)
+                        text_json
+                    )
                 })
                 .collect();
             (200, format!("[{}]", arr.join(",")))
@@ -157,6 +221,15 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             len = body_out.len(),
         )
     }
+}
+
+/// Build a `message.part.updated` event JSON for the SSE stream.
+fn part_updated_event(sid: &str, _role: &str, text: &str) -> String {
+    let text_json = serde_json::Value::String(text.to_string()).to_string();
+    format!(
+        r#"{{"type":"message.part.updated","properties":{{"sessionID":"{}","part":{{"type":"text","text":{}}}}}}}"#,
+        sid, text_json
+    )
 }
 
 /// Extract the first `text` part from a `{"parts":[{"type":"text","text":...}]}` body.
