@@ -690,7 +690,11 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
             .resolve_account(opts.account.as_deref())
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
-        settings_paths.insert(config.resolved_settings_path(&resolved));
+        // Hooks are a Claude-only mechanism; a non-Claude backend has no
+        // settings.json to inject into (and nothing to re-inject on recovery).
+        if resolved.backend.uses_injected_hooks() {
+            settings_paths.insert(config.resolved_settings_path(&resolved));
+        }
 
         // Replay the last N transcript records to recover the real state.
         let transcript_path = opts.transcript_path;
@@ -1239,11 +1243,11 @@ async fn main() {
     let socket_override = cli.socket.as_deref().map(libslop::expand_path);
     let apply_overrides = move |cfg: &mut libslop::SlopdConfig| {
         if let Some(executable) = executable_override.clone() {
-            cfg.run.executable = if executable.len() == 1 {
+            cfg.run.executable = Some(if executable.len() == 1 {
                 libslop::Executable::String(executable.into_iter().next().unwrap())
             } else {
                 libslop::Executable::Array(executable)
-            };
+            });
         }
         cfg.run.slopctl = libslop::resolve_slopctl(&cfg.run.slopctl);
         cfg.control_socket = socket_override.clone();
@@ -1427,7 +1431,8 @@ async fn main() {
                 "backup: cannot auto-restore {} pane(s) — configured executable {:?} not found on slopd's PATH. \
                  systemd user services start with a minimal PATH (no ~/.local/bin); add a PATH drop-in for slopd.service. \
                  Manifest preserved and auto-backup paused — fix PATH, then run `slopctl restore`.",
-                count, config.run.executable.program(),
+                count,
+                config.run.executable.as_ref().map(|e| e.program()).unwrap_or("claude"),
             );
             true
         } else {
@@ -2077,13 +2082,22 @@ struct SpawnSpec {
     /// `-c` working directory for the new pane (also the cwd a relative
     /// executable resolves against). `None` → tmux default.
     working_dir: Option<String>,
-    /// `CLAUDE_CONFIG_DIR` for the resolved account, if any.
+    /// Agent config dir for the resolved account, if any. Exported under the
+    /// backend's env var (`CLAUDE_CONFIG_DIR` / `OPENCODE_CONFIG_DIR`).
     config_dir: Option<std::path::PathBuf>,
+    /// Agent backend in effect (drives the config-dir env var; spawn dispatch
+    /// by backend is added in a later phase — for now all panes spawn via the
+    /// same tmux path, which is correct for Claude and a no-op stub for opencode
+    /// until the OpencodeBackend lands).
+    backend: libslop::Backend,
+    /// Resolved executable to spawn (program + its own args), from
+    /// `ResolvedAccount`. Trailing args below are appended after these.
+    executable: libslop::Executable,
     /// Extra `-e KEY=VALUE` for the pane (run only; a PATH entry here also
     /// drives executable resolution). Empty for restore.
     extra_env: Vec<(String, String)>,
-    /// Args appended after the configured executable's own args (run: the
-    /// user's extra args; restore: `--resume <session_id>`).
+    /// Args appended after the executable's own args (run: the user's extra
+    /// args; restore: `--resume <session_id>`).
     trailing_args: Vec<String>,
 }
 
@@ -2119,10 +2133,10 @@ async fn spawn_claude_pane(
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let program = config.run.executable.program();
+    let program = spec.executable.program();
     let resolved = libslop::resolve_executable(program, &lookup_path, &lookup_cwd).ok_or_else(|| {
         format!(
-            "configured executable {:?} not found — check `[run] executable` (or --executable) and slopd's PATH \
+            "configured executable {:?} not found — check `[run] executable` / account `executable` (or --executable) and slopd's PATH \
              (systemd user services start with a minimal PATH that omits ~/.local/bin, where `claude` usually lives)",
             program
         )
@@ -2143,7 +2157,7 @@ async fn spawn_claude_pane(
             cmd.args(["-c", dir]);
         }
         if let Some(ref dir) = spec.config_dir {
-            cmd.args(["-e", &format!("CLAUDE_CONFIG_DIR={}", dir.display())]);
+            cmd.args(["-e", &format!("{}={}", spec.backend.config_dir_env_var(), dir.display())]);
         }
         // Forward LLVM_PROFILE_FILE so instrumented child binaries (e.g.
         // mock_claude) write coverage data even when launched in a tmux window.
@@ -2156,7 +2170,7 @@ async fn spawn_claude_pane(
         // Spawn the resolved absolute path, not the bare program name, so the
         // launch never depends on the pane's own PATH.
         cmd.arg(&resolved)
-            .args(c.run.executable.args())
+            .args(spec.executable.args())
             .args(&spec.trailing_args);
         cmd
     })
@@ -2192,7 +2206,15 @@ async fn spawn_claude_pane(
 fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    libslop::executable_exists(config.run.executable.program(), &path, &cwd)
+    // Restore currently targets Claude panes only (the manifest gains a `backend`
+    // field in a later phase); use the global executable or the Claude default.
+    let program = config
+        .run
+        .executable
+        .as_ref()
+        .map(|e| e.program())
+        .unwrap_or("claude");
+    libslop::executable_exists(program, &path, &cwd)
 }
 
 /// The launch cwd recorded in a Claude transcript: the first record's `cwd`,
@@ -2311,8 +2333,10 @@ async fn restore_panes(
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
         let settings_path = config.resolved_settings_path(&resolved);
-        if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
-            warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
+        if resolved.backend.uses_injected_hooks() {
+            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
+                warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
+            }
         }
 
         // `claude --resume` finds the session via the project dir of its launch
@@ -2326,6 +2350,8 @@ async fn restore_panes(
         let new_id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
             working_dir: launch_dir,
             config_dir: resolved.config_dir.clone(),
+            backend: resolved.backend,
+            executable: resolved.executable.clone(),
             extra_env: Vec::new(),
             trailing_args: vec!["--resume".to_string(), session_id.clone()],
         }).await {
@@ -2685,10 +2711,13 @@ async fn handle_request(
                 Err(message) => return libslop::ResponseBody::Error { message },
             };
             // Inject hooks into the account's settings.json (the dir the new pane
-            // will actually read), not necessarily the default one.
-            let settings_path = config.resolved_settings_path(&resolved);
-            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
-                warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+            // will actually read), not necessarily the default one. Claude only —
+            // opencode and other non-Claude backends are driven without hooks.
+            if resolved.backend.uses_injected_hooks() {
+                let settings_path = config.resolved_settings_path(&resolved);
+                if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
+                    warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+                }
             }
             // Resolve start directory: per-session flag takes precedence over config default.
             // Both are `~` / `$VAR`-expanded here (against slopd's environment), so a
@@ -2727,12 +2756,14 @@ async fn handle_request(
             let output = spawn_claude_pane(config, session_lock, &SpawnSpec {
                 working_dir: effective_start_dir.as_ref().and_then(|d| d.to_str().map(str::to_string)),
                 config_dir: resolved.config_dir.clone(),
+                backend: resolved.backend,
+                executable: resolved.executable.clone(),
                 extra_env: merged_env,
                 trailing_args: extra_args,
             }).await;
             match output {
                 Ok(pane_id) => {
-                    debug!("spawned {:?} in pane {}", config.run.executable, pane_id);
+                    debug!("spawned {:?} ({}) in pane {}", resolved.executable, resolved.backend.canonical_executable(), pane_id);
                     managed_panes.insert(pane_id.clone());
                     // Wake any hook handlers that arrived before managed_panes.insert()
                     // (race between tmux creating the pane and this task resuming).

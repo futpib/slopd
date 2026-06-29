@@ -1121,6 +1121,140 @@ mod tests {
         assert_eq!(cfg.claude_config_dir(), PathBuf::from("/tmp/cc/sub"));
     }
 
+    // --- backend + executable resolution (model C) tests ---
+
+    #[test]
+    fn backend_default_is_claude() {
+        assert_eq!(Backend::default(), Backend::Claude);
+        let cfg = SlopdConfig::default();
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.backend, Backend::Claude);
+        assert_eq!(resolved.executable, Executable::String("claude".to_string()));
+    }
+
+    #[test]
+    fn backend_explicit_opencode_defaults_executable() {
+        // `backend = "opencode"` alone → spawn opencode (vice-versa).
+        let cfg = config_from_toml("[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n");
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+        assert_eq!(resolved.backend.config_dir_env_var(), "OPENCODE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn backend_inferred_from_executable() {
+        // `executable = "opencode"` alone → infer opencode.
+        let cfg = config_from_toml(
+            "[run]\nexecutable = \"opencode\"\n[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\n",
+        );
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+    }
+
+    #[test]
+    fn backend_inferred_from_default_account_global_executable() {
+        // A bare `[run] executable = "opencode"` flips the default account too.
+        let cfg = config_from_toml("[run]\nexecutable = \"opencode\"\n");
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+    }
+
+    #[test]
+    fn backend_conflict_between_explicit_and_executable_errors() {
+        // backend = "claude" + executable = "opencode" → contradiction.
+        let cfg = config_from_toml(
+            "[accounts.bad]\nclaude_config_dir = \"x\"\nbackend = \"claude\"\nexecutable = \"opencode\"\n",
+        );
+        let err = cfg.resolve_account(Some("bad")).unwrap_err();
+        assert!(err.contains("conflict"), "expected conflict error: {}", err);
+    }
+
+    #[test]
+    fn backend_custom_executable_is_override_not_inferred() {
+        // Unrecognized executable + explicit backend → override, no conflict.
+        let cfg = config_from_toml(
+            "[accounts.oc]\nclaude_config_dir = \"x\"\nbackend = \"opencode\"\nexecutable = \"/opt/my-oc-fork\"\n",
+        );
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+        assert_eq!(resolved.executable, Executable::String("/opt/my-oc-fork".to_string()));
+    }
+
+    #[test]
+    fn backend_custom_executable_without_explicit_backend_defaults_claude() {
+        // Unrecognized executable alone can't be inferred → Claude (inference is
+        // recognized-names only; custom paths need an explicit backend).
+        let cfg = config_from_toml(
+            "[accounts.oc]\nclaude_config_dir = \"x\"\nexecutable = \"/opt/my-oc-fork\"\n",
+        );
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Claude);
+        assert_eq!(resolved.executable, Executable::String("/opt/my-oc-fork".to_string()));
+    }
+
+    #[test]
+    fn backend_per_account_does_not_inherit_top_level() {
+        // Top-level `backend` backs only the default account, like claude_config_dir.
+        let cfg = config_from_toml(
+            "backend = \"opencode\"\n[accounts.work]\nclaude_config_dir = \"x\"\n",
+        );
+        assert_eq!(cfg.resolve_account(None).unwrap().backend, Backend::Opencode);
+        assert_eq!(cfg.resolve_account(Some("work")).unwrap().backend, Backend::Claude);
+    }
+
+    #[test]
+    fn backend_account_table_overrides_global_executable() {
+        // Per-account executable wins over the global `[run] executable`.
+        let cfg = config_from_toml(
+            "[run]\nexecutable = \"claude\"\n[accounts.oc]\nclaude_config_dir = \"x\"\nexecutable = \"opencode\"\n",
+        );
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+    }
+
+    #[test]
+    fn backend_shorthand_dir_account_derives_from_global_executable() {
+        // Bare-string account has no backend/executable → derive from global.
+        let cfg = config_from_toml("[run]\nexecutable = \"opencode\"\n[accounts]\noc = \"~/.config/opencode\"\n");
+        let resolved = cfg.resolve_account(Some("oc")).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+    }
+
+    #[test]
+    fn backend_executable_array_form_program_is_inferred() {
+        // Array executable: inference looks at argv[0].
+        let cfg = config_from_toml(
+            "[run]\nexecutable = [\"opencode\", \"--dangerously-skip-permissions\"]\n",
+        );
+        let resolved = cfg.resolve_account(None).unwrap();
+        assert_eq!(resolved.backend, Backend::Opencode);
+        assert_eq!(resolved.executable.args(), &["--dangerously-skip-permissions".to_string()]);
+    }
+
+    #[test]
+    fn backend_all_settings_paths_skips_non_claude() {
+        // Hook injection targets are Claude-only.
+        let cfg = config_from_toml(
+            "[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n\
+             [accounts.work]\nclaude_config_dir = \"~/.config/claude-work\"\n",
+        );
+        let paths = cfg.all_settings_paths();
+        // Only the default (claude) + work (claude) accounts; oc (opencode) skipped.
+        assert_eq!(paths.len(), 2, "opencode account must be skipped: {:?}", paths);
+    }
+
+    #[test]
+    fn backend_infer_from_program_strips_path_and_exe() {
+        assert_eq!(Backend::infer_from_program("claude"), Some(Backend::Claude));
+        assert_eq!(Backend::infer_from_program("/usr/bin/opencode"), Some(Backend::Opencode));
+        assert_eq!(Backend::infer_from_program("opencode.exe"), Some(Backend::Opencode));
+        assert_eq!(Backend::infer_from_program("/opt/my-fork"), None);
+        assert_eq!(Backend::infer_from_program("opencode-ai"), None, "only exact canonical names match");
+    }
+
     // --- slopctl interactive-run config ---
 
     #[test]
@@ -1307,6 +1441,13 @@ pub struct SlopdConfig {
     /// selected. Shorthand for `[accounts.default] claude_config_dir = ...`.
     /// Supports `~` and `$VAR` / `${VAR}` expansion.
     pub claude_config_dir: Option<PathBuf>,
+    /// Backend for the reserved [`DEFAULT_ACCOUNT`] (the account used when no
+    /// account is selected). Shorthand for `[accounts.default] backend = ...`.
+    /// Named accounts do **not** inherit this — set `backend` on each
+    /// `[accounts.<name>]`. When unset, the default account's backend is derived
+    /// — see [`Backend::resolve`].
+    #[serde(default)]
+    pub backend: Option<Backend>,
     /// Named Claude accounts. Each maps an account name to its own configuration
     /// (at minimum a Claude config dir, the per-account equivalent of
     /// `claude_config_dir`). Select one for a pane with
@@ -1362,34 +1503,66 @@ pub enum AccountConfig {
 /// backward-compatible), plus a matching accessor on [`AccountConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSettings {
-    /// The account's Claude config directory.
+    /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
+    /// for [`Backend::Claude`] or `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`]).
+    /// The field name is historical; it is the agent config dir regardless of
+    /// backend.
     pub claude_config_dir: PathBuf,
-    // Future per-account options go here, e.g.:
-    //   #[serde(default)] pub executable: Option<Executable>,
-    //   #[serde(default)] pub env: std::collections::BTreeMap<String, String>,
+    /// Agent backend for this account. When unset, the backend is derived — see
+    /// [`Backend::resolve`].
+    #[serde(default)]
+    pub backend: Option<Backend>,
+    /// Per-account executable override. When unset, the global `[run] executable`
+    /// is used (or the backend's canonical binary — see [`Backend::resolve`]).
+    #[serde(default)]
+    pub executable: Option<Executable>,
 }
 
 impl AccountConfig {
-    /// The account's Claude config directory, as written in config (unexpanded).
+    /// The account's agent config directory, as written in config (unexpanded).
     pub fn claude_config_dir(&self) -> &PathBuf {
         match self {
             AccountConfig::Dir(p) => p,
             AccountConfig::Settings(s) => &s.claude_config_dir,
         }
     }
+
+    /// Per-account backend override, if set (table form only).
+    pub fn backend(&self) -> Option<Backend> {
+        match self {
+            AccountConfig::Settings(s) => s.backend,
+            AccountConfig::Dir(_) => None,
+        }
+    }
+
+    /// Per-account executable override, if set (table form only).
+    pub fn executable(&self) -> Option<&Executable> {
+        match self {
+            AccountConfig::Settings(s) => s.executable.as_ref(),
+            AccountConfig::Dir(_) => None,
+        }
+    }
 }
 
 /// The outcome of resolving a requested account name against the config: the
-/// account that is in effect and the Claude config dir to hand the new pane.
+/// account in effect, the agent config dir, and the resolved backend +
+/// executable to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
     /// The account name in effect (always set; [`DEFAULT_ACCOUNT`] for the
     /// default). Recorded on the pane as `@slopd_account` so it shows in `ps`
     /// and child panes can inherit it.
     pub name: String,
-    /// The Claude config dir to export as `CLAUDE_CONFIG_DIR`. `None` means
-    /// leave `CLAUDE_CONFIG_DIR` unset so Claude falls back to `~/.claude`.
+    /// The agent config dir to export (as `CLAUDE_CONFIG_DIR` /`
+    /// `OPENCODE_CONFIG_DIR`, selected by [`Self::backend`]). `None` means leave
+    /// it unset so the agent falls back to its default.
     pub config_dir: Option<PathBuf>,
+    /// The agent backend in effect (drives spawn behavior + the config-dir env
+    /// var + whether hooks are injected).
+    pub backend: Backend,
+    /// The executable to spawn for this account (already resolved against the
+    /// backend per [`Backend::resolve`]).
+    pub executable: Executable,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1417,7 +1590,98 @@ impl SlopdTmuxConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Which agent CLI a pane runs. Selects the spawn backend, the config-dir env
+/// var exported into the pane, and whether slopd injects Claude-style hooks.
+///
+/// Resolution against `executable` is bidirectional ("each implies the other"):
+/// see [`Backend::resolve`]. Inference recognizes only the canonical binary
+/// names (`claude`, `opencode`); a custom path/wrapper needs an explicit
+/// `backend` and is treated as an executable override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// Anthropic's Claude Code CLI (default). Uses `~/.claude`, injects
+    /// `slopctl hook` entries into `settings.json`, and tails the jsonl
+    /// transcript.
+    #[default]
+    Claude,
+    /// OpenCode (`opencode`). Runs the TUI with an embedded HTTP server; slopd
+    /// drives it over HTTP/SSE — no hooks, no jsonl tailing.
+    Opencode,
+}
+
+impl Backend {
+    /// The canonical bare binary name for this backend (`claude` / `opencode`).
+    pub fn canonical_executable(self) -> &'static str {
+        match self {
+            Backend::Claude => "claude",
+            Backend::Opencode => "opencode",
+        }
+    }
+
+    /// Infer a backend from a binary name, recognizing only the canonical names
+    /// (a directory prefix and `.exe` suffix are tolerated). Returns `None` for
+    /// custom paths/wrappers — those need an explicit `backend` and are treated
+    /// as an executable override, never inferred or conflicted.
+    pub fn infer_from_program(program: &str) -> Option<Backend> {
+        let base = program.rsplit('/').next().unwrap_or(program).trim_end_matches(".exe");
+        match base {
+            "claude" => Some(Backend::Claude),
+            "opencode" => Some(Backend::Opencode),
+            _ => None,
+        }
+    }
+
+    /// The env var slopd exports to point the agent at its config dir.
+    pub fn config_dir_env_var(self) -> &'static str {
+        match self {
+            Backend::Claude => "CLAUDE_CONFIG_DIR",
+            Backend::Opencode => "OPENCODE_CONFIG_DIR",
+        }
+    }
+
+    /// Whether slopd injects `slopctl hook` entries into this backend's
+    /// settings file (Claude only; opencode is driven over HTTP instead).
+    pub fn uses_injected_hooks(self) -> bool {
+        matches!(self, Backend::Claude)
+    }
+
+    /// Resolve `(explicit backend, explicit executable)` into the backend in
+    /// effect and the executable to spawn, under the "each implies the other"
+    /// rule (model C):
+    ///
+    /// - `backend` set → authoritative; `executable` defaults to its canonical
+    ///   binary when unset.
+    /// - `backend` unset → inferred from `executable` when it is a recognized
+    ///   name, else [`Backend::Claude`].
+    /// - An explicit `backend` that contradicts a recognized `executable` is an
+    ///   error (e.g. `backend = "claude"` + `executable = "opencode"`).
+    /// - An unrecognized `executable` (custom path/wrapper) is always treated as
+    ///   an override and never infers or conflicts.
+    pub fn resolve(
+        explicit_backend: Option<Backend>,
+        explicit_executable: Option<&Executable>,
+    ) -> Result<(Backend, Executable), String> {
+        let inferred = explicit_executable.and_then(|e| Backend::infer_from_program(e.program()));
+        if let (Some(asked), Some(inferred)) = (explicit_backend, inferred) {
+            if asked != inferred {
+                return Err(format!(
+                    "backend {:?} conflicts with executable {:?} (which implies backend {:?})",
+                    asked,
+                    explicit_executable.unwrap().program(),
+                    inferred,
+                ));
+            }
+        }
+        let backend = explicit_backend.or(inferred).unwrap_or_default();
+        let executable = explicit_executable
+            .cloned()
+            .unwrap_or_else(|| Executable::String(backend.canonical_executable().to_string()));
+        Ok((backend, executable))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Executable {
     String(String),
@@ -1450,8 +1714,13 @@ impl Default for Executable {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdRunConfig {
+    /// Agent executable for panes that don't override it per-account. When
+    /// unset, the effective executable is derived via [`Backend::resolve`] (the
+    /// resolved backend's canonical binary). A recognized name here
+    /// (`claude`/`opencode`) also implies the backend for accounts that don't
+    /// set one.
     #[serde(default)]
-    pub executable: Executable,
+    pub executable: Option<Executable>,
     /// Path to slopctl binary used for hook injection (default: "slopctl")
     #[serde(default = "default_slopctl")]
     pub slopctl: String,
@@ -1534,7 +1803,7 @@ pub fn resolve_slopctl(configured: &str) -> String {
 impl Default for SlopdRunConfig {
     fn default() -> Self {
         Self {
-            executable: Executable::default(),
+            executable: None,
             slopctl: default_slopctl(),
             start_directory: None,
             env: std::collections::BTreeMap::new(),
@@ -1706,12 +1975,19 @@ impl SlopdConfig {
         // The default account is backed by [accounts.default], then the
         // top-level claude_config_dir, then ~/.claude (left unset).
         if name == DEFAULT_ACCOUNT {
-            let config_dir = self
-                .accounts
-                .get(DEFAULT_ACCOUNT)
+            let acct = self.accounts.get(DEFAULT_ACCOUNT);
+            let config_dir = acct
                 .map(|a| expand_path(a.claude_config_dir()))
                 .or_else(|| self.claude_config_dir.as_deref().map(expand_path));
-            return Ok(ResolvedAccount { name, config_dir });
+            // Backend/executable: [accounts.default] wins over the top-level
+            // `backend` / `[run] executable`; the top-level values back ONLY the
+            // default account (named accounts don't inherit them).
+            let explicit_backend = acct.and_then(|a| a.backend()).or(self.backend);
+            let explicit_executable = acct
+                .and_then(|a| a.executable())
+                .or(self.run.executable.as_ref());
+            let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
+            return Ok(ResolvedAccount { name, config_dir, backend, executable });
         }
 
         let account = self.accounts.get(&name).ok_or_else(|| {
@@ -1723,9 +1999,17 @@ impl SlopdConfig {
                 configured.join(", "),
             )
         })?;
+        // Named accounts: per-account backend/executable, falling back to the
+        // global `[run] executable` (but NOT the top-level `backend`, which is
+        // default-account-only, matching `claude_config_dir`).
+        let explicit_backend = account.backend();
+        let explicit_executable = account.executable().or(self.run.executable.as_ref());
+        let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
         Ok(ResolvedAccount {
             name,
             config_dir: Some(expand_path(account.claude_config_dir())),
+            backend,
+            executable,
         })
     }
 
@@ -1755,6 +2039,11 @@ impl SlopdConfig {
             // resolve_account only errors for unknown named accounts; every name
             // here comes from the config (or is DEFAULT_ACCOUNT), so this holds.
             if let Ok(resolved) = self.resolve_account(Some(name)) {
+                // Hooks are a Claude-only mechanism; opencode (and any future
+                // non-Claude backend) has no settings.json to inject into.
+                if !resolved.backend.uses_injected_hooks() {
+                    continue;
+                }
                 let path = self.resolved_settings_path(&resolved);
                 if seen.insert(path.clone()) {
                     out.push(path);
