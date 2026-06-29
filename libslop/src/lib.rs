@@ -218,6 +218,12 @@ pub enum TmuxOption {
     /// Stores the account name the pane was launched under (empty/unset for the
     /// unnamed default account). Used to re-inject the right hooks on recovery.
     SlopdAccount,
+    /// Stores the pane's agent backend (`claude` / `opencode`); unset = claude.
+    SlopdBackend,
+    /// For opencode panes: the embedded HTTP server port slopd drives the pane over.
+    SlopdOpencodePort,
+    /// For opencode panes: the per-pane basic-auth token for that server.
+    SlopdOpencodeToken,
 }
 
 impl TmuxOption {
@@ -231,6 +237,9 @@ impl TmuxOption {
             TmuxOption::SlopdCreatedAt => "@slopd_created_at",
             TmuxOption::SlopdTranscriptPath => "@slopd_transcript_path",
             TmuxOption::SlopdAccount => "@slopd_account",
+            TmuxOption::SlopdBackend => "@slopd_backend",
+            TmuxOption::SlopdOpencodePort => "@slopd_opencode_port",
+            TmuxOption::SlopdOpencodeToken => "@slopd_opencode_token",
         }
     }
 }
