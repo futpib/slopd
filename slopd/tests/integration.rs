@@ -9920,6 +9920,70 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
 }
 
 #[test]
+fn opencode_follows_tui_session_switch() {
+    // When the human navigates the TUI to a different session, opencode emits a
+    // `tui.session.select` SSE event. slopd must follow it: re-point the session it
+    // drives so `ps`/`send`/`transcript` describe the conversation the pane now
+    // shows, instead of staying bound to the spawn-time session. Without the fix,
+    // slopd kept driving the old session and the two views diverged.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl_raw(&["run", "--account", "oc"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --account oc failed: {:?}", run_out.status);
+
+    // slopd starts on the spawn-time session.
+    let session_of = |env: &TestEnv| -> Option<String> {
+        let ps: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        ps.into_iter().find(|p| p.pane_id == pane_id).and_then(|p| p.session_id)
+    };
+    assert_eq!(session_of(&env).as_deref(), Some("ses_mock"),
+        "slopd should start bound to the spawn-time session");
+
+    // Drive the TUI to switch sessions: the mock's "switch" prompt creates a second
+    // top-level session and emits tui.session.select for it.
+    let send = env.slopctl(&["send", &pane_id, "switch"]);
+    assert!(send.status.success(), "slopctl send 'switch' failed: {:?}", send.status);
+
+    // slopd must re-point onto the followed session (ses_mock2).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut followed = false;
+    while Instant::now() < deadline {
+        if session_of(&env).as_deref() == Some("ses_mock2") {
+            followed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    assert!(followed,
+        "slopd did not follow tui.session.select onto ses_mock2; ps session = {:?}",
+        session_of(&env));
+
+    // And the command paths follow too: `transcript` now reads the second session's
+    // conversation over HTTP (GET /session/ses_mock2/message), not the original's.
+    let transcript = env.slopctl(&["transcript", &pane_id]);
+    let out = String::from_utf8_lossy(&transcript.stdout);
+    assert!(out.contains("second session message"),
+        "transcript should follow onto the second session, got: {}", out);
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn run_backend_flag_overrides_to_opencode_without_an_account() {
     // `slopctl run --backend opencode` with no opencode account declared: the
     // flag flips the default account's backend to opencode and, because the

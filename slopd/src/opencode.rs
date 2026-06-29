@@ -84,6 +84,25 @@ impl OpencodeClient {
             .ok_or_else(|| "POST /session returned no id".to_string())
     }
 
+    /// `POST /tui/select-session` — command the TUI to display `session_id`, so the
+    /// session slopd drives is the one the human sees in the pane. Without this the
+    /// TUI may sit on a different (e.g. restored) session than slopd discovered,
+    /// leaving `slopctl ps`/`send`/`transcript` describing a conversation the pane
+    /// never shows. Best-effort: a failure is logged by the caller, not fatal.
+    pub async fn select_session(&self, session_id: &str) -> Result<(), String> {
+        let resp = self
+            .req(reqwest::Method::POST, "/tui/select-session")
+            .json(&serde_json::json!({ "sessionID": session_id }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("POST /tui/select-session {}: {}", status, resp.text().await.unwrap_or_default()));
+        }
+        Ok(())
+    }
+
     /// `GET /session` → every session id (used to tell "idle but exists" from
     /// "still booting", since idle sessions are absent from `/session/status`).
     pub async fn session_ids(&self) -> Result<Vec<String>, String> {
@@ -99,7 +118,7 @@ impl OpencodeClient {
             .collect())
     }
 
-    /// `GET /session` → the most recent session id (highest `timeCreated`), if any.
+    /// `GET /session` → the most recent session id (highest creation time), if any.
     /// Used to discover the session id of a freshly-spawned opencode pane.
     pub async fn latest_session(&self) -> Result<Option<String>, String> {
         let resp = self.req(reqwest::Method::GET, "/session").send().await.map_err(|e| e.to_string())?;
@@ -108,10 +127,7 @@ impl OpencodeClient {
             return Err(format!("GET /session {}: {}", status, resp.text().await.unwrap_or_default()));
         }
         let arr = resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?;
-        Ok(arr
-            .into_iter()
-            .max_by_key(|s| s.get("timeCreated").and_then(|t| t.as_u64()).unwrap_or(0))
-            .and_then(|s| s.get("id").and_then(|i| i.as_str()).map(str::to_string)))
+        Ok(latest_session_id(&arr).map(str::to_string))
     }
 
     /// `GET /session/status` → the status object for one session. `Ok(None)` if the
@@ -332,6 +348,39 @@ pub fn session_created_parent(event: &Value) -> Option<&str> {
         .and_then(|p| p.get("info"))
         .and_then(|i| i.get("parentID"))
         .and_then(|v| v.as_str())
+}
+
+/// Creation timestamp of a session object from `GET /session`. opencode 1.17.x
+/// nests it at `time.created`; older/other shapes used a top-level `timeCreated`,
+/// kept as a fallback. Returns 0 when neither is present (so such sessions sort
+/// oldest rather than poisoning the comparison).
+pub fn session_created_time(session: &Value) -> u64 {
+    session
+        .get("time")
+        .and_then(|t| t.get("created"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| session.get("timeCreated").and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+/// The id of the most recently created session in a `GET /session` array, or None
+/// if empty. Split out (and pure) so the "which session did slopd pick" logic is
+/// unit-testable without an HTTP round-trip.
+pub fn latest_session_id(sessions: &[Value]) -> Option<&str> {
+    sessions
+        .iter()
+        .max_by_key(|s| session_created_time(s))
+        .and_then(|s| s.get("id").and_then(|i| i.as_str()))
+}
+
+/// For a `tui.session.select` event, the session id the TUI navigated to
+/// (`properties.sessionID`). slopd follows this so the session it drives stays the
+/// one the human is actually looking at in the pane.
+pub fn tui_selected_session(event: &Value) -> Option<&str> {
+    if event_type(event) != Some("tui.session.select") {
+        return None;
+    }
+    event_session_id(event)
 }
 
 /// Map an SSE event to a detailed-state transition, if it implies one.
@@ -638,6 +687,43 @@ mod tests {
         assert_eq!(session_created_parent(&top), None);
         // Non-session.created events → None.
         assert_eq!(session_created_parent(&ev("session.idle", "s")), None);
+    }
+
+    #[test]
+    fn session_created_time_reads_nested_then_legacy_field() {
+        // opencode 1.17.x nests creation time at time.created.
+        let nested = json!({"id":"ses_a","time":{"created":1782677883868u64,"updated":9}});
+        assert_eq!(session_created_time(&nested), 1782677883868);
+        // Legacy/alternate top-level timeCreated is the fallback.
+        let legacy = json!({"id":"ses_b","timeCreated":42});
+        assert_eq!(session_created_time(&legacy), 42);
+        // Neither present → 0 (sorts oldest, never poisons max_by_key).
+        assert_eq!(session_created_time(&json!({"id":"ses_c"})), 0);
+        // The bug this guards: keying on the absent top-level `timeCreated`
+        // scored every real-shaped session 0, making discovery arbitrary.
+        assert_eq!(session_created_time(&json!({"id":"ses_d","time":{"created":7}})), 7);
+    }
+
+    #[test]
+    fn latest_session_id_picks_newest_by_created() {
+        let sessions = vec![
+            json!({"id":"ses_old","time":{"created":100}}),
+            json!({"id":"ses_new","time":{"created":300}}),
+            json!({"id":"ses_mid","time":{"created":200}}),
+        ];
+        assert_eq!(latest_session_id(&sessions), Some("ses_new"));
+        // Empty → None.
+        assert_eq!(latest_session_id(&[]), None);
+    }
+
+    #[test]
+    fn tui_selected_session_extracts_target() {
+        // The real event shape captured from opencode 1.17.x.
+        let e = json!({"id":"evt_1","type":"tui.session.select","properties":{"sessionID":"ses_target"}});
+        assert_eq!(tui_selected_session(&e), Some("ses_target"));
+        // Other event types → None (only tui.session.select drives a follow).
+        assert_eq!(tui_selected_session(&ev("session.idle", "ses_x")), None);
+        assert_eq!(tui_selected_session(&ev("session.created", "ses_x")), None);
     }
 
     #[test]

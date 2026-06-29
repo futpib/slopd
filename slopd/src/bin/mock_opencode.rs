@@ -21,6 +21,9 @@ use std::time::Duration;
 const SID: &str = "ses_mock";
 /// A child session id used to simulate an opencode subagent (parent = SID).
 const CHILD_SID: &str = "ses_mock_child";
+/// A second top-level session the human can switch the TUI to (no parent), used
+/// to exercise slopd following `tui.session.select`.
+const SID_2: &str = "ses_mock2";
 
 struct MockState {
     busy: bool,
@@ -35,6 +38,12 @@ struct MockState {
     /// Mirrors real opencode: a fresh TUI lists NO session until one is created
     /// (POST /session). Exercises slopd's ensure_session() create-if-absent path.
     session_created: bool,
+    /// True once a second session (SID_2) exists — the human navigated to / created
+    /// it in the TUI. When set, GET /session lists it too.
+    second_session: bool,
+    /// The session id last selected via POST /tui/select-session (records that
+    /// slopd imposed its session on the TUI at spawn).
+    selected_session: Option<String>,
 }
 
 fn main() {
@@ -68,6 +77,8 @@ fn main() {
         event_tx,
         boom_failed: false,
         session_created: resumed_session,
+        second_session: false,
+        selected_session: None,
     }));
 
     for stream in listener.incoming() {
@@ -163,17 +174,34 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
         ("GET", "/global/health") => (200, r#"{"healthy":true,"version":"mock"}"#.to_string()),
 
         ("GET", "/session") => {
-            // Real opencode: a fresh TUI lists no session until one is created.
-            if state.lock().unwrap().session_created {
-                (200, r#"[{"id":"ses_mock","timeCreated":1,"title":"mock"}]"#.to_string())
-            } else {
-                (200, "[]".to_string())
+            // Real opencode 1.17.x shape: creation time nested at time.created (NOT
+            // a top-level timeCreated). A fresh TUI lists no session until created.
+            let s = state.lock().unwrap();
+            let mut sessions: Vec<String> = Vec::new();
+            if s.session_created {
+                sessions.push(format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#));
             }
+            if s.second_session {
+                // Newer than SID, so a (correct) latest-by-created discovery would
+                // even pick this one — but the test asserts slopd follows the
+                // explicit tui.session.select, not "latest".
+                sessions.push(format!(r#"{{"id":"{SID_2}","time":{{"created":200,"updated":200}},"title":"mock2"}}"#));
+            }
+            (200, format!("[{}]", sessions.join(",")))
         }
 
         ("POST", "/session") => {
             state.lock().unwrap().session_created = true;
-            (200, r#"{"id":"ses_mock","timeCreated":1,"title":"mock"}"#.to_string())
+            (200, format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#))
+        }
+
+        // slopd imposes its session on the TUI at spawn (and the TUI reports the
+        // human's navigation via the tui.session.select SSE event). Record the
+        // selection so a test can assert slopd called it.
+        ("POST", "/tui/select-session") => {
+            let sid = extract_session_id(body);
+            state.lock().unwrap().selected_session = sid;
+            (200, "true".to_string())
         }
 
         ("GET", "/session/status") => {
@@ -188,6 +216,15 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
 
         ("POST", p) if p == format!("/session/{SID}/prompt_async") => {
             let text = extract_text(body);
+            // Test hook: a "switch" prompt simulates the human navigating the TUI to
+            // a different top-level session (SID_2). The server creates that session
+            // and emits the tui.session.select event slopd follows; the prompt
+            // itself produces no turn.
+            if text == "switch" {
+                state.lock().unwrap().second_session = true;
+                emit(&state, serde_json::json!({"type":"tui.session.select","properties":{"sessionID":SID_2}}).to_string());
+                (204, String::new())
+            } else {
             // Test hook: a "boom" prompt fails the first time (session.error) so
             // slopd's auto-continue retry can be exercised; it succeeds on retry.
             let fail_this = text == "boom" && !state.lock().unwrap().boom_failed;
@@ -242,6 +279,7 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 });
                 (204, String::new())
             }
+            }
         }
 
         ("POST", p) if p == format!("/session/{SID}/command") => (200, "{}".to_string()),
@@ -266,6 +304,12 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 })
                 .collect();
             (200, format!("[{}]", arr.join(",")))
+        }
+
+        // The followed second session has its own (distinct) transcript, so a test
+        // can prove `slopctl transcript` reads SID_2 after the follow, not SID.
+        ("GET", p) if p == format!("/session/{SID_2}/message") => {
+            (200, r#"[{"info":{"role":"user"},"parts":[{"type":"text","text":"second session message"}]}]"#.to_string())
         }
 
         _ => (404, r#"{"error":"not found"}"#.to_string()),
@@ -327,4 +371,11 @@ fn extract_text(body: &str) -> String {
         }
     }
     body.to_string()
+}
+
+/// Extract `sessionID` from a `{"sessionID":"ses_..."}` request body.
+fn extract_session_id(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("sessionID").and_then(|s| s.as_str()).map(str::to_string))
 }

@@ -380,7 +380,13 @@ async fn run_opencode_driver(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = interval.tick() => {
-                reconcile_opencode_status(&client, &session_id, &pane_id, &config, &panes, &event_tx).await;
+                // Read the live session id: the SSE reader re-points it when the
+                // human navigates the TUI, and this backstop must poll whatever
+                // session is currently being followed, not the spawn-time one.
+                let sid = panes.get(&pane_id)
+                    .and_then(|s| s.opencode.lock().unwrap().as_ref().map(|oc| oc.session_id.clone()))
+                    .unwrap_or_else(|| session_id.clone());
+                reconcile_opencode_status(&client, &sid, &pane_id, &config, &panes, &event_tx).await;
             }
         }
     }
@@ -460,6 +466,11 @@ async fn read_opencode_sse(
     let mut buf = String::new();
     // Child sessions spawned by this pane's main session (opencode subagents).
     let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The main session slopd currently tracks. Seeded from the spawn-time id but
+    // re-pointed when the human navigates the TUI to another session (see the
+    // `tui.session.select` handling below) — so `ps`/`send`/`transcript` follow
+    // whatever conversation the pane is actually showing.
+    let mut current_session = session_id.to_string();
     loop {
         let chunk = tokio::select! {
             c = resp.chunk() => c.map_err(|e| e.to_string())?,
@@ -472,11 +483,39 @@ async fn read_opencode_sse(
             let block: String = buf.drain(..idx + 2).collect();
             let Some(payload) = extract_sse_data(&block) else { continue };
             let Some(event) = opencode::event_from_line(&payload) else { continue };
+
+            // The human switched the TUI to another session — follow it: re-point
+            // the shared OpencodeState (so send/interrupt/transcript target it),
+            // persist the new id on the pane, and forget the old session's
+            // subagents. Skip no-op re-selects of the session we already track.
+            if let Some(selected) = opencode::tui_selected_session(&event) {
+                if selected != current_session {
+                    debug!("opencode pane {}: TUI selected session {} (was {})", pane_id, selected, current_session);
+                    current_session = selected.to_string();
+                    children.clear();
+                    // Re-point the shared state so send/interrupt/transcript target
+                    // the followed session; grab a client clone for the reconcile.
+                    let client = panes.get(pane_id).and_then(|state| {
+                        state.opencode.lock().unwrap().as_mut().map(|oc| {
+                            oc.session_id = current_session.clone();
+                            oc.client.clone()
+                        })
+                    });
+                    let _ = tmux_set_pane_option(config, pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &current_session).await;
+                    // Re-reconcile so state reflects the newly-followed session (it
+                    // may be idle, so no further events would arrive on their own).
+                    if let Some(client) = client {
+                        reconcile_opencode_status(&client, &current_session, pane_id, config, panes, event_tx).await;
+                    }
+                }
+                continue;
+            }
+
             let ev_sid = opencode::event_session_id(&event).map(str::to_string);
 
             // Register a child session spawned by this pane (opencode subagent).
             if opencode::event_type(&event) == Some("session.created")
-                && opencode::session_created_parent(&event) == Some(session_id)
+                && opencode::session_created_parent(&event) == Some(current_session.as_str())
             {
                 if let Some(ref sid) = ev_sid {
                     children.insert(sid.clone());
@@ -486,7 +525,7 @@ async fn read_opencode_sse(
                         event_type: "SubagentStart".to_string(),
                         pane_id: Some(pane_id.to_string()),
                         payload: serde_json::json!({
-                            "session_id": session_id,
+                            "session_id": current_session,
                             "hook_event_name": "SubagentStart",
                             "opencode_child_session": sid,
                             "properties": event.get("properties").cloned().unwrap_or(serde_json::Value::Null),
@@ -495,7 +534,7 @@ async fn read_opencode_sse(
                     });
                 }
             }
-            let is_main = ev_sid.as_deref() == Some(session_id);
+            let is_main = ev_sid.as_deref() == Some(current_session.as_str());
             let is_child = ev_sid.as_deref().is_some_and(|s| children.contains(s));
             if !is_main && !is_child {
                 continue;
@@ -514,7 +553,7 @@ async fn read_opencode_sse(
                         event_type: "SubagentStop".to_string(),
                         pane_id: Some(pane_id.to_string()),
                         payload: serde_json::json!({
-                            "session_id": session_id,
+                            "session_id": current_session,
                             "hook_event_name": "SubagentStop",
                             "opencode_child_session": sid,
                         }),
@@ -3331,6 +3370,12 @@ async fn handle_request(
                         };
                         if !session_id.is_empty() {
                             let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
+                            // Point the TUI at the session slopd drives, so the pane
+                            // shows the same conversation slopctl operates on (the TUI
+                            // may otherwise sit on a restored/older session).
+                            if let Err(e) = client.select_session(&session_id).await {
+                                debug!("opencode pane {}: select-session failed (TUI may show a different session): {}", pane_id, e);
+                            }
                         }
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
                         let pane_state = panes.get_or_insert(&pane_id);
