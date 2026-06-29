@@ -310,6 +310,9 @@ struct PaneState {
     opencode: std::sync::Mutex<Option<OpencodeState>>,
     /// Cancels the opencode status-polling driver when the pane is killed.
     opencode_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    /// For opencode panes: the most recent non-command prompt, used to auto-retry
+    /// on `session.error` (the opencode analogue of Claude's StopFailure retry).
+    opencode_last_prompt: std::sync::Mutex<Option<String>>,
 }
 
 impl PaneState {
@@ -324,6 +327,7 @@ impl PaneState {
             expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
             opencode: std::sync::Mutex::new(None),
             opencode_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            opencode_last_prompt: std::sync::Mutex::new(None),
         }
     }
 
@@ -476,6 +480,10 @@ async fn read_opencode_sse(
                     set_pane_detailed_state(config, pane_id, &new, Some(&current), event_tx, panes).await;
                 }
             }
+            // A clean turn end (session.idle) resets the auto-continue retry budget.
+            if opencode::event_type(&event) == Some("session.idle") {
+                *panes.get_or_insert(pane_id).retry_state.lock().unwrap() = None;
+            }
             // Transcript record (live `listen --transcript`).
             if let Some((rtype, payload)) = opencode::event_to_transcript(&event) {
                 let _ = event_tx.send(libslop::Record {
@@ -485,6 +493,10 @@ async fn read_opencode_sse(
                     payload,
                     cursor: None,
                 });
+            }
+            // Auto-continue: a failed turn (session.error) re-sends the last prompt.
+            if opencode::event_is_failure(&event) {
+                schedule_opencode_auto_continue(pane_id, config, panes).await;
             }
         }
     }
@@ -503,6 +515,83 @@ fn extract_sse_data(block: &str) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
+}
+
+/// OpenCode analogue of Claude's `StopFailure` auto-continue: on a
+/// `session.error` event, re-send the last non-command prompt via `prompt_async`
+/// with exponential backoff, up to `[run] max_retry_attempts`. Mirrors the Claude
+/// retry path (`expecting_auto_continue` + `RetryState`) so a manual prompt or a
+/// later successful turn cancels a pending retry.
+async fn schedule_opencode_auto_continue(
+    pane_id: &str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+) {
+    if !config.run.auto_continue_on_failure {
+        return;
+    }
+    let pane_state = panes.get_or_insert(pane_id);
+    let oc = match pane_state.opencode.lock().unwrap().clone() {
+        Some(oc) => oc,
+        None => return,
+    };
+    let prompt = match pane_state.opencode_last_prompt.lock().unwrap().clone() {
+        Some(p) => p,
+        None => return,
+    };
+    let policy = BackoffPolicy::from_config(&config.run);
+    let (attempt, send_at) = {
+        let mut guard = pane_state.retry_state.lock().unwrap();
+        match RetryState::next(guard.as_ref(), &policy, tokio::time::Instant::now()) {
+            Some(n) => {
+                let attempt = n.attempt_count;
+                let send_at = n.next_send_at;
+                *guard = Some(n);
+                (attempt, send_at)
+            }
+            None => {
+                *guard = None;
+                debug!("opencode session.error: pane {} exceeded max retry attempts, giving up", pane_id);
+                return;
+            }
+        }
+    };
+    pane_state
+        .expecting_auto_continue
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let client = oc.client;
+    let session_id = oc.session_id;
+    let pid = pane_id.to_string();
+    let panes = panes.clone();
+    tokio::spawn(async move {
+        let delay = send_at.saturating_duration_since(tokio::time::Instant::now());
+        if !delay.is_zero() {
+            debug!("opencode session.error: pane {} will retry in {:?}", pid, delay);
+            tokio::time::sleep(delay).await;
+        }
+        // Re-validate the retry is still current (a manual prompt or a successful
+        // turn resets retry_state / clears the last prompt).
+        let still_valid = panes
+            .get(&pid)
+            .map(|s| {
+                s.retry_state
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|r| r.matches(attempt, send_at))
+            })
+            .unwrap_or(false);
+        if !still_valid {
+            return;
+        }
+        debug!("opencode session.error: retrying pane {} (attempt {})", pid, attempt);
+        if client.send_message(&session_id, &prompt).await.is_ok() {
+            if let Some(s) = panes.get(&pid) {
+                s.prompt_submitted.notify_waiters();
+            }
+        }
+    });
 }
 
 /// Tail a transcript .jsonl file, broadcasting each new JSON record as an event.
@@ -3299,6 +3388,11 @@ async fn handle_request(
                 };
                 return match res {
                     Ok(()) => {
+                        // Record the prompt so a `session.error` can auto-retry it.
+                        if !is_command {
+                            *state.opencode_last_prompt.lock().unwrap() = Some(prompt.clone());
+                            *state.retry_state.lock().unwrap() = None;
+                        }
                         state.prompt_submitted.notify_waiters();
                         libslop::ResponseBody::Sent { pane_id }
                     }

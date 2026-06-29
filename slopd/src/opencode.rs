@@ -409,4 +409,77 @@ mod tests {
         assert_eq!(recs[1].0, "assistant");
         assert_eq!(recs[0].1["parts"][0]["text"], "hi");
     }
+
+    // --- SSE event mapping (real opencode shapes) ---
+
+    fn ev(t: &str, session_id: &str) -> Value {
+        json!({ "id": "evt_test", "type": t, "properties": { "sessionID": session_id } })
+    }
+
+    #[test]
+    fn event_session_id_and_type_extract() {
+        let e = ev("session.idle", "ses_x");
+        assert_eq!(event_session_id(&e), Some("ses_x"));
+        assert_eq!(event_type(&e), Some("session.idle"));
+        // server-lifecycle events have no sessionID.
+        let no_sid = json!({ "type": "server.heartbeat", "properties": {} });
+        assert_eq!(event_session_id(&no_sid), None);
+    }
+
+    #[test]
+    fn event_to_detailed_maps_real_event_types() {
+        let sid = "ses_x";
+        assert_eq!(event_to_detailed(&ev("session.idle", sid)), Some(PaneDetailedState::Ready));
+        assert_eq!(
+            event_to_detailed(&json!({"type":"session.status","properties":{"sessionID":sid,"status":{"type":"busy"}}})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(event_to_detailed(&ev("message.updated", sid)), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(event_to_detailed(&ev("message.part.updated", sid)), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(event_to_detailed(&ev("step-start", sid)), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(event_to_detailed(&ev("tool.execute.before", sid)), Some(PaneDetailedState::BusyToolUse));
+        assert_eq!(event_to_detailed(&ev("tool.execute.after", sid)), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(event_to_detailed(&ev("permission.asked", sid)), Some(PaneDetailedState::AwaitingInputPermission));
+        assert_eq!(event_to_detailed(&ev("session.compacted", sid)), Some(PaneDetailedState::BusyCompacting));
+        // A failed turn recovers to Ready.
+        assert_eq!(event_to_detailed(&ev("session.error", sid)), Some(PaneDetailedState::Ready));
+        // Unrelated event → no transition.
+        assert_eq!(event_to_detailed(&ev("catalog.updated", sid)), None);
+    }
+
+    #[test]
+    fn event_to_transcript_maps_messages() {
+        let sid = "ses_x";
+        let msg = json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"assistant"}}});
+        let (rtype, _payload) = event_to_transcript(&msg).expect("message.updated → transcript");
+        assert_eq!(rtype, "assistant");
+        let part = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"text","text":"hi"}}});
+        let (rtype, payload) = event_to_transcript(&part).expect("message.part.updated → transcript");
+        assert_eq!(rtype, "text");
+        assert_eq!(payload["part"]["text"], "hi");
+        assert!(event_to_transcript(&ev("session.idle", sid)).is_none());
+    }
+
+    #[test]
+    fn event_is_failure_detects_session_error() {
+        assert!(event_is_failure(&ev("session.error", "ses_x")));
+        assert!(!event_is_failure(&ev("session.idle", "ses_x")));
+    }
+
+    #[test]
+    fn status_to_detailed_matches_real_opencode_shape() {
+        // Real shape: {"type":"busy"} for a busy session.
+        assert_eq!(status_to_detailed(&json!({"type":"busy"})), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(status_to_detailed(&json!({"type":"idle"})), Some(PaneDetailedState::Ready));
+        // status/state still accepted as aliases.
+        assert_eq!(status_to_detailed(&json!({"status":"busy"})), Some(PaneDetailedState::BusyProcessing));
+    }
+
+    #[test]
+    fn event_from_line_parses_data_payload() {
+        let v = event_from_line(r#"{"type":"session.idle","properties":{"sessionID":"s"}}"#).unwrap();
+        assert_eq!(v["type"], "session.idle");
+        assert!(event_from_line("").is_none());
+        assert!(event_from_line("not json").is_none());
+    }
 }

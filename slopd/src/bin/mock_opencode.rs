@@ -27,6 +27,9 @@ struct MockState {
     /// SSE event broadcast (JSON strings). Only one subscriber (the driver).
     event_rx: Option<mpsc::Receiver<String>>,
     event_tx: mpsc::Sender<String>,
+    /// Test hook: the first "boom" prompt fails (session.error) so slopd's
+    /// auto-continue can be exercised; subsequent "boom" prompts succeed.
+    boom_failed: bool,
 }
 
 fn main() {
@@ -51,6 +54,7 @@ fn main() {
         messages: Vec::new(),
         event_rx: Some(event_rx),
         event_tx,
+        boom_failed: false,
     }));
 
     for stream in listener.incoming() {
@@ -162,27 +166,39 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
 
         ("POST", p) if p == format!("/session/{SID}/prompt_async") => {
             let text = extract_text(body);
-            {
-                let mut s = state.lock().unwrap();
-                s.busy = true;
-                s.messages.push(("user".to_string(), text.clone()));
-                s.messages.push(("assistant".to_string(), format!("echo: {text}")));
+            // Test hook: a "boom" prompt fails the first time (session.error) so
+            // slopd's auto-continue retry can be exercised; it succeeds on retry.
+            let fail_this = text == "boom" && !state.lock().unwrap().boom_failed;
+            if fail_this {
+                state.lock().unwrap().boom_failed = true;
+                state.lock().unwrap().messages.push(("user".to_string(), text));
+                emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
+                emit(&state, format!(r#"{{"type":"session.error","properties":{{"sessionID":"{SID}"}}}}"#));
+                state.lock().unwrap().busy = false;
+                (204, String::new())
+            } else {
+                {
+                    let mut s = state.lock().unwrap();
+                    s.busy = true;
+                    s.messages.push(("user".to_string(), text.clone()));
+                    s.messages.push(("assistant".to_string(), format!("echo: {text}")));
+                }
+                // Stream a realistic turn over SSE: busy → user msg → assistant
+                // msg → (after a beat) idle.
+                emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
+                emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"user"}}}}}}"#));
+                emit(&state, part_updated_event(SID, "user", &text));
+                emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"assistant"}}}}}}"#));
+                let st = state.clone();
+                let echo = format!("echo: {text}");
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    emit(&st, part_updated_event(SID, "assistant", &echo));
+                    st.lock().unwrap().busy = false;
+                    emit(&st, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
+                });
+                (204, String::new())
             }
-            // Stream a realistic turn over SSE: busy → user msg → assistant msg
-            // → (after a beat) idle.
-            emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
-            emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"user"}}}}}}"#));
-            emit(&state, part_updated_event(SID, "user", &text));
-            emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"assistant"}}}}}}"#));
-            let st = state.clone();
-            let echo = format!("echo: {text}");
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                emit(&st, part_updated_event(SID, "assistant", &echo));
-                st.lock().unwrap().busy = false;
-                emit(&st, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
-            });
-            (204, String::new())
         }
 
         ("POST", p) if p == format!("/session/{SID}/command") => (200, "{}".to_string()),

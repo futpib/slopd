@@ -10068,4 +10068,41 @@ fn opencode_listen_transcript_streams_live_over_sse() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn opencode_auto_continues_after_session_error() {
+    // A "boom" prompt fails the first time (session.error); slopd's auto-continue
+    // retries it, the retry succeeds, and the assistant reply lands — exercising
+    // the opencode equivalent of Claude's StopFailure retry.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    // Fast backoff so the retry lands within the test window.
+    let env = TestEnv::new_with_auto_continue(Some(&[mock_path.as_str()]), None, 3, 50, 200)
+        .expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run --backend opencode failed");
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    assert!(env.slopctl(&["send", &pane_id, "boom"]).status.success(), "slopctl send boom failed");
+
+    // The retry's successful turn appends an assistant "echo: boom".
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out_bytes = env.slopctl(&["transcript", &pane_id]).stdout;
+        let out = String::from_utf8_lossy(&out_bytes);
+        if out.contains("echo: boom") {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("auto-continue retry did not produce echo: boom; transcript: {}", out);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // The retried turn's session.idle lands shortly after the message; wait for it.
+    wait_until_ready(&env, &pane_id, Duration::from_secs(10));
+    kill_slopd(slopd);
+}
+
 
