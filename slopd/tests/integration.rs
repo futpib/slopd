@@ -10033,6 +10033,54 @@ fn opencode_creates_own_session_not_ephemeral_boot_session() {
 }
 
 #[test]
+fn opencode_fresh_pane_becomes_ready_not_stuck_booting() {
+    // A freshly-spawned opencode pane must transition booting_up -> ready on its
+    // own: the driver POSTs slopd's session and the status-poll confirms it exists
+    // and is idle, flipping the pane to ready. This is the no-wait path — we
+    // assert the transition happens (not just that `run` blocked until ready), so
+    // a regression that left the pane stuck booting_up (e.g. readiness keyed on a
+    // session that never appears in GET /session) is caught.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    // env.slopctl injects --no-wait, so run returns while the pane is still
+    // booting_up; the driver must drive it to ready without the run blocking.
+    let run_out = env.slopctl(&["run", "--account", "oc"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --no-wait --account oc failed: {:?}", run_out.status);
+
+    // Poll until ready (driver reconciles every ~3s; allow margin). The pane must
+    // NOT remain stuck in booting_up.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut final_state = libslop::PaneDetailedState::BootingUp;
+    while Instant::now() < deadline {
+        let (_, d) = env.pane_state(&pane_id);
+        final_state = d.clone();
+        if d == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    kill_slopd(slopd);
+
+    assert_eq!(final_state, libslop::PaneDetailedState::Ready,
+        "fresh opencode pane stuck in {:?}, expected it to reach ready", final_state);
+}
+
+#[test]
 fn run_backend_flag_overrides_to_opencode_without_an_account() {
     // `slopctl run --backend opencode` with no opencode account declared: the
     // flag flips the default account's backend to opencode and, because the
