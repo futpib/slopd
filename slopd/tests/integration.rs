@@ -9722,4 +9722,125 @@ fn auto_continue_gives_up_after_max_attempts() {
         "expected exactly max_retry_attempts (2) auto-continue prompts, got {}", continue_count);
 }
 
+/// A turn that runs LONGER than the retry backoff must not provoke a second
+/// "continue": the resend is edge-triggered by StopFailure (end of turn), not a
+/// periodic timer, so while the auto-continued turn is still running no new retry
+/// is scheduled. Guards against a regression to naive periodic resending, which
+/// would spam "continue" into the busy turn. Backoff is 100ms but the continued
+/// turn runs 1000ms — 10× the delay — so any periodic resender would fire
+/// several times in that window.
+#[test]
+fn auto_continue_does_not_resend_during_long_turn() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let Some(env) = TestEnv::new_with_auto_continue(
+        Some(&[cargo_bin("mock_claude").to_str().unwrap()]),
+        None,
+        5,   // max_attempts (room for spurious resends to show up if the bug exists)
+        100, // initial_backoff_ms
+        200, // max_backoff_ms
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Wait for the pane to be ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&pane_id);
+        if detailed == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd);
+            panic!("pane did not become ready; detailed_state: {:?}", detailed);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Subscribe before triggering so we catch every injected "continue".
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let stdout = listen.stdout.take().unwrap();
+    let (subscribed_line, reader) = read_line_timeout(stdout, Duration::from_secs(10))
+        .expect("timed out reading subscribed line");
+    assert!(subscribed_line.contains("subscribed"), "unexpected first line: {:?}", subscribed_line);
+
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/newline-mode always-submit", "Enter", "Enter"])
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Fail once, then the injected "continue" runs a 1000ms busy turn (10× the
+    // 100ms backoff) before a clean Stop.
+    env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "/fail-then-busy 1000", "Enter"])
+        .status()
+        .unwrap();
+
+    // Count "continue" prompts across a fixed wall-clock window that spans the
+    // whole busy turn. Drain on a background thread so a GAP in the stream (the
+    // busy turn emits PreToolUse/PostToolUse/Stop — none of them UserPromptSubmit
+    // — so this --hook-filtered stream is silent for ~1s) does NOT end
+    // collection early: a periodic resender would fire its spurious "continue"
+    // precisely during that silent gap, so we must keep listening through it.
+    // 2.5s comfortably exceeds the 1000ms turn plus scheduling slack.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = std::io::BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match buf.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut continue_count = 0;
+    let collect_deadline = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < collect_deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v["source"] == "hook" && v["payload"]["prompt"].as_str() == Some("continue") {
+                    continue_count += 1;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // The continued turn ended cleanly, so the pane is back to Ready.
+    let (_, detailed) = env.pane_state(&pane_id);
+
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    assert_eq!(continue_count, 1,
+        "expected exactly one auto-continue (no resend during the long turn), got {}", continue_count);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready,
+        "pane should be Ready after the continued turn completed cleanly");
+}
+
 

@@ -472,6 +472,12 @@ fn main() {
     // slopd's own injected "continue" — ends in StopFailure, simulating a
     // persistent API outage. Used to test the auto-continue retry cap.
     let mut always_fail = false;
+    // When set (via /fail-then-busy <ms>), the NEXT prompt — slopd's injected
+    // "continue" — runs a busy turn of this many ms (deliberately longer than the
+    // retry backoff) before finishing with a clean Stop, instead of failing. Used
+    // to test that slopd does NOT fire a second "continue" into a turn that
+    // outlasts the backoff delay.
+    let mut fail_then_busy_ms: Option<u64> = None;
 
     loop {
         match stdin.read(&mut byte) {
@@ -739,6 +745,44 @@ fn main() {
                 if prompt == "/always-fail" {
                     always_fail = true;
                     fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
+                    continue;
+                }
+
+                // Arm "fail this turn, then run a long busy turn on the next
+                // prompt": the /fail-then-busy command itself fails (first
+                // StopFailure), and the following prompt (slopd's injected
+                // "continue") runs busy for <ms> before a clean Stop.
+                if let Some(ms) = prompt.strip_prefix("/fail-then-busy ") {
+                    fail_then_busy_ms = Some(ms.trim().parse().unwrap_or(0));
+                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                        "message": { "role": "user", "content": &prompt },
+                    })));
+                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
+                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                        "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
+                    })));
+                    fire_stop_failure(no_hooks, &settings, session_id, &cwd, &transcript_path);
+                    continue;
+                }
+
+                // The prompt after /fail-then-busy (slopd's injected "continue")
+                // runs a busy turn longer than the backoff, then finishes cleanly.
+                if let Some(busy_ms) = fail_then_busy_ms.take() {
+                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
+                        "message": { "role": "user", "content": &prompt },
+                    })));
+                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
+                    fire_hooks(no_hooks, &settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path));
+                    std::thread::sleep(std::time::Duration::from_millis(busy_ms));
+                    fire_hooks(no_hooks, &settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd, &transcript_path));
+                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
+                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                    })));
+                    fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
                     continue;
                 }
 
