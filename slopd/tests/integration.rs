@@ -10202,4 +10202,61 @@ fn opencode_listen_hook_fires_synthesized_events() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn opencode_subagent_turn_tracks_busy_subagent() {
+    // opencode runs subagents as child sessions (session.created with parentID ==
+    // the pane's session). slopd detects that → busy_subagent. (Verified the
+    // child-session shape against real opencode 1.17.x.)
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    assert!(env.slopctl(&["send", &pane_id, "please spawn a subagent"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_subagent = false;
+    while Instant::now() < deadline {
+        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusySubagent {
+            seen_subagent = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen_subagent, "opencode subagent turn should pass through busy_subagent");
+    wait_until_ready(&env, &pane_id, Duration::from_secs(10));
+    kill_slopd(slopd);
+}
+
+#[test]
+fn opencode_question_tool_tracks_awaiting_elicitation() {
+    // opencode's `question` tool is its elicitation equivalent (agent asking the
+    // user a clarifying question) → awaiting_input_elicitation, plus a
+    // synthesized Elicitation hook.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    assert!(env.slopctl(&["send", &pane_id, "ask me a question"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_elicitation = false;
+    while Instant::now() < deadline {
+        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::AwaitingInputElicitation {
+            seen_elicitation = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen_elicitation, "opencode question tool should set awaiting_input_elicitation");
+    kill_slopd(slopd);
+}
+
 

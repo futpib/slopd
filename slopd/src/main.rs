@@ -458,6 +458,8 @@ async fn read_opencode_sse(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     let mut buf = String::new();
+    // Child sessions spawned by this pane's main session (opencode subagents).
+    let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let chunk = tokio::select! {
             c = resp.chunk() => c.map_err(|e| e.to_string())?,
@@ -470,15 +472,52 @@ async fn read_opencode_sse(
             let block: String = buf.drain(..idx + 2).collect();
             let Some(payload) = extract_sse_data(&block) else { continue };
             let Some(event) = opencode::event_from_line(&payload) else { continue };
-            if !opencode::event_session_id(&event).is_some_and(|sid| sid == session_id) {
+            let ev_sid = opencode::event_session_id(&event).map(str::to_string);
+
+            // Register a child session spawned by this pane (opencode subagent).
+            if opencode::event_type(&event) == Some("session.created")
+                && opencode::session_created_parent(&event) == Some(session_id)
+            {
+                if let Some(ref sid) = ev_sid {
+                    children.insert(sid.clone());
+                }
+            }
+            let is_main = ev_sid.as_deref() == Some(session_id);
+            let is_child = ev_sid.as_deref().is_some_and(|s| children.contains(s));
+            if !is_main && !is_child {
                 continue;
             }
-            // State transition.
-            if let Some(new) = opencode::event_to_detailed(&event) {
+            // A child session ending → drop it so the main session's state resurfaces.
+            if is_child
+                && matches!(
+                    opencode::event_type(&event),
+                    Some("session.idle") | Some("session.deleted") | Some("session.error")
+                )
+            {
+                if let Some(ref sid) = ev_sid {
+                    children.remove(sid);
+                }
+            }
+
+            // STATE: an active child session (subagent) overrides → busy_subagent.
+            let target = if !children.is_empty() {
+                Some(libslop::PaneDetailedState::BusySubagent)
+            } else if is_main {
+                opencode::event_to_detailed(&event)
+            } else {
+                None
+            };
+            if let Some(new) = target {
                 let current = panes.get_or_insert(pane_id).detailed_state.lock().unwrap().clone();
                 if new != current {
                     set_pane_detailed_state(config, pane_id, &new, Some(&current), event_tx, panes).await;
                 }
+            }
+
+            // Side effects apply to the main session only (a subagent's internal
+            // traffic isn't this pane's transcript/hooks).
+            if !is_main {
+                continue;
             }
             // A clean turn end (session.idle) resets the auto-continue retry budget.
             if opencode::event_type(&event) == Some("session.idle") {

@@ -319,6 +319,21 @@ pub fn event_type(event: &Value) -> Option<&str> {
     event.get("type").and_then(|v| v.as_str())
 }
 
+/// For a `session.created` event, the parent session id
+/// (`properties.info.parentID`). opencode runs subagents as child sessions, so a
+/// `session.created` whose parent is the pane's main session means a subagent was
+/// spawned (verified against real opencode 1.17.x).
+pub fn session_created_parent(event: &Value) -> Option<&str> {
+    if event_type(event) != Some("session.created") {
+        return None;
+    }
+    event
+        .get("properties")
+        .and_then(|p| p.get("info"))
+        .and_then(|i| i.get("parentID"))
+        .and_then(|v| v.as_str())
+}
+
 /// Map an SSE event to a detailed-state transition, if it implies one.
 ///
 /// Verified against real opencode 1.17.x. Tool activity rides on
@@ -345,12 +360,21 @@ pub fn event_to_detailed(event: &Value) -> Option<PaneDetailedState> {
         "message.part.updated" => {
             let part = props.get("part").unwrap_or(&Value::Null);
             if part.get("type").and_then(|v| v.as_str()) == Some("tool") {
-                match part
+                let tool = part.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                let status = part
                     .get("state")
                     .and_then(|s| s.get("status"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("running")
-                {
+                    .unwrap_or("running");
+                // opencode's `question` tool IS Claude's elicitation (the agent
+                // asking the user a clarifying question) — not a regular tool.
+                if tool == "question" {
+                    return match status {
+                        "completed" | "error" => Some(PaneDetailedState::BusyProcessing),
+                        _ => Some(PaneDetailedState::AwaitingInputElicitation),
+                    };
+                }
+                match status {
                     "completed" | "error" => Some(PaneDetailedState::BusyProcessing),
                     _ => Some(PaneDetailedState::BusyToolUse),
                 }
@@ -395,15 +419,24 @@ pub fn event_to_hook(event: &Value) -> Option<(&'static str, Value)> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("running");
             let input = part().get("state").and_then(|s| s.get("input")).cloned().unwrap_or(Value::Null);
-            match status {
-                "completed" | "error" => (
-                    "PostToolUse",
-                    json!({ "tool_name": tool_name, "tool_input": input }),
-                ),
-                _ => (
-                    "PreToolUse",
-                    json!({ "tool_name": tool_name, "tool_input": input }),
-                ),
+            // The `question` tool is opencode's elicitation → Claude Elicitation hooks.
+            if tool_name == "question" {
+                let name = match status {
+                    "completed" | "error" => "ElicitationResult",
+                    _ => "Elicitation",
+                };
+                (name, json!({ "tool_name": tool_name, "tool_input": input }))
+            } else {
+                match status {
+                    "completed" | "error" => (
+                        "PostToolUse",
+                        json!({ "tool_name": tool_name, "tool_input": input }),
+                    ),
+                    _ => (
+                        "PreToolUse",
+                        json!({ "tool_name": tool_name, "tool_input": input }),
+                    ),
+                }
             }
         }
         _ => return None,
@@ -576,6 +609,35 @@ mod tests {
         assert_eq!(event_to_hook(&ev("session.compacted", sid)).unwrap().0, "PreCompact");
         // unrelated → none
         assert!(event_to_hook(&ev("server.heartbeat", sid)).is_none());
+    }
+
+    #[test]
+    fn event_to_detailed_question_tool_is_elicitation() {
+        // opencode's `question` tool = Claude's elicitation.
+        let pending = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"pending"}}}});
+        let completed = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"completed"}}}});
+        assert_eq!(event_to_detailed(&pending), Some(PaneDetailedState::AwaitingInputElicitation));
+        assert_eq!(event_to_detailed(&completed), Some(PaneDetailedState::BusyProcessing));
+    }
+
+    #[test]
+    fn event_to_hook_question_tool_is_elicitation() {
+        let pending = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"pending","input":{"message":"size?"}}}}});
+        let completed = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"completed"}}}});
+        assert_eq!(event_to_hook(&pending).unwrap().0, "Elicitation");
+        assert_eq!(event_to_hook(&completed).unwrap().0, "ElicitationResult");
+    }
+
+    #[test]
+    fn session_created_parent_detects_subagent() {
+        // A child session whose parent is the main session = a subagent.
+        let child = json!({"type":"session.created","properties":{"sessionID":"ses_child","info":{"id":"ses_child","parentID":"ses_main","agent":"general"}}});
+        assert_eq!(session_created_parent(&child), Some("ses_main"));
+        // A session.created with no parent (top-level) → None.
+        let top = json!({"type":"session.created","properties":{"sessionID":"ses_top","info":{"id":"ses_top"}}});
+        assert_eq!(session_created_parent(&top), None);
+        // Non-session.created events → None.
+        assert_eq!(session_created_parent(&ev("session.idle", "s")), None);
     }
 
     #[test]

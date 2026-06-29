@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const SID: &str = "ses_mock";
+/// A child session id used to simulate an opencode subagent (parent = SID).
+const CHILD_SID: &str = "ses_mock_child";
 
 struct MockState {
     busy: bool,
@@ -204,27 +206,39 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                     s.messages.push(("assistant".to_string(), format!("echo: {text}")));
                 }
                 let uses_tool = text.contains("tool");
-                // Stream a realistic turn over SSE: busy → user msg → (tool call)
-                // → assistant msg → (after a beat) idle.
-                emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
-                emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"user"}}}}}}"#));
+                let uses_subagent = text.contains("subagent");
+                let asks_question = text.contains("question");
+                // busy + user message
+                emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":SID,"status":{"type":"busy"}}}).to_string());
+                emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":SID,"info":{"role":"user"}}}).to_string());
                 emit(&state, part_updated_event(SID, "user", &text));
-                if uses_tool {
-                    // Tool part: pending → running (→ BusyToolUse), completed later.
+                if uses_subagent {
+                    // Spawn a child session (opencode subagent): session.created with parentID.
+                    emit(&state, serde_json::json!({"type":"session.created","properties":{"sessionID":CHILD_SID,"info":{"id":CHILD_SID,"parentID":SID,"agent":"general","title":"mock subagent"}}}).to_string());
+                    emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":CHILD_SID,"status":{"type":"busy"}}}).to_string());
+                    emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":CHILD_SID,"info":{"role":"assistant"}}}).to_string());
+                } else if asks_question {
+                    // The `question` tool is opencode's elicitation (agent asking the user).
+                    emit(&state, tool_part_event(SID, "question", "pending", serde_json::json!({"input":{"message":"what size?"}})));
+                } else if uses_tool {
                     emit(&state, tool_part_event(SID, "bash", "pending", serde_json::json!({})));
-                    emit(&state, tool_part_event(SID, "bash", "running", serde_json::json!({ "input": { "command": "cat sample.txt" } })));
+                    emit(&state, tool_part_event(SID, "bash", "running", serde_json::json!({"input":{"command":"cat sample.txt"}})));
                 }
-                emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"assistant"}}}}}}"#));
+                emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":SID,"info":{"role":"assistant"}}}).to_string());
                 let st = state.clone();
                 let echo = format!("echo: {text}");
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(300));
-                    if uses_tool {
-                        emit(&st, tool_part_event(SID, "bash", "completed", serde_json::json!({ "output": "hello-world" })));
+                    std::thread::sleep(Duration::from_millis(400));
+                    if uses_subagent {
+                        emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":CHILD_SID}}).to_string());
+                    } else if asks_question {
+                        emit(&st, tool_part_event(SID, "question", "completed", serde_json::json!({"output":"large"})));
+                    } else if uses_tool {
+                        emit(&st, tool_part_event(SID, "bash", "completed", serde_json::json!({"output":"hello-world"})));
                     }
                     emit(&st, part_updated_event(SID, "assistant", &echo));
                     st.lock().unwrap().busy = false;
-                    emit(&st, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
+                    emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":SID}}).to_string());
                 });
                 (204, String::new())
             }
