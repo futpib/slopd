@@ -9849,6 +9849,7 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     // binds the assigned --port and serves the API subset OpencodeClient uses),
     // tracks it via the status-poll driver, and drives send/interrupt/transcript
     // over HTTP — exercising every dispatch branch the backend added.
+    build_bin("slopctl");
     build_bin("mock_opencode");
     let mock_opencode = cargo_bin("mock_opencode");
     let oc_config_dir = tempfile::tempdir().unwrap();
@@ -9905,6 +9906,32 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     // Interrupt over HTTP (POST /abort).
     let interrupt = env.slopctl(&["interrupt", &pane_id]);
     assert!(interrupt.status.success(), "slopctl interrupt failed: {:?}", interrupt.status);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn run_backend_flag_overrides_to_opencode_without_an_account() {
+    // `slopctl run --backend opencode` with no opencode account declared: the
+    // flag flips the default account's backend to opencode and, because the
+    // configured executable (mock_opencode) is an unrecognized name, keeps it as
+    // the spawn binary — the documented override behaviour for custom paths.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl_raw(&["run", "--backend", "opencode"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --backend opencode failed: {:?} stderr={:?}",
+        run_out.status, String::from_utf8_lossy(&run_out.stderr));
+
+    let (_, detailed) = env.pane_state(&pane_id);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready,
+        "opencode pane created via --backend should reach ready, got {:?}", detailed);
 
     kill_slopd(slopd);
 }

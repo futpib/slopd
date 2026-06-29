@@ -2807,7 +2807,7 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account } => {
+        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend } => {
             // Pick the account: an explicit --account wins; otherwise inherit the
             // parent pane's account (its @slopd_account option) so a pane spawned
             // from another pane stays on the same account by default.
@@ -2821,7 +2821,21 @@ async fn handle_request(
             // Resolve to the account's Claude config dir before doing anything
             // else, so an unknown account fails fast without spawning.
             let resolved = match config.resolve_account(requested_account.as_deref()) {
-                Ok(resolved) => resolved,
+                Ok(mut resolved) => {
+                    // `--backend` override is authoritative: flip the backend and
+                    // recompute the executable — keep it if it already matches or is
+                    // a custom path, else swap a conflicting recognized name to the
+                    // backend's canonical binary.
+                    if let Some(backend) = backend {
+                        resolved.executable = match libslop::Backend::infer_from_program(resolved.executable.program()) {
+                            Some(inferred) if inferred == backend => resolved.executable.clone(),
+                            Some(_) => libslop::Executable::String(backend.canonical_executable().to_string()),
+                            None => resolved.executable.clone(),
+                        };
+                        resolved.backend = backend;
+                    }
+                    resolved
+                }
                 Err(message) => return libslop::ResponseBody::Error { message },
             };
             // Inject hooks into the account's settings.json (the dir the new pane

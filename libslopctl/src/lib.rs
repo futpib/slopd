@@ -104,6 +104,13 @@ pub enum CommonCommand {
         /// back to slopd's default_account.
         #[arg(short = 'a', long, value_name = "NAME")]
         account: Option<String>,
+        /// Override the pane's agent backend — `claude` or `opencode`. By default
+        /// the account's resolved backend is used. An explicit override wins: the
+        /// executable is kept if it already matches or is a custom path, else
+        /// swapped to the backend's canonical binary. Handy for `slopctl run
+        /// --backend opencode` without declaring an account.
+        #[arg(long, value_name = "KIND")]
+        backend: Option<String>,
         /// Instead of waiting for the pane to become ready, hand off to a viewer
         /// once it exists: run slopctl's configured [run] interactive_command
         /// (default `tmux attach -t slopd`), with `{{pane_id}}` replaced by the
@@ -695,8 +702,9 @@ impl<
         start_directory: Option<PathBuf>,
         env: Vec<(String, String)>,
         account: Option<String>,
+        backend: Option<libslop::Backend>,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account }).await? {
+        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend }).await? {
             libslop::ResponseBody::Run { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -1495,6 +1503,7 @@ pub async fn execute_run<R, W>(
     start_directory: Option<PathBuf>,
     env: Vec<(String, String)>,
     account: Option<String>,
+    backend: Option<libslop::Backend>,
     no_wait: bool,
     ready_timeout_secs: u64,
 ) -> Result<(), Error>
@@ -1503,7 +1512,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     if no_wait {
-        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
+        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
         println!("{}", pane_id);
         return Ok(());
     }
@@ -1527,7 +1536,7 @@ where
     ];
     let mut subscription = client.subscribe(filters).await?;
 
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
 
     let overall_deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(ready_timeout_secs);
@@ -1615,13 +1624,14 @@ pub async fn execute_run_interactive<R, W>(
     start_directory: Option<PathBuf>,
     env: Vec<(String, String)>,
     account: Option<String>,
+    backend: Option<libslop::Backend>,
     viewer: &InteractiveRun,
 ) -> Result<(), Error>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account).await?;
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
     // Pre-resolved vars (socket, session, …) plus the now-known pane id.
     let mut vars: Vec<(&str, &str)> = viewer.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     vars.push(("pane_id", &pane_id));
@@ -1708,8 +1718,16 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, interactive, no_wait, ready_timeout } => {
+        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, backend, interactive, no_wait, ready_timeout } => {
             let env = build_cli_env(&env_files, &envs)?;
+            let backend = match backend.as_deref() {
+                Some("claude") => Some(libslop::Backend::Claude),
+                Some("opencode") => Some(libslop::Backend::Opencode),
+                Some(other) => return Err(Error::RunFailed(
+                    format!("invalid --backend {other:?}: expected \"claude\" or \"opencode\""),
+                )),
+                None => None,
+            };
             // Resolve / validate --start-directory before the value leaves this
             // process. Over a local socket a relative path resolves against
             // slopctl's cwd; over a remote (iroh) connection the client's cwd is
@@ -1737,6 +1755,7 @@ where
                     start_directory,
                     env,
                     account,
+                    backend,
                     viewer,
                 ).await?;
             } else {
@@ -1747,6 +1766,7 @@ where
                     start_directory,
                     env,
                     account,
+                    backend,
                     no_wait,
                     ready_timeout,
                 ).await?;
@@ -1901,6 +1921,7 @@ mod tests {
             envs: vec![],
             env_files: vec![],
             account: None,
+            backend: None,
             interactive: false,
             no_wait: true,
             ready_timeout: 30,

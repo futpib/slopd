@@ -2388,6 +2388,11 @@ pub enum RequestBody {
         /// (`default_account`, else the unnamed `claude_config_dir`).
         #[serde(default)]
         account: Option<String>,
+        /// Override the pane's agent backend (`--backend`). `None` = use the
+        /// account's resolved backend. An explicit override wins; see the run
+        /// handler for the executable recomputation.
+        #[serde(default)]
+        backend: Option<Backend>,
     },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
