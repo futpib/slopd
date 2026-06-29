@@ -666,8 +666,9 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `claude_con
 
 ### Current limitations
 
-- **State fidelity**: opencode's `/session/status` + SSE events are mapped onto slopd's full state set, verified against real opencode 1.17.x: idle/busy (`session.idle`/`session.status`), **tool use** (`message.part.updated` `part.type=tool`), **subagent** (`session.created` for a child session whose `parentID` is this pane's session), **elicitation** (opencode's `question` tool → `awaiting_input_elicitation`), permission (`permission.asked`), compaction (`session.compacted`).
-- **`listen --hook` (unified)**: opencode has no native hooks, so slopd **synthesizes** hook-NAMED events from its SSE bus (`session.idle`→`Stop`, `message.updated(user)`→`UserPromptSubmit`, `message.part.updated(tool)`→`PreToolUse`/`PostToolUse`, `permission.asked`→`PermissionRequest`, `session.error`→`StopFailure`, …). `slopctl listen --hook`/`wait --hook` therefore work uniformly across backends. The hook *name* is the contract; the payload's deeper fields are backend-specific (the raw opencode `properties` are carried under `properties`).
+- **No server password (TUI mode)**: the opencode TUI is itself a client of its embedded server and can't authenticate to it, so slopd spawns the pane **without** `OPENCODE_SERVER_PASSWORD` (verified against real opencode 1.17.x). The server is therefore open on `127.0.0.1` — acceptable for the single-user local model slopd assumes, but it can't be locked down the way headless `opencode serve` can.
+- **Subagent transcript not surfaced**: opencode runs subagents as child sessions; slopd tracks the subagent *state* (`busy_subagent`) and emits `SubagentStart`/`SubagentStop` hooks, but the subagent's own messages are **not** folded into the pane's transcript (`slopctl transcript` / `listen --transcript` show the main session only).
+- **Rare events mapped per-doc**: the `permission.asked` and `session.compacted` mappings follow the opencode plugin docs but weren't individually triggered in a real-opencode smoke (auto-allowed bash; no compaction in short turns). The common path (idle/busy/tool/subagent/elicitation) is verified against real opencode 1.17.x.
 
 ---
 

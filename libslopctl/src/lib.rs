@@ -457,54 +457,43 @@ pub fn resolve_pane_id_or_session(
 }
 
 /// Print a table of pane info to stdout.
+///
+/// The column set is **fixed** (always the same columns in the same order), so
+/// the layout never shifts with daemon state. For robust programmatic parsing,
+/// prefer `slopctl ps --json` (a stable `PaneInfo` array) — the human table's
+/// column *widths* still adapt to content.
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
-    use std::collections::HashSet;
     let fmt = timeago::Formatter::new();
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
 
-    // Show the BACKEND column only when more than one backend is in play, so
-    // single-backend (Claude-only) users see no extra noise.
-    let show_backend = panes
+    // Single ordered source of truth for the columns: (header, value-fn). Header
+    // and rows are both derived from this, so they can never drift apart (no
+    // magic indices) and the set never changes with state.
+    let cols: Vec<(&str, Box<dyn Fn(&libslop::PaneInfo) -> String>)> = vec![
+        ("PANE", Box::new(|p| p.pane_id.clone())),
+        ("CREATED", Box::new(|p| fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))))),
+        ("LAST_ACTIVE", Box::new(|p| fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))))),
+        ("SESSION", Box::new(|p| p.session_id.as_deref().unwrap_or("-").to_string())),
+        ("PARENT", Box::new(|p| p.parent_pane_id.as_deref().unwrap_or("-").to_string())),
+        ("BACKEND", Box::new(|p| p.backend.canonical_executable().to_string())),
+        ("ACCOUNT", Box::new(|p| p.account.clone())),
+        ("TAGS", Box::new(|p| if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") })),
+        ("STATE", Box::new(|p| p.state.as_str().to_string())),
+        ("DETAILED_STATE", Box::new(|p| p.detailed_state.as_str().to_string())),
+        ("WORKING_DIR", Box::new(|p| p.working_dir.as_deref().unwrap_or("-").to_string())),
+    ];
+
+    let header: Vec<&str> = cols.iter().map(|(h, _)| *h).collect();
+    let rows: Vec<Vec<String>> = panes
         .iter()
-        .map(|p| p.backend.canonical_executable())
-        .collect::<HashSet<_>>()
-        .len()
-        > 1;
+        .map(|p| cols.iter().map(|(_, f)| f(p)).collect())
+        .collect();
 
-    let cells_of = |p: &libslop::PaneInfo| -> Vec<String> {
-        let mut cells = vec![
-            p.pane_id.clone(),
-            fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))),
-            fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))),
-            p.session_id.as_deref().unwrap_or("-").to_string(),
-            p.parent_pane_id.as_deref().unwrap_or("-").to_string(),
-            p.account.clone(),
-            if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") },
-            p.state.as_str().to_string(),
-            p.detailed_state.as_str().to_string(),
-            p.working_dir.as_deref().unwrap_or("-").to_string(),
-        ];
-        if show_backend {
-            // Place BACKEND after PARENT, before ACCOUNT.
-            cells.insert(5, p.backend.canonical_executable().to_string());
-        }
-        cells
-    };
-
-    let mut header: Vec<&str> =
-        vec!["PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "ACCOUNT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR"];
-    if show_backend {
-        header.insert(5, "BACKEND");
-    }
-
-    let rows: Vec<Vec<String>> = panes.iter().map(cells_of).collect();
-    let header_row: Vec<String> = header.iter().map(|s| s.to_string()).collect();
-
-    let widths: Vec<usize> = (0..header_row.len())
+    let widths: Vec<usize> = (0..header.len())
         .map(|c| {
-            let mut w = header_row[c].len();
+            let mut w = header[c].len();
             for r in &rows {
                 w = w.max(r[c].len());
             }
@@ -519,6 +508,7 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
             .collect::<Vec<_>>()
             .join("  ")
     };
+    let header_row: Vec<String> = header.iter().map(|s| s.to_string()).collect();
     println!("{}", render(&header_row));
     for r in &rows {
         println!("{}", render(r));
