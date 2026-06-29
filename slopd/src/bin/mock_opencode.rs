@@ -24,6 +24,10 @@ const CHILD_SID: &str = "ses_mock_child";
 /// A second top-level session the human can switch the TUI to (no parent), used
 /// to exercise slopd following `tui.session.select`.
 const SID_2: &str = "ses_mock2";
+/// An ephemeral boot session that GET /session lists but the server has already
+/// garbage-collected, so it 404s on use. Simulates the real bug where slopd
+/// adopted the TUI's transient boot session and then send failed.
+const GHOST_SID: &str = "ses_ghost";
 
 struct MockState {
     busy: bool,
@@ -44,6 +48,11 @@ struct MockState {
     /// The session id last selected via POST /tui/select-session (records that
     /// slopd imposed its session on the TUI at spawn).
     selected_session: Option<String>,
+    /// Simulate a freshly-booted TUI's ephemeral session: GET /session lists
+    /// GHOST_SID (so a "adopt the latest existing session" discovery would grab
+    /// it), but it has been garbage-collected, so anything addressing it 404s.
+    /// slopd must POST its own session instead of adopting this one.
+    ghost_session: bool,
 }
 
 fn main() {
@@ -52,6 +61,7 @@ fn main() {
     // `-s <id>` means a session is being resumed → it already exists (mirrors
     // real opencode, where `opencode -s <id>` makes that session present).
     let mut resumed_session = false;
+    let mut ghost = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -61,6 +71,9 @@ fn main() {
                 resumed_session = true;
                 let _ = args.next(); // consume the session id
             }
+            // Test flag: list a garbage-collected "ghost" session in GET /session
+            // that 404s on use — reproduces the ephemeral-boot-session bug.
+            "--ghost-session" => ghost = true,
             _ => { /* ignore unknown flags (e.g. opencode passthrough) */ }
         }
     }
@@ -79,6 +92,7 @@ fn main() {
         session_created: resumed_session,
         second_session: false,
         selected_session: None,
+        ghost_session: ghost,
     }));
 
     for stream in listener.incoming() {
@@ -178,6 +192,11 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             // a top-level timeCreated). A fresh TUI lists no session until created.
             let s = state.lock().unwrap();
             let mut sessions: Vec<String> = Vec::new();
+            if s.ghost_session {
+                // The ephemeral boot session: listed, and the NEWEST (created 999),
+                // so a discover-the-latest path would pick it — but it 404s on use.
+                sessions.push(format!(r#"{{"id":"{GHOST_SID}","time":{{"created":999,"updated":999}},"title":"ghost"}}"#));
+            }
             if s.session_created {
                 sessions.push(format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#));
             }

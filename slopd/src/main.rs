@@ -3371,11 +3371,25 @@ async fn handle_request(
                         if !session_id.is_empty() {
                             let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
                             // Point the TUI at the session slopd drives, so the pane
-                            // shows the same conversation slopctl operates on (the TUI
-                            // may otherwise sit on a restored/older session).
-                            if let Err(e) = client.select_session(&session_id).await {
-                                debug!("opencode pane {}: select-session failed (TUI may show a different session): {}", pane_id, e);
-                            }
+                            // shows the same conversation slopctl operates on. The
+                            // HTTP server accepts select-session immediately, but the
+                            // TUI client only acts on it once it has finished booting
+                            // its UI and subscribed — calling once at spawn races that
+                            // and the TUI lands on its own welcome screen instead. So
+                            // re-assert it a few times over the first couple seconds;
+                            // it's idempotent, and once the TUI honors it (and emits
+                            // tui.session.select) the SSE follow keeps the two in sync.
+                            let client = client.clone();
+                            let sid = session_id.clone();
+                            let pane = pane_id.clone();
+                            tokio::spawn(async move {
+                                for _ in 0..10 {
+                                    if let Err(e) = client.select_session(&sid).await {
+                                        debug!("opencode pane {}: select-session attempt failed: {}", pane, e);
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                }
+                            });
                         }
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
                         let pane_state = panes.get_or_insert(&pane_id);

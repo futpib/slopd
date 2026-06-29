@@ -9984,6 +9984,55 @@ fn opencode_follows_tui_session_switch() {
 }
 
 #[test]
+fn opencode_creates_own_session_not_ephemeral_boot_session() {
+    // Regression: a freshly-booted opencode TUI opens an empty session that the
+    // server garbage-collects. slopd used to ADOPT the latest existing session
+    // (GET /session) at spawn — so it latched onto that ephemeral boot session,
+    // which then 404'd, and `slopctl send` failed with "Session not found"
+    // (observed live). slopd must instead POST its own (persistent) session.
+    //
+    // The mock's --ghost-session lists GHOST_SID as the newest session in
+    // GET /session but 404s on any use of it — exactly the trap. The fix must
+    // ignore it and drive a POSTed, sendable session.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    // executable is an array so the --ghost-session test flag reaches the mock.
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = [{:?}, \"--ghost-session\"]\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl_raw(&["run", "--account", "oc"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --account oc failed: {:?}", run_out.status);
+
+    // slopd must NOT have adopted the ghost; it POSTed its own session (ses_mock).
+    let ps: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let p = ps.iter().find(|p| p.pane_id == pane_id).expect("pane in ps");
+    assert_ne!(p.session_id.as_deref(), Some("ses_ghost"),
+        "slopd adopted the ephemeral ghost session instead of creating its own");
+    assert_eq!(p.session_id.as_deref(), Some("ses_mock"),
+        "slopd should drive the session it POSTed; got {:?}", p.session_id);
+
+    // The decisive check: send must succeed over HTTP (the ghost would 404).
+    let send = env.slopctl(&["send", &pane_id, "hello"]);
+    assert!(send.status.success(),
+        "send failed — slopd is driving an unusable session: {:?} stderr={:?}",
+        send.status, String::from_utf8_lossy(&send.stderr));
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn run_backend_flag_overrides_to_opencode_without_an_account() {
     // `slopctl run --backend opencode` with no opencode account declared: the
     // flag flips the default account's backend to opencode and, because the

@@ -59,14 +59,17 @@ impl OpencodeClient {
         resp.json::<Value>().await.map_err(|e| e.to_string())
     }
 
-    /// Return the session id slopd should drive: the latest existing one, or — if
-    /// the server has none (a freshly-booted TUI creates no session until the
-    /// first message) — create one via `POST /session`. Verified against real
+    /// Create the session slopd will drive and return its id, via `POST /session`.
+    ///
+    /// We deliberately do NOT adopt a *discovered* session here. A freshly-booted
+    /// TUI opens its own empty session, but opencode garbage-collects an unused
+    /// empty session, so latching onto "the latest existing session" can leave
+    /// slopd pointed at an id the server later 404s on (observed live: send fails
+    /// with "Session not found"). POSTing our own session yields one that is
+    /// guaranteed to persist and accept prompts; the caller then points the TUI at
+    /// it via `select_session`, converging the two views. Verified against real
     /// opencode 1.17.x.
     pub async fn ensure_session(&self) -> Result<String, String> {
-        if let Some(id) = self.latest_session().await? {
-            return Ok(id);
-        }
         let resp = self
             .req(reqwest::Method::POST, "/session")
             .json(&serde_json::json!({}))
@@ -119,7 +122,10 @@ impl OpencodeClient {
     }
 
     /// `GET /session` → the most recent session id (highest creation time), if any.
-    /// Used to discover the session id of a freshly-spawned opencode pane.
+    /// No longer on the spawn path (slopd POSTs its own session — see
+    /// `ensure_session`), but kept as a correct, tested discovery primitive for
+    /// callers that need to find an existing session rather than create one.
+    #[allow(dead_code)]
     pub async fn latest_session(&self) -> Result<Option<String>, String> {
         let resp = self.req(reqwest::Method::GET, "/session").send().await.map_err(|e| e.to_string())?;
         let status = resp.status();
