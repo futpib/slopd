@@ -212,7 +212,10 @@ async fn set_pane_detailed_state(
 struct BackoffPolicy {
     max_attempts: u32,
     initial_backoff_ms: u64,
-    max_backoff_ms: u64,
+    /// Optional ceiling on the per-retry delay. `None` lets the delay keep
+    /// doubling uncapped; `Some(ms)` flattens the schedule into steady polling
+    /// once the delay reaches `ms`.
+    max_backoff_ms: Option<u64>,
 }
 
 impl BackoffPolicy {
@@ -225,12 +228,16 @@ impl BackoffPolicy {
     }
 
     /// Delay before the `attempt`-th retry (1-based): `initial * 2^(attempt-1)`,
-    /// capped at `max_backoff_ms`. The exponent is clamped to avoid overflow on a
-    /// pathological streak of failures.
+    /// optionally capped at `max_backoff_ms`. The exponent is clamped and the
+    /// multiply saturates, so a long streak can't overflow — uncapped, the delay
+    /// just grows until it saturates `u64`.
     fn delay_ms(&self, attempt: u32) -> u64 {
-        self.initial_backoff_ms
-            .saturating_mul(2_u64.pow(attempt.saturating_sub(1).min(20)))
-            .min(self.max_backoff_ms)
+        let delay = self.initial_backoff_ms
+            .saturating_mul(2_u64.pow(attempt.saturating_sub(1).min(63)));
+        match self.max_backoff_ms {
+            Some(cap) => delay.min(cap),
+            None => delay,
+        }
     }
 }
 
@@ -3086,7 +3093,11 @@ mod tests {
     use super::*;
 
     fn policy(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> BackoffPolicy {
-        BackoffPolicy { max_attempts, initial_backoff_ms, max_backoff_ms }
+        BackoffPolicy { max_attempts, initial_backoff_ms, max_backoff_ms: Some(max_backoff_ms) }
+    }
+
+    fn uncapped_policy(max_attempts: u32, initial_backoff_ms: u64) -> BackoffPolicy {
+        BackoffPolicy { max_attempts, initial_backoff_ms, max_backoff_ms: None }
     }
 
     #[test]
@@ -3101,11 +3112,25 @@ mod tests {
     }
 
     #[test]
+    fn backoff_delay_uncapped_keeps_doubling() {
+        // With no cap (the default), the delay doubles every attempt forever.
+        let p = uncapped_policy(20, 1000);
+        assert_eq!(p.delay_ms(1), 1000);    // 1s
+        assert_eq!(p.delay_ms(2), 2000);    // 2s
+        assert_eq!(p.delay_ms(5), 16_000);  // 16s
+        assert_eq!(p.delay_ms(11), 1_024_000); // ~17m, no ceiling
+    }
+
+    #[test]
     fn backoff_delay_does_not_overflow_on_huge_attempt() {
-        // A pathological streak must not panic via shift/mul overflow; it just caps.
+        // A pathological streak must not panic via shift/mul overflow.
+        // Capped: saturates to the ceiling.
         let p = policy(u32::MAX, 1000, 30_000);
         assert_eq!(p.delay_ms(u32::MAX), 30_000);
         assert_eq!(p.delay_ms(1_000_000), 30_000);
+        // Uncapped: saturates u64 rather than panicking.
+        let p = uncapped_policy(u32::MAX, 1000);
+        assert_eq!(p.delay_ms(u32::MAX), u64::MAX);
     }
 
     #[test]

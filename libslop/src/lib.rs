@@ -1480,9 +1480,11 @@ pub struct SlopdRunConfig {
     /// Initial backoff in milliseconds before the first auto-continue retry.
     #[serde(default = "default_initial_backoff_ms")]
     pub initial_backoff_ms: u64,
-    /// Maximum backoff in milliseconds for exponential backoff.
-    #[serde(default = "default_max_backoff_ms")]
-    pub max_backoff_ms: u64,
+    /// Optional ceiling (milliseconds) on the exponential backoff delay. When
+    /// unset the delay keeps doubling every retry uncapped; set it to flatten the
+    /// schedule into steady polling once the delay reaches this value.
+    #[serde(default)]
+    pub max_backoff_ms: Option<u64>,
 }
 
 fn default_auto_continue_on_failure() -> bool {
@@ -1490,19 +1492,16 @@ fn default_auto_continue_on_failure() -> bool {
 }
 
 fn default_max_retry_attempts() -> u32 {
-    // ~5 minutes of total retrying. With initial=1s doubling to a 30s cap, the
-    // delays run 1,2,4,8,16,30,30,…s; 14 attempts sum to ~301s (a fast burst in
-    // the first ~30s for transient blips, then steady 30s polling to ride out a
-    // longer outage unattended).
-    14
+    // Uncapped exponential backoff from initial=1s: the delays run
+    // 1,2,4,8,16,32,64,128s, so the cumulative wait after N attempts is
+    // (2^N - 1)s. 8 attempts sum to 255s (~4m15s) of retrying — long enough to
+    // ride out a transient outage unattended, with each successive retry backing
+    // off further rather than hammering a down API.
+    8
 }
 
 fn default_initial_backoff_ms() -> u64 {
     1000
-}
-
-fn default_max_backoff_ms() -> u64 {
-    30000
 }
 
 fn default_slopctl() -> String {
@@ -1543,7 +1542,7 @@ impl Default for SlopdRunConfig {
             auto_continue_on_failure: default_auto_continue_on_failure(),
             max_retry_attempts: default_max_retry_attempts(),
             initial_backoff_ms: default_initial_backoff_ms(),
-            max_backoff_ms: default_max_backoff_ms(),
+            max_backoff_ms: None,
         }
     }
 }
