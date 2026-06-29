@@ -9878,6 +9878,15 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     assert_eq!(detailed, libslop::PaneDetailedState::Ready,
         "opencode pane should be ready right after wait-for-ready run, got {:?}", detailed);
 
+    // ensure_session() must have POSTed /session (a fresh mock lists no session
+    // until one is created) and recorded its id — ps shows it.
+    let ps_panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let p = ps_panes.iter().find(|p| p.pane_id == pane_id).expect("pane in ps");
+    assert_eq!(p.session_id.as_deref(), Some("ses_mock"),
+        "ensure_session should have created/reused session ses_mock; got {:?}", p.session_id);
+    assert_eq!(p.backend, libslop::Backend::Opencode);
+
     // Send over HTTP (prompt_async). mock_opencode acks 204 (the
     // UserPromptSubmit-equivalent), then simulates a busy→idle turn.
     let send = env.slopctl(&["send", &pane_id, "hello from slopd"]);
@@ -10256,6 +10265,109 @@ fn opencode_question_tool_tracks_awaiting_elicitation() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(seen_elicitation, "opencode question tool should set awaiting_input_elicitation");
+    kill_slopd(slopd);
+}
+
+#[test]
+fn opencode_daemon_restart_reattaches_runtime() {
+    // A daemon restart (tmux + the opencode pane survive) must re-adopt the pane
+    // and reattach its HTTP runtime + driver from the stored @slopd_opencode_port
+    // option (load_managed_panes recovery for opencode). Verified by: the pane is
+    // still tracked with backend=opencode, reaches ready again, and a send works.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd1 = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // Clean shutdown: tmux session + the opencode pane survive.
+    kill_slopd(slopd1);
+    let slopd2 = env.spawn_slopd();
+
+    // The pane is re-adopted from tmux, runtime reattached, driver resumed → ready.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        if let Some(p) = panes.iter().find(|p| p.pane_id == pane_id) {
+            assert_eq!(p.backend, libslop::Backend::Opencode, "recovered pane should stay opencode");
+            if p.detailed_state == libslop::PaneDetailedState::Ready {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("opencode pane not re-tracked after daemon restart");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // A send succeeding post-restart proves the HTTP client was reattached.
+    assert!(env.slopctl(&["send", &pane_id, "still alive"]).status.success(), "send after restart failed");
+    kill_slopd(slopd2);
+}
+
+#[test]
+fn opencode_subagent_emits_subagent_hooks() {
+    // A child session (subagent) synthesizes SubagentStart (on spawn) and
+    // SubagentStop (on child idle) hooks, so `listen --hook SubagentStart` works.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "SubagentStart", "--hook", "SubagentStop", "--pane-id", &pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn slopctl listen");
+    {
+        use std::io::Read;
+        let stdout = listen.stdout.as_mut().expect("listener stdout");
+        let mut buf = [0u8; 1];
+        let mut line = Vec::new();
+        loop {
+            stdout.read_exact(&mut buf).expect("read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"), "unexpected first line: {:?}", line);
+    }
+
+    assert!(env.slopctl(&["send", &pane_id, "please spawn a subagent"]).status.success());
+    let stdout = listen.stdout.take().expect("listener stdout gone");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines().flatten() {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_start = false;
+    let mut saw_stop = false;
+    while Instant::now() < deadline && !(saw_start && saw_stop) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.contains(r#""source":"hook""#) => {
+                if line.contains(r#""event_type":"SubagentStart""#) { saw_start = true; }
+                if line.contains(r#""event_type":"SubagentStop""#) { saw_stop = true; }
+            }
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    kill_child(listen);
+    assert!(saw_start, "expected a synthesized SubagentStart hook");
+    assert!(saw_stop, "expected a synthesized SubagentStop hook");
     kill_slopd(slopd);
 }
 

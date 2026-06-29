@@ -480,6 +480,19 @@ async fn read_opencode_sse(
             {
                 if let Some(ref sid) = ev_sid {
                     children.insert(sid.clone());
+                    // Synthesize a SubagentStart hook (opencode subagent = child session).
+                    let _ = event_tx.send(libslop::Record {
+                        source: "hook".to_string(),
+                        event_type: "SubagentStart".to_string(),
+                        pane_id: Some(pane_id.to_string()),
+                        payload: serde_json::json!({
+                            "session_id": session_id,
+                            "hook_event_name": "SubagentStart",
+                            "opencode_child_session": sid,
+                            "properties": event.get("properties").cloned().unwrap_or(serde_json::Value::Null),
+                        }),
+                        cursor: None,
+                    });
                 }
             }
             let is_main = ev_sid.as_deref() == Some(session_id);
@@ -496,6 +509,17 @@ async fn read_opencode_sse(
             {
                 if let Some(ref sid) = ev_sid {
                     children.remove(sid);
+                    let _ = event_tx.send(libslop::Record {
+                        source: "hook".to_string(),
+                        event_type: "SubagentStop".to_string(),
+                        pane_id: Some(pane_id.to_string()),
+                        payload: serde_json::json!({
+                            "session_id": session_id,
+                            "hook_event_name": "SubagentStop",
+                            "opencode_child_session": sid,
+                        }),
+                        cursor: None,
+                    });
                 }
             }
 
