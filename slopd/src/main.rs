@@ -2446,7 +2446,22 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             backend,
         });
     }
+    // managed_panes is a DashSet, so its iteration order is hash-arbitrary and
+    // varies between slopd instances. Sort by the pane's numeric tmux id (`%N`)
+    // so `ps` (and `ps --json`) list panes in a stable, intuitive spawn order
+    // instead of shuffling. Ids that don't parse sort last, by string, as a
+    // deterministic fallback.
+    panes.sort_by_key(|p| pane_id_sort_key(&p.pane_id));
     Ok(panes)
+}
+
+/// Sort key for a tmux pane id: `%N` → `(0, N, "")` so panes order by their
+/// numeric id; anything unparseable → `(1, 0, id)` so it sorts last but stably.
+fn pane_id_sort_key(pane_id: &str) -> (u8, u64, String) {
+    match pane_id.strip_prefix('%').and_then(|n| n.parse::<u64>().ok()) {
+        Some(n) => (0, n, String::new()),
+        None => (1, 0, pane_id.to_string()),
+    }
 }
 
 /// Write the current managed-pane set to the backup manifest on disk, returning
@@ -3863,6 +3878,14 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_id_sort_orders_numerically_then_unparseable_last() {
+        let mut ids = vec!["%83", "%9", "%60", "weird", "%100", "%7"];
+        ids.sort_by(|a, b| pane_id_sort_key(a).cmp(&pane_id_sort_key(b)));
+        // %9 before %60/%83/%100 (numeric, not lexicographic); non-%N sorts last.
+        assert_eq!(ids, vec!["%7", "%9", "%60", "%83", "%100", "weird"]);
+    }
 
     fn policy(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> BackoffPolicy {
         BackoffPolicy { max_attempts, initial_backoff_ms, max_backoff_ms: Some(max_backoff_ms) }

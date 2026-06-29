@@ -1043,6 +1043,64 @@ fn ps_lists_panes_with_session_id_and_tags() {
 }
 
 #[test]
+fn ps_lists_panes_in_stable_numeric_order() {
+    // Regression: panes are tracked in a DashSet (hash-arbitrary iteration), so
+    // `ps` used to list them in a shuffled, instance-dependent order. They must
+    // come back sorted by numeric pane id (%N), stably across repeated calls.
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    // Spawn several panes (sleep-infinity: no session needed for a pure ordering
+    // check). Their tmux ids are assigned in increasing numeric order.
+    let mut spawned: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let out = env.slopctl(&["run"]);
+        assert!(out.status.success(), "slopctl run failed: {:?}", out);
+        spawned.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+
+    let pane_num = |id: &str| -> u64 {
+        id.strip_prefix('%').and_then(|n| n.parse().ok()).expect("pane id is %N")
+    };
+
+    // Read ps --json a few times; order must be identical each time AND sorted
+    // ascending by numeric pane id.
+    let mut prev: Option<Vec<String>> = None;
+    for call in 0..3 {
+        let out = env.slopctl(&["ps", "--json"]);
+        assert!(out.status.success(), "ps --json failed: {:?}", out);
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&out.stdout).expect("ps --json is not valid JSON");
+        let ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+
+        let nums: Vec<u64> = ids.iter().map(|id| pane_num(id)).collect();
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        assert_eq!(nums, sorted, "ps call {call} not sorted by numeric pane id: {ids:?}");
+
+        if let Some(ref p) = prev {
+            assert_eq!(&ids, p, "ps order changed between calls: {p:?} then {ids:?}");
+        }
+        prev = Some(ids);
+    }
+
+    // All spawned panes are present.
+    let final_ids = prev.unwrap();
+    for s in &spawned {
+        assert!(final_ids.contains(s), "spawned pane {s} missing from ps: {final_ids:?}");
+    }
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn ps_shows_parent_pane() {
     build_bin("slopd");
     build_bin("slopctl");
