@@ -494,6 +494,18 @@ async fn read_opencode_sse(
                     cursor: None,
                 });
             }
+            // Synthesized hook event (unifies `listen --hook`/`wait --hook` across
+            // backends — opencode has no native hooks, so we emit hook-NAMED events
+            // derived from its bus).
+            if let Some((hook_name, payload)) = opencode::event_to_hook(&event) {
+                let _ = event_tx.send(libslop::Record {
+                    source: "hook".to_string(),
+                    event_type: hook_name.to_string(),
+                    pane_id: Some(pane_id.to_string()),
+                    payload,
+                    cursor: None,
+                });
+            }
             // Auto-continue: a failed turn (session.error) re-sends the last prompt.
             if opencode::event_is_failure(&event) {
                 schedule_opencode_auto_continue(pane_id, config, panes).await;

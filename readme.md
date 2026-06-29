@@ -666,8 +666,8 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `claude_con
 
 ### Current limitations
 
-- **State fidelity**: opencode's `/session/status` + SSE events are mapped onto slopd's states; the common path (idle/busy via `session.idle`/`session.status`, tool use, permission, compaction) is verified against real opencode 1.17.x. Rarer Claude states with no opencode signal (e.g. `busy_subagent`, `awaiting_input_elicitation`) simply don't occur for opencode panes.
-- **`listen --hook`**: opencode publishes a bus, not Claude-style hooks, so `slopctl listen --hook` is a no-op for opencode panes — use `listen --transcript` / `listen --event` instead.
+- **State fidelity**: opencode's `/session/status` + SSE events are mapped onto slopd's states; the common path (idle/busy, **tool use** via `message.part.updated` `part.type=tool`, permission, compaction) is verified against real opencode 1.17.x. Rarer Claude states with no opencode signal (e.g. `busy_subagent`, `awaiting_input_elicitation`) simply don't occur for opencode panes.
+- **`listen --hook` (unified)**: opencode has no native hooks, so slopd **synthesizes** hook-NAMED events from its SSE bus (`session.idle`→`Stop`, `message.updated(user)`→`UserPromptSubmit`, `message.part.updated(tool)`→`PreToolUse`/`PostToolUse`, `permission.asked`→`PermissionRequest`, `session.error`→`StopFailure`, …). `slopctl listen --hook`/`wait --hook` therefore work uniformly across backends. The hook *name* is the contract; the payload's deeper fields are backend-specific (the raw opencode `properties` are carried under `properties`).
 
 ---
 

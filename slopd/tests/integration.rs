@@ -10105,4 +10105,101 @@ fn opencode_auto_continues_after_session_error() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn opencode_tool_use_tracks_busy_tool_use_state() {
+    // A tool-using turn streams `message.part.updated` with part.type=tool
+    // (state pending/running), which maps to busy_tool_use — closing the
+    // state-fidelity gap (verified shape from real opencode).
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    assert!(env.slopctl(&["send", &pane_id, "please use a tool"]).status.success());
+    // The mock holds the tool in pending/running (~300ms) → busy_tool_use.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_tool_use = false;
+    while Instant::now() < deadline {
+        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusyToolUse {
+            seen_tool_use = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen_tool_use, "opencode tool turn should pass through busy_tool_use");
+    wait_until_ready(&env, &pane_id, Duration::from_secs(10));
+    kill_slopd(slopd);
+}
+
+#[test]
+fn opencode_listen_hook_fires_synthesized_events() {
+    // Option A: opencode has no native hooks, but slopd synthesizes hook-NAMED
+    // events from its SSE bus, so `slopctl listen --hook` works uniformly. A turn
+    // end emits a `Stop` hook (and a tool turn emits `PreToolUse`).
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // Subscribe to Stop + PreToolUse hooks on this pane before sending.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "Stop", "--hook", "PreToolUse", "--pane-id", &pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn slopctl listen");
+    {
+        use std::io::Read;
+        let stdout = listen.stdout.as_mut().expect("listener stdout");
+        let mut buf = [0u8; 1];
+        let mut line = Vec::new();
+        loop {
+            stdout.read_exact(&mut buf).expect("read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"), "unexpected first line: {:?}", line);
+    }
+
+    // A tool turn should produce both PreToolUse and (at turn end) Stop hooks.
+    assert!(env.slopctl(&["send", &pane_id, "please use a tool"]).status.success());
+
+    let stdout = listen.stdout.take().expect("listener stdout gone");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines().flatten() {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_pretool = false;
+    let mut saw_stop = false;
+    while Instant::now() < deadline && !(saw_pretool && saw_stop) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains(r#""source":"hook""#) {
+                    if line.contains(r#""event_type":"PreToolUse""#) { saw_pretool = true; }
+                    if line.contains(r#""event_type":"Stop""#) { saw_stop = true; }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    kill_child(listen);
+    assert!(saw_pretool, "expected a synthesized PreToolUse hook event");
+    assert!(saw_stop, "expected a synthesized Stop hook event");
+    kill_slopd(slopd);
+}
+
 

@@ -321,32 +321,101 @@ pub fn event_type(event: &Value) -> Option<&str> {
 
 /// Map an SSE event to a detailed-state transition, if it implies one.
 ///
-/// Verified mappings: `session.idle`→Ready, `session.status{type:busy}`→busy,
-/// `message.*`/`step-*`→BusyProcessing. Documented (not yet smoke-observed):
-/// `tool.execute.before`→BusyToolUse, `tool.execute.after`→BusyProcessing,
-/// `permission.asked`→AwaitingInputPermission, `session.compacted`→BusyCompacting.
+/// Verified against real opencode 1.17.x. Tool activity rides on
+/// `message.part.updated` with `properties.part.type == "tool"` and
+/// `part.state.status` (pending/running → BusyToolUse; completed/error →
+/// BusyProcessing) — there is no separate `tool.execute.*` bus event (those are
+/// in-process plugin events). `permission.asked` and `session.compacted` are
+/// mapped per the plugin docs (not yet individually observed on the bus).
 pub fn event_to_detailed(event: &Value) -> Option<PaneDetailedState> {
     let t = event_type(event)?;
     let props = event.get("properties").unwrap_or(&Value::Null);
     match t {
         "session.idle" => Some(PaneDetailedState::Ready),
+        // A failed turn leaves the agent idle (opencode doesn't always follow
+        // session.error with session.idle); recover to Ready so the pane isn't
+        // stuck busy. (Auto-RETRY is handled separately on this event.)
+        "session.error" => Some(PaneDetailedState::Ready),
         // session.status carries the status object in properties.status.
         "session.status" => props.get("status").and_then(|s| status_to_detailed(s)),
-        // A message is being produced → the agent is working.
-        "message.updated" | "message.part.updated" | "message.removed" | "message.part.removed" => {
+        "session.compacted" => Some(PaneDetailedState::BusyCompacting),
+        "permission.asked" => Some(PaneDetailedState::AwaitingInputPermission),
+        // A message is being produced → working. For a tool part, distinguish
+        // tool-use from plain processing via part.state.status.
+        "message.part.updated" => {
+            let part = props.get("part").unwrap_or(&Value::Null);
+            if part.get("type").and_then(|v| v.as_str()) == Some("tool") {
+                match part
+                    .get("state")
+                    .and_then(|s| s.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("running")
+                {
+                    "completed" | "error" => Some(PaneDetailedState::BusyProcessing),
+                    _ => Some(PaneDetailedState::BusyToolUse),
+                }
+            } else {
+                Some(PaneDetailedState::BusyProcessing)
+            }
+        }
+        "message.updated" | "message.removed" | "message.part.removed" => {
             Some(PaneDetailedState::BusyProcessing)
         }
         "step-start" | "step-finish" => Some(PaneDetailedState::BusyProcessing),
-        "tool.execute.before" => Some(PaneDetailedState::BusyToolUse),
-        "tool.execute.after" => Some(PaneDetailedState::BusyProcessing),
-        "permission.asked" => Some(PaneDetailedState::AwaitingInputPermission),
-        "session.compacted" => Some(PaneDetailedState::BusyCompacting),
-        // A failed turn leaves the agent idle (opencode doesn't always follow
-        // session.error with session.idle); recover to Ready so the pane isn't
-        // stuck busy. (Auto-RETRY of the failed turn is a future enhancement.)
-        "session.error" => Some(PaneDetailedState::Ready),
         _ => None,
     }
+}
+
+/// Map an SSE event onto a Claude-hook event name (+ a hook-shaped payload) so
+/// `slopctl listen --hook` / `wait --hook` work uniformly across backends. The
+/// hook *name* is the cross-backend contract; the payload carries the opencode
+/// `properties` under `opencode` plus best-effort hook fields (so `--where`
+/// predicates on `hook_event_name`/`tool_name` work; deeper fields are
+/// backend-specific).
+pub fn event_to_hook(event: &Value) -> Option<(&'static str, Value)> {
+    let t = event_type(event)?;
+    let props = event.get("properties").unwrap_or(&Value::Null);
+    let sid = event_session_id(event).unwrap_or("");
+    let part = || props.get("part").unwrap_or(&Value::Null);
+
+    let (name, extra): (&'static str, Value) = match t {
+        "session.idle" => ("Stop", json!({})),
+        "session.error" => ("StopFailure", json!({})),
+        "permission.asked" => ("PermissionRequest", json!({})),
+        "session.compacted" => ("PreCompact", json!({})),
+        "message.updated" if props.get("info").and_then(|i| i.get("role")).and_then(|r| r.as_str()) == Some("user") => {
+            ("UserPromptSubmit", json!({}))
+        }
+        // Tool start/end ride on message.part.updated (part.type == "tool").
+        "message.part.updated" if part().get("type").and_then(|v| v.as_str()) == Some("tool") => {
+            let tool_name = part().get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let status = part()
+                .get("state")
+                .and_then(|s| s.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("running");
+            let input = part().get("state").and_then(|s| s.get("input")).cloned().unwrap_or(Value::Null);
+            match status {
+                "completed" | "error" => (
+                    "PostToolUse",
+                    json!({ "tool_name": tool_name, "tool_input": input }),
+                ),
+                _ => (
+                    "PreToolUse",
+                    json!({ "tool_name": tool_name, "tool_input": input }),
+                ),
+            }
+        }
+        _ => return None,
+    };
+    let payload = json!({
+        "session_id": sid,
+        "hook_event_name": name,
+        "opencode_event": t,
+        "properties": props,
+        "extra": extra,
+    });
+    Some((name, payload))
 }
 
 /// Map an SSE event to a transcript record (type, payload), if it carries
@@ -463,16 +532,50 @@ mod tests {
             Some(PaneDetailedState::BusyProcessing)
         );
         assert_eq!(event_to_detailed(&ev("message.updated", sid)), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(event_to_detailed(&ev("message.part.updated", sid)), Some(PaneDetailedState::BusyProcessing));
+        // Real tool shape: message.part.updated with part.type=tool + state.status.
+        let tool_running = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"running"}}}});
+        let tool_completed = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"completed"}}}});
+        let text_part = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"text","text":"hi"}}});
+        assert_eq!(event_to_detailed(&tool_running), Some(PaneDetailedState::BusyToolUse));
+        assert_eq!(event_to_detailed(&tool_completed), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(event_to_detailed(&text_part), Some(PaneDetailedState::BusyProcessing));
+        // plugin-event names (tool.execute.*) are NOT on the SSE bus → no transition.
+        assert_eq!(event_to_detailed(&ev("tool.execute.before", sid)), None);
         assert_eq!(event_to_detailed(&ev("step-start", sid)), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(event_to_detailed(&ev("tool.execute.before", sid)), Some(PaneDetailedState::BusyToolUse));
-        assert_eq!(event_to_detailed(&ev("tool.execute.after", sid)), Some(PaneDetailedState::BusyProcessing));
         assert_eq!(event_to_detailed(&ev("permission.asked", sid)), Some(PaneDetailedState::AwaitingInputPermission));
         assert_eq!(event_to_detailed(&ev("session.compacted", sid)), Some(PaneDetailedState::BusyCompacting));
         // A failed turn recovers to Ready.
         assert_eq!(event_to_detailed(&ev("session.error", sid)), Some(PaneDetailedState::Ready));
         // Unrelated event → no transition.
         assert_eq!(event_to_detailed(&ev("catalog.updated", sid)), None);
+    }
+
+    #[test]
+    fn event_to_hook_synthesizes_hook_names() {
+        let sid = "ses_x";
+        // session.idle → Stop
+        let (n, p) = event_to_hook(&ev("session.idle", sid)).unwrap();
+        assert_eq!(n, "Stop");
+        assert_eq!(p["hook_event_name"], "Stop");
+        // session.error → StopFailure
+        assert_eq!(event_to_hook(&ev("session.error", sid)).unwrap().0, "StopFailure");
+        // user message → UserPromptSubmit (assistant message → no hook)
+        let user_msg = json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"user"}}});
+        assert_eq!(event_to_hook(&user_msg).unwrap().0, "UserPromptSubmit");
+        let asst_msg = json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"assistant"}}});
+        assert!(event_to_hook(&asst_msg).is_none());
+        // tool part pending → PreToolUse; completed → PostToolUse (carries tool name)
+        let tool_pending = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"pending","input":{"command":"ls"}}}}});
+        let (n, p) = event_to_hook(&tool_pending).unwrap();
+        assert_eq!(n, "PreToolUse");
+        assert_eq!(p["extra"]["tool_name"], "bash");
+        let tool_done = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"completed"}}}});
+        assert_eq!(event_to_hook(&tool_done).unwrap().0, "PostToolUse");
+        // permission/compaction
+        assert_eq!(event_to_hook(&ev("permission.asked", sid)).unwrap().0, "PermissionRequest");
+        assert_eq!(event_to_hook(&ev("session.compacted", sid)).unwrap().0, "PreCompact");
+        // unrelated → none
+        assert!(event_to_hook(&ev("server.heartbeat", sid)).is_none());
     }
 
     #[test]

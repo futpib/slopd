@@ -30,16 +30,26 @@ struct MockState {
     /// Test hook: the first "boom" prompt fails (session.error) so slopd's
     /// auto-continue can be exercised; subsequent "boom" prompts succeed.
     boom_failed: bool,
+    /// Mirrors real opencode: a fresh TUI lists NO session until one is created
+    /// (POST /session). Exercises slopd's ensure_session() create-if-absent path.
+    session_created: bool,
 }
 
 fn main() {
     let mut port: Option<u16> = None;
     let mut hostname = "127.0.0.1".to_string();
+    // `-s <id>` means a session is being resumed → it already exists (mirrors
+    // real opencode, where `opencode -s <id>` makes that session present).
+    let mut resumed_session = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => port = args.next().and_then(|s| s.parse().ok()),
             "--hostname" => hostname = args.next().unwrap_or(hostname),
+            "-s" | "--session" => {
+                resumed_session = true;
+                let _ = args.next(); // consume the session id
+            }
             _ => { /* ignore unknown flags (e.g. opencode passthrough) */ }
         }
     }
@@ -55,6 +65,7 @@ fn main() {
         event_rx: Some(event_rx),
         event_tx,
         boom_failed: false,
+        session_created: resumed_session,
     }));
 
     for stream in listener.incoming() {
@@ -149,10 +160,19 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
     let (status, body_out) = match (method, path) {
         ("GET", "/global/health") => (200, r#"{"healthy":true,"version":"mock"}"#.to_string()),
 
-        ("GET", "/session") => (
-            200,
-            r#"[{"id":"ses_mock","timeCreated":1,"title":"mock"}]"#.to_string(),
-        ),
+        ("GET", "/session") => {
+            // Real opencode: a fresh TUI lists no session until one is created.
+            if state.lock().unwrap().session_created {
+                (200, r#"[{"id":"ses_mock","timeCreated":1,"title":"mock"}]"#.to_string())
+            } else {
+                (200, "[]".to_string())
+            }
+        }
+
+        ("POST", "/session") => {
+            state.lock().unwrap().session_created = true;
+            (200, r#"{"id":"ses_mock","timeCreated":1,"title":"mock"}"#.to_string())
+        }
 
         ("GET", "/session/status") => {
             // REAL shape: busy sessions present with {"type":"busy"}; idle absent.
@@ -183,16 +203,25 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                     s.messages.push(("user".to_string(), text.clone()));
                     s.messages.push(("assistant".to_string(), format!("echo: {text}")));
                 }
-                // Stream a realistic turn over SSE: busy → user msg → assistant
-                // msg → (after a beat) idle.
+                let uses_tool = text.contains("tool");
+                // Stream a realistic turn over SSE: busy → user msg → (tool call)
+                // → assistant msg → (after a beat) idle.
                 emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
                 emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"user"}}}}}}"#));
                 emit(&state, part_updated_event(SID, "user", &text));
+                if uses_tool {
+                    // Tool part: pending → running (→ BusyToolUse), completed later.
+                    emit(&state, tool_part_event(SID, "bash", "pending", serde_json::json!({})));
+                    emit(&state, tool_part_event(SID, "bash", "running", serde_json::json!({ "input": { "command": "cat sample.txt" } })));
+                }
                 emit(&state, format!(r#"{{"type":"message.updated","properties":{{"sessionID":"{SID}","info":{{"role":"assistant"}}}}}}"#));
                 let st = state.clone();
                 let echo = format!("echo: {text}");
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(300));
+                    if uses_tool {
+                        emit(&st, tool_part_event(SID, "bash", "completed", serde_json::json!({ "output": "hello-world" })));
+                    }
                     emit(&st, part_updated_event(SID, "assistant", &echo));
                     st.lock().unwrap().busy = false;
                     emit(&st, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
@@ -237,6 +266,28 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             len = body_out.len(),
         )
     }
+}
+
+/// Build a `message.part.updated` event for a TOOL part with the given state
+/// status (pending/running/completed), merging `body` into `part.state`. Mirrors
+/// how real opencode streams tool activity over the SSE bus.
+fn tool_part_event(sid: &str, tool: &str, status: &str, body: serde_json::Value) -> String {
+    let mut state = serde_json::json!({ "status": status });
+    if let serde_json::Value::Object(m) = body {
+        if let serde_json::Value::Object(ref mut s) = state {
+            for (k, v) in m {
+                s.insert(k, v);
+            }
+        }
+    }
+    serde_json::json!({
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": sid,
+            "part": { "type": "tool", "tool": tool, "callID": "call_mock", "state": state }
+        }
+    })
+    .to_string()
 }
 
 /// Build a `message.part.updated` event JSON for the SSE stream.
