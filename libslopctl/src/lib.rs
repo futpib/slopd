@@ -344,9 +344,9 @@ pub fn parse_filters(raw: Vec<String>) -> Result<Vec<(String, String)>, Error> {
     raw.into_iter().map(|f| {
         match f.split_once('=') {
             Some((k, v)) => {
-                if !matches!(k, "tag" | "agent" | "account") {
+                if !matches!(k, "tag" | "backend" | "account") {
                     return Err(Error::FilterError(
-                        format!("unknown filter key {:?}: supported keys are 'tag', 'agent', 'account'", k),
+                        format!("unknown filter key {:?}: supported keys are 'tag', 'backend', 'account'", k),
                     ));
                 }
                 Ok((k.to_string(), v.to_string()))
@@ -368,7 +368,7 @@ pub fn apply_filters(panes: Vec<libslop::PaneInfo>, filters: &[(String, String)]
             match key.as_str() {
                 "tag" => pane.tags.iter().any(|t| t == value),
                 // Match the backend by its canonical binary name (claude/opencode).
-                "agent" => pane.backend.canonical_executable() == value,
+                "backend" => pane.backend.canonical_executable() == value,
                 "account" => pane.account == *value,
                 _ => false,
             }
@@ -464,9 +464,9 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
 
-    // Show the AGENT column only when more than one backend is in play, so
+    // Show the BACKEND column only when more than one backend is in play, so
     // single-backend (Claude-only) users see no extra noise.
-    let show_agent = panes
+    let show_backend = panes
         .iter()
         .map(|p| p.backend.canonical_executable())
         .collect::<HashSet<_>>()
@@ -486,8 +486,8 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
             p.detailed_state.as_str().to_string(),
             p.working_dir.as_deref().unwrap_or("-").to_string(),
         ];
-        if show_agent {
-            // Place AGENT after PARENT, before ACCOUNT.
+        if show_backend {
+            // Place BACKEND after PARENT, before ACCOUNT.
             cells.insert(5, p.backend.canonical_executable().to_string());
         }
         cells
@@ -495,8 +495,8 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
 
     let mut header: Vec<&str> =
         vec!["PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "ACCOUNT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR"];
-    if show_agent {
-        header.insert(5, "AGENT");
+    if show_backend {
+        header.insert(5, "BACKEND");
     }
 
     let rows: Vec<Vec<String>> = panes.iter().map(cells_of).collect();
@@ -2021,25 +2021,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_filters_accepts_tag_agent_account() {
+    fn parse_filters_accepts_tag_backend_account() {
         assert!(parse_filters(vec!["tag=x".into()]).is_ok());
-        assert!(parse_filters(vec!["agent=opencode".into()]).is_ok());
+        assert!(parse_filters(vec!["backend=opencode".into()]).is_ok());
         assert!(parse_filters(vec!["account=work".into()]).is_ok());
+        assert!(parse_filters(vec!["agent=opencode".into()]).is_err(), "'agent' is not a filter key");
         assert!(parse_filters(vec!["bogus=x".into()]).is_err());
     }
 
     #[test]
-    fn apply_filters_match_by_agent_and_account() {
+    fn apply_filters_match_by_backend_and_account() {
         let panes = vec![
             pane_with(libslop::Backend::Opencode, "oc", &[]),
             pane_with(libslop::Backend::Claude, "work", &["prod"]),
             pane_with(libslop::Backend::Claude, "default", &[]),
         ];
-        let agent_oc = apply_filters(panes.clone(), &[("agent".into(), "opencode".into())]);
-        assert_eq!(agent_oc.len(), 1);
+        let be_oc = apply_filters(panes.clone(), &[("backend".into(), "opencode".into())]);
+        assert_eq!(be_oc.len(), 1);
         let acct = apply_filters(panes.clone(), &[("account".into(), "work".into())]);
         assert_eq!(acct.len(), 1);
-        let claude_prod = apply_filters(panes, &[("agent".into(), "claude".into()), ("tag".into(), "prod".into())]);
+        let claude_prod = apply_filters(panes, &[("backend".into(), "claude".into()), ("tag".into(), "prod".into())]);
         assert_eq!(claude_prod.len(), 1);
     }
 
