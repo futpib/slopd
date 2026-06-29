@@ -9843,4 +9843,70 @@ fn auto_continue_does_not_resend_during_long_turn() {
         "pane should be Ready after the continued turn completed cleanly");
 }
 
+#[test]
+fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
+    // End-to-end for the opencode backend: slopd spawns mock_opencode (which
+    // binds the assigned --port and serves the API subset OpencodeClient uses),
+    // tracks it via the status-poll driver, and drives send/interrupt/transcript
+    // over HTTP — exercising every dispatch branch the backend added.
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    // An opencode account whose executable is the mock. backend is explicit
+    // (inference only recognizes the canonical "opencode"/"claude" names, and
+    // this binary is named mock_opencode).
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    // Wait-for-ready run: the driver polls mock_opencode's /session/status=idle
+    // and flips the pane to ready. Returns the pane id on stdout.
+    let run_out = env.slopctl_raw(&["run", "--account", "oc"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --account oc failed: {:?} stdout={:?}",
+        run_out.status, String::from_utf8_lossy(&run_out.stdout));
+
+    let (_, detailed) = env.pane_state(&pane_id);
+    assert_eq!(detailed, libslop::PaneDetailedState::Ready,
+        "opencode pane should be ready right after wait-for-ready run, got {:?}", detailed);
+
+    // Send over HTTP (prompt_async). mock_opencode acks 204 (the
+    // UserPromptSubmit-equivalent), then simulates a busy→idle turn.
+    let send = env.slopctl(&["send", &pane_id, "hello from slopd"]);
+    assert!(send.status.success(), "slopctl send failed: {:?} stderr={:?}",
+        send.status, String::from_utf8_lossy(&send.stderr));
+
+    // Wait for the mock's turn to complete (busy → ready).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut back_to_ready = false;
+    while Instant::now() < deadline {
+        let (_, d) = env.pane_state(&pane_id);
+        if d == libslop::PaneDetailedState::Ready {
+            back_to_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(back_to_ready, "opencode pane did not return to ready after send");
+
+    // Transcript was pulled over HTTP (GET /message) and contains the prompt.
+    let transcript = env.slopctl(&["transcript", &pane_id]);
+    let out = String::from_utf8_lossy(&transcript.stdout);
+    assert!(out.contains("hello from slopd"),
+        "opencode transcript should contain the sent text, got: {}", out);
+
+    // Interrupt over HTTP (POST /abort).
+    let interrupt = env.slopctl(&["interrupt", &pane_id]);
+    assert!(interrupt.status.success(), "slopctl interrupt failed: {:?}", interrupt.status);
+
+    kill_slopd(slopd);
+}
+
 
