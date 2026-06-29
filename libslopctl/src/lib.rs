@@ -344,9 +344,9 @@ pub fn parse_filters(raw: Vec<String>) -> Result<Vec<(String, String)>, Error> {
     raw.into_iter().map(|f| {
         match f.split_once('=') {
             Some((k, v)) => {
-                if k != "tag" {
+                if !matches!(k, "tag" | "agent" | "account") {
                     return Err(Error::FilterError(
-                        format!("unknown filter key {:?}: only 'tag' is supported", k),
+                        format!("unknown filter key {:?}: supported keys are 'tag', 'agent', 'account'", k),
                     ));
                 }
                 Ok((k.to_string(), v.to_string()))
@@ -367,6 +367,9 @@ pub fn apply_filters(panes: Vec<libslop::PaneInfo>, filters: &[(String, String)]
         filters.iter().all(|(key, value)| {
             match key.as_str() {
                 "tag" => pane.tags.iter().any(|t| t == value),
+                // Match the backend by its canonical binary name (claude/opencode).
+                "agent" => pane.backend.canonical_executable() == value,
+                "account" => pane.account == *value,
                 _ => false,
             }
         })
@@ -455,57 +458,70 @@ pub fn resolve_pane_id_or_session(
 
 /// Print a table of pane info to stdout.
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
-    let now = std::time::SystemTime::now();
+    use std::collections::HashSet;
     let fmt = timeago::Formatter::new();
-    struct Row {
-        pane: String,
-        created: String,
-        last_active: String,
-        session: String,
-        parent: String,
-        account: String,
-        tags: String,
-        state: String,
-        detailed_state: String,
-        working_dir: String,
-    }
-    let rows: Vec<Row> = panes.iter().map(|p| {
-        let epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        Row {
-            pane: p.pane_id.clone(),
-            created: fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))),
-            last_active: fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))),
-            session: p.session_id.as_deref().unwrap_or("-").to_string(),
-            parent: p.parent_pane_id.as_deref().unwrap_or("-").to_string(),
-            account: p.account.clone(),
-            tags: if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") },
-            state: p.state.as_str().to_string(),
-            detailed_state: p.detailed_state.as_str().to_string(),
-            working_dir: p.working_dir.as_deref().unwrap_or("-").to_string(),
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+
+    // Show the AGENT column only when more than one backend is in play, so
+    // single-backend (Claude-only) users see no extra noise.
+    let show_agent = panes
+        .iter()
+        .map(|p| p.backend.canonical_executable())
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
+
+    let cells_of = |p: &libslop::PaneInfo| -> Vec<String> {
+        let mut cells = vec![
+            p.pane_id.clone(),
+            fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))),
+            fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))),
+            p.session_id.as_deref().unwrap_or("-").to_string(),
+            p.parent_pane_id.as_deref().unwrap_or("-").to_string(),
+            p.account.clone(),
+            if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") },
+            p.state.as_str().to_string(),
+            p.detailed_state.as_str().to_string(),
+            p.working_dir.as_deref().unwrap_or("-").to_string(),
+        ];
+        if show_agent {
+            // Place AGENT after PARENT, before ACCOUNT.
+            cells.insert(5, p.backend.canonical_executable().to_string());
         }
-    }).collect();
+        cells
+    };
 
-    let pane_w          = rows.iter().map(|r| r.pane.len()).max().unwrap_or(0).max(4);
-    let created_w       = rows.iter().map(|r| r.created.len()).max().unwrap_or(0).max(7);
-    let last_active_w   = rows.iter().map(|r| r.last_active.len()).max().unwrap_or(0).max(11);
-    let session_w       = rows.iter().map(|r| r.session.len()).max().unwrap_or(0).max(7);
-    let parent_w        = rows.iter().map(|r| r.parent.len()).max().unwrap_or(0).max(6);
-    let account_w       = rows.iter().map(|r| r.account.len()).max().unwrap_or(0).max(7);
-    let tags_w          = rows.iter().map(|r| r.tags.len()).max().unwrap_or(0).max(4);
-    let state_w         = rows.iter().map(|r| r.state.len()).max().unwrap_or(0).max(5);
-    let detailed_w      = rows.iter().map(|r| r.detailed_state.len()).max().unwrap_or(0).max(14);
-    let working_dir_w   = rows.iter().map(|r| r.working_dir.len()).max().unwrap_or(0).max(11);
+    let mut header: Vec<&str> =
+        vec!["PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "ACCOUNT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR"];
+    if show_agent {
+        header.insert(5, "AGENT");
+    }
 
-    println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<account_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
-        "PANE", "CREATED", "LAST_ACTIVE", "SESSION", "PARENT", "ACCOUNT", "TAGS", "STATE", "DETAILED_STATE", "WORKING_DIR",
-        pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-        parent_w=parent_w, account_w=account_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
+    let rows: Vec<Vec<String>> = panes.iter().map(cells_of).collect();
+    let header_row: Vec<String> = header.iter().map(|s| s.to_string()).collect();
 
+    let widths: Vec<usize> = (0..header_row.len())
+        .map(|c| {
+            let mut w = header_row[c].len();
+            for r in &rows {
+                w = w.max(r[c].len());
+            }
+            w
+        })
+        .collect();
+    let render = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(c, v)| format!("{:<width$}", v, width = widths[c]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", render(&header_row));
     for r in &rows {
-        println!("{:<pane_w$}  {:<created_w$}  {:<last_active_w$}  {:<session_w$}  {:<parent_w$}  {:<account_w$}  {:<tags_w$}  {:<state_w$}  {:<detailed_w$}  {:<working_dir_w$}",
-            r.pane, r.created, r.last_active, r.session, r.parent, r.account, r.tags, r.state, r.detailed_state, r.working_dir,
-            pane_w=pane_w, created_w=created_w, last_active_w=last_active_w, session_w=session_w,
-            parent_w=parent_w, account_w=account_w, tags_w=tags_w, state_w=state_w, detailed_w=detailed_w, working_dir_w=working_dir_w);
+        println!("{}", render(r));
     }
 }
 
@@ -1987,6 +2003,46 @@ mod tests {
         assert!(validate_pane_id_arg("%abc").is_err());
     }
 
+    fn pane_with(backend: libslop::Backend, account: &str, tags: &[&str]) -> libslop::PaneInfo {
+        libslop::PaneInfo {
+            pane_id: "%1".into(),
+            created_at: 0,
+            last_active: 0,
+            session_id: None,
+            parent_pane_id: None,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            state: libslop::PaneState::Ready,
+            detailed_state: libslop::PaneDetailedState::Ready,
+            working_dir: None,
+            transcript_path: None,
+            account: account.into(),
+            backend,
+        }
+    }
+
+    #[test]
+    fn parse_filters_accepts_tag_agent_account() {
+        assert!(parse_filters(vec!["tag=x".into()]).is_ok());
+        assert!(parse_filters(vec!["agent=opencode".into()]).is_ok());
+        assert!(parse_filters(vec!["account=work".into()]).is_ok());
+        assert!(parse_filters(vec!["bogus=x".into()]).is_err());
+    }
+
+    #[test]
+    fn apply_filters_match_by_agent_and_account() {
+        let panes = vec![
+            pane_with(libslop::Backend::Opencode, "oc", &[]),
+            pane_with(libslop::Backend::Claude, "work", &["prod"]),
+            pane_with(libslop::Backend::Claude, "default", &[]),
+        ];
+        let agent_oc = apply_filters(panes.clone(), &[("agent".into(), "opencode".into())]);
+        assert_eq!(agent_oc.len(), 1);
+        let acct = apply_filters(panes.clone(), &[("account".into(), "work".into())]);
+        assert_eq!(acct.len(), 1);
+        let claude_prod = apply_filters(panes, &[("agent".into(), "claude".into()), ("tag".into(), "prod".into())]);
+        assert_eq!(claude_prod.len(), 1);
+    }
+
     #[test]
     fn resolve_pane_id_or_session_passes_through_tmux_pane() {
         let (p, s) = resolve_pane_id_or_session(Some("%79".into()), None).unwrap();
@@ -2030,6 +2086,7 @@ mod tests {
             working_dir: None,
             transcript_path: None,
             account: libslop::DEFAULT_ACCOUNT.to_string(),
+            backend: libslop::Backend::Claude,
         }
     }
 

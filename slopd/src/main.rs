@@ -2089,6 +2089,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
         // A pane with no recorded account is on the default account (e.g. panes
         // from before this option existed, or the session's idle pane).
         let account = raw.opts.account.unwrap_or_else(|| libslop::DEFAULT_ACCOUNT.to_string());
+        let backend = raw.opts.backend.unwrap_or(libslop::Backend::Claude);
         panes.push(libslop::PaneInfo {
             pane_id: raw.pane_id,
             created_at,
@@ -2101,6 +2102,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             working_dir: raw.working_dir,
             transcript_path: raw.opts.transcript_path,
             account,
+            backend,
         });
     }
     Ok(panes)

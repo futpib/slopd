@@ -2554,7 +2554,7 @@ impl PaneDetailedState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     /// Unix timestamp when slopd spawned this pane (from @slopd_created_at).
@@ -2586,6 +2586,11 @@ pub struct PaneInfo {
     /// to [`DEFAULT_ACCOUNT`] for panes with no recorded account.
     #[serde(default = "default_account_name")]
     pub account: String,
+    /// The agent backend this pane runs (from @slopd_backend). Defaults to
+    /// [`Backend::Claude`] for panes with no recorded backend (e.g. created
+    /// before multi-backend support).
+    #[serde(default)]
+    pub backend: Backend,
 }
 
 /// Serde default for [`PaneInfo::account`]: the reserved default account name.
