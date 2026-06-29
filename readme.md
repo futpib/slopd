@@ -200,6 +200,21 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # CLI `--env` / `--env-file` override these.
 # env_files = ["~/.config/slopd/pane.env"]
 
+# Auto-continue a turn that ends with StopFailure (e.g. an API 500): slopd
+# injects a "continue" prompt after an exponential backoff so an unattended pane
+# recovers on its own instead of stalling until you nudge it (default: true).
+# auto_continue_on_failure = true
+# Give up after this many consecutive failed retries, then leave the pane idle
+# (default: 8 — with the defaults below, ~4m15s of retrying).
+# max_retry_attempts = 8
+# Delay before the first retry, in milliseconds; doubles each subsequent retry
+# (default: 1000).
+# initial_backoff_ms = 1000
+# Optional ceiling (milliseconds) on the backoff delay. Unset means the delay
+# keeps doubling uncapped (1s, 2s, 4s, …); set it to flatten the tail into steady
+# polling once the delay reaches this value (default: unset).
+# max_backoff_ms = 30000
+
 # [backup]
 # Back up the managed-pane set to disk and restore it after a reboot (see
 # "Backup and restore"). The two automatic behaviours are independent; manual
@@ -633,6 +648,18 @@ When slopd starts a Claude pane it automatically injects `slopctl hook <event>` 
 | Misc | `Notification` |
 
 Hook injection is **idempotent** and **concurrency-safe**: an exclusive advisory lock prevents duplicate entries even if multiple slopd processes run simultaneously.
+
+### Auto-continue on failure
+
+When a turn ends with `StopFailure` (e.g. Claude hit an API 500), it would otherwise just stop and wait for a human to resume it — bad for an unattended pane. slopd instead recovers on its own: it sends a `continue` prompt after an exponential backoff, retrying until the turn completes or the attempt cap is reached. The pane stays in the `ready` state throughout; the retry counter lives in per-pane metadata.
+
+The resend is **edge-triggered** by `StopFailure` (the end of a turn), not a periodic timer — so a `continue` that kicks off a long-running turn never provokes a second one while that turn is still going. Retrying stops as soon as any of these happens:
+
+- the turn finally succeeds (a clean `Stop`) — the counter resets, ready for a future failure;
+- `max_retry_attempts` consecutive failures are reached — slopd gives up and leaves the pane idle;
+- you submit a prompt yourself — taking over cancels any pending retry.
+
+All of this is configurable (or disabled) under `[run]` — see `auto_continue_on_failure`, `max_retry_attempts`, `initial_backoff_ms`, and `max_backoff_ms` in [slopd config](#slopd-config). With the defaults (8 attempts, 1s backoff doubling uncapped) a persistently-failing turn is retried over ~4m15s before slopd stops.
 
 ---
 
