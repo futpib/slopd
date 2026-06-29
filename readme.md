@@ -136,7 +136,7 @@ kill -HUP $(pgrep -x slopd)
 systemctl --user reload slopd
 ```
 
-The reload affects subsequent operations only — already-running Claude panes keep the executable, env, and `claude_config_dir` they were spawned with. Verbosity / log level cannot be changed at reload (re-start to apply). A malformed `config.toml` keeps the previous config; check the daemon log for the parse error. `slopctl status` exposes a `config_generation` counter that bumps on each successful reload.
+The reload affects subsequent operations only — already-running Claude panes keep the executable, env, and `config_dir` they were spawned with. Verbosity / log level cannot be changed at reload (re-start to apply). A malformed `config.toml` keeps the previous config; check the daemon log for the parse error. `slopctl status` exposes a `config_generation` counter that bumps on each successful reload.
 
 ---
 
@@ -146,14 +146,14 @@ The reload affects subsequent operations only — already-running Claude panes k
 
 File: `~/.config/slopd/config.toml`
 
-All defaults are fine for most setups. The only key you are likely to want to set is `claude_config_dir` if Claude's config lives somewhere other than `~/.claude`.
+All defaults are fine for most setups. The only key you are likely to want to set is `config_dir` if Claude's config lives somewhere other than `~/.claude`.
 
 ```toml
 # Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude). This sets
 # the dir for the reserved "default" account — the one used when no account is
 # selected. Equivalent to writing [accounts.default].
 # Supports ~ and $VAR / ${VAR} expansion (as do all account config dirs).
-# claude_config_dir = "~/.claude"
+# config_dir = "~/.claude"
 
 # Account used by `slopctl run` when no --account is given and none is inherited
 # from the current pane. Omit to fall back to the "default" account above.
@@ -166,7 +166,7 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # [accounts]
 # work = "~/.config/claude-work"            # shorthand: just the dir
 # [accounts.personal]
-# claude_config_dir = "~/.config/claude-personal"
+# config_dir = "~/.config/claude-personal"
 
 # [tmux]
 # Path to a custom tmux socket. When omitted slopd uses its default server.
@@ -234,7 +234,7 @@ All defaults are fine for most setups. The only key you are likely to want to se
 #### Multiple accounts
 
 Run different panes under different Claude config dirs. There is always a
-reserved account named `default`, backed by the top-level `claude_config_dir`
+reserved account named `default`, backed by the top-level `config_dir`
 (or `~/.claude`); define additional ones under `[accounts]`, each mapping a name
 to its own config (at minimum a config dir). The table form
 (`[accounts.<name>]`) is extensible — future per-account options live there.
@@ -252,7 +252,7 @@ variable to manage). Resolution order for each `run`:
 1. an explicit `--account <name>` flag;
 2. otherwise the account inherited from the current pane;
 3. otherwise slopd's `default_account`;
-4. otherwise the `default` account (`claude_config_dir`, or Claude's `~/.claude`).
+4. otherwise the `default` account (`config_dir`, or Claude's `~/.claude`).
 
 An unknown account name fails the `run` with an error listing the configured
 accounts, before any pane is spawned. Account config dirs support `~` and
@@ -644,7 +644,7 @@ OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drive
 ```toml
 [accounts.oc]
 backend = "opencode"                      # selects the opencode backend
-claude_config_dir = "~/.config/opencode"  # agent config dir (exported as OPENCODE_CONFIG_DIR)
+config_dir = "~/.config/opencode"  # agent config dir (exported as OPENCODE_CONFIG_DIR)
 ```
 
 ```bash
@@ -658,7 +658,7 @@ The `backend` and the executable resolve bidirectionally ("each implies the othe
 - `backend = "claude"` + `executable = "opencode"` → **error** (contradiction).
 - `executable = "/path/to/my-opencode-fork"` (unrecognized name) → treated as an executable override under the configured `backend` (default `claude`); set `backend = "opencode"` explicitly to drive a fork.
 
-Named accounts do **not** inherit the top-level `backend` (mirroring `claude_config_dir`); set it on each `[accounts.<name>]`.
+Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir`); set it on each `[accounts.<name>]`.
 
 ### What works identically
 

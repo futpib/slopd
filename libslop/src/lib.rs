@@ -204,7 +204,7 @@ pub enum TmuxOption {
     /// Marks the slopd-managed tmux session; value is "true"
     SlopdManaged,
     /// Stores the Claude session ID on a pane
-    SlopdClaudeSessionId,
+    SlopdSessionId,
     /// Comma-separated ancestor pane IDs (immediate parent first, then grandparent, etc.)
     SlopdAncestorPanes,
     /// Stores the simplified pane state
@@ -230,7 +230,7 @@ impl TmuxOption {
     pub fn as_str(&self) -> &'static str {
         match self {
             TmuxOption::SlopdManaged => "@slopd_managed",
-            TmuxOption::SlopdClaudeSessionId => "@slopd_claude_session_id",
+            TmuxOption::SlopdSessionId => "@slopd_session_id",
             TmuxOption::SlopdAncestorPanes => "@slopd_ancestor_panes",
             TmuxOption::SlopdState => "@slopd_state",
             TmuxOption::SlopdDetailedState => "@slopd_detailed_state",
@@ -1014,16 +1014,16 @@ mod tests {
     fn account_config_accepts_bare_string() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/claude-work\"\n");
         let acct = cfg.accounts.get("work").expect("work account missing");
-        assert_eq!(acct.claude_config_dir(), &PathBuf::from("/srv/claude-work"));
+        assert_eq!(acct.config_dir(), &PathBuf::from("/srv/claude-work"));
     }
 
     #[test]
     fn account_config_accepts_table_form() {
         let cfg = config_from_toml(
-            "[accounts.personal]\nclaude_config_dir = \"/srv/claude-personal\"\n",
+            "[accounts.personal]\nconfig_dir = \"/srv/claude-personal\"\n",
         );
         let acct = cfg.accounts.get("personal").expect("personal account missing");
-        assert_eq!(acct.claude_config_dir(), &PathBuf::from("/srv/claude-personal"));
+        assert_eq!(acct.config_dir(), &PathBuf::from("/srv/claude-personal"));
     }
 
     #[test]
@@ -1062,9 +1062,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_account_default_uses_top_level_claude_config_dir() {
-        // Top-level claude_config_dir backs the reserved "default" account.
-        let cfg = config_from_toml("claude_config_dir = \"/srv/legacy\"\n");
+    fn resolve_account_default_uses_top_level_config_dir() {
+        // Top-level config_dir backs the reserved "default" account.
+        let cfg = config_from_toml("config_dir = \"/srv/legacy\"\n");
         for requested in [None, Some(DEFAULT_ACCOUNT)] {
             let resolved = cfg.resolve_account(requested).unwrap();
             assert_eq!(resolved.name, DEFAULT_ACCOUNT);
@@ -1074,9 +1074,9 @@ mod tests {
 
     #[test]
     fn resolve_account_explicit_default_table_overrides_top_level() {
-        // [accounts.default] wins over the top-level claude_config_dir shorthand.
+        // [accounts.default] wins over the top-level config_dir shorthand.
         let cfg = config_from_toml(
-            "claude_config_dir = \"/srv/legacy\"\n[accounts]\ndefault = \"/srv/explicit\"\n",
+            "config_dir = \"/srv/legacy\"\n[accounts]\ndefault = \"/srv/explicit\"\n",
         );
         let resolved = cfg.resolve_account(Some(DEFAULT_ACCOUNT)).unwrap();
         assert_eq!(resolved.name, DEFAULT_ACCOUNT);
@@ -1113,21 +1113,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_account_expands_tilde_in_top_level_claude_config_dir() {
-        // The default account's top-level claude_config_dir is `~`-expanded too.
-        let cfg = config_from_toml("claude_config_dir = \"~/claude-default\"\n");
+    fn resolve_account_expands_tilde_in_top_level_config_dir() {
+        // The default account's top-level config_dir is `~`-expanded too.
+        let cfg = config_from_toml("config_dir = \"~/claude-default\"\n");
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(resolved.config_dir, Some(home_dir().join("claude-default")));
     }
 
     #[test]
-    fn claude_config_dir_method_expands_tilde_and_var() {
-        let cfg = config_from_toml("claude_config_dir = \"~/claude-default\"\n");
-        assert_eq!(cfg.claude_config_dir(), home_dir().join("claude-default"));
+    fn config_dir_method_expands_tilde_and_var() {
+        let cfg = config_from_toml("config_dir = \"~/claude-default\"\n");
+        assert_eq!(cfg.config_dir(), home_dir().join("claude-default"));
         // SAFETY: single-threaded test; no other thread reads this var concurrently.
         unsafe { std::env::set_var("SLOPD_TEST_CC_DIR", "/tmp/cc") };
-        let cfg = config_from_toml("claude_config_dir = \"$SLOPD_TEST_CC_DIR/sub\"\n");
-        assert_eq!(cfg.claude_config_dir(), PathBuf::from("/tmp/cc/sub"));
+        let cfg = config_from_toml("config_dir = \"$SLOPD_TEST_CC_DIR/sub\"\n");
+        assert_eq!(cfg.config_dir(), PathBuf::from("/tmp/cc/sub"));
     }
 
     // --- backend + executable resolution (model C) tests ---
@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn backend_explicit_opencode_defaults_executable() {
         // `backend = "opencode"` alone → spawn opencode (vice-versa).
-        let cfg = config_from_toml("[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n");
+        let cfg = config_from_toml("[accounts.oc]\nconfig_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n");
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
         assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
@@ -1155,7 +1155,7 @@ mod tests {
     fn backend_inferred_from_executable() {
         // `executable = "opencode"` alone → infer opencode.
         let cfg = config_from_toml(
-            "[run]\nexecutable = \"opencode\"\n[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\n",
+            "[run]\nexecutable = \"opencode\"\n[accounts.oc]\nconfig_dir = \"~/.config/opencode\"\n",
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
@@ -1174,7 +1174,7 @@ mod tests {
     fn backend_conflict_between_explicit_and_executable_errors() {
         // backend = "claude" + executable = "opencode" → contradiction.
         let cfg = config_from_toml(
-            "[accounts.bad]\nclaude_config_dir = \"x\"\nbackend = \"claude\"\nexecutable = \"opencode\"\n",
+            "[accounts.bad]\nconfig_dir = \"x\"\nbackend = \"claude\"\nexecutable = \"opencode\"\n",
         );
         let err = cfg.resolve_account(Some("bad")).unwrap_err();
         assert!(err.contains("conflict"), "expected conflict error: {}", err);
@@ -1184,7 +1184,7 @@ mod tests {
     fn backend_custom_executable_is_override_not_inferred() {
         // Unrecognized executable + explicit backend → override, no conflict.
         let cfg = config_from_toml(
-            "[accounts.oc]\nclaude_config_dir = \"x\"\nbackend = \"opencode\"\nexecutable = \"/opt/my-oc-fork\"\n",
+            "[accounts.oc]\nconfig_dir = \"x\"\nbackend = \"opencode\"\nexecutable = \"/opt/my-oc-fork\"\n",
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
@@ -1196,7 +1196,7 @@ mod tests {
         // Unrecognized executable alone can't be inferred → Claude (inference is
         // recognized-names only; custom paths need an explicit backend).
         let cfg = config_from_toml(
-            "[accounts.oc]\nclaude_config_dir = \"x\"\nexecutable = \"/opt/my-oc-fork\"\n",
+            "[accounts.oc]\nconfig_dir = \"x\"\nexecutable = \"/opt/my-oc-fork\"\n",
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Claude);
@@ -1205,9 +1205,9 @@ mod tests {
 
     #[test]
     fn backend_per_account_does_not_inherit_top_level() {
-        // Top-level `backend` backs only the default account, like claude_config_dir.
+        // Top-level `backend` backs only the default account, like config_dir.
         let cfg = config_from_toml(
-            "backend = \"opencode\"\n[accounts.work]\nclaude_config_dir = \"x\"\n",
+            "backend = \"opencode\"\n[accounts.work]\nconfig_dir = \"x\"\n",
         );
         assert_eq!(cfg.resolve_account(None).unwrap().backend, Backend::Opencode);
         assert_eq!(cfg.resolve_account(Some("work")).unwrap().backend, Backend::Claude);
@@ -1217,7 +1217,7 @@ mod tests {
     fn backend_account_table_overrides_global_executable() {
         // Per-account executable wins over the global `[run] executable`.
         let cfg = config_from_toml(
-            "[run]\nexecutable = \"claude\"\n[accounts.oc]\nclaude_config_dir = \"x\"\nexecutable = \"opencode\"\n",
+            "[run]\nexecutable = \"claude\"\n[accounts.oc]\nconfig_dir = \"x\"\nexecutable = \"opencode\"\n",
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
@@ -1247,8 +1247,8 @@ mod tests {
     fn backend_all_settings_paths_skips_non_claude() {
         // Hook injection targets are Claude-only.
         let cfg = config_from_toml(
-            "[accounts.oc]\nclaude_config_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n\
-             [accounts.work]\nclaude_config_dir = \"~/.config/claude-work\"\n",
+            "[accounts.oc]\nconfig_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n\
+             [accounts.work]\nconfig_dir = \"~/.config/claude-work\"\n",
         );
         let paths = cfg.all_settings_paths();
         // Only the default (claude) + work (claude) accounts; oc (opencode) skipped.
@@ -1370,7 +1370,7 @@ mod tests {
     fn resolved_settings_path_default_matches_claude_settings_path() {
         // For the unnamed default, resolved_settings_path must equal the legacy
         // claude_settings_path so startup/shutdown hook management stays consistent.
-        let cfg = config_from_toml("claude_config_dir = \"/srv/legacy\"\n");
+        let cfg = config_from_toml("config_dir = \"/srv/legacy\"\n");
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(cfg.resolved_settings_path(&resolved), cfg.claude_settings_path());
     }
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn all_settings_paths_includes_default_and_accounts_deduped() {
         let cfg = config_from_toml(
-            "claude_config_dir = \"/srv/legacy\"\n\
+            "config_dir = \"/srv/legacy\"\n\
              [accounts]\nwork = \"/srv/work\"\npersonal = \"/srv/legacy\"\n",
         );
         let paths = cfg.all_settings_paths();
@@ -1445,11 +1445,12 @@ pub struct SlopdConfig {
     pub run: SlopdRunConfig,
     #[serde(default)]
     pub backup: SlopdBackupConfig,
-    /// Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude) for the
-    /// reserved [`DEFAULT_ACCOUNT`] account — the one used when no account is
-    /// selected. Shorthand for `[accounts.default] claude_config_dir = ...`.
-    /// Supports `~` and `$VAR` / `${VAR}` expansion.
-    pub claude_config_dir: Option<PathBuf>,
+    /// Agent config dir for the reserved [`DEFAULT_ACCOUNT`] (the account used
+    /// when no account is selected). Exported as `CLAUDE_CONFIG_DIR` (Claude) or
+    /// `OPENCODE_CONFIG_DIR` (opencode). Supports `~` and `$VAR` / `${VAR}`
+    /// expansion.
+    #[serde(alias = "claude_config_dir")]
+    pub config_dir: Option<PathBuf>,
     /// Backend for the reserved [`DEFAULT_ACCOUNT`] (the account used when no
     /// account is selected). Shorthand for `[accounts.default] backend = ...`.
     /// Named accounts do **not** inherit this — set `backend` on each
@@ -1459,7 +1460,7 @@ pub struct SlopdConfig {
     pub backend: Option<Backend>,
     /// Named Claude accounts. Each maps an account name to its own configuration
     /// (at minimum a Claude config dir, the per-account equivalent of
-    /// `claude_config_dir`). Select one for a pane with
+    /// `config_dir`). Select one for a pane with
     /// `slopctl run --account <name>`; child panes inherit their parent's
     /// account unless overridden. The name `default` is reserved (see
     /// [`DEFAULT_ACCOUNT`]).
@@ -1480,7 +1481,7 @@ pub struct SlopdConfig {
 
 /// The reserved account name used when nothing else selects one. Its config dir
 /// comes from `[accounts.default]` if present, otherwise the top-level
-/// `claude_config_dir`, otherwise Claude's own `~/.claude`.
+/// `config_dir`, otherwise Claude's own `~/.claude`.
 pub const DEFAULT_ACCOUNT: &str = "default";
 
 /// Configuration for a single named account. Accepts either a bare string (the
@@ -1492,12 +1493,12 @@ pub const DEFAULT_ACCOUNT: &str = "default";
 /// work = "~/.config/claude-work"          # shorthand: just the dir
 ///
 /// [accounts.personal]
-/// claude_config_dir = "~/.config/claude-personal"   # table form (extensible)
+/// config_dir = "~/.config/claude-personal"   # table form (extensible)
 /// ```
 ///
 /// The table form is where future per-account options live (see
 /// [`AccountSettings`]); the bare-string form is sugar for a table with only
-/// `claude_config_dir` set.
+/// `config_dir` set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AccountConfig {
@@ -1514,9 +1515,8 @@ pub enum AccountConfig {
 pub struct AccountSettings {
     /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
     /// for [`Backend::Claude`] or `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`]).
-    /// The field name is historical; it is the agent config dir regardless of
-    /// backend.
-    pub claude_config_dir: PathBuf,
+    #[serde(alias = "claude_config_dir")]
+    pub config_dir: PathBuf,
     /// Agent backend for this account. When unset, the backend is derived — see
     /// [`Backend::resolve`].
     #[serde(default)]
@@ -1529,10 +1529,10 @@ pub struct AccountSettings {
 
 impl AccountConfig {
     /// The account's agent config directory, as written in config (unexpanded).
-    pub fn claude_config_dir(&self) -> &PathBuf {
+    pub fn config_dir(&self) -> &PathBuf {
         match self {
             AccountConfig::Dir(p) => p,
-            AccountConfig::Settings(s) => &s.claude_config_dir,
+            AccountConfig::Settings(s) => &s.config_dir,
         }
     }
 
@@ -1952,15 +1952,15 @@ impl SlopdConfig {
         }
     }
 
-    pub fn claude_config_dir(&self) -> PathBuf {
-        self.claude_config_dir
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_dir
             .as_deref()
             .map(expand_path)
             .unwrap_or_else(|| home_dir().join(".claude"))
     }
 
     pub fn claude_settings_path(&self) -> PathBuf {
-        self.claude_config_dir().join("settings.json")
+        self.config_dir().join("settings.json")
     }
 
     /// Resolve a requested account name into the account in effect and the
@@ -1969,11 +1969,11 @@ impl SlopdConfig {
     /// The account name is `requested`, else `default_account`, else
     /// [`DEFAULT_ACCOUNT`]. The dir is then:
     /// - for [`DEFAULT_ACCOUNT`]: `[accounts.default]` if present, else the
-    ///   top-level `claude_config_dir`, else `None` (Claude's `~/.claude`);
+    ///   top-level `config_dir`, else `None` (Claude's `~/.claude`);
     /// - for any other name: `[accounts.<name>]`, or an error (listing the
     ///   configured accounts) if it is not configured.
     ///
-    /// All config dirs — named accounts and the top-level `claude_config_dir` —
+    /// All config dirs — named accounts and the top-level `config_dir` —
     /// are `~` / `$VAR`-expanded.
     pub fn resolve_account(&self, requested: Option<&str>) -> Result<ResolvedAccount, String> {
         let name = requested
@@ -1982,12 +1982,12 @@ impl SlopdConfig {
             .unwrap_or_else(|| DEFAULT_ACCOUNT.to_string());
 
         // The default account is backed by [accounts.default], then the
-        // top-level claude_config_dir, then ~/.claude (left unset).
+        // top-level config_dir, then ~/.claude (left unset).
         if name == DEFAULT_ACCOUNT {
             let acct = self.accounts.get(DEFAULT_ACCOUNT);
             let config_dir = acct
-                .map(|a| expand_path(a.claude_config_dir()))
-                .or_else(|| self.claude_config_dir.as_deref().map(expand_path));
+                .map(|a| expand_path(a.config_dir()))
+                .or_else(|| self.config_dir.as_deref().map(expand_path));
             // Backend/executable: [accounts.default] wins over the top-level
             // `backend` / `[run] executable`; the top-level values back ONLY the
             // default account (named accounts don't inherit them).
@@ -2010,13 +2010,13 @@ impl SlopdConfig {
         })?;
         // Named accounts: per-account backend/executable, falling back to the
         // global `[run] executable` (but NOT the top-level `backend`, which is
-        // default-account-only, matching `claude_config_dir`).
+        // default-account-only, matching `config_dir`).
         let explicit_backend = account.backend();
         let explicit_executable = account.executable().or(self.run.executable.as_ref());
         let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
         Ok(ResolvedAccount {
             name,
-            config_dir: Some(expand_path(account.claude_config_dir())),
+            config_dir: Some(expand_path(account.config_dir())),
             backend,
             executable,
         })
@@ -2385,7 +2385,7 @@ pub enum RequestBody {
         env: Vec<(String, String)>,
         /// Named account to launch the pane under. The daemon resolves it to a
         /// Claude config dir via `[accounts]`. `None` means the daemon default
-        /// (`default_account`, else the unnamed `claude_config_dir`).
+        /// (`default_account`, else the unnamed `config_dir`).
         #[serde(default)]
         account: Option<String>,
         /// Override the pane's agent backend (`--backend`). `None` = use the

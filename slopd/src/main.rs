@@ -2218,7 +2218,11 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
         let val = words.next().unwrap_or("").trim().trim_matches('"');
         if key == libslop::TmuxOption::SlopdManaged.as_str() {
             slopd_managed = val == "true";
-        } else if key == libslop::TmuxOption::SlopdClaudeSessionId.as_str() {
+        } else if key == libslop::TmuxOption::SlopdSessionId.as_str()
+            || key == "@slopd_claude_session_id" {
+            // The second clause is a migration fallback: panes created before the
+            // rename still carry the old option name. Reading both lets daemon
+            // recovery pick up existing panes after a deploy.
             session_id = Some(val.to_string());
         } else if key == libslop::TmuxOption::SlopdAncestorPanes.as_str() {
             ancestor_panes = val.split(',')
@@ -2482,7 +2486,7 @@ async fn read_pane_manifest(manifest_path: &std::path::Path) -> Vec<libslop::Pan
 /// Everything that differs between the two ways slopd launches a Claude pane
 /// (`run` and restore). Everything they *share* — resolving the executable to
 /// an absolute path and building the `tmux new-window` command — lives in
-/// [`spawn_claude_pane`], the single chokepoint both go through.
+/// [`spawn_pane`], the single chokepoint both go through.
 #[derive(Default)]
 struct SpawnSpec {
     /// `-c` working directory for the new pane (also the cwd a relative
@@ -2519,7 +2523,7 @@ struct SpawnSpec {
 /// Returns the new pane id, or an error string if the executable can't be
 /// resolved (so the caller can surface it / preserve the manifest) or tmux
 /// fails.
-async fn spawn_claude_pane(
+async fn spawn_pane(
     config: &Arc<libslop::SlopdConfig>,
     session_lock: &SessionLock,
     spec: &SpawnSpec,
@@ -2606,7 +2610,7 @@ async fn spawn_claude_pane(
 /// Whether the configured Claude executable resolves on slopd's PATH. Used as a
 /// pre-flight for the startup restore decision: if it can't be resolved we keep
 /// the manifest as a pending restore (rather than spawn panes that fail) until
-/// the user fixes their PATH. The actual spawn in [`spawn_claude_pane`] resolves
+/// the user fixes their PATH. The actual spawn in [`spawn_pane`] resolves
 /// it again to an absolute path, so this only gates *whether* to attempt a
 /// restore, never how the executable is located.
 fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
@@ -2766,7 +2770,7 @@ async fn restore_panes(
             // No OPENCODE_SERVER_PASSWORD: the opencode TUI's internal client
             // can't auth to its own server and would crash on startup (verified
             // against real opencode). The server is open on 127.0.0.1.
-            let id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
+            let id = match spawn_pane(config, session_lock, &SpawnSpec {
                 working_dir: working_dir.clone(),
                 config_dir: resolved.config_dir.clone(),
                 backend: resolved.backend,
@@ -2820,7 +2824,7 @@ async fn restore_panes(
                 .as_deref()
                 .and_then(transcript_launch_cwd)
                 .or_else(|| working_dir.clone());
-            match spawn_claude_pane(config, session_lock, &SpawnSpec {
+            match spawn_pane(config, session_lock, &SpawnSpec {
                 working_dir: launch_dir,
                 config_dir: resolved.config_dir.clone(),
                 backend: resolved.backend,
@@ -2848,7 +2852,7 @@ async fn restore_panes(
         // Set the session id directly so `ps` is correct immediately; the
         // SessionStart hook will re-set the same id once the session resumes
         // (plain --resume continues the session rather than forking it).
-        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), &session_id).await;
+        let _ = tmux_set_pane_option(config, &new_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
 
         // Remap ancestry: the parent's new id, prepended to the parent's own
         // (already-remapped) chain. Truncates at any ancestor that wasn't
@@ -3043,7 +3047,7 @@ async fn handle_request(
             if event == "SessionStart"
                 && let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
-                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), session_id).await {
+                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdSessionId.as_str(), session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
                 }
@@ -3274,7 +3278,7 @@ async fn handle_request(
             // Spawn through the shared chokepoint, which resolves the executable
             // to an absolute path (so the pane can't fail to find it on its PATH)
             // and surfaces a clear error if it's missing.
-            let output = spawn_claude_pane(config, session_lock, &SpawnSpec {
+            let output = spawn_pane(config, session_lock, &SpawnSpec {
                 working_dir: effective_start_dir.as_ref().and_then(|d| d.to_str().map(str::to_string)),
                 config_dir: resolved.config_dir.clone(),
                 backend: resolved.backend,
@@ -3326,7 +3330,7 @@ async fn handle_request(
                             }
                         };
                         if !session_id.is_empty() {
-                            let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdClaudeSessionId.as_str(), &session_id).await;
+                            let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
                         }
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
                         let pane_state = panes.get_or_insert(&pane_id);
