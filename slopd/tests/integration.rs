@@ -9936,4 +9936,72 @@ fn run_backend_flag_overrides_to_opencode_without_an_account() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn opencode_pane_restores_across_reboot() {
+    // A pane created via `--backend opencode` is backed up with backend=opencode,
+    // and after a simulated reboot slopd restores it with `opencode -s <id>` over a
+    // fresh HTTP port + reattaches the driver — exercising the opencode restore path.
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    env.append_config("[backup]\nauto_restore = true");
+
+    // --- first boot: run an opencode pane, let it reach ready, snapshot ---
+    let slopd1 = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty(), "slopctl run --backend opencode failed");
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    sigint_child(slopd1); // clean shutdown → writes the manifest
+
+    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
+    let manifest: Vec<libslop::PaneInfo> = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let entry = manifest.iter().find(|p| p.session_id.as_deref() == Some("ses_mock"))
+        .expect("opencode pane should be in the manifest");
+    assert_eq!(entry.backend, libslop::Backend::Opencode,
+        "manifest must record the opencode backend so restore dispatches correctly");
+
+    // --- simulate reboot: destroy the slopd tmux session (and its panes) ---
+    let kill = env.tmux.tmux().args(["kill-session", "-t", "slopd"]).status().unwrap();
+    assert!(kill.success(), "failed to kill slopd tmux session");
+
+    // --- second boot: auto-restore re-spawns opencode -s + reattaches driver ---
+    let slopd2 = env.spawn_slopd();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let restored = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        if let Some(p) = panes.into_iter().find(|p| p.session_id.as_deref() == Some("ses_mock")) {
+            break p;
+        }
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("opencode pane was not restored within timeout");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    assert_eq!(restored.backend, libslop::Backend::Opencode, "restored pane should be opencode");
+    assert_ne!(restored.pane_id, pane_id, "restored pane should have a new tmux id");
+    // The reattached driver should advance it to ready again.
+    wait_until_ready(&env, &restored.pane_id, Duration::from_secs(15));
+
+    kill_slopd(slopd2);
+}
+
+/// Poll `pane_state` until the pane is Ready, panicking after `timeout`.
+fn wait_until_ready(env: &TestEnv, pane_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if env.pane_state(pane_id).1 == libslop::PaneDetailedState::Ready {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("pane {} did not reach ready within {:?}", pane_id, timeout);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 

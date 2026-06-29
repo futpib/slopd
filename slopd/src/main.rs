@@ -2435,46 +2435,109 @@ async fn restore_panes(
         }
 
         // Resolve the account (falling back to default if it was removed from
-        // config) and inject its hooks before spawning, like the run handler.
-        let resolved = config
+        // config) for its executable + config dir. The BACKEND is taken from the
+        // manifest entry (authoritative — a pane created via `--backend opencode`
+        // on the default account must restore as opencode even though the default
+        // account now resolves to claude).
+        let mut resolved = config
             .resolve_account(Some(account.as_str()))
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
-        // OpenCode reboot-restore is not yet wired (it needs a fresh port/token
-        // allocation + `-s <id>` spawn + driver re-attach, not `--resume`). Skip
-        // rather than mis-spawn; the session survives in the opencode DB and can
-        // be resumed manually with `opencode -s <id>`.
-        if resolved.backend == libslop::Backend::Opencode {
-            warn!("backup: skipping opencode pane {} (session {}) — reboot-restore for opencode is not yet supported", old_id, session_id);
-            continue;
+        let manifest_backend = p.backend;
+        if resolved.backend != manifest_backend {
+            resolved.backend = manifest_backend;
+            // Recompute the executable to match: keep a custom/unrecognized path,
+            // else swap a recognized name to the backend's canonical binary.
+            resolved.executable = match libslop::Backend::infer_from_program(resolved.executable.program()) {
+                Some(inferred) if inferred == manifest_backend => resolved.executable.clone(),
+                Some(_) => libslop::Executable::String(manifest_backend.canonical_executable().to_string()),
+                None => resolved.executable.clone(),
+            };
         }
-        let settings_path = config.resolved_settings_path(&resolved);
-        if resolved.backend.uses_injected_hooks() {
+        // Resume the recorded session. Claude: `claude --resume` from the launch
+        // cwd. OpenCode: `opencode -s <id>` over a freshly-allocated HTTP port,
+        // then reattach the status-poll driver.
+        let new_id = if resolved.backend == libslop::Backend::Opencode {
+            let port = match opencode::alloc_port() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("backup: failed to allocate opencode port for pane {} (session {}): {}", old_id, session_id, e);
+                    continue;
+                }
+            };
+            let token = opencode::random_token();
+            let env = vec![
+                ("OPENCODE_SERVER_PASSWORD".to_string(), token.clone()),
+                ("OPENCODE_SERVER_USERNAME".to_string(), "opencode".to_string()),
+            ];
+            let id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
+                working_dir: working_dir.clone(),
+                config_dir: resolved.config_dir.clone(),
+                backend: resolved.backend,
+                executable: resolved.executable.clone(),
+                extra_env: env,
+                trailing_args: vec![
+                    "-s".to_string(),
+                    session_id.clone(),
+                    "--port".to_string(),
+                    port.to_string(),
+                    "--hostname".to_string(),
+                    "127.0.0.1".to_string(),
+                ],
+            }).await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("backup: failed to restore opencode pane {} (session {}): {}", old_id, session_id, e);
+                    continue;
+                }
+            };
+            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdBackend.as_str(), "opencode").await;
+            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
+            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdOpencodeToken.as_str(), &token).await;
+            let client = opencode::OpencodeClient::new(port, Some(token));
+            let driver_cancel = tokio_util::sync::CancellationToken::new();
+            let pane_state = panes.get_or_insert(&id);
+            *pane_state.opencode.lock().unwrap() = Some(OpencodeState {
+                client: client.clone(),
+                session_id: session_id.clone(),
+            });
+            *pane_state.opencode_cancel.lock().unwrap() = driver_cancel.clone();
+            tokio::spawn(run_opencode_driver(
+                client,
+                session_id.clone(),
+                id.clone(),
+                config.clone(),
+                panes.clone(),
+                event_tx.clone(),
+                driver_cancel,
+            ));
+            id
+        } else {
+            let settings_path = config.resolved_settings_path(&resolved);
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
                 warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
             }
-        }
-
-        // `claude --resume` finds the session via the project dir of its launch
-        // cwd (the dir Claude was started in). `working_dir` is pane_current_path,
-        // which drifts when the agent `cd`s, so prefer the transcript's recorded
-        // launch cwd; fall back to working_dir when there's no transcript.
-        let launch_dir = transcript_path
-            .as_deref()
-            .and_then(transcript_launch_cwd)
-            .or_else(|| working_dir.clone());
-        let new_id = match spawn_claude_pane(config, session_lock, &SpawnSpec {
-            working_dir: launch_dir,
-            config_dir: resolved.config_dir.clone(),
-            backend: resolved.backend,
-            executable: resolved.executable.clone(),
-            extra_env: Vec::new(),
-            trailing_args: vec!["--resume".to_string(), session_id.clone()],
-        }).await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("backup: failed to restore pane {} (session {}): {}", old_id, session_id, e);
-                continue;
+            // `claude --resume` finds the session via the project dir of its launch
+            // cwd (the dir Claude was started in). `working_dir` is pane_current_path,
+            // which drifts when the agent `cd`s, so prefer the transcript's recorded
+            // launch cwd; fall back to working_dir when there's no transcript.
+            let launch_dir = transcript_path
+                .as_deref()
+                .and_then(transcript_launch_cwd)
+                .or_else(|| working_dir.clone());
+            match spawn_claude_pane(config, session_lock, &SpawnSpec {
+                working_dir: launch_dir,
+                config_dir: resolved.config_dir.clone(),
+                backend: resolved.backend,
+                executable: resolved.executable.clone(),
+                extra_env: Vec::new(),
+                trailing_args: vec!["--resume".to_string(), session_id.clone()],
+            }).await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("backup: failed to restore pane {} (session {}): {}", old_id, session_id, e);
+                    continue;
+                }
             }
         };
 

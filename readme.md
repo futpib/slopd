@@ -665,7 +665,6 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `claude_con
 ### Current limitations
 
 - **State fidelity**: opencode's `/session/status` is mapped onto slopd's states best-effort; some granular Claude states (e.g. `busy_subagent`, `awaiting_input_elicitation`) may collapse to the nearest equivalent until finer opencode signals are confirmed against a real server.
-- **Reboot restore**: opencode panes are tracked live and survive a *daemon* restart, but are **not** auto-respawned after a reboot yet (`opencode -s <id>` restore is pending). The session survives in the opencode DB and can be resumed manually.
 - **Live transcript streaming**: `slopctl transcript` (pull) works; live `listen --transcript` streaming for opencode is pending (SSE `GET /event`).
 
 ---
