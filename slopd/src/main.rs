@@ -1431,7 +1431,9 @@ async fn reconcile_panes(
 
     // Test hook: simulate the production failure mode where `tmux list-panes`
     // transiently returned without our managed panes.  Used by the reconcile
-    // false-positive regression test.
+    // false-positive regression test. Compiled only under the `testing` feature so
+    // the env-var branch never exists in a production daemon.
+    #[cfg(feature = "testing")]
     let (present_ids, dead_panes) = if std::env::var("SLOPD_TEST_RECONCILE_FORCE_EMPTY").is_ok() {
         (std::collections::HashSet::new(), std::collections::HashMap::new())
     } else {
