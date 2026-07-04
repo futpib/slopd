@@ -120,6 +120,20 @@ fn handle(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
+    // Test hook: append every incoming request to a log file so a test can prove
+    // whether slopd's driver is still talking to this server. Used by the
+    // driver-teardown regression test, which stands a fresh mock on a killed
+    // pane's port and asserts a properly-cancelled driver never reconnects.
+    // Compiled only under the `testing` feature so the hook never exists outside
+    // tests.
+    #[cfg(feature = "testing")]
+    if let Ok(log_path) = std::env::var("MOCK_OPENCODE_CONN_LOG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "{} {}", method, path);
+        }
+    }
+
     if path == "/event" {
         // SSE stream — long-lived, handled in its own thread.
         stream_sse(state, stream);

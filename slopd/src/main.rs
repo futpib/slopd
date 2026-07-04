@@ -335,6 +335,16 @@ impl PaneState {
     fn is_opencode(&self) -> bool {
         self.opencode.lock().unwrap().is_some()
     }
+
+    /// Stop every background task attached to this pane. Called from every
+    /// teardown path (explicit kill + both reconcile-driven reaps) so a pane that
+    /// exits keeps nothing running behind it. For opencode panes this is what
+    /// stops the SSE reader + backstop poll from reconnecting to a now-dead server
+    /// forever; Claude panes only have the transcript tailer.
+    fn cancel_drivers(&self) {
+        self.transcript_cancel.lock().unwrap().cancel();
+        self.opencode_cancel.lock().unwrap().cancel();
+    }
 }
 
 /// OpenCode pane driver. Real-time state + transcript come from the server's SSE
@@ -1467,7 +1477,7 @@ async fn reconcile_panes(
         info!("pane {} no longer exists, emitting PaneDestroyed", pane_id);
         reparent_children_of(config, managed_panes, &pane_id).await;
         if let Some(state) = panes.remove(&pane_id) {
-            state.transcript_cancel.lock().unwrap().cancel();
+            state.cancel_drivers();
         }
         managed_panes.remove(&pane_id);
         let _ = event_tx.send(libslop::Record {
@@ -1545,7 +1555,7 @@ async fn handle_dead_pane(
     );
     reparent_children_of(config, managed_panes, pane_id).await;
     if let Some(state) = panes.remove(pane_id) {
-        state.transcript_cancel.lock().unwrap().cancel();
+        state.cancel_drivers();
     }
     managed_panes.remove(pane_id);
 
@@ -3010,7 +3020,7 @@ async fn handle_request(
                 _ => {}
             }
             if let Some(state) = panes.remove(&pane_id) {
-                state.transcript_cancel.lock().unwrap().cancel();
+                state.cancel_drivers();
             }
             managed_panes.remove(&pane_id);
             let _ = event_tx.send(libslop::Record {
@@ -3383,6 +3393,7 @@ async fn handle_request(
                                 String::new()
                             }
                         };
+                        let driver_cancel = tokio_util::sync::CancellationToken::new();
                         if !session_id.is_empty() {
                             let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
                             // Point the TUI at the session slopd drives, so the pane
@@ -3394,19 +3405,28 @@ async fn handle_request(
                             // re-assert it a few times over the first couple seconds;
                             // it's idempotent, and once the TUI honors it (and emits
                             // tui.session.select) the SSE follow keeps the two in sync.
+                            // Shares the driver cancel token so it stops immediately if
+                            // the pane is killed mid-boot (rather than poking a dead
+                            // server for the rest of its 10 attempts).
                             let client = client.clone();
                             let sid = session_id.clone();
                             let pane = pane_id.clone();
+                            let cancel = driver_cancel.clone();
                             tokio::spawn(async move {
                                 for _ in 0..10 {
+                                    if cancel.is_cancelled() {
+                                        return;
+                                    }
                                     if let Err(e) = client.select_session(&sid).await {
                                         debug!("opencode pane {}: select-session attempt failed: {}", pane, e);
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => return,
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                                    }
                                 }
                             });
                         }
-                        let driver_cancel = tokio_util::sync::CancellationToken::new();
                         let pane_state = panes.get_or_insert(&pane_id);
                         *pane_state.opencode.lock().unwrap() = Some(OpencodeState {
                             client: client.clone(),

@@ -10139,6 +10139,119 @@ fn opencode_fresh_pane_becomes_ready_not_stuck_booting() {
 }
 
 #[test]
+fn opencode_driver_stops_reconnecting_after_pane_death() {
+    // Regression: tearing down an opencode pane must cancel its HTTP driver (the
+    // SSE reader + backstop poll). Before the fix, every teardown path cancelled
+    // only the transcript tailer, so the opencode driver kept reconnecting to its
+    // now-dead server forever — slopd accumulated a "graveyard" of killed panes it
+    // polled indefinitely.
+    //
+    // We can't observe the leak against the pane's own server (killing the pane
+    // kills that server too). Instead we kill the pane, stand a FRESH mock on the
+    // same freed port that logs every request it receives, and assert the
+    // (should-be-cancelled) driver never connects to it. A leaked driver would
+    // reconnect within a couple of backoff cycles and leave log lines behind.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+    let conn_log_dir = tempfile::tempdir().unwrap();
+    let conn_log = conn_log_dir.path().join("conns.log");
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    let run_out = env.slopctl(&["run", "--account", "oc"]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "slopctl run --account oc failed: {:?}", run_out.status);
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // Read the port slopd allocated for this pane's embedded server.
+    let opt = env
+        .tmux
+        .tmux()
+        .args(["show-options", "-p", "-t", &pane_id, "@slopd_opencode_port"])
+        .output()
+        .expect("show-options");
+    let port: u16 = String::from_utf8_lossy(&opt.stdout)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no @slopd_opencode_port on pane {}", pane_id));
+
+    // Kill the pane. This kills the in-pane mock (freeing the port) and, with the
+    // fix, cancels the opencode driver.
+    let kill_out = env.slopctl(&["kill", &pane_id]);
+    assert!(kill_out.status.success(), "slopctl kill failed: {:?}", kill_out.status);
+
+    // Wait for the old server to be gone (connection refused) so the fresh mock
+    // can bind the same port.
+    let addr = format!("127.0.0.1:{}", port);
+    let free_deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+    {
+        if Instant::now() > free_deadline {
+            panic!("in-pane mock on port {} never exited after kill", port);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Stand a fresh mock on the same port, logging every request it receives.
+    let mut standalone = Command::new(&mock_opencode)
+        .args(["--port", &port.to_string(), "--hostname", "127.0.0.1"])
+        .env("MOCK_OPENCODE_CONN_LOG", &conn_log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn standalone mock_opencode");
+
+    // Wait until it's listening.
+    let up_deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        Duration::from_millis(200),
+    )
+    .is_err()
+    {
+        if Instant::now() > up_deadline {
+            let _ = standalone.kill();
+            kill_slopd(slopd);
+            panic!("standalone mock failed to bind port {}", port);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Give a leaked driver ample time to reconnect. Its SSE reader retries with
+    // backoff (starting at 1s) and the backstop poll runs every 3s, so several
+    // seconds is plenty for at least one connection in the unfixed case.
+    std::thread::sleep(Duration::from_secs(8));
+
+    let _ = standalone.kill();
+    let _ = standalone.wait();
+    kill_slopd(slopd);
+
+    let connections = std::fs::read_to_string(&conn_log).unwrap_or_default();
+    let count = connections.lines().count();
+    assert_eq!(
+        count, 0,
+        "cancelled opencode driver must not reconnect to a dead pane's port; \
+         saw {} request(s) to the replacement server:\n{}",
+        count, connections,
+    );
+}
+
+#[test]
 fn run_backend_flag_overrides_to_opencode_without_an_account() {
     // `slopctl run --backend opencode` with no opencode account declared: the
     // flag flips the default account's backend to opencode and, because the
