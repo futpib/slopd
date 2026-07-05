@@ -786,6 +786,123 @@ fn run_surfaces_crash_output_and_exit_status() {
         "no pane id should be printed for a pane that died; got stdout: {:?}", stdout);
 }
 
+/// A crashed pane's captured death screen must survive in slopd's own log, not
+/// just in the PaneDestroyed broadcast: the broadcast is ephemeral, so when a
+/// pane dies while nobody is running `slopctl listen` (the common case — an
+/// agent crashing overnight), the only durable record of WHY is the warn line
+/// slopd writes (journald under systemd). Spawn slopd with stderr captured at
+/// RUST_LOG=warn, crash a mock_claude pane with a recognizable message, and
+/// assert the message and exit status land in the log.
+#[test]
+fn dead_pane_output_is_logged_for_claude_backend() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let marker = "FATAL: mock claude crashed for the log test";
+    let Some(env) = TestEnv::new(Some(&[&mock_claude_path, "--crash-output", marker])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let mut slopd = env.spawn_slopd_with_stderr_captured();
+
+    // Subscribe before spawning so the PaneDestroyed emitted by the reconciler
+    // (which fires AFTER the warn line is written) can't be missed.
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+
+    // Read the log after shutdown so it is complete (EOF on slopd exit).
+    let mut stderr = slopd.stderr.take().expect("slopd stderr is piped");
+    kill_slopd(slopd);
+    let mut log = String::new();
+    {
+        use std::io::Read as _;
+        stderr.read_to_string(&mut log).expect("read slopd stderr");
+    }
+
+    assert!(log.contains(marker),
+        "slopd log should contain the pane's dying words; got: {}", log);
+    assert!(log.contains(&format!("pane {} death output (exit status Some(37))", pane_id)),
+        "slopd log should name the pane and exit status; got: {}", log);
+}
+
+/// Same guarantee for the opencode backend: an opencode pane that crashes on
+/// launch (before ever binding its port) must leave its death screen in slopd's
+/// log. The dead-pane capture is backend-agnostic — this pins that it stays so.
+#[test]
+fn dead_pane_output_is_logged_for_opencode_backend() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+
+    let mock_opencode_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let marker = "FATAL: mock opencode crashed for the log test";
+    let Some(env) = TestEnv::new_full(None, None, None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    // An opencode account whose executable is the mock in crash mode: it prints
+    // the marker and exits 37 before binding the assigned port.
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = [{:?}, \"--crash-output\", {:?}]\nclaude_config_dir = {:?}\n",
+        mock_opencode_path,
+        marker,
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let mut slopd = env.spawn_slopd_with_stderr_captured();
+
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    // Spawn `run` without waiting for its reply: the Run handler holds the
+    // response for up to 20s retrying ensure_session against the opencode
+    // server that never binds (the executable crashed), which outlasts
+    // slopctl's request timeout. The reconciler detects and logs the death
+    // independently of that reply, and the PaneDestroyed event names the pane.
+    let mut run_child = Command::new(cargo_bin("slopctl"))
+        .args(["run", "--no-wait", "--account", "oc"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("TMUX_TMPDIR")
+        .env_remove("TMPDIR")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl run");
+
+    let event = wait_for_event(listener, |v| v["event_type"] == "PaneDestroyed");
+    let pane_id = event["pane_id"].as_str().expect("PaneDestroyed carries pane_id").to_string();
+    let _ = run_child.kill();
+    let _ = run_child.wait();
+
+    let mut stderr = slopd.stderr.take().expect("slopd stderr is piped");
+    kill_slopd(slopd);
+    let mut log = String::new();
+    {
+        use std::io::Read as _;
+        stderr.read_to_string(&mut log).expect("read slopd stderr");
+    }
+
+    assert!(log.contains(marker),
+        "slopd log should contain the opencode pane's dying words; got: {}", log);
+    assert!(log.contains(&format!("pane {} death output (exit status Some(37))", pane_id)),
+        "slopd log should name the pane and exit status; got: {}", log);
+}
+
 /// Failure case: the configured executable doesn't exist. A typo'd or
 /// uninstalled `[run] executable` is the most common misconfiguration, and
 /// `tmux new-window <missing>` still returns a pane id — so without an explicit

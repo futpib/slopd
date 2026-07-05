@@ -1555,6 +1555,17 @@ async fn handle_dead_pane(
         "managed pane {} exited (status {:?}); emitting PaneDestroyed with {} bytes of captured output",
         pane_id, exit_status, output_tail.len(),
     );
+    // The PaneDestroyed broadcast is ephemeral — if no slopctl listener was
+    // subscribed at the moment of death, the captured screen evaporates with
+    // it. Log the dying words through the normal log as well (journald under
+    // systemd), so "what happened to pane %N?" stays answerable after the
+    // fact via `journalctl --user -u slopd`. Clean exits stay quiet.
+    if !output_tail.is_empty() && exit_status != Some(0) {
+        warn!(
+            "pane {} death output (exit status {:?}):\n{}",
+            pane_id, exit_status, output_tail,
+        );
+    }
     reparent_children_of(config, managed_panes, pane_id).await;
     if let Some(state) = panes.remove(pane_id) {
         state.cancel_drivers();

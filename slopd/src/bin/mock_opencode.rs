@@ -74,6 +74,19 @@ fn main() {
             // Test flag: list a garbage-collected "ghost" session in GET /session
             // that 404s on use — reproduces the ephemeral-boot-session bug.
             "--ghost-session" => ghost = true,
+            // Failure-injection mode (mirrors mock_claude --crash-output): print a
+            // diagnostic line to the terminal then exit non-zero before binding the
+            // port — simulating opencode crashing on launch with a visible error.
+            // The brief pause keeps the exit realistic (a real opencode takes
+            // >100ms to reach a crash), comfortably outlasting slopd's
+            // remain-on-exit set-option round-trip so the pane lingers as DEAD.
+            "--crash-output" => {
+                let msg = args.next()
+                    .unwrap_or_else(|| "mock_opencode: simulated startup crash".to_string());
+                println!("{}", msg);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::process::exit(37);
+            }
             _ => { /* ignore unknown flags (e.g. opencode passthrough) */ }
         }
     }
