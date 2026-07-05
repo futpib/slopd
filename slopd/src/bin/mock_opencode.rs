@@ -53,6 +53,10 @@ struct MockState {
     /// it), but it has been garbage-collected, so anything addressing it 404s.
     /// slopd must POST its own session instead of adopting this one.
     ghost_session: bool,
+    /// The session id passed via `-s <id>` (resume). When set, GET /session
+    /// lists it, so slopd's resume path binds to it instead of POSTing a fresh
+    /// one. Absent for a plain (non-resume) launch.
+    resume_id: Option<String>,
 }
 
 fn main() {
@@ -61,6 +65,10 @@ fn main() {
     // `-s <id>` means a session is being resumed → it already exists (mirrors
     // real opencode, where `opencode -s <id>` makes that session present).
     let mut resumed_session = false;
+    // The session id passed via `-s <id>` (resume). When set, GET /session lists
+    // it as an existing session, so slopd's resume path can bind to it — mirrors
+    // real opencode, where `opencode -s <id>` makes that exact session present.
+    let mut resume_id: Option<String> = None;
     let mut ghost = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -69,7 +77,7 @@ fn main() {
             "--hostname" => hostname = args.next().unwrap_or(hostname),
             "-s" | "--session" => {
                 resumed_session = true;
-                let _ = args.next(); // consume the session id
+                resume_id = args.next(); // capture the resumed session id
             }
             // Test flag: list a garbage-collected "ghost" session in GET /session
             // that 404s on use — reproduces the ephemeral-boot-session bug.
@@ -106,6 +114,7 @@ fn main() {
         second_session: false,
         selected_session: None,
         ghost_session: ghost,
+        resume_id,
     }));
 
     for stream in listener.incoming() {
@@ -223,6 +232,11 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 // The ephemeral boot session: listed, and the NEWEST (created 999),
                 // so a discover-the-latest path would pick it — but it 404s on use.
                 sessions.push(format!(r#"{{"id":"{GHOST_SID}","time":{{"created":999,"updated":999}},"title":"ghost"}}"#));
+            }
+            if let Some(rid) = &s.resume_id {
+                // The resumed session is present (created before everything else),
+                // so slopd's resume path finds and binds to exactly this id.
+                sessions.push(format!(r#"{{"id":"{rid}","time":{{"created":50,"updated":50}},"title":"resumed"}}"#));
             }
             if s.session_created {
                 sessions.push(format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#));

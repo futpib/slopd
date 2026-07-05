@@ -1516,6 +1516,58 @@ fn parse_list_panes(
     (present, dead)
 }
 
+/// Extract a resume-target session id from `slopctl run`'s passthrough args.
+/// Accepts the uniform `--resume <id>` (matching Claude's own flag) as well as
+/// opencode's native `-s <id>` / `--session <id>`, plus the `--flag=<id>`
+/// spellings. Returns the first id found. The run handler uses this to bind an
+/// opencode pane to the resumed session instead of POSTing a fresh one (which
+/// would strand the resumed conversation on a new empty session).
+fn extract_resume_target(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--resume" | "-s" | "--session" => {
+                if let Some(v) = it.next() {
+                    if !v.starts_with('-') {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            other => {
+                for pfx in ["--resume=", "--session=", "-s="] {
+                    if let Some(v) = other.strip_prefix(pfx) {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Remove every resume flag (and its separate value) from an arg list, in any
+/// spelling [`extract_resume_target`] recognizes. The run handler uses this to
+/// re-express an opencode resume as the canonical `-s <id>`: opencode rejects
+/// `--resume`, prints its usage, and exits — killing the pane.
+fn strip_resume_flags(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--resume" | "-s" | "--session" => {
+                // Drop the flag and its value token.
+                let _ = it.next();
+            }
+            other
+                if other.starts_with("--resume=")
+                    || other.starts_with("--session=")
+                    || other.starts_with("-s=") => {}
+            _ => out.push(a),
+        }
+    }
+    out
+}
+
 /// Handle a managed pane that exited and is lingering as a DEAD pane because we
 /// set remain-on-exit on it at spawn. Capture its frozen final screen and exit
 /// status — the whole point of remain-on-exit — emit an enriched PaneDestroyed
@@ -3332,7 +3384,23 @@ async fn handle_request(
             } else {
                 None
             };
-            let mut trailing = extra_args;
+            // Detect a resume target in the passthrough args (any spelling:
+            // `--resume <id>`, opencode's `-s <id>` / `--session <id>`). For
+            // opencode the pane must be spawned with the canonical `-s <id>`
+            // AND slopd must bind its tracking to this id below, skipping the
+            // "POST a fresh session" step — otherwise the resumed conversation
+            // is stranded on a new empty session. Claude keeps `--resume` as-is.
+            let resume_session = extract_resume_target(&extra_args);
+            let mut trailing = if resolved.backend == libslop::Backend::Opencode {
+                let mut t = strip_resume_flags(extra_args);
+                if let Some(sid) = &resume_session {
+                    t.push("-s".to_string());
+                    t.push(sid.clone());
+                }
+                t
+            } else {
+                extra_args
+            };
             let spawn_env = merged_env;
             if let Some(port) = opencode_port {
                 let mut v = trailing.clone();
@@ -3388,22 +3456,38 @@ async fn handle_request(
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
 
                         let client = opencode::OpencodeClient::new(port, None);
-                        // Discover or create the session slopd will drive. A fresh
-                        // TUI has no session until the first message, so create one
-                        // (POST /session) if none exists. Bounded so a pane that
-                        // never boots its server doesn't hang the run handler.
-                        let session_id = match tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                            loop {
-                                match client.ensure_session().await {
-                                    Ok(id) if !id.is_empty() => return id,
-                                    _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                        // Bind the session slopd will drive. Resume: the pane was
+                        // spawned with `-s <id>`, so bind directly to that id —
+                        // wait (bounded) for the server to list it as it finishes
+                        // booting, then track it regardless. Do NOT call
+                        // ensure_session here: POSTing a fresh session would strand
+                        // the resumed conversation on a new empty one. Fresh run:
+                        // discover-or-create via ensure_session as before (a fresh
+                        // TUI has no session until the first message).
+                        let session_id = if let Some(sid) = resume_session.clone() {
+                            let _ = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                                loop {
+                                    match client.session_ids().await {
+                                        Ok(ids) if ids.iter().any(|i| *i == sid) => return,
+                                        _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                                    }
                                 }
-                            }
-                        }).await {
-                            Ok(id) => id,
-                            Err(_) => {
-                                warn!("opencode pane {}: timed out creating/discovering a session; state tracking will be limited", pane_id);
-                                String::new()
+                            }).await;
+                            sid
+                        } else {
+                            match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                                loop {
+                                    match client.ensure_session().await {
+                                        Ok(id) if !id.is_empty() => return id,
+                                        _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                                    }
+                                }
+                            }).await {
+                                Ok(id) => id,
+                                Err(_) => {
+                                    warn!("opencode pane {}: timed out creating/discovering a session; state tracking will be limited", pane_id);
+                                    String::new()
+                                }
                             }
                         };
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
@@ -3918,6 +4002,45 @@ mod tests {
         ids.sort_by(|a, b| pane_id_sort_key(a).cmp(&pane_id_sort_key(b)));
         // %9 before %60/%83/%100 (numeric, not lexicographic); non-%N sorts last.
         assert_eq!(ids, vec!["%7", "%9", "%60", "%83", "%100", "weird"]);
+    }
+
+    #[test]
+    fn extract_resume_target_recognizes_every_spelling() {
+        let id = "ses_0e54cad77ffeghO0xI5t1A27d2";
+        // Uniform --resume (Claude-native), plus opencode's -s / --session, and
+        // the --flag=<id> forms all yield the id.
+        for args in [
+            vec!["--resume".to_string(), id.to_string()],
+            vec!["-s".to_string(), id.to_string()],
+            vec!["--session".to_string(), id.to_string()],
+            vec![format!("--resume={id}")],
+            vec![format!("--session={id}")],
+            vec![format!("-s={id}")],
+        ] {
+            assert_eq!(extract_resume_target(&args).as_deref(), Some(id), "args: {:?}", args);
+        }
+        // No resume flag → None; a flag with no value → None.
+        assert_eq!(extract_resume_target(&["--port".to_string(), "8080".to_string()]), None);
+        assert_eq!(extract_resume_target(&["--resume".to_string()]), None);
+    }
+
+    #[test]
+    fn strip_resume_flags_removes_flag_and_value_preserving_the_rest() {
+        let id = "ses_abc";
+        // Two-token form: both the flag and its value are dropped; the rest stays.
+        let out = strip_resume_flags(vec![
+            "--resume".to_string(), id.to_string(),
+            "--port".to_string(), "0".to_string(),
+        ]);
+        assert_eq!(out, vec!["--port".to_string(), "0".to_string()]);
+        // -s and --session forms, and the --flag=<id> forms, are all stripped.
+        assert_eq!(strip_resume_flags(vec!["-s".to_string(), id.to_string()]), Vec::<String>::new());
+        assert_eq!(strip_resume_flags(vec![format!("--session={id}")]), Vec::<String>::new());
+        // Nothing to strip → unchanged.
+        assert_eq!(
+            strip_resume_flags(vec!["--agent".to_string(), "build".to_string()]),
+            vec!["--agent".to_string(), "build".to_string()],
+        );
     }
 
     fn policy(max_attempts: u32, initial_backoff_ms: u64, max_backoff_ms: u64) -> BackoffPolicy {

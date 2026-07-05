@@ -10094,6 +10094,49 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     kill_slopd(slopd);
 }
 
+/// Resuming an opencode session via `slopctl run` must bind slopd's tracking to
+/// the REQUESTED session id, not POST a fresh empty one. Regression test for the
+/// bug where the run handler always called ensure_session (POST /session),
+/// stranding the resumed conversation on a new session: `slopctl run --backend
+/// opencode -- -s <id>` spawned a pane but `ps` showed a different, empty
+/// session. With the fix, the pane tracks exactly the id passed to `-s`.
+#[test]
+fn opencode_run_resume_binds_to_requested_session() {
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    // Resume a specific session id via the passthrough `-s <id>`. mock_opencode
+    // lists it in GET /session (as real opencode does for `opencode -s <id>`), so
+    // slopd's resume path finds and binds it.
+    let target = "ses_resume_target_1234";
+    let run_out = env.slopctl_raw(&["run", "--account", "oc", "--ready-timeout", "30", "--", "-s", target]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !pane_id.is_empty(),
+        "resume run failed: {:?} stderr={:?}", run_out.status, String::from_utf8_lossy(&run_out.stderr));
+
+    // The tracked session must be exactly the resumed id — NOT the fresh
+    // "ses_mock" that ensure_session's POST would have produced.
+    let ps_panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let p = ps_panes.iter().find(|p| p.pane_id == pane_id).expect("pane in ps");
+    assert_eq!(p.session_id.as_deref(), Some(target),
+        "resumed pane must track the requested session id, got {:?}", p.session_id);
+    assert_eq!(p.backend, libslop::Backend::Opencode);
+
+    kill_slopd(slopd);
+}
+
 #[test]
 fn opencode_follows_tui_session_switch() {
     // When the human navigates the TUI to a different session, opencode emits a
