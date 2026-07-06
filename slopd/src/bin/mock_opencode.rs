@@ -57,6 +57,18 @@ struct MockState {
     /// lists it, so slopd's resume path binds to it instead of POSTing a fresh
     /// one. Absent for a plain (non-resume) launch.
     resume_id: Option<String>,
+    /// Subagent (child session) simulation. `child_exists` lists CHILD_SID in
+    /// GET /session with `parentID == SID` (real opencode keeps a finished child
+    /// listed). `child_status` is the child's `/session/status` entry type
+    /// (`"busy"`/`"retry"`) or `None` when idle — idle sessions are absent from the
+    /// map, exactly like real opencode. This lets a test drive a subagent whose
+    /// terminal SSE event is dropped (leak) or that wedges in `retry`.
+    child_exists: bool,
+    child_status: Option<String>,
+    /// When set, the MAIN session reports `{"type":"retry",…}` in `/session/status`
+    /// (rate-limit backoff) rather than plain busy — mirrors an opencode session
+    /// that exhausted its quota and is auto-retrying.
+    main_retry: bool,
 }
 
 fn main() {
@@ -115,6 +127,9 @@ fn main() {
         selected_session: None,
         ghost_session: ghost,
         resume_id,
+        child_exists: false,
+        child_status: None,
+        main_retry: false,
     }));
 
     for stream in listener.incoming() {
@@ -241,6 +256,11 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             if s.session_created {
                 sessions.push(format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#));
             }
+            if s.child_exists {
+                // A subagent child session — real opencode lists it (with parentID)
+                // and keeps it listed after it finishes.
+                sessions.push(format!(r#"{{"id":"{CHILD_SID}","parentID":"{SID}","time":{{"created":150,"updated":150}},"title":"mock subagent"}}"#));
+            }
             if s.second_session {
                 // Newer than SID, so a (correct) latest-by-created discovery would
                 // even pick this one — but the test asserts slopd follows the
@@ -265,13 +285,20 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
         }
 
         ("GET", "/session/status") => {
-            // REAL shape: busy sessions present with {"type":"busy"}; idle absent.
-            let busy = state.lock().unwrap().busy;
-            if busy {
-                (200, format!(r#"{{"{SID}":{{"type":"busy"}}}}"#))
-            } else {
-                (200, "{}".to_string())
+            // REAL shape: a map of every non-idle session. Busy → {"type":"busy"};
+            // a rate-limited session auto-retrying → {"type":"retry",…}; idle
+            // sessions are absent. A running subagent lists its child session too.
+            let s = state.lock().unwrap();
+            let mut entries: Vec<String> = Vec::new();
+            if s.busy {
+                entries.push(format!(r#""{SID}":{{"type":"busy"}}"#));
+            } else if s.main_retry {
+                entries.push(format!(r#""{SID}":{{"type":"retry","attempt":3,"message":"mock rate limit","next":9999999999999}}"#));
             }
+            if let Some(t) = &s.child_status {
+                entries.push(format!(r#""{CHILD_SID}":{{"type":"{t}"}}"#));
+            }
+            (200, format!("{{{}}}", entries.join(",")))
         }
 
         ("POST", p) if p == format!("/session/{SID}/prompt_async") => {
@@ -304,13 +331,27 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 }
                 let uses_tool = text.contains("tool");
                 let uses_subagent = text.contains("subagent");
+                // Subagent failure modes that reproduce the busy_subagent leak:
+                // `leak`  → the child finishes (absent from /session/status) but its
+                //           session.idle SSE event is DROPPED (missed on a reconnect).
+                // `retry` → the child wedges in `{"type":"retry"}` (rate-limited) and
+                //           never emits a terminal event; the main session retries too.
+                // In both, only the backstop's /session/status reconcile can clear it.
+                let leak_subagent = uses_subagent && text.contains("leak");
+                let retry_subagent = uses_subagent && text.contains("retry");
                 let asks_question = text.contains("question");
                 // busy + user message
                 emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":SID,"status":{"type":"busy"}}}).to_string());
                 emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":SID,"info":{"role":"user"}}}).to_string());
                 emit(&state, part_updated_event(SID, "user", &text));
                 if uses_subagent {
-                    // Spawn a child session (opencode subagent): session.created with parentID.
+                    // Spawn a child session (opencode subagent): session.created with
+                    // parentID, and reflect it as a running child in /session/status.
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.child_exists = true;
+                        s.child_status = Some("busy".to_string());
+                    }
                     emit(&state, serde_json::json!({"type":"session.created","properties":{"sessionID":CHILD_SID,"info":{"id":CHILD_SID,"parentID":SID,"agent":"general","title":"mock subagent"}}}).to_string());
                     emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":CHILD_SID,"status":{"type":"busy"}}}).to_string());
                     emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":CHILD_SID,"info":{"role":"assistant"}}}).to_string());
@@ -327,7 +368,27 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(400));
                     if uses_subagent {
-                        emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":CHILD_SID}}).to_string());
+                        if retry_subagent {
+                            // Child wedges in `retry` and the main session retries too;
+                            // NEITHER emits a terminal event. Nothing on the SSE stream
+                            // can clear busy_subagent — only the backstop's
+                            // /session/status reconcile (child no longer "working").
+                            let mut s = st.lock().unwrap();
+                            s.child_status = Some("retry".to_string());
+                            s.main_retry = true;
+                            s.busy = false;
+                            return;
+                        }
+                        // Child finished → gone from /session/status.
+                        st.lock().unwrap().child_status = None;
+                        if !leak_subagent {
+                            // Normal subagent: emit the child's terminal event so the
+                            // SSE reader drops it immediately.
+                            emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":CHILD_SID}}).to_string());
+                        }
+                        // leak_subagent: the child's session.idle is DROPPED (never
+                        // sent), so the SSE reader keeps the stale entry — the backstop
+                        // prune is the only thing that can recover the pane.
                     } else if asks_question {
                         emit(&st, tool_part_event(SID, "question", "completed", serde_json::json!({"output":"large"})));
                     } else if uses_tool {

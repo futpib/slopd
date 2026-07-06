@@ -347,6 +347,20 @@ impl PaneState {
     }
 }
 
+/// Live subagents (opencode child sessions) of the pane's current session, mapped
+/// to when slopd first saw each. Shared between the SSE reader (which adds on
+/// `session.created` and removes on the child's terminal event) and the backstop
+/// (which prunes any child no longer *working* per `/session/status`, so a missed
+/// terminal event can't pin the pane to `busy_subagent` forever). Non-empty ⇒ the
+/// pane's detailed state is `busy_subagent`.
+type SubagentSet = Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>;
+
+/// Grace before the backstop prunes a tracked subagent that is not currently
+/// working: a child that was just spawned may not have reported `busy` in
+/// `/session/status` yet, so give it one poll cycle's worth of slack before
+/// treating "not working" as "finished".
+const SUBAGENT_PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// OpenCode pane driver. Real-time state + transcript come from the server's SSE
 /// stream (`GET /event`); a slow `/session` + `/session/status` poll is a backstop
 /// and also drives initial readiness — a freshly-spawned opencode session is idle
@@ -366,6 +380,11 @@ async fn run_opencode_driver(
     // Initial reconcile so the pane reaches Ready quickly after spawn.
     reconcile_opencode_status(&client, &session_id, &pane_id, &config, &panes, &event_tx).await;
 
+    // Set of live subagents (child sessions), shared by the SSE reader and the
+    // backstop below so the backstop can prune a child whose terminal event the
+    // SSE reader never saw.
+    let subagents: SubagentSet = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // SSE reader (reconnects with backoff). Shares the cancel token so it stops
     // when the pane is killed.
     {
@@ -376,8 +395,9 @@ async fn run_opencode_driver(
         let panes = panes.clone();
         let event_tx = event_tx.clone();
         let cancel = cancel.clone();
+        let subagents = subagents.clone();
         tokio::spawn(async move {
-            run_opencode_sse(client, session_id, pane_id, config, panes, event_tx, cancel).await
+            run_opencode_sse(client, session_id, pane_id, config, panes, event_tx, cancel, subagents).await
         });
     }
 
@@ -396,7 +416,22 @@ async fn run_opencode_driver(
                 let sid = panes.get(&pane_id)
                     .and_then(|s| s.opencode.lock().unwrap().as_ref().map(|oc| oc.session_id.clone()))
                     .unwrap_or_else(|| session_id.clone());
-                reconcile_opencode_status(&client, &sid, &pane_id, &config, &panes, &event_tx).await;
+                // Authoritatively reconcile live subagents first: drop any child
+                // that is no longer working per /session/status (finished, or
+                // wedged in `retry`) even if its terminal SSE event was missed.
+                let live_subagents =
+                    reconcile_opencode_subagents(&client, &sid, &pane_id, &subagents, &event_tx).await;
+                if live_subagents > 0 {
+                    // A subagent is genuinely running → busy_subagent wins over the
+                    // main session's own status (mirrors the SSE reader's override).
+                    let current = panes.get_or_insert(&pane_id).detailed_state.lock().unwrap().clone();
+                    if current != libslop::PaneDetailedState::BusySubagent {
+                        set_pane_detailed_state(&config, &pane_id, &libslop::PaneDetailedState::BusySubagent, Some(&current), &event_tx, &panes).await;
+                    }
+                } else {
+                    // No live subagent → the pane reflects its own session's status.
+                    reconcile_opencode_status(&client, &sid, &pane_id, &config, &panes, &event_tx).await;
+                }
             }
         }
     }
@@ -430,8 +465,64 @@ async fn reconcile_opencode_status(
     }
 }
 
+/// Reconcile the live-subagent set against the authoritative `/session/status`.
+///
+/// The SSE reader adds a child on `session.created` and removes it on the child's
+/// `session.idle`/`deleted`/`error`. But that terminal event can be missed — an
+/// SSE reconnect between spawn and finish, or a child that never emits it because
+/// it is wedged in `retry` (rate-limit backoff). Left unchecked, the stale entry
+/// pins the pane to `busy_subagent` indefinitely and poisons every main-session
+/// event. This backstop drops any tracked child that is not currently *working*
+/// per `/session/status` (finished ⇒ absent; wedged ⇒ `retry`), after a short
+/// grace so a just-spawned child isn't pruned before it reports busy. Returns the
+/// number of subagents still live and emits a synthetic `SubagentStop` for each
+/// pruned child so `wait`/`listen` stay correct without the SSE event.
+async fn reconcile_opencode_subagents(
+    client: &opencode::OpencodeClient,
+    session_id: &str,
+    pane_id: &str,
+    subagents: &SubagentSet,
+    event_tx: &EventTx,
+) -> usize {
+    // On an API error, leave the set unchanged rather than churn state.
+    let map = match client.status_map().await {
+        Ok(m) => m,
+        Err(_) => return subagents.lock().unwrap().len(),
+    };
+    let now = std::time::Instant::now();
+    let mut stopped: Vec<String> = Vec::new();
+    let remaining = {
+        let mut set = subagents.lock().unwrap();
+        set.retain(|sid, added| {
+            let working = map.get(sid).map(opencode::status_is_working).unwrap_or(false);
+            if working || now.duration_since(*added) < SUBAGENT_PRUNE_GRACE {
+                return true;
+            }
+            stopped.push(sid.clone());
+            false
+        });
+        set.len()
+    };
+    for sid in stopped {
+        debug!("opencode pane {}: pruning stale subagent {} (not working in /session/status)", pane_id, sid);
+        let _ = event_tx.send(libslop::Record {
+            source: "hook".to_string(),
+            event_type: "SubagentStop".to_string(),
+            pane_id: Some(pane_id.to_string()),
+            payload: serde_json::json!({
+                "session_id": session_id,
+                "hook_event_name": "SubagentStop",
+                "opencode_child_session": sid,
+            }),
+            cursor: None,
+        });
+    }
+    remaining
+}
+
 /// SSE reader: connect `GET /event`, parse `data:` payloads, apply state +
 /// transcript updates for this pane's session. Reconnects with backoff on error.
+#[allow(clippy::too_many_arguments)] // wiring fn threading shared daemon state
 async fn run_opencode_sse(
     client: opencode::OpencodeClient,
     session_id: String,
@@ -440,6 +531,7 @@ async fn run_opencode_sse(
     panes: PaneMap,
     event_tx: EventTx,
     cancel: tokio_util::sync::CancellationToken,
+    subagents: SubagentSet,
 ) {
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
@@ -449,7 +541,7 @@ async fn run_opencode_sse(
         match client.events().send().await {
             Ok(resp) => {
                 backoff = std::time::Duration::from_secs(1);
-                if let Err(e) = read_opencode_sse(resp, &session_id, &pane_id, &config, &panes, &event_tx, &cancel).await {
+                if let Err(e) = read_opencode_sse(resp, &session_id, &pane_id, &config, &panes, &event_tx, &cancel, &subagents).await {
                     debug!("opencode SSE stream for {} ended: {}", pane_id, e);
                 }
             }
@@ -464,6 +556,7 @@ async fn run_opencode_sse(
 }
 
 /// Read one SSE connection to completion, dispatching each session-scoped event.
+#[allow(clippy::too_many_arguments)] // wiring fn threading shared daemon state
 async fn read_opencode_sse(
     mut resp: reqwest::Response,
     session_id: &str,
@@ -472,10 +565,14 @@ async fn read_opencode_sse(
     panes: &PaneMap,
     event_tx: &EventTx,
     cancel: &tokio_util::sync::CancellationToken,
+    subagents: &SubagentSet,
 ) -> Result<(), String> {
     let mut buf = String::new();
-    // Child sessions spawned by this pane's main session (opencode subagents).
-    let mut children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Child sessions spawned by this pane's main session (opencode subagents) live
+    // in the shared `subagents` set: added here on `session.created`, removed on
+    // the child's terminal event, and pruned by the backstop if that event is
+    // missed. Persists across SSE reconnects (the set is owned by the driver), so a
+    // subagent that spans a reconnect stays tracked.
     // The main session slopd currently tracks. Seeded from the spawn-time id but
     // re-pointed when the human navigates the TUI to another session (see the
     // `tui.session.select` handling below) — so `ps`/`send`/`transcript` follow
@@ -502,7 +599,7 @@ async fn read_opencode_sse(
                 if selected != current_session {
                     debug!("opencode pane {}: TUI selected session {} (was {})", pane_id, selected, current_session);
                     current_session = selected.to_string();
-                    children.clear();
+                    subagents.lock().unwrap().clear();
                     // Re-point the shared state so send/interrupt/transcript target
                     // the followed session; grab a client clone for the reconcile.
                     let client = panes.get(pane_id).and_then(|state| {
@@ -528,7 +625,7 @@ async fn read_opencode_sse(
                 && opencode::session_created_parent(&event) == Some(current_session.as_str())
             {
                 if let Some(ref sid) = ev_sid {
-                    children.insert(sid.clone());
+                    subagents.lock().unwrap().insert(sid.clone(), std::time::Instant::now());
                     // Synthesize a SubagentStart hook (opencode subagent = child session).
                     let _ = event_tx.send(libslop::Record {
                         source: "hook".to_string(),
@@ -545,7 +642,7 @@ async fn read_opencode_sse(
                 }
             }
             let is_main = ev_sid.as_deref() == Some(current_session.as_str());
-            let is_child = ev_sid.as_deref().is_some_and(|s| children.contains(s));
+            let is_child = ev_sid.as_deref().is_some_and(|s| subagents.lock().unwrap().contains_key(s));
             if !is_main && !is_child {
                 continue;
             }
@@ -557,7 +654,7 @@ async fn read_opencode_sse(
                 )
             {
                 if let Some(ref sid) = ev_sid {
-                    children.remove(sid);
+                    subagents.lock().unwrap().remove(sid);
                     let _ = event_tx.send(libslop::Record {
                         source: "hook".to_string(),
                         event_type: "SubagentStop".to_string(),
@@ -573,7 +670,7 @@ async fn read_opencode_sse(
             }
 
             // STATE: an active child session (subagent) overrides → busy_subagent.
-            let target = if !children.is_empty() {
+            let target = if !subagents.lock().unwrap().is_empty() {
                 Some(libslop::PaneDetailedState::BusySubagent)
             } else if is_main {
                 opencode::event_to_detailed(&event)

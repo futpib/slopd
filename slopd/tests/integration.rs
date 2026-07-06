@@ -10733,6 +10733,128 @@ fn opencode_subagent_turn_tracks_busy_subagent() {
 }
 
 #[test]
+fn opencode_retrying_subagent_does_not_stick_busy_subagent() {
+    // Regression (reproduces a live incident): a subagent (child session) that
+    // wedges in `retry` (rate-limit backoff) never emits a terminal SSE event, so
+    // the SSE reader's subagent entry would leak forever and pin the pane to
+    // busy_subagent — poisoning every main-session event even though nothing is
+    // actually running. The backstop reconciles the subagent set against
+    // /session/status: a child that is no longer "working" there (retry ≠ working)
+    // is pruned, and the main session's own `retry` status surfaces as
+    // busy_processing instead.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // "subagent" + "retry" → the mock spawns a child, then wedges BOTH the child and
+    // the main session in retry with NO terminal event on the SSE stream.
+    assert!(env.slopctl(&["send", &pane_id, "please spawn a retry subagent"]).status.success());
+
+    // The SSE reader sees the child spawn → busy_subagent.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen_subagent = false;
+    while Instant::now() < deadline {
+        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusySubagent {
+            seen_subagent = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen_subagent, "expected busy_subagent once the child session spawns");
+
+    // It must NOT stay stuck: the backstop prunes the retry-wedged child and the
+    // main session's retry surfaces as busy_processing. (Before the fix it stayed
+    // busy_subagent indefinitely.)
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut recovered = false;
+    while Instant::now() < deadline {
+        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusyProcessing {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        recovered,
+        "retry-wedged subagent must not pin the pane to busy_subagent; expected recovery to busy_processing, got {:?}",
+        env.pane_state(&pane_id).1
+    );
+    kill_slopd(slopd);
+}
+
+#[test]
+fn opencode_leaked_subagent_pruned_when_idle_event_missed() {
+    // Regression: if the child's terminal SSE event is missed (e.g. dropped on an
+    // SSE reconnect), the SSE reader never removes it and the pane would stay
+    // busy_subagent. The backstop must notice the child is gone from
+    // /session/status and prune it, synthesizing the SubagentStop the SSE stream
+    // never delivered. Asserting SubagentStop fires has teeth: with the child's
+    // session.idle dropped, ONLY the backstop prune can produce it.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(Some(&[mock_path.as_str()]), None, None).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8_lossy(&env.slopctl_raw(&["run", "--backend", "opencode"]).stdout).trim().to_string();
+    assert!(!pane_id.is_empty());
+    wait_until_ready(&env, &pane_id, Duration::from_secs(15));
+
+    // Subscribe to SubagentStop before triggering, so we can prove the prune emits
+    // it even though the child's session.idle is never sent.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "SubagentStop", "--pane-id", &pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn slopctl listen");
+    {
+        use std::io::Read;
+        let stdout = listen.stdout.as_mut().expect("listener stdout");
+        let mut buf = [0u8; 1];
+        let mut line = Vec::new();
+        loop {
+            stdout.read_exact(&mut buf).expect("read subscription confirmation");
+            if buf[0] == b'\n' { break; }
+            line.push(buf[0]);
+        }
+        assert!(String::from_utf8_lossy(&line).contains("subscribed"), "unexpected first line");
+    }
+
+    // "subagent" + "leak" → the child spawns and finishes (gone from
+    // /session/status) but its session.idle SSE event is DROPPED.
+    assert!(env.slopctl(&["send", &pane_id, "please spawn a leak subagent"]).status.success());
+    let stdout = listen.stdout.take().expect("listener stdout gone");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines().flatten() {
+            if tx.send(line).is_err() { break; }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_stop = false;
+    while Instant::now() < deadline && !saw_stop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line.contains(r#""event_type":"SubagentStop""#) => saw_stop = true,
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    kill_child(listen);
+    assert!(saw_stop, "backstop must synthesize SubagentStop for a child whose session.idle was missed");
+    // And the pane recovers to ready (the leaked subagent no longer pins it).
+    wait_until_ready(&env, &pane_id, Duration::from_secs(10));
+    kill_slopd(slopd);
+}
+
+#[test]
 fn opencode_question_tool_tracks_awaiting_elicitation() {
     // opencode's `question` tool is its elicitation equivalent (agent asking the
     // user a clarifying question) → awaiting_input_elicitation, plus a

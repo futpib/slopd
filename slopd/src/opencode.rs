@@ -126,6 +126,25 @@ impl OpencodeClient {
         Ok(v.get(session_id).cloned())
     }
 
+    /// `GET /session/status` → the whole busy map (`{"<sid>":{"type":…}, …}`).
+    /// Every session that is not idle is listed; idle sessions are absent. Used to
+    /// authoritatively reconcile the set of live subagents, so a child whose
+    /// `session.idle` slopd never observed (SSE gap, or the child is wedged in
+    /// `retry`) is still detected as finished.
+    pub async fn status_map(&self) -> Result<serde_json::Map<String, Value>, String> {
+        let resp = self
+            .req(reqwest::Method::GET, "/session/status")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("GET /session/status {}: {}", status, resp.text().await.unwrap_or_default()));
+        }
+        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        Ok(v.as_object().cloned().unwrap_or_default())
+    }
+
     /// `POST /session/:id/prompt_async` — non-blocking prompt submit. Returns once
     /// the server acknowledges (204 / 2xx), which is slopd's "prompt accepted"
     /// signal (the analogue of Claude's `UserPromptSubmit` hook).
@@ -233,6 +252,15 @@ pub fn status_to_detailed(status: &Value) -> Option<PaneDetailedState> {
     if s == "busy" || s == "running" || s == "processing" || s == "streaming" {
         return Some(PaneDetailedState::BusyProcessing);
     }
+    // A rate-limited / errored session opencode is auto-retrying reports
+    // `{"type":"retry","attempt":N,"message":"…limit…","next":<ts>}`. It is not
+    // doing work, but it is not ready either (it will resume when the backoff
+    // elapses), so surface it as busy rather than leaving the pane's state stale.
+    // Deliberately NOT treated as "working" for subagent tracking (see
+    // `status_is_working`): a child wedged in retry is not an active subagent.
+    if s == "retry" {
+        return Some(PaneDetailedState::BusyProcessing);
+    }
     if s == "tool" || s == "tool_use" || s == "busy_tool_use" {
         return Some(PaneDetailedState::BusyToolUse);
     }
@@ -250,6 +278,26 @@ pub fn status_to_detailed(status: &Value) -> Option<PaneDetailedState> {
         return Some(PaneDetailedState::AwaitingInputPermission);
     }
     None
+}
+
+/// Whether a `/session/status` entry means the session is *actively working* (as
+/// opposed to idle, or wedged in `retry` waiting on a rate-limit backoff). Used to
+/// decide if a child session still counts as a live subagent: a child that is not
+/// working here has effectively finished, even if slopd never saw its
+/// `session.idle` SSE event (missed on a reconnect, or the child never emitted one
+/// because it is stuck retrying). `retry` deliberately does NOT count as working.
+pub fn status_is_working(status: &Value) -> bool {
+    let s = status
+        .get("type")
+        .and_then(|v| v.as_str())
+        .or_else(|| status.get("status").and_then(|v| v.as_str()))
+        .or_else(|| status.get("state").and_then(|v| v.as_str()))
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    matches!(
+        s.as_str(),
+        "busy" | "running" | "processing" | "streaming" | "tool" | "tool_use" | "compacting"
+    ) || status.get("busy").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// One normalized transcript record: (`type`, payload) — matches the shape slopd
@@ -663,6 +711,30 @@ mod tests {
         assert_eq!(status_to_detailed(&json!({"type":"idle"})), Some(PaneDetailedState::Ready));
         // status/state still accepted as aliases.
         assert_eq!(status_to_detailed(&json!({"status":"busy"})), Some(PaneDetailedState::BusyProcessing));
+    }
+
+    #[test]
+    fn status_to_detailed_maps_retry_to_busy() {
+        // Real shape for a rate-limited session auto-retrying (verified live):
+        // {"type":"retry","attempt":15,"message":"…Limit Exhausted…","next":<ts>}.
+        // It is not ready, so it must surface as busy rather than leave state stale.
+        let retry = json!({"type":"retry","attempt":15,"message":"Weekly/Monthly Limit Exhausted","next":1783384638319i64});
+        assert_eq!(status_to_detailed(&retry), Some(PaneDetailedState::BusyProcessing));
+    }
+
+    #[test]
+    fn status_is_working_excludes_retry_and_idle() {
+        // Working states → a child in one of these is a live subagent.
+        assert!(status_is_working(&json!({"type":"busy"})));
+        assert!(status_is_working(&json!({"type":"running"})));
+        assert!(status_is_working(&json!({"type":"tool"})));
+        assert!(status_is_working(&json!({"busy": true})));
+        // Retry is NOT working: a child wedged in rate-limit backoff is not an
+        // active subagent, so it must not pin the pane to busy_subagent.
+        assert!(!status_is_working(&json!({"type":"retry","attempt":3})));
+        // Idle / unknown / empty → not working (absent from /session/status = idle).
+        assert!(!status_is_working(&json!({"type":"idle"})));
+        assert!(!status_is_working(&json!({})));
     }
 
     #[test]
