@@ -462,6 +462,21 @@ pub fn resolve_pane_id_or_session(
 /// the layout never shifts with daemon state. For robust programmatic parsing,
 /// prefer `slopctl ps --json` (a stable `PaneInfo` array) — the human table's
 /// column *widths* still adapt to content.
+/// Max width of the `TITLE` column in the human table; longer titles are cut with
+/// an ellipsis. `--json` is unaffected (it serializes the full `pane_title`).
+const TITLE_MAX: usize = 50;
+
+/// Truncate a title to [`TITLE_MAX`] display chars, appending `…` when cut.
+/// Char-based (not byte-based) so a multibyte title isn't split mid-codepoint.
+fn truncate_title(title: &str) -> String {
+    if title.chars().count() <= TITLE_MAX {
+        return title.to_string();
+    }
+    let mut out: String = title.chars().take(TITLE_MAX.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let fmt = timeago::Formatter::new();
     let epoch = std::time::SystemTime::now()
@@ -483,6 +498,9 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
         ("STATE", Box::new(|p| p.state.as_str().to_string())),
         ("DETAILED_STATE", Box::new(|p| p.detailed_state.as_str().to_string())),
         ("WORKING_DIR", Box::new(|p| p.working_dir.as_deref().unwrap_or("-").to_string())),
+        // Last column: the agent's self-assigned pane title. Truncated so a long
+        // title can't blow out the table; `--json` carries the full value.
+        ("TITLE", Box::new(|p| p.pane_title.as_deref().map(truncate_title).unwrap_or_else(|| "-".to_string()))),
     ];
 
     let header: Vec<&str> = cols.iter().map(|(h, _)| *h).collect();
@@ -2007,6 +2025,7 @@ mod tests {
             transcript_path: None,
             account: account.into(),
             backend,
+            pane_title: None,
         }
     }
 
@@ -2078,6 +2097,7 @@ mod tests {
             transcript_path: None,
             account: libslop::DEFAULT_ACCOUNT.to_string(),
             backend: libslop::Backend::Claude,
+            pane_title: None,
         }
     }
 

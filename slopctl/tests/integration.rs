@@ -84,6 +84,13 @@ fn ps_table_contains_expected_columns() {
     assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
     let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
 
+    // Give the pane a title with a leading status glyph, as a real agent would; ps
+    // must surface it in the TITLE column with the glyph stripped (normalized).
+    let _ = env.tmux.tmux()
+        .args(["select-pane", "-t", &pane_id, "-T", "✳ my test title"])
+        .output()
+        .expect("set pane title");
+
     let output = env.slopctl(&["ps"]);
 
     kill_slopd(slopd);
@@ -96,6 +103,9 @@ fn ps_table_contains_expected_columns() {
     assert!(stdout.contains("SESSION"), "missing SESSION column: {}", stdout);
     assert!(stdout.contains("STATE"), "missing STATE column: {}", stdout);
     assert!(stdout.contains("WORKING_DIR"), "missing WORKING_DIR column: {}", stdout);
+    assert!(stdout.contains("TITLE"), "missing TITLE column: {}", stdout);
+    assert!(stdout.contains("my test title"), "missing normalized pane title: {}", stdout);
+    assert!(!stdout.contains('✳'), "status glyph should be stripped from the title: {}", stdout);
     assert!(stdout.contains(&pane_id), "missing pane_id in output: {}", stdout);
     assert!(stdout.contains("ago") || stdout.contains("now"), "missing time in output: {}", stdout);
 }

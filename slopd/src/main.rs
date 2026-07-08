@@ -2535,22 +2535,26 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
         pane_id: String,
         last_active: u64,
         working_dir: Option<String>,
+        title: Option<String>,
         opts: ParsedPaneOptions,
     }
     let mut raw_panes = Vec::new();
     for pane_id in managed_panes.snapshot() {
+        // Tab-delimited so the path and the (space-bearing) pane title stay
+        // separable; window_activity is numeric so it never contains a tab.
         let dm_out = tmux(config)
             .args(["display-message", "-p", "-t", &pane_id, "-F",
-                   "#{window_activity} #{pane_current_path}"])
+                   "#{window_activity}\t#{pane_current_path}\t#{pane_title}"])
             .output()
             .await;
-        let (last_active, working_dir) = match dm_out {
+        let (last_active, working_dir, title) = match dm_out {
             Ok(out) if out.status.success() => {
-                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let mut parts = line.splitn(2, ' ');
+                let line = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
+                let mut parts = line.splitn(3, '\t');
                 let activity: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
                 let cwd = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-                (activity, cwd)
+                let title = parts.next().and_then(libslop::normalize_pane_title);
+                (activity, cwd, title)
             }
             _ => continue,
         };
@@ -2564,7 +2568,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             _ => continue,
         };
 
-        raw_panes.push(RawPane { pane_id, last_active, working_dir, opts });
+        raw_panes.push(RawPane { pane_id, last_active, working_dir, title, opts });
     }
 
     // Build set of live managed pane IDs.
@@ -2616,6 +2620,7 @@ async fn list_panes(config: &libslop::SlopdConfig, managed_panes: &ManagedPanes)
             transcript_path: raw.opts.transcript_path,
             account,
             backend,
+            pane_title: raw.title,
         });
     }
     // managed_panes is a DashSet, so its iteration order is hash-arbitrary and

@@ -432,6 +432,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalize_pane_title_strips_status_glyphs_and_oc_prefix() {
+        // Real samples (verified against live panes).
+        assert_eq!(normalize_pane_title("OC | tg-dm-responder takeover").as_deref(), Some("tg-dm-responder takeover"));
+        assert_eq!(normalize_pane_title("✳ orchestrator").as_deref(), Some("orchestrator"));
+        assert_eq!(normalize_pane_title("⠂ slopd").as_deref(), Some("slopd"));
+        assert_eq!(normalize_pane_title("⠐ Review z.ai models and usage billing").as_deref(), Some("Review z.ai models and usage billing"));
+        // Spinner glyph in front of the opencode prefix (both stripped, either order).
+        assert_eq!(normalize_pane_title("⠐ OC | building").as_deref(), Some("building"));
+        // A plain title is preserved; a title starting with a digit is kept intact.
+        assert_eq!(normalize_pane_title("plain title").as_deref(), Some("plain title"));
+        assert_eq!(normalize_pane_title("42 fixes").as_deref(), Some("42 fixes"));
+        // Nothing informative → None.
+        assert_eq!(normalize_pane_title("✳"), None);
+        assert_eq!(normalize_pane_title("   "), None);
+    }
+
+    #[test]
     fn runtime_fallback_prefers_run_user_then_private_temp() {
         let temp = std::path::Path::new("/tmp");
         // /run/user/<uid> present -> use it (what a login session would).
@@ -2591,6 +2608,42 @@ pub struct PaneInfo {
     /// before multi-backend support).
     #[serde(default)]
     pub backend: Backend,
+    /// Human-readable title from the pane's tmux title (`#{pane_title}`), which
+    /// both backends set to the agent's self-assigned name/summary. Already
+    /// normalized (status glyph / spinner frame and the opencode `OC | ` prefix
+    /// stripped — see [`normalize_pane_title`]); `None` if the pane has no
+    /// informative title. Purely descriptive: slopd never keys off it.
+    #[serde(default)]
+    pub pane_title: Option<String>,
+}
+
+/// Clean an agent's tmux pane title (`#{pane_title}`) into a stable label.
+///
+/// Agents prefix their pane title with a live status indicator — a spinner frame
+/// (braille `⠂`/`⠐`/… that changes every animation tick) or a ready glyph (`✳`) —
+/// and opencode further prefixes `OC | `. Left raw these flicker and add noise in
+/// a table, so strip the leading non-alphanumeric glyph run and an `OC | ` prefix,
+/// in either order. Returns `None` if nothing informative remains.
+pub fn normalize_pane_title(raw: &str) -> Option<String> {
+    let mut s = raw.trim();
+    // Iterate: a spinner glyph may precede the `OC | ` prefix, or vice versa.
+    loop {
+        let before = s;
+        // Drop a leading status/spinner glyph run: leading non-alphanumeric chars
+        // (stops at the first letter/digit, so real titles are preserved).
+        s = s.trim_start_matches(|c: char| !c.is_alphanumeric()).trim_start();
+        if let Some(rest) = s.strip_prefix("OC | ") {
+            s = rest.trim_start();
+        }
+        if s == before {
+            break;
+        }
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Serde default for [`PaneInfo::account`]: the reserved default account name.
