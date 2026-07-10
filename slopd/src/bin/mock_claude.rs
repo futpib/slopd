@@ -408,7 +408,29 @@ fn main() {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let session_id = "mock-session-id-1234";
+    // Honor `--session-id <id>` like real Claude: it pins the id of the session
+    // this process actually runs as — the one the transcript file is named for.
+    // slopd's fork path passes the minted fork id here. Absent → default id.
+    let session_id: &str = args
+        .iter()
+        .position(|a| a == "--session-id")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or("mock-session-id-1234");
+    // The `--resume <id>` target, if any (the session being resumed / forked from).
+    let resume_src: Option<&str> = args
+        .iter()
+        .position(|a| a == "--resume")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str);
+    // Fork mode: `--fork-session` copies the resumed session into a NEW one
+    // (`--session-id`). CRUCIAL fidelity detail (verified against real Claude
+    // v2.1.x): the SessionStart hook then fires with the RESUMED SOURCE id
+    // (`--resume`), NOT the new fork id — even though `transcript_path` already
+    // points at the fork's new file. slopd must not trust that id (it pins the
+    // minted fork id instead). A fresh run or a plain `--resume` reports its own id.
+    let forking = args.iter().any(|a| a == "--fork-session");
+    let session_start_sid: &str = if forking { resume_src.unwrap_or(session_id) } else { session_id };
     let cwd = std::env::current_dir().unwrap_or_default();
 
     // Create a transcript .jsonl file, mirroring real Claude behaviour.
@@ -421,7 +443,15 @@ fn main() {
         PathBuf::from(config_dir).join("projects").join("mock")
     };
     std::fs::create_dir_all(&transcript_dir).unwrap_or_default();
+    // The transcript file this process actually writes is named for the session it
+    // runs as (the fork id in fork mode).
     let transcript_path = transcript_dir.join(format!("{}.jsonl", session_id));
+    // The path reported in the SessionStart hook. Faithful to real Claude: while
+    // forking, the hook names the SOURCE session's file (the fork's own file is not
+    // written until its first turn), even though this process will write the fork's
+    // file. slopd must rewrite this to the fork's file. Non-fork: identical to
+    // transcript_path.
+    let session_start_transcript_path = transcript_dir.join(format!("{}.jsonl", session_start_sid));
 
     // Put the terminal in raw mode so we receive key bytes directly (Ctrl+C = 0x03,
     // Ctrl+D = 0x04, Escape = 0x1b) rather than having the terminal driver intercept them.
@@ -437,7 +467,10 @@ fn main() {
     };
 
     if !no_session_start {
-        let mut payload = hook_payload("SessionStart", session_id, &cwd, &transcript_path);
+        // In fork mode both diverge from the running session (see above): the hook
+        // carries the resumed SOURCE id and the SOURCE transcript file; slopd must
+        // rewrite both to the minted fork id / file. Non-fork: identical.
+        let mut payload = hook_payload("SessionStart", session_start_sid, &cwd, &session_start_transcript_path);
         payload["source"] = serde_json::json!("startup");
         payload["model"] = serde_json::json!("mock");
         fire_hooks(no_hooks, &settings, "SessionStart", &payload);

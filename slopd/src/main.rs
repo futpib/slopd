@@ -313,6 +313,12 @@ struct PaneState {
     /// For opencode panes: the most recent non-command prompt, used to auto-retry
     /// on `session.error` (the opencode analogue of Claude's StopFailure retry).
     opencode_last_prompt: std::sync::Mutex<Option<String>>,
+    /// For a Claude pane created by `fork`: the fork's session id (which slopd
+    /// minted and passed via `--session-id`). Real Claude fires its `SessionStart`
+    /// hook with the *resumed* source session id — not the forked id — so without
+    /// this pin the pane would be mis-bound to the source session. When set, the
+    /// SessionStart handler uses this id instead of the hook payload's.
+    pinned_session_id: std::sync::Mutex<Option<String>>,
 }
 
 impl PaneState {
@@ -328,6 +334,7 @@ impl PaneState {
             opencode: std::sync::Mutex::new(None),
             opencode_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             opencode_last_prompt: std::sync::Mutex::new(None),
+            pinned_session_id: std::sync::Mutex::new(None),
         }
     }
 
@@ -1145,6 +1152,21 @@ async fn read_pane_account(config: &libslop::SlopdConfig, pane_id: &str) -> Opti
     }
     let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if val.is_empty() { None } else { Some(val) }
+}
+
+/// Read a pane's recorded opencode HTTP port (`@slopd_opencode_port`). `None`
+/// if the option is unset (not an opencode pane) or unparseable.
+async fn read_pane_opencode_port(config: &libslop::SlopdConfig, pane_id: &str) -> Option<u16> {
+    let out = tmux(config)
+        .args(["show-options", "-t", pane_id, "-p", "-v",
+               libslop::TmuxOption::SlopdOpencodePort.as_str()])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Scan the slopd session for managed panes and return the distinct
@@ -3246,8 +3268,23 @@ async fn handle_request(
             // includes a transcript_path we haven't seen yet for this pane.
             // This covers both SessionStart and any hook fired after a slopd
             // restart where the tailer is no longer running.
-            if let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
+            if let Some(raw_transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
                 let state = panes.get_or_insert(pane);
+                // A forked Claude pane: real Claude's hooks report the SOURCE
+                // transcript file until the fork's first turn writes its own file.
+                // slopd minted (and pinned) the fork id, so rewrite the path to the
+                // fork's own file in the same directory — the tailer waits for it to
+                // appear. Non-fork panes, and hooks that already name the fork file,
+                // pass through unchanged.
+                let corrected = state.pinned_session_id.lock().unwrap().clone().and_then(|fork_id| {
+                    let p = std::path::Path::new(raw_transcript_path);
+                    if p.file_stem().and_then(|s| s.to_str()) == Some(fork_id.as_str()) {
+                        None
+                    } else {
+                        p.parent().map(|dir| dir.join(format!("{fork_id}.jsonl")).to_string_lossy().into_owned())
+                    }
+                });
+                let transcript_path: &str = corrected.as_deref().unwrap_or(raw_transcript_path);
                 let already_tailing = state.transcript_path.lock().unwrap().as_deref() == Some(transcript_path);
                 if !already_tailing {
                     debug!("hook {}: starting transcript tail for pane {} path={}", event, pane, transcript_path);
@@ -3275,13 +3312,23 @@ async fn handle_request(
             }
 
             // Side effects for specific hooks (not state-related).
-            if event == "SessionStart"
-                && let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) {
+            if event == "SessionStart" {
+                // A forked Claude pane pins the (minted) fork session id: real
+                // Claude reports the *resumed source* id in this hook, not the
+                // fork's, so trusting the payload would mis-bind the pane to the
+                // source session. The pin wins when present; otherwise use the
+                // payload id (the normal fresh/resume path).
+                let pinned = panes.get_or_insert(pane).pinned_session_id.lock().unwrap().clone();
+                let session_id = pinned.or_else(|| {
+                    payload.get("session_id").and_then(|v| v.as_str()).map(str::to_string)
+                });
+                if let Some(session_id) = session_id {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
-                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdSessionId.as_str(), session_id).await {
+                    if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
                 }
+            }
             if event == "UserPromptSubmit" {
                 debug!("UserPromptSubmit: notifying pending senders for pane {}", pane);
                 let pane_state = panes.get_or_insert(pane);
@@ -3402,7 +3449,111 @@ async fn handle_request(
             libslop::ResponseBody::Hooked
         }
 
-        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend } => {
+        libslop::RequestBody::Fork { pane_id, start_directory, env, extra_args } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
+            // Resolve the source pane's session id, cwd, account, and backend in
+            // one shot. (list_panes is a couple of tmux calls per pane; fork is a
+            // rare, interactive operation, so the cost is irrelevant here.)
+            let src = match list_panes(config, managed_panes).await {
+                Ok(list) => list.into_iter().find(|p| p.pane_id == pane_id),
+                Err(message) => return libslop::ResponseBody::Error { message },
+            };
+            let Some(src) = src else {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} not found", pane_id),
+                };
+            };
+            let Some(src_session) = src.session_id.clone() else {
+                return libslop::ResponseBody::Error {
+                    message: format!(
+                        "pane {} has no known session id yet; cannot fork (is the agent still booting?)",
+                        pane_id
+                    ),
+                };
+            };
+            // Produce the resume args that reconstruct the source session's
+            // history in a *fresh* session, and learn that fresh session's id:
+            //   - Claude: mint the id ourselves and let `--fork-session` copy the
+            //     transcript into it (verified: `--session-id` is honored with
+            //     `--fork-session`, and the original session is left untouched).
+            //   - opencode: ask the source pane's own server to fork (it owns the
+            //     live session in the shared store); the response carries the new
+            //     id, which a pane spawned with `-s <id>` will then bind to via
+            //     the existing resume path.
+            let (fork_args, new_session_id): (Vec<String>, String) = match src.backend {
+                libslop::Backend::Opencode => {
+                    let Some(port) = read_pane_opencode_port(config, &pane_id).await else {
+                        return libslop::ResponseBody::Error {
+                            message: format!("opencode pane {} has no recorded port; cannot fork", pane_id),
+                        };
+                    };
+                    let client = opencode::OpencodeClient::new(port, None);
+                    match client.fork_session(&src_session, None).await {
+                        Ok(new_id) => {
+                            let mut a = vec!["-s".to_string(), new_id.clone()];
+                            a.extend(extra_args);
+                            (a, new_id)
+                        }
+                        Err(e) => return libslop::ResponseBody::Error {
+                            message: format!("opencode fork of session {} failed: {}", src_session, e),
+                        },
+                    }
+                }
+                _ => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    let mut a = vec![
+                        "--resume".to_string(), src_session,
+                        "--fork-session".to_string(),
+                        "--session-id".to_string(), new_id.clone(),
+                    ];
+                    a.extend(extra_args);
+                    (a, new_id)
+                }
+            };
+            // Default the fork's cwd to the source pane's cwd. Claude resolves a
+            // resumed transcript by (encoded) cwd, so a mismatch would make
+            // `--resume` fail to find the session; opencode's fork inherits the
+            // source directory, so the pane cwd should match it too.
+            let start_directory = start_directory
+                .or_else(|| src.working_dir.as_ref().map(std::path::PathBuf::from));
+            // Reuse the entire Run spawn path (account resolution, env merge, port
+            // allocation, spawn, session binding, ancestor-chain linkage, events)
+            // by dispatching a synthetic Run. Boxed because handle_request recurses.
+            // Claude only: pin the minted fork id THROUGH the Run so the Run handler
+            // sets it before the pane is registered — beating the pane's SessionStart
+            // hook (which reports the resumed source id, not the fork's, and would
+            // otherwise mis-bind both the session id and the transcript path).
+            // opencode tracks its id via the resume path, so it needs no pin.
+            let pin_session_id = if src.backend == libslop::Backend::Opencode {
+                None
+            } else {
+                Some(new_session_id.clone())
+            };
+            let run = libslop::RequestBody::Run {
+                parent_pane_id: Some(pane_id.clone()),
+                extra_args: fork_args,
+                start_directory,
+                env,
+                account: Some(src.account.clone()),
+                backend: Some(src.backend),
+                pin_session_id,
+            };
+            match Box::pin(handle_request(
+                run, start_time, config, panes, managed_panes, event_tx,
+                pane_registered, session_lock, config_generation, pending_restore,
+            )).await {
+                libslop::ResponseBody::Run { pane_id } => {
+                    libslop::ResponseBody::Forked { pane_id, session_id: new_session_id }
+                }
+                other => other,
+            }
+        }
+
+        libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend, pin_session_id } => {
             // Pick the account: an explicit --account wins; otherwise inherit the
             // parent pane's account (its @slopd_account option) so a pane spawned
             // from another pane stays on the same account by default.
@@ -3536,6 +3687,16 @@ async fn handle_request(
             match output {
                 Ok(pane_id) => {
                     debug!("spawned {:?} ({}) in pane {}", resolved.executable, resolved.backend.canonical_executable(), pane_id);
+                    // Pin a forked Claude pane's session id BEFORE registering it, so
+                    // the SessionStart hook (which won't be processed until the pane is
+                    // in managed_panes) sees the pin and binds the fork id, not the
+                    // resumed source id it reports. Also set @slopd_session_id up front
+                    // so `ps` is correct before the first hook arrives. (opencode forks
+                    // pass None here.)
+                    if let Some(ref pin) = pin_session_id {
+                        *panes.get_or_insert(&pane_id).pinned_session_id.lock().unwrap() = Some(pin.clone());
+                        let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), pin).await;
+                    }
                     managed_panes.insert(pane_id.clone());
                     // Wake any hook handlers that arrived before managed_panes.insert()
                     // (race between tmux creating the pane and this task resuming).

@@ -21,6 +21,7 @@ libc = "0.2.183"
 clap = { version = "4.6.0", features = ["derive"] }
 tokio-util = "0.7"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 libsloptest = { path = "../libsloptest" }

@@ -134,6 +134,40 @@ pub enum CommonCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
+    /// Fork a running pane: open a new pane whose agent session begins as a copy
+    /// of the source pane's conversation, then diverges independently. The source
+    /// pane keeps running, untouched. The fork inherits the source's account,
+    /// backend, and (by default) working directory.
+    Fork {
+        /// Tmux pane ID to fork from (e.g. %42).
+        pane_id: String,
+        /// Working directory for the forked pane. Defaults to the source pane's
+        /// cwd (Claude resolves its transcript by cwd, so overriding this to a
+        /// different directory will usually make the fork fail to find history).
+        /// Supports ~ and $VAR / ${VAR} expansion (applied by slopd).
+        #[arg(short = 'c', long, value_name = "DIR")]
+        start_directory: Option<PathBuf>,
+        /// Extra environment variables for the forked pane (repeatable).
+        /// Format: KEY=VALUE, with $VAR / ${VAR} expansion against slopctl's env.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+        /// Path to a dotenv-style file of KEY=VALUE lines (repeatable).
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_files: Vec<PathBuf>,
+        /// Hand off to a viewer once the forked pane exists (see `run --interactive`).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Don't wait for the forked pane to become ready; print its id as soon
+        /// as it is created.
+        #[arg(long)]
+        no_wait: bool,
+        /// Seconds to wait for the forked pane to become ready before giving up.
+        #[arg(long, default_value = "30", value_name = "SECS")]
+        ready_timeout: u64,
+        /// Extra arguments passed to the forked backend invocation (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
     /// Terminate a Claude pane.
     Kill {
         /// Tmux pane ID (e.g. %42).
@@ -728,8 +762,22 @@ impl<
         account: Option<String>,
         backend: Option<libslop::Backend>,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend }).await? {
+        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend, pin_session_id: None }).await? {
             libslop::ResponseBody::Run { pane_id } => Ok(pane_id),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Fork a running pane. Returns `(new_pane_id, new_session_id)`.
+    pub async fn fork(
+        &mut self,
+        pane_id: String,
+        start_directory: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        extra_args: Vec<String>,
+    ) -> Result<(String, String), Error> {
+        match self.request(libslop::RequestBody::Fork { pane_id, start_directory, env, extra_args }).await? {
+            libslop::ResponseBody::Forked { pane_id, session_id } => Ok((pane_id, session_id)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -1541,7 +1589,19 @@ where
         return Ok(());
     }
 
-    let filters = vec![
+    let mut subscription = client.subscribe(ready_event_filters()).await?;
+
+    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
+
+    wait_pane_ready(&mut subscription, pane_id, ready_timeout_secs).await
+}
+
+/// The event filters a `run`/`fork` readiness wait subscribes to: the pane's
+/// detailed-state transitions (to see it go live), plus the two death signals
+/// (`PaneDestroyed`, `SessionEnd`) so a pane that dies while booting fails fast
+/// instead of hanging until the timeout.
+fn ready_event_filters() -> Vec<libslop::EventFilter> {
+    vec![
         libslop::EventFilter {
             source: Some("slopd".to_string()),
             event_type: Some("DetailedStateChange".to_string()),
@@ -1557,11 +1617,20 @@ where
             event_type: Some("SessionEnd".to_string()),
             ..Default::default()
         },
-    ];
-    let mut subscription = client.subscribe(filters).await?;
+    ]
+}
 
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
-
+/// Wait for a freshly-spawned pane to become ready, printing its id on success.
+/// `subscription` must have been created (with `ready_event_filters`) *before*
+/// the pane was spawned, so no early state change is missed. Shared by `run` and
+/// `fork`. On a clean timeout it prints the id and exits the process with code 2
+/// (the pane is left alive for investigation); if the pane dies it returns an
+/// enriched error.
+async fn wait_pane_ready(
+    subscription: &mut Subscription,
+    pane_id: String,
+    ready_timeout_secs: u64,
+) -> Result<(), Error> {
     let overall_deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(ready_timeout_secs);
     // Set once the pane first reaches a live (non-booting) state; thereafter the
@@ -1635,6 +1704,57 @@ where
             }
         }
     }
+}
+
+/// Fork counterpart of `execute_run`: subscribe, ask slopd to fork the source
+/// pane, then wait for the new pane to become ready. Mirrors `execute_run`'s
+/// readiness/`no_wait` semantics exactly (shared `wait_pane_ready`).
+pub async fn execute_fork<R, W>(
+    client: &mut Client<R, W>,
+    source_pane_id: String,
+    start_directory: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+    no_wait: bool,
+    ready_timeout_secs: u64,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if no_wait {
+        let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
+        println!("{}", pane_id);
+        return Ok(());
+    }
+
+    let mut subscription = client.subscribe(ready_event_filters()).await?;
+
+    let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
+
+    wait_pane_ready(&mut subscription, pane_id, ready_timeout_secs).await
+}
+
+/// Interactive counterpart of `execute_fork`, mirroring `execute_run_interactive`:
+/// fork without waiting for readiness, then hand off to the viewer command with
+/// its `{pane_id}` placeholder replaced by the new pane id.
+pub async fn execute_fork_interactive<R, W>(
+    client: &mut Client<R, W>,
+    source_pane_id: String,
+    start_directory: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+    viewer: &InteractiveRun,
+) -> Result<(), Error>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
+    let mut vars: Vec<(&str, &str)> = viewer.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    vars.push(("pane_id", &pane_id));
+    let argv = libslop::SlopctlConfig::substitute(&viewer.command, &vars);
+    run_viewer_command(&argv, viewer.run_type, &pane_id)
 }
 
 /// Run for `run --interactive`: create the pane (without waiting for it to
@@ -1794,6 +1914,30 @@ where
                     no_wait,
                     ready_timeout,
                 ).await?;
+            }
+        }
+        CommonCommand::Fork { pane_id, start_directory, envs, env_files, interactive, no_wait, ready_timeout, extra_args } => {
+            let env = build_cli_env(&env_files, &envs)?;
+            // Resolve / validate --start-directory exactly like `run` (local cwd
+            // vs. rejected-over-remote). When omitted, slopd defaults it to the
+            // source pane's cwd.
+            let start_directory = if ctx.local {
+                start_directory.map(resolve_local_start_directory)
+            } else {
+                if let Some(ref dir) = start_directory {
+                    check_remote_start_directory(dir)?;
+                }
+                start_directory
+            };
+            if interactive {
+                let Some(viewer) = ctx.interactive.as_ref() else {
+                    return Err(Error::RunFailed(
+                        "`fork --interactive` is not supported for remote endpoints".to_string(),
+                    ));
+                };
+                execute_fork_interactive(client, pane_id, start_directory, env, extra_args, viewer).await?;
+            } else {
+                execute_fork(client, pane_id, start_directory, env, extra_args, no_wait, ready_timeout).await?;
             }
         }
         CommonCommand::Kill { pane_id } => {

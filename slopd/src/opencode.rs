@@ -76,6 +76,36 @@ impl OpencodeClient {
             .ok_or_else(|| "POST /session returned no id".to_string())
     }
 
+    /// `POST /session/:id/fork` — create a new session that is a copy of
+    /// `session_id`'s history up to now (optionally truncated at `message_id`),
+    /// diverging independently thereafter. The source session is untouched.
+    /// Returns the new session's id (opencode assigns it and echoes the full
+    /// Session object; the fork is a top-level session — `parentID` is null, so
+    /// it is not confused with a subagent child). Because sessions live in the
+    /// shared on-disk store, a pane spawned later with `-s <new id>` will find
+    /// it.
+    pub async fn fork_session(&self, session_id: &str, message_id: Option<&str>) -> Result<String, String> {
+        let body = match message_id {
+            Some(m) => json!({ "messageID": m }),
+            None => json!({}),
+        };
+        let resp = self
+            .req(reqwest::Method::POST, &format!("/session/{}/fork", session_id))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("POST /session/{}/fork {}: {}", session_id, status, resp.text().await.unwrap_or_default()));
+        }
+        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        v.get("id")
+            .and_then(|i| i.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("POST /session/{}/fork returned no id", session_id))
+    }
+
     /// `POST /tui/select-session` — command the TUI to display `session_id`, so the
     /// session slopd drives is the one the human sees in the pane. Without this the
     /// TUI may sit on a different (e.g. restored) session than slopd discovered,

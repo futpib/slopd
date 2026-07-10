@@ -420,6 +420,21 @@ interactive_type = "forking"
 
 `--interactive` is a local-slopctl feature (it attaches to slopd's tmux); `iroh-slopctl run --interactive` errors.
 
+### `slopctl fork <PANE_ID> [--no-wait] [-i] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+
+Open a new pane whose agent session **starts as a copy** of `PANE_ID`'s conversation and then diverges independently. The source pane keeps running, untouched — the two share history up to the fork point and nothing after it. The fork inherits the source's account, backend, and (by default) working directory. Prints the new pane id, and — like `run` — waits for it to become ready unless `--no-wait` is given.
+
+```bash
+FORK=$(slopctl fork %1)          # branch %1's conversation into a fresh pane
+```
+
+How the copy is made is backend-specific, but both use the agent's own native fork so history is duplicated faithfully rather than re-sent:
+
+- **Claude Code** — spawns `claude --resume <src> --fork-session` with a freshly minted `--session-id`, so the new pane is a distinct session whose transcript is copied from the source's.
+- **opencode** — calls the source pane's server `POST /session/:id/fork`, which creates a new top-level session copying the source's messages, then binds the new pane to it.
+
+The fork records the source as its `PARENT` (visible in `ps`), so provenance is clear. Because Claude resolves a resumed transcript by working directory, `--start-directory` defaults to the source pane's cwd; overriding it to a different directory will usually make a Claude fork fail to find the history (opencode is unaffected). `-i` / `--no-wait` / `-e` / `--env-file` behave as they do for `run`.
+
 ### `slopctl kill <PANE_ID>`
 
 Terminate a Claude pane.

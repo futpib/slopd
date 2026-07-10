@@ -28,6 +28,10 @@ const SID_2: &str = "ses_mock2";
 /// garbage-collected, so it 404s on use. Simulates the real bug where slopd
 /// adopted the TUI's transient boot session and then send failed.
 const GHOST_SID: &str = "ses_ghost";
+/// The session id `POST /session/:id/fork` returns. A pane spawned later with
+/// `-s <this>` binds to it (the second mock process lists its `-s` id), modelling
+/// how a real fork lands in the shared store and is resumable by the new pane.
+const FORK_SID: &str = "ses_mock_fork";
 
 struct MockState {
     busy: bool,
@@ -273,6 +277,18 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
         ("POST", "/session") => {
             state.lock().unwrap().session_created = true;
             (200, format!(r#"{{"id":"{SID}","time":{{"created":100,"updated":100}},"title":"mock"}}"#))
+        }
+
+        // Fork: real opencode's `POST /session/:id/fork` copies the source
+        // session's history into a NEW top-level session (verified against real
+        // opencode 1.17.x: response is the full Session with a fresh id, NO
+        // parentID — a fork is not a subagent child — and a "(fork #N)" title
+        // suffix). slopd reads the new id from this response and spawns a pane
+        // with `-s <id>`; that second mock process lists its `-s` id, which is
+        // how the fork becomes bindable (the analogue of the real shared store).
+        ("POST", p) if p.starts_with("/session/") && p.ends_with("/fork") => {
+            let src = p.trim_start_matches("/session/").trim_end_matches("/fork");
+            (200, format!(r#"{{"id":"{FORK_SID}","directory":"/mock","parentID":null,"title":"{src} (fork #1)","time":{{"created":300,"updated":300}}}}"#))
         }
 
         // slopd imposes its session on the TUI at spawn (and the TUI reports the

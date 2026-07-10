@@ -10138,6 +10138,137 @@ fn opencode_run_resume_binds_to_requested_session() {
 }
 
 #[test]
+fn fork_opencode_pane_binds_new_pane_to_forked_session() {
+    // Forking an opencode pane must: call the SOURCE server's POST /session/:id/fork
+    // (which mints a fresh top-level session id and returns it), spawn a NEW pane
+    // bound to that id via the resume path, link it to the source as parent, and
+    // leave the source pane running untouched. The mock's fork endpoint returns
+    // FORK_SID ("ses_mock_fork"); the new pane, spawned with `-s ses_mock_fork`,
+    // lists and binds to it (the analogue of the real shared session store).
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+
+    // Source opencode pane on its own POSTed session (ses_mock).
+    let run_out = env.slopctl_raw(&["run", "--account", "oc", "--ready-timeout", "30"]);
+    let src_pane = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(run_out.status.success() && !src_pane.is_empty(),
+        "opencode run failed: {:?} stderr={:?}", run_out.status, String::from_utf8_lossy(&run_out.stderr));
+
+    // Fork it: the new pane must become ready and have its id printed.
+    let fork_out = env.slopctl_raw(&["fork", &src_pane, "--ready-timeout", "30"]);
+    let fork_pane = String::from_utf8_lossy(&fork_out.stdout).trim().to_string();
+    assert!(fork_out.status.success() && !fork_pane.is_empty(),
+        "fork failed: {:?} stderr={:?}", fork_out.status, String::from_utf8_lossy(&fork_out.stderr));
+    assert_ne!(fork_pane, src_pane, "fork must create a distinct pane");
+
+    let ps: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let fp = ps.iter().find(|p| p.pane_id == fork_pane).expect("fork pane in ps");
+    assert_eq!(fp.session_id.as_deref(), Some("ses_mock_fork"),
+        "fork pane must bind to the forked session id, got {:?}", fp.session_id);
+    assert_eq!(fp.backend, libslop::Backend::Opencode);
+    assert_eq!(fp.parent_pane_id.as_deref(), Some(src_pane.as_str()),
+        "fork pane must record the source pane as its parent");
+
+    // The source pane is untouched: still present, still on its own session.
+    let sp = ps.iter().find(|p| p.pane_id == src_pane).expect("source pane still present");
+    assert_eq!(sp.session_id.as_deref(), Some("ses_mock"),
+        "source pane session must be untouched by the fork, got {:?}", sp.session_id);
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn fork_claude_pane_mints_new_forked_session() {
+    // Forking a Claude pane mints a fresh session id and spawns a pane with
+    // `--resume <src> --fork-session --session-id <new>`. The new pane must track
+    // the minted id (uuid-shaped, distinct from the source's), record the source as
+    // its parent, and leave the source running. mock_claude honors --session-id, so
+    // its SessionStart hook reports exactly the id slopd minted.
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_out = env.slopctl(&["run"]);
+    assert!(run_out.status.success(), "run failed: {:?}", run_out);
+    let src_pane = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &src_pane);
+
+    // Fork the claude pane; catch the forked pane's SessionStart so slopd has
+    // finished binding by the time we inspect ps.
+    let fork_listener = env.spawn_session_start_listener();
+    let fork_out = env.slopctl_raw(&["fork", &src_pane, "--ready-timeout", "30"]);
+    let fork_pane = String::from_utf8_lossy(&fork_out.stdout).trim().to_string();
+    assert!(fork_out.status.success() && !fork_pane.is_empty(),
+        "fork failed: {:?} stderr={:?}", fork_out.status, String::from_utf8_lossy(&fork_out.stderr));
+    assert_ne!(fork_pane, src_pane, "fork must create a distinct pane");
+
+    // Faithful to real Claude (verified live): a forked pane's SessionStart hook
+    // fires with the RESUMED SOURCE id, not the minted fork id. slopd must NOT
+    // bind that id — it pins the fork id it minted. The listener returns the hook
+    // id, which is therefore the source id.
+    let hook_sid = env.wait_for_session_start(fork_listener, &fork_pane);
+    assert_eq!(hook_sid, "mock-session-id-1234",
+        "mock must reproduce real Claude: the fork's SessionStart reports the source id");
+
+    let ps: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let fp = ps.iter().find(|p| p.pane_id == fork_pane).expect("fork pane in ps");
+    assert_eq!(fp.backend, libslop::Backend::Claude);
+    // Regression: despite the SessionStart hook reporting the source id, slopd
+    // tracks the MINTED fork id — a fresh uuid, distinct from the source's.
+    let fork_sid = fp.session_id.clone().expect("fork pane has a session id");
+    assert_ne!(fork_sid, "mock-session-id-1234",
+        "slopd must pin the minted fork id, not the source id the SessionStart hook reports");
+    assert_eq!(fork_sid.len(), 36, "fork session id should be a uuid, got {:?}", fork_sid);
+    assert_eq!(fork_sid.matches('-').count(), 4, "fork session id should be a uuid, got {:?}", fork_sid);
+    // The tracked transcript is the fork's OWN file (named for the fork id), not
+    // the source's — so `transcript`/tailing read the copy, not the original.
+    let tp = fp.transcript_path.clone().expect("fork pane has a transcript path");
+    assert!(tp.ends_with(&format!("{}.jsonl", fork_sid)),
+        "fork transcript must be the fork session's file, got {:?}", tp);
+    assert!(!tp.contains("mock-session-id-1234"),
+        "fork transcript must not be the source session's file, got {:?}", tp);
+    assert_eq!(fp.parent_pane_id.as_deref(), Some(src_pane.as_str()),
+        "fork pane must record the source pane as its parent");
+
+    // The source pane keeps its original session.
+    let sp = ps.iter().find(|p| p.pane_id == src_pane).expect("source pane present");
+    assert_eq!(sp.session_id.as_deref(), Some("mock-session-id-1234"),
+        "source pane session must be untouched by the fork");
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn opencode_follows_tui_session_switch() {
     // When the human navigates the TUI to a different session, opencode emits a
     // `tui.session.select` SSE event. slopd must follow it: re-point the session it

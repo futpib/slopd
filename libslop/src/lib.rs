@@ -2410,6 +2410,33 @@ pub enum RequestBody {
         /// handler for the executable recomputation.
         #[serde(default)]
         backend: Option<Backend>,
+        /// Internal (daemon-set) only: pin this Claude session id on the new pane
+        /// before it is registered, so its `SessionStart` hook — which real Claude
+        /// fires with the *resumed source* id, not this one — cannot mis-bind it.
+        /// Set only by the `Fork` handler's synthetic Run; always `None` from the
+        /// CLI. Ignored for opencode (which tracks its id via the resume path).
+        #[serde(default)]
+        pin_session_id: Option<String>,
+    },
+    /// Fork a running pane into a new pane whose backend session starts as a
+    /// copy of the source pane's session history, then diverges independently.
+    /// The source pane is untouched. Backend-specific: for Claude the daemon
+    /// mints a fresh session id and spawns `--resume <src> --fork-session
+    /// --session-id <new>`; for opencode it calls the source server's
+    /// `POST /session/:id/fork` and spawns a pane bound to the returned id.
+    Fork {
+        /// The pane to fork from.
+        pane_id: String,
+        /// Working directory for the new pane. Defaults to the source pane's
+        /// cwd (Claude resolves its transcript by cwd, so this must match).
+        #[serde(default)]
+        start_directory: Option<PathBuf>,
+        /// Extra environment variables for the forked pane (like `Run`).
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Extra args appended to the forked backend invocation (like `Run`).
+        #[serde(default)]
+        extra_args: Vec<String>,
     },
     Kill { pane_id: String },
     Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
@@ -2455,6 +2482,9 @@ pub struct Response {
 pub enum ResponseBody {
     Status { state: DaemonState },
     Run { pane_id: String },
+    /// Response to Fork: the new pane and the backend session id it was bound to
+    /// (minted by the daemon for Claude, returned by the fork API for opencode).
+    Forked { pane_id: String, session_id: String },
     Kill { pane_id: String },
     Sent { pane_id: String },
     Interrupted { pane_id: String },
