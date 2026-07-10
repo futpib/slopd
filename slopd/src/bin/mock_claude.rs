@@ -2,6 +2,34 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// How long the terminal waits after an Escape for a follow-up byte before
+/// deciding the Escape stood alone. An Escape immediately followed by another
+/// byte is an escape sequence (e.g. `ESC` + a printable char = `Alt-<char>`),
+/// whereas a lone Escape is an interrupt. Real terminals use ~25-50ms; slopd's
+/// interrupt settle is deliberately far larger so a genuine interrupt never
+/// falls inside this window.
+const ESC_FOLLOWUP_WINDOW_MS: i32 = 50;
+
+/// Poll stdin for a single byte, waiting up to `timeout_ms`. Returns the byte if
+/// one arrives in time, else `None`. Used to model a terminal's Escape
+/// disambiguation window (see [`ESC_FOLLOWUP_WINDOW_MS`]).
+fn poll_byte(stdin_fd: i32, stdin: &mut std::io::Stdin, timeout_ms: i32) -> Option<u8> {
+    let mut pfd = libc::pollfd {
+        fd: stdin_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if ret <= 0 {
+        return None;
+    }
+    let mut byte = [0u8; 1];
+    match stdin.read(&mut byte) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(byte[0]),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NewlineMode {
     /// Every newline submits the line (original behaviour).
@@ -95,6 +123,10 @@ fn read_busy_input(
                     }),
                 ));
                 queued.push(prompt);
+            }
+            0x15 => {
+                // Ctrl-U kills the input line (any draft queued so far).
+                line_buf.clear();
             }
             _ => {
                 line_buf.push(b);
@@ -499,6 +531,9 @@ fn main() {
     let mut last_interrupt: Option<u8> = None;
     let mut stdin = std::io::stdin();
     let mut byte = [0u8; 1];
+    // A byte read while disambiguating an Escape that turned out not to belong to
+    // the escape sequence; processed on the next iteration before reading stdin.
+    let mut pending: Option<u8> = None;
     let mut newline_mode = NewlineMode::Alternating;
     let mut newline_count: u64 = 0;
     // When set (via /always-fail), every subsequent submitted prompt — including
@@ -513,11 +548,16 @@ fn main() {
     let mut fail_then_busy_ms: Option<u64> = None;
 
     loop {
-        match stdin.read(&mut byte) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let b = byte[0];
+        let b = match pending.take() {
+            Some(p) => p,
+            None => {
+                match stdin.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                byte[0]
+            }
+        };
         match b {
             0x03 | 0x04 => {
                 if last_interrupt == Some(b) {
@@ -526,9 +566,35 @@ fn main() {
                 }
                 last_interrupt = Some(b);
             }
+            0x15 => {
+                // Ctrl-U kills the input line. Real Claude clears the editable
+                // buffer; slopd relies on this to submit a prompt verbatim rather
+                // than concatenated onto a stale draft or ghosted suggestion.
+                line_buf.clear();
+                last_interrupt = None;
+            }
             0x1b => {
-                // Single or double Esc: interrupt / rewind mode — never exit.
-                last_interrupt = Some(b);
+                // Escape disambiguation, mirroring a real terminal. An Escape
+                // immediately followed by a printable byte is `Alt-<char>`: the
+                // terminal swallows that byte (it never reaches the input buffer).
+                // A lone Escape — nothing arrives within the window — is an
+                // interrupt and does NOT clear the input line.
+                match poll_byte(stdin_fd, &mut stdin, ESC_FOLLOWUP_WINDOW_MS) {
+                    Some(nb) if (0x20..=0x7e).contains(&nb) => {
+                        // Esc + printable = Alt-<char>: swallow the char, leave
+                        // the existing buffer untouched.
+                        last_interrupt = None;
+                    }
+                    Some(nb) => {
+                        // Lone Escape, then a distinct control key: process that
+                        // key normally on the next iteration.
+                        last_interrupt = Some(0x1b);
+                        pending = Some(nb);
+                    }
+                    None => {
+                        last_interrupt = Some(0x1b);
+                    }
+                }
             }
             0x0d | 0x0a => {
                 last_interrupt = None;

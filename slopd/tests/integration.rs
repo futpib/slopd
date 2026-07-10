@@ -3507,17 +3507,177 @@ fn send_with_interrupt_preempts_busy_pane() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Subscribe to UserPromptSubmit now — the /busy prompt already fired its own
+    // (PreToolUse, hence BusyToolUse, comes after it), so the only prompt we
+    // capture here is the interrupt-delivered one.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let listen_stdout = listen.stdout.take().unwrap();
+    let (subscribed, reader) = read_line_timeout(listen_stdout, Duration::from_secs(10))
+        .expect("timed out reading subscribed line");
+    assert!(subscribed.contains("subscribed"), "unexpected first line: {:?}", subscribed);
+
     // send --interrupt should interrupt the busy pane and deliver the prompt.
     let start = Instant::now();
     let send_out = env.slopctl(&["send", "--interrupt", &pane_id, "hello after interrupt", "--timeout", "10"]);
     let elapsed = start.elapsed();
 
+    let (line, _reader) = read_line_timeout(reader, Duration::from_secs(10))
+        .expect("timed out reading UserPromptSubmit event");
+
     let _ = busy_thread.join();
+    kill_child(listen);
     kill_slopd(slopd);
 
     assert!(send_out.status.success(), "send --interrupt failed: {:?}", send_out);
     // Should complete quickly (interrupt fires immediately), not wait the full 30s.
     assert!(elapsed < Duration::from_secs(8), "send --interrupt took {:?}", elapsed);
+    // And the prompt must arrive verbatim — the interrupt keystrokes must not
+    // corrupt it (the old sequence ate the first character).
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    let got = event["payload"]["prompt"].as_str().expect("prompt is a string");
+    assert_eq!(got.trim_end_matches('\n'), "hello after interrupt",
+        "interrupt-delivered prompt was corrupted");
+}
+
+/// Regression (%121): `send --interrupt` on an idle pane must deliver the prompt
+/// verbatim. The old interrupt sequence (C-c, C-d, Escape) left the Escape glued
+/// to the first typed character, so the terminal read the pair as an escape
+/// sequence and swallowed that character — "Reply…" arrived as "eply…" — and
+/// against a pane with no in-flight activity the send timed out entirely.
+#[test]
+fn send_interrupt_delivers_prompt_verbatim_on_idle_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Subscribe to UserPromptSubmit so we can read the prompt Claude actually saw.
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let listen_stdout = listen.stdout.take().unwrap();
+    let timeout = Duration::from_secs(10);
+    let (subscribed, reader) = read_line_timeout(listen_stdout, timeout)
+        .expect("timed out reading subscribed line");
+    assert!(subscribed.contains("subscribed"), "unexpected first line: {:?}", subscribed);
+
+    // The leading 'R' is exactly the character the old interrupt sequence ate.
+    let prompt = "Reply with exactly the word ZULU.";
+    let send_out = env.slopctl(&["send", "--interrupt", &pane_id, prompt, "--timeout", "10"]);
+    assert!(send_out.status.success(), "send --interrupt failed: {:?}", send_out);
+
+    let (line, _reader) = read_line_timeout(reader, timeout)
+        .expect("timed out reading UserPromptSubmit event");
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    assert_eq!(event["event_type"], "UserPromptSubmit");
+    // Trailing newline is a mock-only artifact of Alternating newline mode (the
+    // first of slopd's retry Enters is modeled as a literal newline); real Claude
+    // has none. The bug under test corrupts the START of the prompt, not the end.
+    let got = event["payload"]["prompt"].as_str().expect("prompt is a string");
+    assert_eq!(got.trim_end_matches('\n'), prompt,
+        "interrupt-delivered prompt was corrupted (first character eaten?)");
+}
+
+/// Regression: `send` must clear any residual input before typing, so the prompt
+/// is submitted verbatim rather than concatenated onto a stale draft or a ghosted
+/// autocomplete suggestion left in the input box.
+#[test]
+fn send_clears_stale_input_before_typing() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    ) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let env = Arc::new(env);
+    let slopd = env.spawn_slopd();
+
+    let listener = env.spawn_session_start_listener();
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    env.wait_for_session_start(listener, &pane_id);
+
+    // Leave a stale draft in the input box: typed straight to the pane, never
+    // submitted (no Enter). Byte order in the pty guarantees the mock reads this
+    // before slopd's clear + prompt.
+    let typed = env.tmux.tmux()
+        .args(["send-keys", "-t", &pane_id, "-l", "STALE_DRAFT_"])
+        .output()
+        .expect("tmux send-keys failed");
+    assert!(typed.status.success(), "tmux send-keys failed: {:?}", typed);
+
+    let mut listen = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--hook", "UserPromptSubmit"])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen");
+    let listen_stdout = listen.stdout.take().unwrap();
+    let timeout = Duration::from_secs(10);
+    let (subscribed, reader) = read_line_timeout(listen_stdout, timeout)
+        .expect("timed out reading subscribed line");
+    assert!(subscribed.contains("subscribed"), "unexpected first line: {:?}", subscribed);
+
+    let prompt = "clean prompt END.";
+    let send_out = env.slopctl(&["send", &pane_id, prompt, "--timeout", "10"]);
+    assert!(send_out.status.success(), "send failed: {:?}", send_out);
+
+    let (line, _reader) = read_line_timeout(reader, timeout)
+        .expect("timed out reading UserPromptSubmit event");
+    kill_child(listen);
+    kill_slopd(slopd);
+
+    let event: serde_json::Value = serde_json::from_str(line.trim()).expect("event is not valid JSON");
+    let got = event["payload"]["prompt"].as_str().expect("prompt is a string");
+    assert_eq!(got.trim_end_matches('\n'), prompt,
+        "prompt was concatenated onto stale input instead of replacing it");
 }
 
 /// Helper: create a raw tmux pane in the "test" session that slopd has never seen.

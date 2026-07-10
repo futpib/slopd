@@ -3415,6 +3415,14 @@ async fn restore_panes(
     restored
 }
 
+/// After sending the interrupt Escape on a `send --interrupt`, wait this long
+/// before any further keystrokes. A lone Escape must register as an interrupt on
+/// its own; if the next keystroke is glued to it the terminal reads the pair as
+/// an escape sequence and swallows that keystroke (which ate the first character
+/// of interrupt-delivered prompts). Comfortably larger than the mock terminal's
+/// Escape window and any real terminal's ~25-50ms.
+const INTERRUPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
 async fn send_interrupt_keys(config: &libslop::SlopdConfig, pane_id: &str) -> Result<(), libslop::ResponseBody> {
     for key in &["C-c", "C-d", "Escape"] {
         if let Err(e) = tmux_send_keys(config, pane_id, key).await {
@@ -4249,13 +4257,21 @@ async fn handle_request(
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(timeout_secs);
 
-            // If --interrupt was requested, send C-c/C-d/Escape first to preempt
-            // whatever Claude is currently doing.
+            // If --interrupt was requested, preempt the running turn with Escape
+            // (Claude's cancel key). Unlike the Ctrl-C/Ctrl-D sequence the
+            // standalone `interrupt` command uses, a lone Escape can't quit an
+            // idle session and, being a single key, is cleanly separated from the
+            // keystrokes that follow.
             if interrupt {
-                let _guard = state.type_mutex.lock().await;
-                if let Err(e) = send_interrupt_keys(config, &pane_id).await {
-                    return e;
+                {
+                    let _guard = state.type_mutex.lock().await;
+                    if let Err(e) = tmux_send_keys(config, &pane_id, "Escape").await {
+                        return libslop::ResponseBody::Error { message: e.to_string() };
+                    }
                 }
+                // Let the Escape settle as a standalone interrupt before typing;
+                // otherwise the terminal swallows the first prompt character.
+                tokio::time::sleep(INTERRUPT_SETTLE).await;
             }
 
             // Subscribe to DetailedStateChange events before reading current state
@@ -4319,6 +4335,14 @@ async fn handle_request(
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
             let _guard = state.type_mutex.lock().await;
+
+            // Clear any residual input first with Ctrl-U (a queued draft, a
+            // ghosted autocomplete suggestion, or leftover keystrokes) so the
+            // prompt is submitted verbatim instead of concatenated onto whatever
+            // was already in the box.
+            if let Err(e) = tmux_send_keys(config, &pane_id, "C-u").await {
+                return libslop::ResponseBody::Error { message: e.to_string() };
+            }
 
             // Type the prompt text (without Enter) first.
             let result = tmux_send_keys(config, &pane_id, &prompt).await;

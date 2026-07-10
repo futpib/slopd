@@ -446,7 +446,7 @@ slopctl kill %2
 ### `slopctl send <PANE_ID> <PROMPT> [--interrupt] [--timeout SECS]`
 ### `slopctl send <KEY=VALUE> <PROMPT> [--select one|any|all] [--interrupt] [--timeout SECS]`
 
-Type `PROMPT` into a pane (or panes matching a filter) and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout.
+Type `PROMPT` into a pane (or panes matching a filter) and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout. The input line is cleared (Ctrl+U) before the prompt is typed, so a stale draft or a ghosted autocomplete suggestion left in the box can't concatenate onto it — the prompt is submitted verbatim.
 
 When the first positional argument contains `=`, it is treated as a filter instead of a pane ID.
 
@@ -479,7 +479,7 @@ slopctl send %1 "/clear"
 | `any` | Send to one arbitrarily chosen matching pane |
 | `all` | Send to all matching panes |
 
-`--interrupt` / `-i`: Send Ctrl+C, Ctrl+D, and Escape to the pane(s) before typing the prompt. Equivalent to running `slopctl interrupt` first.
+`--interrupt` / `-i`: Preempt a running turn with Escape before sending, then let it settle before typing so the Escape isn't read as an escape sequence that swallows the first character. (This differs from the standalone `slopctl interrupt`, which sends the fuller Ctrl+C / Ctrl+D / Escape sequence but never types after — so the eaten-character hazard doesn't apply there.)
 
 ### `slopctl interrupt <PANE_ID>`
 
