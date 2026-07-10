@@ -768,6 +768,53 @@ Emitted by slopd itself whenever a pane's state changes.
 
 Detailed state values: `booting_up`, `ready`, `busy_processing`, `busy_tool_use`, `busy_subagent`, `busy_compacting`, `awaiting_input_permission`, `awaiting_input_elicitation`.
 
+#### `PaneDestroyed` — a managed pane died
+
+Emitted once whenever a managed pane is torn down, from every death path, with a classified cause and the pane's full identity — so "what happened to pane %N?" is answerable after the fact, without any surviving tmux state.
+
+```json
+{
+  "source": "slopd",
+  "event_type": "PaneDestroyed",
+  "pane_id": "%119",
+  "payload": {
+    "cause": "vanished",
+    "detected_by": "reconcile_vanished",
+    "backend": "opencode",
+    "session_id": "ses_0e54cad77ffeghO0xI5t1A27d2",
+    "parent_pane_id": "%60",
+    "working_dir": "/home/claude",
+    "title": "tg-dm-responder takeover",
+    "last_state": "ready",
+    "spawned_at": 1720000000,
+    "lived_secs": 12345,
+    "exit_status": 37,
+    "preceding_hook": "after-kill-pane",
+    "output": "…final screen tail (self_exit only)…"
+  }
+}
+```
+
+`cause` is one of:
+
+| cause | meaning |
+| --- | --- |
+| `deliberate_kill` | an explicit `slopctl kill` (`detected_by: kill_rpc`) |
+| `self_exit` | the agent process exited on its own; `exit_status` and `output` (its final screen) are captured |
+| `vanished` | the pane was removed from tmux by something outside slopd (an external `tmux kill-pane`/`kill-window`) |
+| `server_gone` | the whole tmux server/session was gone — every managed pane died at once |
+
+For a `vanished` pane, `preceding_hook` correlates the tmux lifecycle hook that fired just before it: `after-kill-pane` (a deliberate external kill) versus `window-unlinked` (a closed window).
+
+The broadcast is ephemeral — if no subscriber is listening at the moment of death it is lost — so slopd also writes the same record as **one structured line to its log** (stderr → the systemd journal). Abnormal deaths (`vanished`, `server_gone`, or a nonzero `self_exit`) log at `WARN` so they are visible at the default verbosity; a clean `slopctl kill` or a zero-exit process logs at `INFO`. After the fact:
+
+```bash
+journalctl --user -u slopd | grep 'pane %119 died'
+# pane %119 died: cause=vanished detected_by=reconcile_vanished backend=opencode \
+#   session=ses_0e54… parent=%60 state=ready exit=- lived=12345s title="…" \
+#   cwd=/home/claude preceding_hook=after-kill-pane
+```
+
 ### `source:transcript` — Claude conversation transcript
 
 slopd tails each pane's Claude transcript `.jsonl` file and re-broadcasts every record as an event. This lets subscribers read Claude's conversation in real time without polling the file system.

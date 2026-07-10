@@ -287,6 +287,83 @@ struct OpencodeState {
     session_id: String,
 }
 
+/// Why a managed pane was torn down. Recorded on every death so the systemd
+/// journal (and the `PaneDestroyed` event) can answer "what happened to pane
+/// %N?" without any surviving tmux state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeathCause {
+    /// Torn down by an explicit `slopctl kill` (the Kill RPC).
+    DeliberateKill,
+    /// The agent process exited on its own; slopd caught the remain-on-exit
+    /// husk and recorded its exit status + final screen.
+    SelfExit,
+    /// The whole tmux server / slopd session was gone when reconcile looked —
+    /// every managed pane died at once (server crash, `tmux kill-server`).
+    ServerGone,
+    /// The pane was removed from tmux by something outside slopd (an external
+    /// `tmux kill-pane` / `kill-window`), leaving neither a husk nor a Kill RPC.
+    Vanished,
+}
+
+impl DeathCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeathCause::DeliberateKill => "deliberate_kill",
+            DeathCause::SelfExit => "self_exit",
+            DeathCause::ServerGone => "server_gone",
+            DeathCause::Vanished => "vanished",
+        }
+    }
+
+    /// Whether this death is unexpected enough to warrant a WARN (always visible
+    /// in the journal at slopd's default verbosity). A clean `slopctl kill` or a
+    /// zero-exit process is routine (INFO); a vanished pane, a nonzero exit, or a
+    /// lost server is exactly the mystery a post-mortem needs, so it is a warning.
+    fn is_abnormal(self, exit_status: Option<i64>) -> bool {
+        match self {
+            DeathCause::DeliberateKill => false,
+            DeathCause::SelfExit => exit_status != Some(0),
+            DeathCause::ServerGone | DeathCause::Vanished => true,
+        }
+    }
+}
+
+/// Which slopd code path noticed the death — finer-grained than [`DeathCause`],
+/// recorded alongside it to pin down how slopd learned of the teardown.
+#[derive(Clone, Copy)]
+enum DeathDetectedBy {
+    /// The Kill RPC handler (`slopctl kill`).
+    KillRpc,
+    /// The reconcile loop's DEAD-pane (remain-on-exit husk) path.
+    ReconcileDeadPane,
+    /// The reconcile loop's vanished-pane path.
+    ReconcileVanished,
+}
+
+impl DeathDetectedBy {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeathDetectedBy::KillRpc => "kill_rpc",
+            DeathDetectedBy::ReconcileDeadPane => "reconcile_dead_pane",
+            DeathDetectedBy::ReconcileVanished => "reconcile_vanished",
+        }
+    }
+}
+
+/// A durable snapshot of a pane's identity, kept in memory so a death can be
+/// fully described after the pane's tmux options are already gone. Populated at
+/// spawn (backend/parent/working_dir/created_at) and kept fresh as slopd learns
+/// the session id (SessionStart hook / opencode bind / fork pin) and title.
+#[derive(Clone, Default)]
+struct PaneIdentity {
+    backend: libslop::Backend,
+    session_id: Option<String>,
+    parent_pane_id: Option<String>,
+    working_dir: Option<String>,
+    title: Option<String>,
+    created_at: Option<u64>,
+}
+
 /// Per-pane state shared across connection handlers.
 struct PaneState {
     /// Serialises the type-then-enter sequence so two concurrent sends don't interleave.
@@ -319,6 +396,10 @@ struct PaneState {
     /// this pin the pane would be mis-bound to the source session. When set, the
     /// SessionStart handler uses this id instead of the hook payload's.
     pinned_session_id: std::sync::Mutex<Option<String>>,
+    /// Durable identity snapshot (backend, session id, parent, cwd, title,
+    /// spawn time), populated at spawn and kept fresh as slopd learns more. Read
+    /// at teardown to describe the death after the pane's tmux options are gone.
+    identity: std::sync::Mutex<PaneIdentity>,
 }
 
 impl PaneState {
@@ -335,7 +416,15 @@ impl PaneState {
             opencode_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             opencode_last_prompt: std::sync::Mutex::new(None),
             pinned_session_id: std::sync::Mutex::new(None),
+            identity: std::sync::Mutex::new(PaneIdentity::default()),
         }
+    }
+
+    /// Merge a freshly-learned session id into the identity snapshot. Called
+    /// wherever slopd binds/rebinds a session (SessionStart, opencode bind,
+    /// fork pin) so a later death record names the right session.
+    fn note_session_id(&self, session_id: &str) {
+        self.identity.lock().unwrap().session_id = Some(session_id.to_string());
     }
 
     /// Whether this pane is an opencode pane (has an opencode runtime attached).
@@ -610,6 +699,7 @@ async fn read_opencode_sse(
                     // Re-point the shared state so send/interrupt/transcript target
                     // the followed session; grab a client clone for the reconcile.
                     let client = panes.get(pane_id).and_then(|state| {
+                        state.note_session_id(&current_session);
                         state.opencode.lock().unwrap().as_mut().map(|oc| {
                             oc.session_id = current_session.clone();
                             oc.client.clone()
@@ -1230,6 +1320,25 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         let initial_state = recovered_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
         set_pane_detailed_state(config, pane_id, &initial_state, None, event_tx, panes).await;
 
+        // Rebuild the identity snapshot from the pane's tmux options so a pane
+        // recovered across a daemon restart is just as describable at death as a
+        // freshly-spawned one (the death record's only other source, the pane's
+        // options, is gone by the time it dies). working_dir isn't a slopd option
+        // so it stays unset here; a later `ps` fills the title.
+        {
+            let state = panes.get_or_insert(pane_id);
+            let mut id = state.identity.lock().unwrap();
+            id.backend = opts.backend.unwrap_or(libslop::Backend::Claude);
+            // Immediate parent is the first ancestor; read the field directly since
+            // `opts` is already partially moved (transcript_path) above, which would
+            // block the `parent_pane_id()` method's whole-`self` borrow.
+            id.parent_pane_id = opts.ancestor_panes.first().cloned();
+            id.created_at = opts.created_at;
+            if let Some(sid) = opts.session_id.as_ref().filter(|s| !s.is_empty()) {
+                id.session_id = Some(sid.clone());
+            }
+        }
+
         // Start the transcript tailer if we have a path.
         if let Some(transcript_path) = transcript_path {
             let state = panes.get_or_insert(pane_id);
@@ -1303,6 +1412,23 @@ async fn recover_state_from_transcript(
 
 type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
 type PaneRegistered = Arc<tokio::sync::Notify>;
+/// The most recent time each relevant tmux lifecycle hook fired, shared between
+/// the TmuxHook handler and the reconcile loop. When a pane is found to have
+/// vanished, a hook that landed just before it disambiguates the cause. tmux
+/// fires these with no pane id (the pane is already gone), so temporal
+/// correlation is the only signal available — and both may fire for one kill
+/// (killing a window's last pane fires `after-kill-pane` *and* `window-unlinked`),
+/// so they are tracked separately and `after-kill-pane`, the deliberate-kill
+/// signal, is preferred over `window-unlinked`, which also fires for plain
+/// window closes.
+#[derive(Default)]
+struct RecentHooks {
+    after_kill_pane: Option<std::time::Instant>,
+    window_unlinked: Option<std::time::Instant>,
+}
+type HookLog = Arc<std::sync::Mutex<RecentHooks>>;
+/// How recently a tmux hook must have fired to be attributed to a vanished pane.
+const HOOK_CORRELATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 /// After a reboot with `auto_restore` off, holds `Some(n)` while `n` panes from
 /// the on-disk manifest await a `slopctl restore`; `None` when nothing is
 /// pending. While `Some`, auto-backup is suspended so the manifest (the restore
@@ -1516,6 +1642,137 @@ async fn tmux_session_output(
     build_cmd(config).output().await
 }
 
+/// The single chokepoint for recording a pane's death. Every teardown path
+/// (explicit kill, process exit, external removal, lost server) routes through
+/// here so the death is described exactly once, completely, and consistently:
+///
+///  1. a structured log line to stderr → the systemd journal (`journalctl --user
+///     -u slopd`). Abnormal deaths (vanished / nonzero exit / server gone) log at
+///     WARN so they are visible at slopd's default verbosity; routine ones (a
+///     clean `slopctl kill` or zero exit) log at INFO.
+///  2. the `PaneDestroyed` broadcast, enriched with the same fields so a live
+///     `slopctl` listener sees them too (and `slopctl run` keeps reading the
+///     `exit_status`/`output` it always has).
+///
+/// `state` is the [`PaneState`] the caller just removed from the map — its
+/// identity snapshot is the only surviving description of the pane once tmux has
+/// dropped it. This makes "what happened to pane %N?" answerable from the journal
+/// alone, which is exactly what a lingering `pane=None` kill-hook could not do.
+#[allow(clippy::too_many_arguments)]
+fn record_pane_death(
+    event_tx: &EventTx,
+    pane_id: &str,
+    cause: DeathCause,
+    detected_by: DeathDetectedBy,
+    state: Option<&Arc<PaneState>>,
+    exit_status: Option<i64>,
+    output_tail: Option<String>,
+    preceding_hook: Option<String>,
+) {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (identity, last_state) = match state {
+        Some(s) => (
+            s.identity.lock().unwrap().clone(),
+            Some(s.detailed_state.lock().unwrap().clone()),
+        ),
+        None => (PaneIdentity::default(), None),
+    };
+    let lived_secs = identity.created_at.map(|c| ts.saturating_sub(c));
+    let output_tail = output_tail.filter(|s| !s.is_empty());
+    let last_state_str = last_state.as_ref().map(|s| s.as_str());
+
+    // 1. Structured journal line — one line, all forensic fields, greppable.
+    let line = format!(
+        "pane {} died: cause={} detected_by={} backend={} session={} parent={} state={} exit={} lived={} title={:?} cwd={} preceding_hook={}",
+        pane_id,
+        cause.as_str(),
+        detected_by.as_str(),
+        identity.backend.canonical_executable(),
+        identity.session_id.as_deref().unwrap_or("?"),
+        identity.parent_pane_id.as_deref().unwrap_or("-"),
+        last_state_str.unwrap_or("?"),
+        exit_status.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+        lived_secs.map(|s| format!("{s}s")).unwrap_or_else(|| "?".into()),
+        identity.title.as_deref().unwrap_or("-"),
+        identity.working_dir.as_deref().unwrap_or("-"),
+        preceding_hook.as_deref().unwrap_or("-"),
+    );
+    if cause.is_abnormal(exit_status) {
+        warn!("{line}");
+    } else {
+        info!("{line}");
+    }
+    // For an abnormal SelfExit the pane printed its dying words; surface them too
+    // (the ephemeral PaneDestroyed broadcast may have no listener at death time).
+    if let Some(out) = output_tail.as_ref().filter(|_| cause.is_abnormal(exit_status)) {
+        warn!("pane {} death output:\n{}", pane_id, out);
+    }
+
+    // 2. Enriched PaneDestroyed broadcast. Keeps the legacy `exit_status`/`output`
+    // keys `slopctl run` reads, plus the full identity/cause for richer listeners.
+    let mut payload = serde_json::json!({
+        "pane_id": pane_id,
+        "cause": cause.as_str(),
+        "detected_by": detected_by.as_str(),
+        "backend": identity.backend.canonical_executable(),
+        "ts": ts,
+    });
+    if let Some(sid) = identity.session_id {
+        payload["session_id"] = serde_json::json!(sid);
+    }
+    if let Some(parent) = identity.parent_pane_id {
+        payload["parent_pane_id"] = serde_json::json!(parent);
+    }
+    if let Some(cwd) = identity.working_dir {
+        payload["working_dir"] = serde_json::json!(cwd);
+    }
+    if let Some(title) = identity.title {
+        payload["title"] = serde_json::json!(title);
+    }
+    if let Some(s) = last_state_str {
+        payload["last_state"] = serde_json::json!(s);
+    }
+    if let Some(spawned) = identity.created_at {
+        payload["spawned_at"] = serde_json::json!(spawned);
+    }
+    if let Some(l) = lived_secs {
+        payload["lived_secs"] = serde_json::json!(l);
+    }
+    if let Some(code) = exit_status {
+        payload["exit_status"] = serde_json::json!(code);
+    }
+    if let Some(out) = output_tail {
+        payload["output"] = serde_json::json!(out);
+    }
+    if let Some(hook) = preceding_hook {
+        payload["preceding_hook"] = serde_json::json!(hook);
+    }
+    let _ = event_tx.send(libslop::Record {
+        source: "slopd".to_string(),
+        event_type: "PaneDestroyed".to_string(),
+        pane_id: Some(pane_id.to_string()),
+        payload,
+        cursor: None,
+    });
+}
+
+/// Attribute a vanished pane's cause to a recent tmux hook, if one fired within
+/// [`HOOK_CORRELATION_WINDOW`]. `after-kill-pane` (an explicit external
+/// kill-pane/kill-window) is preferred over `window-unlinked` (which also fires
+/// as a side effect of that same kill, and for plain window closes), so a
+/// deliberate external kill is reported as such even when both hooks landed.
+fn recent_hook(hook_log: &HookLog) -> Option<String> {
+    let fresh = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() <= HOOK_CORRELATION_WINDOW);
+    let hooks = hook_log.lock().unwrap();
+    if fresh(hooks.after_kill_pane) {
+        Some("after-kill-pane".to_string())
+    } else if fresh(hooks.window_unlinked) {
+        Some("window-unlinked".to_string())
+    } else {
+        None
+    }
+}
+
 /// Reconcile managed_panes against live tmux panes, emitting PaneDestroyed
 /// for any managed pane that no longer exists.
 async fn reconcile_panes(
@@ -1523,6 +1780,7 @@ async fn reconcile_panes(
     panes: &PaneMap,
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
+    hook_log: &HookLog,
 ) {
     let session = config.tmux.session();
     // Pull pane_dead/pane_dead_status alongside the id: a pane we set
@@ -1533,6 +1791,10 @@ async fn reconcile_panes(
         .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id} #{pane_dead} #{pane_dead_status}"])
         .output()
         .await;
+    // `server_gone` distinguishes a vanished-pane cause: when the whole tmux
+    // server/session is gone every managed pane died together (ServerGone),
+    // versus a single pane externally removed while the server lived (Vanished).
+    let mut server_gone = false;
     let (present_ids, dead_panes): (std::collections::HashSet<String>, std::collections::HashMap<String, Option<i64>>) = match output {
         Ok(out) if out.status.success() => {
             parse_list_panes(&String::from_utf8_lossy(&out.stdout))
@@ -1543,6 +1805,7 @@ async fn reconcile_panes(
                 || stderr.contains("can't find session:")
         } => {
             // Server or session is gone — all managed panes are dead.
+            server_gone = true;
             (std::collections::HashSet::new(), std::collections::HashMap::new())
         }
         _ => return,
@@ -1595,21 +1858,28 @@ async fn reconcile_panes(
             continue;
         }
 
-        info!("pane {} no longer exists, emitting PaneDestroyed", pane_id);
         reparent_children_of(config, managed_panes, &pane_id).await;
-        if let Some(state) = panes.remove(&pane_id) {
+        let state = panes.remove(&pane_id);
+        if let Some(ref state) = state {
             state.cancel_drivers();
         }
         managed_panes.remove(&pane_id);
-        let _ = event_tx.send(libslop::Record {
-            source: "slopd".to_string(),
-            event_type: "PaneDestroyed".to_string(),
-            pane_id: Some(pane_id.clone()),
-            payload: serde_json::json!({
-                "pane_id": pane_id,
-            }),
-            cursor: None,
-        });
+        // A gone server killed every pane at once (ServerGone); otherwise this
+        // single pane was removed out from under slopd (Vanished). For a vanished
+        // pane, correlate the most recent tmux lifecycle hook to say whether it
+        // was an external kill-pane (`after-kill-pane`) or a closed window.
+        let cause = if server_gone { DeathCause::ServerGone } else { DeathCause::Vanished };
+        let preceding_hook = (cause == DeathCause::Vanished).then(|| recent_hook(hook_log)).flatten();
+        record_pane_death(
+            event_tx,
+            &pane_id,
+            cause,
+            DeathDetectedBy::ReconcileVanished,
+            state.as_ref(),
+            None,
+            None,
+            preceding_hook,
+        );
     }
 }
 
@@ -1722,41 +1992,28 @@ async fn handle_dead_pane(
         _ => String::new(),
     };
 
-    info!(
-        "managed pane {} exited (status {:?}); emitting PaneDestroyed with {} bytes of captured output",
-        pane_id, exit_status, output_tail.len(),
-    );
-    // The PaneDestroyed broadcast is ephemeral — if no slopctl listener was
-    // subscribed at the moment of death, the captured screen evaporates with
-    // it. Log the dying words through the normal log as well (journald under
-    // systemd), so "what happened to pane %N?" stays answerable after the
-    // fact via `journalctl --user -u slopd`. Clean exits stay quiet.
-    if !output_tail.is_empty() && exit_status != Some(0) {
-        warn!(
-            "pane {} death output (exit status {:?}):\n{}",
-            pane_id, exit_status, output_tail,
-        );
-    }
     reparent_children_of(config, managed_panes, pane_id).await;
-    if let Some(state) = panes.remove(pane_id) {
+    let state = panes.remove(pane_id);
+    if let Some(ref state) = state {
         state.cancel_drivers();
     }
     managed_panes.remove(pane_id);
 
-    let mut payload = serde_json::json!({ "pane_id": pane_id });
-    if let Some(code) = exit_status {
-        payload["exit_status"] = serde_json::json!(code);
-    }
-    if !output_tail.is_empty() {
-        payload["output"] = serde_json::json!(output_tail);
-    }
-    let _ = event_tx.send(libslop::Record {
-        source: "slopd".to_string(),
-        event_type: "PaneDestroyed".to_string(),
-        pane_id: Some(pane_id.to_string()),
-        payload,
-        cursor: None,
-    });
+    // Record the death once, completely: the process exited on its own, so this
+    // is a SelfExit carrying its exit status and the dying-words screen tail.
+    // record_pane_death logs it (WARN when the exit was nonzero, so it stays in
+    // the journal at default verbosity) and broadcasts the enriched
+    // PaneDestroyed that `slopctl run` reads.
+    record_pane_death(
+        event_tx,
+        pane_id,
+        DeathCause::SelfExit,
+        DeathDetectedBy::ReconcileDeadPane,
+        state.as_ref(),
+        exit_status,
+        Some(output_tail),
+        None,
+    );
 
     // Clear the husk now that we've captured everything we need from it.
     let _ = tmux(config)
@@ -1990,6 +2247,9 @@ async fn main() {
     let panes = PaneMap::new();
     let managed_panes = ManagedPanes::new();
     let pane_registered: PaneRegistered = Arc::new(tokio::sync::Notify::new());
+    // Tracks the most recent tmux lifecycle hooks so a vanished pane can be
+    // attributed to an external kill vs a closed window (see [`HookLog`]).
+    let hook_log: HookLog = Arc::new(std::sync::Mutex::new(RecentHooks::default()));
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<libslop::Record>(256);
     let event_tx: EventTx = Arc::new(event_tx);
@@ -2097,13 +2357,23 @@ async fn main() {
     let reconcile_panes_map = panes.clone();
     let reconcile_managed = managed_panes.clone();
     let reconcile_tx = event_tx.clone();
+    let reconcile_hook_log = hook_log.clone();
+    // The background reconcile is a backstop for deaths the tmux hooks miss.
+    // Tests that assert the hook-driven path (e.g. tmux-hook cause correlation)
+    // lengthen this so only the hook path fires; production is always 2s.
+    let reconcile_interval_ms: u64 = 2000;
+    #[cfg(feature = "testing")]
+    let reconcile_interval_ms = std::env::var("SLOPD_TEST_RECONCILE_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(reconcile_interval_ms);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(reconcile_interval_ms));
         loop {
             interval.tick().await;
             // Snapshot the current config for this reconcile pass.
             let config_snapshot = reconcile_config_rx.borrow().clone();
-            reconcile_panes(&config_snapshot, &reconcile_panes_map, &reconcile_managed, &reconcile_tx).await;
+            reconcile_panes(&config_snapshot, &reconcile_panes_map, &reconcile_managed, &reconcile_tx, &reconcile_hook_log).await;
         }
     });
 
@@ -2129,7 +2399,7 @@ async fn main() {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
                 let config_snapshot = config_rx.borrow().clone();
-                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone(), hook_log.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -2263,6 +2533,7 @@ async fn handle_connection(
     session_lock: SessionLock,
     config_generation: Arc<std::sync::atomic::AtomicU64>,
     pending_restore: PendingRestore,
+    hook_log: HookLog,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -2396,7 +2667,7 @@ async fn handle_connection(
             }
 
             body => {
-                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock, &config_generation, &pending_restore).await;
+                let body = handle_request(body, start_time, &config, &panes, &managed_panes, &event_tx, &pane_registered, &session_lock, &config_generation, &pending_restore, &hook_log).await;
                 if write_response(&writer, req.id, body).await.is_err() {
                     break;
                 }
@@ -3165,6 +3436,7 @@ async fn handle_request(
     session_lock: &SessionLock,
     config_generation: &Arc<std::sync::atomic::AtomicU64>,
     pending_restore: &PendingRestore,
+    hook_log: &HookLog,
 ) -> libslop::ResponseBody {
     match body {
 
@@ -3192,6 +3464,13 @@ async fn handle_request(
             // Reparent children before killing: for every managed pane whose ancestor
             // list contains the dying pane, remove it from their ancestor chain.
             reparent_children_of(config, managed_panes, &pane_id).await;
+            // Disown the pane BEFORE tmux kill-pane. kill-pane fires the
+            // `after-kill-pane`/`window-unlinked` hooks, which trigger a reconcile
+            // in a concurrent connection task; if the pane were still in
+            // managed_panes when that reconcile ran, it would race us and record a
+            // spurious `vanished` death for a pane we are deliberately killing.
+            // Removing it first makes this Kill the sole, authoritative recorder.
+            managed_panes.remove(&pane_id);
             let output = tmux(config)
                 .args(["kill-pane", "-t", &pane_id])
                 .output()
@@ -3208,25 +3487,42 @@ async fn handle_request(
                 }
                 _ => {}
             }
-            if let Some(state) = panes.remove(&pane_id) {
+            let state = panes.remove(&pane_id);
+            if let Some(ref state) = state {
                 state.cancel_drivers();
             }
-            managed_panes.remove(&pane_id);
-            let _ = event_tx.send(libslop::Record {
-                source: "slopd".to_string(),
-                event_type: "PaneDestroyed".to_string(),
-                pane_id: Some(pane_id.clone()),
-                payload: serde_json::json!({
-                    "pane_id": pane_id,
-                }),
-                cursor: None,
-            });
+            // managed_panes was already cleared above (before kill-pane).
+            // An explicit `slopctl kill` — the one unambiguous death. Recording it
+            // is what lets a later post-mortem say "slopd killed it" instead of
+            // guessing, as the %119 investigation had to.
+            record_pane_death(
+                event_tx,
+                &pane_id,
+                DeathCause::DeliberateKill,
+                DeathDetectedBy::KillRpc,
+                state.as_ref(),
+                None,
+                None,
+                None,
+            );
             libslop::ResponseBody::Kill { pane_id }
         }
 
         libslop::RequestBody::TmuxHook { event, pane_id } => {
             debug!("tmux-hook: {} pane={:?}", event, pane_id);
-            reconcile_panes(config, panes, managed_panes, event_tx).await;
+            // Remember this hook so a vanished pane found in the reconcile below
+            // (or in a background tick moments later) can attribute its cause:
+            // `after-kill-pane` ⇒ external kill, `window-unlinked` ⇒ closed window.
+            {
+                let now = std::time::Instant::now();
+                let mut hooks = hook_log.lock().unwrap();
+                match event.as_str() {
+                    "after-kill-pane" => hooks.after_kill_pane = Some(now),
+                    "window-unlinked" => hooks.window_unlinked = Some(now),
+                    _ => {}
+                }
+            }
+            reconcile_panes(config, panes, managed_panes, event_tx, hook_log).await;
             libslop::ResponseBody::TmuxHooked
         }
 
@@ -3324,6 +3620,7 @@ async fn handle_request(
                 });
                 if let Some(session_id) = session_id {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
+                    panes.get_or_insert(pane).note_session_id(&session_id);
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
@@ -3544,7 +3841,7 @@ async fn handle_request(
             };
             match Box::pin(handle_request(
                 run, start_time, config, panes, managed_panes, event_tx,
-                pane_registered, session_lock, config_generation, pending_restore,
+                pane_registered, session_lock, config_generation, pending_restore, hook_log,
             )).await {
                 libslop::ResponseBody::Run { pane_id } => {
                     libslop::ResponseBody::Forked { pane_id, session_id: new_session_id }
@@ -3704,6 +4001,22 @@ async fn handle_request(
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdManaged.as_str(), "true").await;
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                     let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCreatedAt.as_str(), &now.to_string()).await;
+                    // Seed the in-memory identity snapshot with everything known at
+                    // spawn. This is the durable record a death is described from
+                    // once the pane's tmux options are gone — session id/title are
+                    // merged in later as slopd learns them. A forked Claude pane
+                    // already has its session id (the pin); others fill it on bind.
+                    {
+                        let state = panes.get_or_insert(&pane_id);
+                        let mut id = state.identity.lock().unwrap();
+                        id.backend = resolved.backend;
+                        id.parent_pane_id = parent_pane_id.clone();
+                        id.working_dir = effective_start_dir.as_ref().and_then(|d| d.to_str().map(str::to_string));
+                        id.created_at = Some(now);
+                        if let Some(ref pin) = pin_session_id {
+                            id.session_id = Some(pin.clone());
+                        }
+                    }
                     // Record the account so `ps` can show it, child panes can
                     // inherit it, and a slopd restart re-injects the right hooks
                     // for this pane (see load_managed_panes).
@@ -3755,6 +4068,7 @@ async fn handle_request(
                         };
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
                         if !session_id.is_empty() {
+                            panes.get_or_insert(&pane_id).note_session_id(&session_id);
                             let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await;
                             // Point the TUI at the session slopd drives, so the pane
                             // shows the same conversation slopctl operates on. The
@@ -4139,7 +4453,28 @@ async fn handle_request(
 
         libslop::RequestBody::Ps => {
             match list_panes(config, managed_panes).await {
-                Ok(panes) => libslop::ResponseBody::Ps { panes },
+                Ok(pane_infos) => {
+                    // Opportunistically refresh each pane's identity snapshot from
+                    // this fresh listing — the pane title (which only tmux knows,
+                    // set by the agent after spawn) and a session-id/cwd backstop.
+                    // `ps` is the natural refresh point; it keeps the eventual death
+                    // record's title current without any extra tmux round-trips.
+                    for info in &pane_infos {
+                        if let Some(state) = panes.get(&info.pane_id) {
+                            let mut id = state.identity.lock().unwrap();
+                            if info.pane_title.is_some() {
+                                id.title = info.pane_title.clone();
+                            }
+                            if id.session_id.is_none() {
+                                id.session_id = info.session_id.clone();
+                            }
+                            if id.working_dir.is_none() {
+                                id.working_dir = info.working_dir.clone();
+                            }
+                        }
+                    }
+                    libslop::ResponseBody::Ps { panes: pane_infos }
+                }
                 Err(e) => libslop::ResponseBody::Error { message: e },
             }
         }

@@ -833,8 +833,10 @@ fn dead_pane_output_is_logged_for_claude_backend() {
 
     assert!(log.contains(marker),
         "slopd log should contain the pane's dying words; got: {}", log);
-    assert!(log.contains(&format!("pane {} death output (exit status Some(37))", pane_id)),
-        "slopd log should name the pane and exit status; got: {}", log);
+    // The enriched death line names the pane, classifies the cause, and carries
+    // the exit status — all on one greppable line in the journal.
+    assert!(log.contains(&format!("pane {} died: cause=self_exit", pane_id)) && log.contains("exit=37"),
+        "slopd log should carry the enriched self_exit death line with exit status; got: {}", log);
 }
 
 /// Same guarantee for the opencode backend: an opencode pane that crashes on
@@ -899,8 +901,109 @@ fn dead_pane_output_is_logged_for_opencode_backend() {
 
     assert!(log.contains(marker),
         "slopd log should contain the opencode pane's dying words; got: {}", log);
-    assert!(log.contains(&format!("pane {} death output (exit status Some(37))", pane_id)),
-        "slopd log should name the pane and exit status; got: {}", log);
+    assert!(log.contains(&format!("pane {} died: cause=self_exit", pane_id)) && log.contains("exit=37"),
+        "slopd log should carry the enriched self_exit death line with exit status; got: {}", log);
+    assert!(log.contains("backend=opencode"),
+        "opencode pane's death line should record its backend; got: {}", log);
+}
+
+/// An explicit `slopctl kill` must record an unambiguous, self-explanatory
+/// death: cause `deliberate_kill`, detected by the Kill RPC, naming the pane's
+/// session and backend. This is the fact a post-mortem needs to say "slopd
+/// killed it" instead of guessing — the exact gap the %119 investigation hit.
+#[test]
+fn kill_records_deliberate_death_with_identity() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    // Give the pane a known session id so the death record proves identity is
+    // carried through teardown (a `sleep infinity` mock fires no SessionStart).
+    let payload = r#"{"session_id":"sess-kill-abc","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    let out = fire_hook(&env, "SessionStart", payload, Some(&pane_id));
+    assert!(out.status.success(), "SessionStart hook failed: {:?}", out);
+
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+    let kill_output = env.slopctl(&["kill", &pane_id]);
+    assert!(kill_output.status.success(), "slopctl kill failed: {:?}", kill_output);
+
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+    kill_slopd(slopd);
+
+    let payload = &event["payload"];
+    assert_eq!(payload["cause"], "deliberate_kill",
+        "explicit kill must be recorded as deliberate_kill; got: {}", event);
+    assert_eq!(payload["detected_by"], "kill_rpc", "got: {}", event);
+    assert_eq!(payload["session_id"], "sess-kill-abc",
+        "death record must carry the pane's session id; got: {}", event);
+    assert_eq!(payload["backend"], "claude", "got: {}", event);
+}
+
+/// The %119 scenario, reproduced: a pane removed by an *external* `tmux
+/// kill-pane` (nothing slopd initiated) must still yield a definitive record —
+/// cause `vanished`, and, via correlation with the `after-kill-pane` lifecycle
+/// hook tmux fires with no pane id, the fact that it was an external kill rather
+/// than a closed window. Before this, such a death logged only a bare
+/// `pane=None` and an unattributed `no longer exists`, which is why %119 could
+/// not be pinned to a session or a cause. The background reconcile is lengthened
+/// so the hook-driven path is what detects the death (deterministic correlation).
+#[test]
+fn externally_killed_pane_records_vanished_with_hook() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd_with_envs(&[("SLOPD_TEST_RECONCILE_INTERVAL_MS", "60000")]);
+
+    let run_output = env.slopctl(&["run"]);
+    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
+    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+
+    let payload = r#"{"session_id":"sess-vanish-xyz","hook_event_name":"SessionStart","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    let out = fire_hook(&env, "SessionStart", payload, Some(&pane_id));
+    assert!(out.status.success(), "SessionStart hook failed: {:?}", out);
+
+    let listener = spawn_event_listener(&env, "PaneDestroyed");
+
+    // Kill the pane straight through tmux, bypassing slopd entirely — exactly
+    // how %119 went (an external kill-pane, not a `slopctl kill`).
+    let killed = env.tmux.tmux()
+        .args(["kill-pane", "-t", &pane_id])
+        .status()
+        .expect("failed to run tmux kill-pane");
+    assert!(killed.success(), "tmux kill-pane failed");
+
+    let event = wait_for_event(listener, {
+        let pane_id = pane_id.clone();
+        move |v| v["event_type"] == "PaneDestroyed" && v["pane_id"] == pane_id.as_str()
+    });
+    kill_slopd(slopd);
+
+    let payload = &event["payload"];
+    assert_eq!(payload["cause"], "vanished",
+        "an external kill-pane must be recorded as vanished; got: {}", event);
+    assert_eq!(payload["detected_by"], "reconcile_vanished", "got: {}", event);
+    assert_eq!(payload["session_id"], "sess-vanish-xyz",
+        "vanished death must still name the session slopd had bound; got: {}", event);
+    assert_eq!(payload["preceding_hook"], "after-kill-pane",
+        "the death should be correlated to tmux's after-kill-pane hook; got: {}", event);
 }
 
 /// Failure case: the configured executable doesn't exist. A typo'd or
