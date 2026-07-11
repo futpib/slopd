@@ -2696,6 +2696,62 @@ fn hook_from_unmanaged_pane_is_not_dispatched() {
     assert_eq!(event["payload"]["prompt"], "from managed");
 }
 
+/// A `SessionEnd` hook from a pane slopd does not manage must be answered
+/// *immediately*, not after the `PANE_REGISTRATION_WAIT` grace.
+///
+/// Regression test for "SessionEnd hook [slopctl hook SessionEnd] failed: Hook
+/// cancelled" on exit. Every Claude that shares the global settings.json fires
+/// `slopctl hook SessionEnd` when it exits — including sessions slopd never
+/// spawned. For an unmanaged pane, slopd used to wait the full
+/// PANE_REGISTRATION_WAIT (2s) for a registration that can never arrive; but
+/// Claude Code cancels a SessionEnd hook that runs past its 1.5s budget, so the
+/// wait guaranteed a cancelled hook and the on-screen error. SessionEnd is
+/// terminal — an unmanaged pane will never register — so it must be answered at
+/// once. A non-terminal hook from the same unmanaged pane still pays the grace,
+/// proving the fast path is specific to SessionEnd rather than a blanket removal.
+#[test]
+fn session_end_from_unmanaged_pane_answers_immediately() {
+    build_bin("slopd");
+    build_bin("slopctl");
+
+    let Some(env) = TestEnv::new(None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+
+    // A pane id slopd has never seen. Without the fix this SessionEnd blocks for
+    // PANE_REGISTRATION_WAIT (2s) waiting for a registration that never comes.
+    let session_end = r#"{"session_id":"outside-session","hook_event_name":"SessionEnd","reason":"prompt_input_exit","transcript_path":"/dev/null","cwd":"/tmp"}"#;
+    let start = Instant::now();
+    let out = fire_hook(&env, "SessionEnd", session_end, Some("%987654"));
+    let elapsed = start.elapsed();
+
+    // Contrast: a non-terminal hook from the same unmanaged pane still waits the
+    // full registration grace, so the fast path above is SessionEnd-specific.
+    let user_prompt = r#"{"session_id":"outside-session","hook_event_name":"UserPromptSubmit","prompt":"x"}"#;
+    let up_start = Instant::now();
+    let up_out = fire_hook(&env, "UserPromptSubmit", user_prompt, Some("%987654"));
+    let up_elapsed = up_start.elapsed();
+
+    kill_slopd(slopd);
+
+    assert!(out.status.success(), "SessionEnd hook failed: {:?}", out);
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "SessionEnd from an unmanaged pane must return well under Claude's 1.5s \
+         SessionEnd budget; took {:?} (regression: PANE_REGISTRATION_WAIT applied)",
+        elapsed,
+    );
+    assert!(up_out.status.success(), "UserPromptSubmit hook failed: {:?}", up_out);
+    assert!(
+        up_elapsed >= Duration::from_millis(1500),
+        "a non-terminal hook from an unmanaged pane should still wait for \
+         registration (~PANE_REGISTRATION_WAIT); took {:?}",
+        up_elapsed,
+    );
+}
+
 /// Panes created before a slopd restart must still be recognized as managed.
 /// Hooks fired from those panes should still be dispatched to subscribers.
 #[test]

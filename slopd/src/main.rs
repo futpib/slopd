@@ -3546,21 +3546,32 @@ async fn handle_request(
             // injected hooks.
             {
                 if !managed_panes.contains(pane) {
-                    // The hook might have arrived before the Run handler's
-                    // managed_panes.insert() ran (race between tmux creating the pane
-                    // and the async task resuming).  Wait briefly for registration.
-                    let _ = tokio::time::timeout(PANE_REGISTRATION_WAIT, async {
-                        loop {
-                            // Create the notified future before re-checking so we don't
-                            // miss a notification that fires between the check and the await.
-                            let notified = pane_registered.notified();
-                            if managed_panes.contains(pane) {
-                                return;
+                    // The registration wait only makes sense for hooks that can race a
+                    // just-spawned pane's managed_panes.insert(): the very first hooks
+                    // (SessionStart, InstructionsLoaded, an early PreToolUse). SessionEnd
+                    // is a *terminal* event — the pane is exiting and, if it isn't
+                    // already managed, it never will be. Waiting the full
+                    // PANE_REGISTRATION_WAIT here would just delay the reply, and Claude
+                    // cancels a SessionEnd hook that doesn't return promptly on shutdown
+                    // ("SessionEnd hook [...] failed: Hook cancelled"). Answer an
+                    // unmanaged pane's SessionEnd immediately instead.
+                    if event != "SessionEnd" {
+                        // The hook might have arrived before the Run handler's
+                        // managed_panes.insert() ran (race between tmux creating the pane
+                        // and the async task resuming).  Wait briefly for registration.
+                        let _ = tokio::time::timeout(PANE_REGISTRATION_WAIT, async {
+                            loop {
+                                // Create the notified future before re-checking so we don't
+                                // miss a notification that fires between the check and the await.
+                                let notified = pane_registered.notified();
+                                if managed_panes.contains(pane) {
+                                    return;
+                                }
+                                notified.await;
                             }
-                            notified.await;
-                        }
-                    })
-                    .await;
+                        })
+                        .await;
+                    }
                     if !managed_panes.contains(pane) {
                         debug!("ignoring hook from unmanaged pane {}", pane);
                         return libslop::ResponseBody::Hooked;

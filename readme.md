@@ -705,6 +705,8 @@ When slopd starts a Claude pane it automatically injects `slopctl hook <event>` 
 
 Hook injection is **idempotent** and **concurrency-safe**: an exclusive advisory lock prevents duplicate entries even if multiple slopd processes run simultaneously.
 
+Because the hooks live in the shared `~/.claude/settings.json`, **any** Claude on the machine fires them — including sessions slopd never spawned. A hook from a pane that has just been spawned may arrive before slopd has finished registering it, so slopd briefly waits (up to a couple of seconds) for the pane to appear in its managed set before deciding the pane is external. The one exception is `SessionEnd`: it is a terminal event (the pane is exiting and, if it is not already managed, never will be), so slopd answers it immediately. Claude cancels a `SessionEnd` hook that runs past its ~1.5 s budget, and an external pane's exit would otherwise sit through the full registration wait and surface as `SessionEnd hook [...] failed: Hook cancelled`.
+
 ### Auto-continue on failure
 
 When a turn ends with `StopFailure` (e.g. Claude hit an API 500), it would otherwise just stop and wait for a human to resume it — bad for an unattended pane. slopd instead recovers on its own: it sends a `continue` prompt after an exponential backoff, retrying until the turn completes or the attempt cap is reached. The pane stays in the `ready` state throughout; the retry counter lives in per-pane metadata.
