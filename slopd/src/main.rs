@@ -183,7 +183,6 @@ async fn set_pane_detailed_state(
             warn!("failed to set {} on pane {}: {}", opt.as_str(), pane_id, e);
         }
     }
-
     let previous_simple = previous.map(|p| p.to_simple());
     if previous_simple.as_ref() != Some(&simple) {
         let _ = event_tx.send(libslop::Record {
@@ -282,18 +281,214 @@ impl RetryState {
     }
 }
 
-/// Per-pane opencode runtime: the HTTP client driving the pane's embedded
-/// server + the session id to target. `None` for Claude panes.
 #[derive(Clone)]
 struct OpencodeState {
     client: opencode::OpencodeClient,
     session_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    last_prompt: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl OpencodeState {
+    fn new(client: opencode::OpencodeClient, session_id: String, cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self { client, session_id, cancel, last_prompt: Arc::new(std::sync::Mutex::new(None)) }
+    }
 }
 
 #[derive(Clone)]
 struct CodexState {
     client: codex::CodexClient,
     thread_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    active_turn: Arc<std::sync::Mutex<Option<String>>>,
+    pending_requests: Arc<std::sync::Mutex<std::collections::HashMap<String, libslop::PaneDetailedState>>>,
+}
+
+impl CodexState {
+    fn new(client: codex::CodexClient, thread_id: String, cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            client,
+            thread_id,
+            cancel,
+            active_turn: Arc::new(std::sync::Mutex::new(None)),
+            pending_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ClaudeState;
+
+#[derive(Clone)]
+enum PaneRuntime {
+    Claude(ClaudeState),
+    Opencode(OpencodeState),
+    Codex(CodexState),
+}
+
+impl Default for PaneRuntime {
+    fn default() -> Self {
+        Self::Claude(ClaudeState)
+    }
+}
+
+/// Backend behavior attached to a live pane. The enum provides closed-world
+/// storage; this trait keeps backend operations out of request dispatch.
+trait BackendRuntime {
+    fn backend(&self) -> libslop::Backend;
+    fn cancel(&self);
+    fn send_transport(&self) -> SendTransport;
+    async fn interrupt(&self) -> Option<Result<(), String>>;
+    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>>;
+}
+
+#[derive(Clone)]
+enum SendTransport {
+    Tui { settle_before_enter: bool },
+    Opencode(OpencodeState),
+}
+
+impl BackendRuntime for ClaudeState {
+    fn backend(&self) -> libslop::Backend {
+        libslop::Backend::Claude
+    }
+
+    fn cancel(&self) {}
+
+    fn send_transport(&self) -> SendTransport {
+        SendTransport::Tui { settle_before_enter: false }
+    }
+
+    async fn interrupt(&self) -> Option<Result<(), String>> {
+        None
+    }
+
+    async fn transcript(&self, _pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        None
+    }
+}
+
+impl BackendRuntime for OpencodeState {
+    fn backend(&self) -> libslop::Backend {
+        libslop::Backend::Opencode
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn send_transport(&self) -> SendTransport {
+        SendTransport::Opencode(self.clone())
+    }
+
+    async fn interrupt(&self) -> Option<Result<(), String>> {
+        Some(self.client.abort(&self.session_id).await)
+    }
+
+    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        Some(self.client.messages(&self.session_id).await.map(|messages| {
+                opencode::messages_to_records(&messages)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (event_type, payload))| libslop::Record {
+                        cursor: Some(index as u64),
+                        source: "transcript".to_string(),
+                        event_type,
+                        pane_id: Some(pane_id.to_string()),
+                        payload,
+                    })
+                    .collect()
+            }))
+    }
+}
+
+impl BackendRuntime for CodexState {
+    fn backend(&self) -> libslop::Backend {
+        libslop::Backend::Codex
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn send_transport(&self) -> SendTransport {
+        SendTransport::Tui { settle_before_enter: true }
+    }
+
+    async fn interrupt(&self) -> Option<Result<(), String>> {
+        let turn = self.active_turn.lock().unwrap().clone();
+        Some(match turn {
+            Some(turn) => self.client.interrupt_turn(&self.thread_id, &turn).await,
+            None => Ok(()),
+        })
+    }
+
+    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        Some(self.client.resume_thread(&self.thread_id).await
+            .map(|thread| codex::thread_records(&thread, pane_id)))
+    }
+}
+
+impl BackendRuntime for PaneRuntime {
+    fn backend(&self) -> libslop::Backend {
+        match self {
+            Self::Claude(runtime) => runtime.backend(),
+            Self::Opencode(runtime) => runtime.backend(),
+            Self::Codex(runtime) => runtime.backend(),
+        }
+    }
+
+    fn cancel(&self) {
+        match self {
+            Self::Claude(runtime) => runtime.cancel(),
+            Self::Opencode(runtime) => runtime.cancel(),
+            Self::Codex(runtime) => runtime.cancel(),
+        }
+    }
+
+    fn send_transport(&self) -> SendTransport {
+        match self {
+            Self::Claude(runtime) => runtime.send_transport(),
+            Self::Opencode(runtime) => runtime.send_transport(),
+            Self::Codex(runtime) => runtime.send_transport(),
+        }
+    }
+
+    async fn interrupt(&self) -> Option<Result<(), String>> {
+        match self {
+            Self::Claude(runtime) => runtime.interrupt().await,
+            Self::Opencode(runtime) => runtime.interrupt().await,
+            Self::Codex(runtime) => runtime.interrupt().await,
+        }
+    }
+
+    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        match self {
+            Self::Claude(runtime) => runtime.transcript(pane_id).await,
+            Self::Opencode(runtime) => runtime.transcript(pane_id).await,
+            Self::Codex(runtime) => runtime.transcript(pane_id).await,
+        }
+    }
+}
+
+trait BackendPolicy {
+    fn serializes_fresh_runs(self) -> bool;
+    fn fork_session_is_known_before_spawn(self) -> bool;
+    fn driver_owns_initial_state(self) -> bool;
+}
+
+impl BackendPolicy for libslop::Backend {
+    fn serializes_fresh_runs(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    fn fork_session_is_known_before_spawn(self) -> bool {
+        !matches!(self, Self::Claude)
+    }
+
+    fn driver_owns_initial_state(self) -> bool {
+        !matches!(self, Self::Claude)
+    }
 }
 
 struct PreparedCodexRun {
@@ -302,6 +497,47 @@ struct PreparedCodexRun {
     socket: std::path::PathBuf,
     events: tokio::sync::broadcast::Receiver<serde_json::Value>,
     existing_threads: std::collections::HashSet<String>,
+}
+
+enum PreparedBackendRun {
+    Claude,
+    Opencode { port: u16, resume_session: Option<String> },
+    Codex(PreparedCodexRun),
+}
+
+impl PreparedBackendRun {
+    fn trailing_args(&self, extra_args: Vec<String>, cwd: &std::path::Path) -> Vec<String> {
+        match self {
+            Self::Claude => extra_args,
+            Self::Opencode { resume_session, .. } => {
+                let mut trailing = strip_resume_flags(extra_args);
+                if let Some(session_id) = resume_session {
+                    trailing.extend(["-s".to_string(), session_id.clone()]);
+                }
+                trailing
+            }
+            Self::Codex(runtime) => {
+                let mut trailing = strip_resume_flags(extra_args);
+                let mut prefix = vec![
+                    "--remote".to_string(), "unix://".to_string(),
+                    "--no-alt-screen".to_string(), "-C".to_string(),
+                    cwd.to_string_lossy().into_owned(),
+                ];
+                if let Some(thread_id) = &runtime.thread_id {
+                    prefix.extend(["resume".to_string(), thread_id.clone()]);
+                }
+                trailing.splice(0..0, prefix);
+                trailing
+            }
+        }
+    }
+
+    fn opencode_port(&self) -> Option<u16> {
+        match self {
+            Self::Opencode { port, .. } => Some(*port),
+            _ => None,
+        }
+    }
 }
 
 /// Why a managed pane was torn down. Recorded on every death so the systemd
@@ -400,21 +636,9 @@ struct PaneState {
     /// manually taking over (which would reset the retry counter and let a
     /// persistently-failing turn retry forever, defeating max_retry_attempts).
     expecting_auto_continue: std::sync::atomic::AtomicBool,
-    /// For opencode panes: HTTP client + session id (set on spawn). None for Claude.
-    opencode: std::sync::Mutex<Option<OpencodeState>>,
-    /// Cancels the opencode status-polling driver when the pane is killed.
-    opencode_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
-    /// For opencode panes: the most recent non-command prompt, used to auto-retry
-    /// on `session.error` (the opencode analogue of Claude's StopFailure retry).
-    opencode_last_prompt: std::sync::Mutex<Option<String>>,
-    /// Codex app-server client + thread bound to this pane.
-    codex: std::sync::Mutex<Option<CodexState>>,
-    /// Most recently active Codex turn, used by interrupt and observation.
-    codex_active_turn: std::sync::Mutex<Option<String>>,
-    /// Observed server requests that keep the pane in an awaiting-input state.
-    /// The visible Codex TUI, not slopd, owns answering them.
-    codex_pending_requests: std::sync::Mutex<std::collections::HashMap<String, libslop::PaneDetailedState>>,
-    codex_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    /// Exactly one backend runtime owns this pane. Backend-specific mutable
+    /// state and cancellation live inside the corresponding variant.
+    runtime: std::sync::Mutex<PaneRuntime>,
     /// For a Claude pane created by `fork`: the fork's session id (which slopd
     /// minted and passed via `--session-id`). Real Claude fires its `SessionStart`
     /// hook with the *resumed* source session id — not the forked id — so without
@@ -437,13 +661,7 @@ impl PaneState {
             transcript_path: std::sync::Mutex::new(None),
             retry_state: std::sync::Mutex::new(None),
             expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
-            opencode: std::sync::Mutex::new(None),
-            opencode_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
-            opencode_last_prompt: std::sync::Mutex::new(None),
-            codex: std::sync::Mutex::new(None),
-            codex_active_turn: std::sync::Mutex::new(None),
-            codex_pending_requests: std::sync::Mutex::new(std::collections::HashMap::new()),
-            codex_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            runtime: std::sync::Mutex::new(PaneRuntime::default()),
             pinned_session_id: std::sync::Mutex::new(None),
             identity: std::sync::Mutex::new(PaneIdentity::default()),
         }
@@ -456,13 +674,39 @@ impl PaneState {
         self.identity.lock().unwrap().session_id = Some(session_id.to_string());
     }
 
-    /// Whether this pane is an opencode pane (has an opencode runtime attached).
-    fn is_opencode(&self) -> bool {
-        self.opencode.lock().unwrap().is_some()
+    fn runtime(&self) -> PaneRuntime {
+        self.runtime.lock().unwrap().clone()
     }
 
-    fn is_codex(&self) -> bool {
-        self.codex.lock().unwrap().is_some()
+    fn set_runtime(&self, runtime: PaneRuntime) {
+        self.runtime().cancel();
+        self.identity.lock().unwrap().backend = runtime.backend();
+        *self.runtime.lock().unwrap() = runtime;
+    }
+
+    fn opencode(&self) -> Option<OpencodeState> {
+        match self.runtime() {
+            PaneRuntime::Opencode(runtime) => Some(runtime),
+            _ => None,
+        }
+    }
+
+    fn update_opencode_session(&self, session_id: String) -> Option<opencode::OpencodeClient> {
+        let mut runtime = self.runtime.lock().unwrap();
+        match &mut *runtime {
+            PaneRuntime::Opencode(runtime) => {
+                runtime.session_id = session_id;
+                Some(runtime.client.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn codex(&self) -> Option<CodexState> {
+        match self.runtime() {
+            PaneRuntime::Codex(runtime) => Some(runtime),
+            _ => None,
+        }
     }
 
     /// Stop every background task attached to this pane. Called from every
@@ -472,8 +716,7 @@ impl PaneState {
     /// forever; Claude panes only have the transcript tailer.
     fn cancel_drivers(&self) {
         self.transcript_cancel.lock().unwrap().cancel();
-        self.opencode_cancel.lock().unwrap().cancel();
-        self.codex_cancel.lock().unwrap().cancel();
+        self.runtime().cancel();
     }
 }
 
@@ -499,9 +742,10 @@ async fn run_codex_driver(
         }
     };
     let state = panes.get_or_insert(&pane_id);
+    let runtime = state.codex().expect("Codex driver requires a Codex runtime");
     let (initial_active, initial_turn) = initial_resume.as_ref().ok().map(|value| codex::thread_runtime(value))
         .unwrap_or((false, None));
-    *state.codex_active_turn.lock().unwrap() = initial_turn;
+    *runtime.active_turn.lock().unwrap() = initial_turn;
     let initial_state = if initial_active { libslop::PaneDetailedState::BusyProcessing }
         else { libslop::PaneDetailedState::Ready };
     set_pane_detailed_state(&config, &pane_id, &initial_state,
@@ -514,7 +758,7 @@ async fn run_codex_driver(
             _ = poll.tick() => {
                 if let Ok(result) = client.read_thread(&thread_id).await {
                     let (active, turn) = codex::thread_runtime(&result);
-                    *state.codex_active_turn.lock().unwrap() = turn;
+                    *runtime.active_turn.lock().unwrap() = turn;
                     let next = if active { libslop::PaneDetailedState::BusyProcessing }
                         else { libslop::PaneDetailedState::Ready };
                     let previous = state.detailed_state.lock().unwrap().clone();
@@ -539,7 +783,7 @@ async fn run_codex_driver(
                 attached = false;
                 // Server-request IDs are scoped to the lost connection and can
                 // no longer be answered after reconnect.
-                state.codex_pending_requests.lock().unwrap().clear();
+                runtime.pending_requests.lock().unwrap().clear();
                 set_pane_detailed_state(&config, &pane_id, &libslop::PaneDetailedState::BootingUp,
                     None, &event_tx, &panes).await;
             }
@@ -557,20 +801,20 @@ async fn run_codex_driver(
             } else {
                 libslop::PaneDetailedState::AwaitingInputPermission
             };
-            state.codex_pending_requests.lock().unwrap().insert(value["id"].to_string(), awaiting);
+            runtime.pending_requests.lock().unwrap().insert(value["id"].to_string(), awaiting);
         }
         let previous = state.detailed_state.lock().unwrap().clone();
         let next = match method.as_str() {
             "turn/started" => {
                 if let Some(id) = value.pointer("/params/turn/id").and_then(|v| v.as_str()) {
-                    *state.codex_active_turn.lock().unwrap() = Some(id.to_string());
+                    *runtime.active_turn.lock().unwrap() = Some(id.to_string());
                 }
                 state.prompt_submitted.notify_waiters();
                 Some(libslop::PaneDetailedState::BusyProcessing)
             }
             "turn/completed" => {
-                *state.codex_active_turn.lock().unwrap() = None;
-                state.codex_pending_requests.lock().unwrap().clear();
+                *runtime.active_turn.lock().unwrap() = None;
+                runtime.pending_requests.lock().unwrap().clear();
                 Some(libslop::PaneDetailedState::Ready)
             }
             "thread/status/changed" if value.pointer("/params/status/type").and_then(|v| v.as_str()) == Some("idle") => {
@@ -589,7 +833,7 @@ async fn run_codex_driver(
             m if codex::normalized_event_type(m) == "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
             _ => None,
         };
-        let next = state.codex_pending_requests.lock().unwrap().values().next().cloned().or(next);
+        let next = runtime.pending_requests.lock().unwrap().values().next().cloned().or(next);
         if let Some(next) = next {
             set_pane_detailed_state(&config, &pane_id, &next, Some(&previous), &event_tx, &panes).await;
         }
@@ -679,7 +923,7 @@ async fn run_opencode_driver(
                 // human navigates the TUI, and this backstop must poll whatever
                 // session is currently being followed, not the spawn-time one.
                 let sid = panes.get(&pane_id)
-                    .and_then(|s| s.opencode.lock().unwrap().as_ref().map(|oc| oc.session_id.clone()))
+                    .and_then(|s| s.opencode().map(|oc| oc.session_id))
                     .unwrap_or_else(|| session_id.clone());
                 // Authoritatively reconcile live subagents first: drop any child
                 // that is no longer working per /session/status (finished, or
@@ -869,10 +1113,7 @@ async fn read_opencode_sse(
                     // the followed session; grab a client clone for the reconcile.
                     let client = panes.get(pane_id).and_then(|state| {
                         state.note_session_id(&current_session);
-                        state.opencode.lock().unwrap().as_mut().map(|oc| {
-                            oc.session_id = current_session.clone();
-                            oc.client.clone()
-                        })
+                        state.update_opencode_session(current_session.clone())
                     });
                     let _ = tmux_set_pane_option(config, pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &current_session).await;
                     // Re-reconcile so state reflects the newly-followed session (it
@@ -1018,11 +1259,11 @@ async fn schedule_opencode_auto_continue(
         return;
     }
     let pane_state = panes.get_or_insert(pane_id);
-    let oc = match pane_state.opencode.lock().unwrap().clone() {
+    let oc = match pane_state.opencode() {
         Some(oc) => oc,
         None => return,
     };
-    let prompt = match pane_state.opencode_last_prompt.lock().unwrap().clone() {
+    let prompt = match oc.last_prompt.lock().unwrap().clone() {
         Some(p) => p,
         None => return,
     };
@@ -1529,17 +1770,16 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         // the recovered tmux pane (a daemon restart doesn't kill it). Reattach
         // the HTTP runtime from the stored port/token/session and resume the
         // status-poll driver, which will advance BootingUp → the real state.
-        if opts.backend == Some(libslop::Backend::Opencode) {
+        match opts.backend.unwrap_or(libslop::Backend::Claude) {
+        libslop::Backend::Opencode => {
             if let (Some(port), Some(session_id)) = (opts.opencode_port, opts.session_id.as_deref()) {
                 if !session_id.is_empty() {
                     let client = opencode::OpencodeClient::new(port, opts.opencode_token.clone());
                     let driver_cancel = tokio_util::sync::CancellationToken::new();
                     let state = panes.get_or_insert(pane_id);
-                    *state.opencode.lock().unwrap() = Some(OpencodeState {
-                        client: client.clone(),
-                        session_id: session_id.to_string(),
-                    });
-                    *state.opencode_cancel.lock().unwrap() = driver_cancel.clone();
+                    state.set_runtime(PaneRuntime::Opencode(OpencodeState::new(
+                        client.clone(), session_id.to_string(), driver_cancel.clone(),
+                    )));
                     tokio::spawn(run_opencode_driver(
                         client,
                         session_id.to_string(),
@@ -1551,7 +1791,8 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
                     ));
                 }
             }
-        } else if opts.backend == Some(libslop::Backend::Codex) {
+        }
+        libslop::Backend::Codex => {
             if let Some(session_id) = opts.session_id.as_deref().filter(|s| !s.is_empty()) {
                 let home = resolved.config_dir.as_deref().map(libslop::expand_path);
                 let socket = opts.codex_socket.as_deref().map(std::path::PathBuf::from)
@@ -1566,9 +1807,10 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
                     match codex::CodexClient::connect(&socket).await {
                         Ok(client) => {
                             let state = panes.get_or_insert(pane_id);
-                            *state.codex.lock().unwrap() = Some(CodexState { client: client.clone(), thread_id: session_id.to_string() });
                             let driver_cancel = tokio_util::sync::CancellationToken::new();
-                            *state.codex_cancel.lock().unwrap() = driver_cancel.clone();
+                            state.set_runtime(PaneRuntime::Codex(CodexState::new(
+                                client.clone(), session_id.to_string(), driver_cancel.clone(),
+                            )));
                             tokio::spawn(run_codex_driver(client, session_id.to_string(), pane_id.to_string(),
                                 config.clone(), panes.clone(), event_tx.clone(), driver_cancel));
                         }
@@ -1576,6 +1818,8 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
                     }
                 }
             }
+        }
+        libslop::Backend::Claude => {}
         }
     }
     settings_paths
@@ -3483,7 +3727,8 @@ async fn restore_panes(
         // Resume the recorded session. Claude: `claude --resume` from the launch
         // cwd. OpenCode: `opencode -s <id>` over a freshly-allocated HTTP port,
         // then reattach the status-poll driver.
-        let new_id = if resolved.backend == libslop::Backend::Opencode {
+        let new_id = match resolved.backend {
+        libslop::Backend::Opencode => {
             let port = match opencode::alloc_port() {
                 Ok(p) => p,
                 Err(e) => {
@@ -3520,11 +3765,9 @@ async fn restore_panes(
             let client = opencode::OpencodeClient::new(port, None);
             let driver_cancel = tokio_util::sync::CancellationToken::new();
             let pane_state = panes.get_or_insert(&id);
-            *pane_state.opencode.lock().unwrap() = Some(OpencodeState {
-                client: client.clone(),
-                session_id: session_id.clone(),
-            });
-            *pane_state.opencode_cancel.lock().unwrap() = driver_cancel.clone();
+            pane_state.set_runtime(PaneRuntime::Opencode(OpencodeState::new(
+                client.clone(), session_id.clone(), driver_cancel.clone(),
+            )));
             tokio::spawn(run_opencode_driver(
                 client,
                 session_id.clone(),
@@ -3535,7 +3778,8 @@ async fn restore_panes(
                 driver_cancel,
             ));
             id
-        } else if resolved.backend == libslop::Backend::Codex {
+        }
+        libslop::Backend::Codex => {
             let path = std::env::var_os("PATH").unwrap_or_default();
             let cwd = working_dir.as_deref().map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -3570,12 +3814,14 @@ async fn restore_panes(
             let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdBackend.as_str(), "codex").await;
             let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdCodexSocket.as_str(), &socket.to_string_lossy()).await;
             let pane_state = panes.get_or_insert(&id);
-            *pane_state.codex.lock().unwrap() = Some(CodexState { client: client.clone(), thread_id: session_id.clone() });
             let driver_cancel = tokio_util::sync::CancellationToken::new();
-            *pane_state.codex_cancel.lock().unwrap() = driver_cancel.clone();
+            pane_state.set_runtime(PaneRuntime::Codex(CodexState::new(
+                client.clone(), session_id.clone(), driver_cancel.clone(),
+            )));
             tokio::spawn(run_codex_driver(client, session_id.clone(), id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel));
             id
-        } else {
+        }
+        libslop::Backend::Claude => {
             let settings_path = config.resolved_settings_path(&resolved);
             if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
                 warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
@@ -3602,6 +3848,7 @@ async fn restore_panes(
                     continue;
                 }
             }
+        }
         };
 
         managed_panes.insert(new_id.clone());
@@ -3645,7 +3892,7 @@ async fn restore_panes(
 
         // Hook-driven Claude panes start booting here. OpenCode and Codex
         // drivers own their initial state and may already have advanced it.
-        if resolved.backend == libslop::Backend::Claude {
+        if !resolved.backend.driver_owns_initial_state() {
             set_pane_detailed_state(config, &new_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
         }
 
@@ -4064,7 +4311,7 @@ async fn handle_request(
                 }
                 libslop::Backend::Codex => {
                     let state = panes.get(&pane_id);
-                    let runtime = state.as_ref().and_then(|s| s.codex.lock().unwrap().clone());
+                    let runtime = state.as_ref().and_then(|s| s.codex());
                     let Some(runtime) = runtime else {
                         return libslop::ResponseBody::Error { message: format!("Codex pane {} has no app-server runtime", pane_id) };
                     };
@@ -4102,7 +4349,7 @@ async fn handle_request(
             // hook (which reports the resumed source id, not the fork's, and would
             // otherwise mis-bind both the session id and the transcript path).
             // opencode tracks its id via the resume path, so it needs no pin.
-            let pin_session_id = if matches!(src.backend, libslop::Backend::Opencode | libslop::Backend::Codex) {
+            let pin_session_id = if src.backend.fork_session_is_known_before_spawn() {
                 None
             } else {
                 Some(new_session_id.clone())
@@ -4161,7 +4408,7 @@ async fn handle_request(
             // A fresh remote TUI does not accept a caller-provided thread id.
             // Serialize creation so two slopctl runs cannot consume each other's
             // global `thread/started` notification from the shared daemon.
-            let _codex_fresh_run_guard = if resolved.backend == libslop::Backend::Codex
+            let _codex_fresh_run_guard = if resolved.backend.serializes_fresh_runs()
                 && extract_resume_target(&extra_args).is_none()
             {
                 Some(CODEX_FRESH_RUN_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await)
@@ -4211,50 +4458,46 @@ async fn handle_request(
             // Codex panes are views onto a thread hosted by the managed local
             // app-server. Start/connect the daemon and establish the thread
             // before creating the tmux pane, so pane identity is deterministic.
-            let mut codex_runtime: Option<PreparedCodexRun> = None;
-            if resolved.backend == libslop::Backend::Codex {
-                let lookup_path = merged_env.iter().rev().find(|(k, _)| k == "PATH")
-                    .map(|(_, v)| std::ffi::OsString::from(v))
-                    .or_else(|| std::env::var_os("PATH")).unwrap_or_default();
-                let lookup_cwd = effective_start_dir.clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let Some(program) = libslop::resolve_executable(resolved.executable.program(), &lookup_path, &lookup_cwd) else {
-                    return libslop::ResponseBody::Error { message: format!("configured Codex executable {:?} not found", resolved.executable.program()) };
-                };
-                let home = resolved.config_dir.as_deref().map(libslop::expand_path);
-                let socket = codex::socket_path(home.as_deref());
-                if let Err(e) = codex::ensure_daemon(&program, home.as_deref(), &socket).await {
-                    return libslop::ResponseBody::Error { message: e };
-                }
-                let client = match codex::CodexClient::connect(&socket).await {
-                    Ok(client) => client,
-                    Err(e) => return libslop::ResponseBody::Error { message: e },
-                };
-                let events = client.subscribe();
-                let existing_threads = client.thread_ids().await.unwrap_or_default();
-                let requested_resume = extract_resume_target(&extra_args);
-                let thread_id = match requested_resume {
-                    Some(id) => match client.resume_thread(&id).await {
-                        Ok(_) => Some(id),
-                        Err(e) => return libslop::ResponseBody::Error { message: e },
+            let prepared = match resolved.backend {
+                libslop::Backend::Claude => PreparedBackendRun::Claude,
+                libslop::Backend::Opencode => match opencode::alloc_port() {
+                    Ok(port) => PreparedBackendRun::Opencode {
+                        port,
+                        resume_session: extract_resume_target(&extra_args),
                     },
-                    None => None,
-                };
-                codex_runtime = Some(PreparedCodexRun { client, thread_id, socket, events, existing_threads });
-            }
-
-            // For opencode panes: allocate a port + per-pane auth token for the
-            // embedded HTTP server, and pass them as spawn args/env. Claude
-            // panes take the unmodified path.
-            let opencode_port = if resolved.backend == libslop::Backend::Opencode {
-                match opencode::alloc_port() {
-                    Ok(p) => Some(p),
                     Err(e) => return libslop::ResponseBody::Error {
                         message: format!("failed to allocate opencode port: {}", e),
                     },
+                },
+                libslop::Backend::Codex => {
+                    let lookup_path = merged_env.iter().rev().find(|(k, _)| k == "PATH")
+                        .map(|(_, v)| std::ffi::OsString::from(v))
+                        .or_else(|| std::env::var_os("PATH")).unwrap_or_default();
+                    let lookup_cwd = effective_start_dir.clone()
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    let Some(program) = libslop::resolve_executable(resolved.executable.program(), &lookup_path, &lookup_cwd) else {
+                        return libslop::ResponseBody::Error { message: format!("configured Codex executable {:?} not found", resolved.executable.program()) };
+                    };
+                    let home = resolved.config_dir.as_deref().map(libslop::expand_path);
+                    let socket = codex::socket_path(home.as_deref());
+                    if let Err(e) = codex::ensure_daemon(&program, home.as_deref(), &socket).await {
+                        return libslop::ResponseBody::Error { message: e };
+                    }
+                    let client = match codex::CodexClient::connect(&socket).await {
+                        Ok(client) => client,
+                        Err(e) => return libslop::ResponseBody::Error { message: e },
+                    };
+                    let events = client.subscribe();
+                    let existing_threads = client.thread_ids().await.unwrap_or_default();
+                    let thread_id = match extract_resume_target(&extra_args) {
+                        Some(id) => match client.resume_thread(&id).await {
+                            Ok(_) => Some(id),
+                            Err(e) => return libslop::ResponseBody::Error { message: e },
+                        },
+                        None => None,
+                    };
+                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, socket, events, existing_threads })
                 }
-            } else {
-                None
             };
             // Detect a resume target in the passthrough args (any spelling:
             // `--resume <id>`, opencode's `-s <id>` / `--session <id>`). For
@@ -4262,37 +4505,11 @@ async fn handle_request(
             // AND slopd must bind its tracking to this id below, skipping the
             // "POST a fresh session" step — otherwise the resumed conversation
             // is stranded on a new empty session. Claude keeps `--resume` as-is.
-            let resume_session = extract_resume_target(&extra_args);
-            let mut trailing = if resolved.backend == libslop::Backend::Opencode {
-                let mut t = strip_resume_flags(extra_args);
-                if let Some(sid) = &resume_session {
-                    t.push("-s".to_string());
-                    t.push(sid.clone());
-                }
-                t
-            } else if resolved.backend == libslop::Backend::Codex {
-                let thread_id = &codex_runtime.as_ref().expect("Codex runtime prepared").thread_id;
-                let mut t = strip_resume_flags(extra_args);
-                // Remote TUI mode otherwise lets the daemon's own cwd win over
-                // the pane cwd. Pass it explicitly so Codex tools and slopd's
-                // recorded working directory describe the same workspace.
-                let codex_cwd = effective_start_dir.clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let mut prefix = vec![
-                    "--remote".to_string(), "unix://".to_string(),
-                    "--no-alt-screen".to_string(), "-C".to_string(),
-                    codex_cwd.to_string_lossy().into_owned(),
-                ];
-                if let Some(thread_id) = thread_id {
-                    prefix.extend(["resume".to_string(), thread_id.clone()]);
-                }
-                t.splice(0..0, prefix);
-                t
-            } else {
-                extra_args
-            };
+            let spawn_cwd = effective_start_dir.clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let mut trailing = prepared.trailing_args(extra_args, &spawn_cwd);
             let spawn_env = merged_env;
-            if let Some(port) = opencode_port {
+            if let Some(port) = prepared.opencode_port() {
                 let mut v = trailing.clone();
                 v.extend([
                     "--port".to_string(),
@@ -4366,8 +4583,8 @@ async fn handle_request(
                     // id, attach the HTTP runtime, and start the status-poll driver
                     // (which advances BootingUp → Ready/idle). Claude panes skip this
                     // and rely on the SessionStart hook + jsonl tailer instead.
-                    if resolved.backend == libslop::Backend::Opencode {
-                        let port = opencode_port.expect("opencode port allocated above");
+                    match prepared {
+                    PreparedBackendRun::Opencode { port, resume_session } => {
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdBackend.as_str(), "opencode").await;
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
 
@@ -4442,11 +4659,9 @@ async fn handle_request(
                             });
                         }
                         let pane_state = panes.get_or_insert(&pane_id);
-                        *pane_state.opencode.lock().unwrap() = Some(OpencodeState {
-                            client: client.clone(),
-                            session_id: session_id.clone(),
-                        });
-                        *pane_state.opencode_cancel.lock().unwrap() = driver_cancel.clone();
+                        pane_state.set_runtime(PaneRuntime::Opencode(OpencodeState::new(
+                            client.clone(), session_id.clone(), driver_cancel.clone(),
+                        )));
                         tokio::spawn(run_opencode_driver(
                             client,
                             session_id,
@@ -4456,8 +4671,8 @@ async fn handle_request(
                             event_tx.clone(),
                             driver_cancel,
                         ));
-                    } else if resolved.backend == libslop::Backend::Codex {
-                        let PreparedCodexRun { client, thread_id, socket, mut events, existing_threads } = codex_runtime.expect("Codex runtime prepared");
+                    }
+                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, socket, mut events, existing_threads }) => {
                         let thread_id = match thread_id {
                             Some(id) => id,
                             None => match codex::wait_for_thread_started(&mut events, std::time::Duration::from_secs(20), &existing_threads).await {
@@ -4473,12 +4688,15 @@ async fn handle_request(
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCodexSocket.as_str(), &socket.to_string_lossy()).await;
                         let pane_state = panes.get_or_insert(&pane_id);
                         pane_state.note_session_id(&thread_id);
-                        *pane_state.codex.lock().unwrap() = Some(CodexState { client: client.clone(), thread_id: thread_id.clone() });
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
-                        *pane_state.codex_cancel.lock().unwrap() = driver_cancel.clone();
+                        pane_state.set_runtime(PaneRuntime::Codex(CodexState::new(
+                            client.clone(), thread_id.clone(), driver_cancel.clone(),
+                        )));
                         tokio::spawn(run_codex_driver(
                             client, thread_id, pane_id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel,
                         ));
+                    }
+                    PreparedBackendRun::Claude => {}
                     }
 
                     // Test hook: SLOPD_TEST_RUN_YIELD_MS adds an extra async sleep here so
@@ -4552,16 +4770,15 @@ async fn handle_request(
                 };
             }
             let state = panes.get_or_insert(&pane_id);
+            let send_transport = state.runtime().send_transport();
+            let settle_before_enter = matches!(
+                send_transport,
+                SendTransport::Tui { settle_before_enter: true }
+            );
 
             // OpenCode panes are HTTP-driven: handle the whole send here and
             // return. Claude and Codex panes fall through to the tmux path.
-            if state.is_opencode() {
-                let oc = state.opencode.lock().unwrap().clone();
-                let Some(oc) = oc else {
-                    return libslop::ResponseBody::Error {
-                        message: format!("opencode pane {} has no HTTP runtime", pane_id),
-                    };
-                };
+            if let SendTransport::Opencode(oc) = send_transport {
                 if interrupt {
                     if let Err(e) = oc.client.abort(&oc.session_id).await {
                         warn!("opencode abort failed for pane {}: {}", pane_id, e);
@@ -4599,7 +4816,7 @@ async fn handle_request(
                     Ok(()) => {
                         // Record the prompt so a `session.error` can auto-retry it.
                         if !is_command {
-                            *state.opencode_last_prompt.lock().unwrap() = Some(prompt.clone());
+                            *oc.last_prompt.lock().unwrap() = Some(prompt.clone());
                             *state.retry_state.lock().unwrap() = None;
                         }
                         state.prompt_submitted.notify_waiters();
@@ -4716,7 +4933,7 @@ async fn handle_request(
                     // composer submission (notably an in-flight steer). Submit
                     // exactly once through its visible TUI and let app-server
                     // notifications drive subsequent state.
-                    if state.is_codex() {
+                    if settle_before_enter {
                         // Ratatui can render the pasted text one event-loop tick
                         // after tmux reports send-keys complete. An immediate
                         // Enter is then ignored and leaves the text as a draft.
@@ -4772,30 +4989,10 @@ async fn handle_request(
             }
             let state = panes.get_or_insert(&pane_id);
 
-            if state.is_codex() {
-                let runtime = state.codex.lock().unwrap().clone();
-                let turn = state.codex_active_turn.lock().unwrap().clone();
-                return match (runtime, turn) {
-                    (Some(runtime), Some(turn)) => match runtime.client.interrupt_turn(&runtime.thread_id, &turn).await {
-                        Ok(()) => libslop::ResponseBody::Interrupted { pane_id },
-                        Err(message) => libslop::ResponseBody::Error { message },
-                    },
-                    (Some(_), None) => libslop::ResponseBody::Interrupted { pane_id },
-                    (None, _) => libslop::ResponseBody::Error { message: format!("Codex pane {} has no app-server runtime", pane_id) },
-                };
-            }
-
-            // OpenCode: interrupt via HTTP abort. Claude: tmux C-c/C-d/Esc below.
-            if state.is_opencode() {
-                let oc = state.opencode.lock().unwrap().clone();
-                let Some(oc) = oc else {
-                    return libslop::ResponseBody::Error {
-                        message: format!("opencode pane {} has no HTTP runtime", pane_id),
-                    };
-                };
-                return match oc.client.abort(&oc.session_id).await {
+            if let Some(result) = state.runtime().interrupt().await {
+                return match result {
                     Ok(()) => libslop::ResponseBody::Interrupted { pane_id },
-                    Err(e) => libslop::ResponseBody::Error { message: e },
+                    Err(message) => libslop::ResponseBody::Error { message },
                 };
             }
 
@@ -4914,11 +5111,9 @@ async fn handle_request(
 
         libslop::RequestBody::ReadTranscript { pane_id, before_cursor, limit } => {
             if let Some(state) = panes.get(&pane_id) {
-                let runtime = state.codex.lock().unwrap().clone();
-                if let Some(runtime) = runtime {
-                    return match runtime.client.resume_thread(&runtime.thread_id).await {
-                        Ok(result) => {
-                            let mut records = codex::thread_records(&result, &pane_id);
+                if let Some(result) = state.runtime().transcript(&pane_id).await {
+                    return match result {
+                        Ok(mut records) => {
                             if let Some(before) = before_cursor {
                                 records.retain(|record| record.cursor.is_some_and(|cursor| cursor < before));
                             }
@@ -4931,42 +5126,6 @@ async fn handle_request(
                     };
                 }
             }
-            // OpenCode: conversation lives in the opencode DB, served over HTTP —
-            // there is no jsonl file. Pull and map it. (Cursor pagination is
-            // byte-offset based for Claude; opencode uses index cursors for now.)
-            if let Some(state) = panes.get(&pane_id) {
-                if state.is_opencode() {
-                    let oc = state.opencode.lock().unwrap().clone();
-                    let Some(oc) = oc else {
-                        return libslop::ResponseBody::TranscriptPage { records: vec![] };
-                    };
-                    let _ = before_cursor;
-                    match oc.client.messages(&oc.session_id).await {
-                        Ok(msgs) => {
-                            let mut records: Vec<libslop::Record> = opencode::messages_to_records(&msgs)
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, (event_type, payload))| libslop::Record {
-                                    cursor: Some(i as u64),
-                                    source: "transcript".to_string(),
-                                    event_type,
-                                    pane_id: Some(pane_id.clone()),
-                                    payload,
-                                })
-                                .collect();
-                            if limit > 0 {
-                                let limit = limit as usize;
-                                if records.len() > limit {
-                                    records = records.split_off(records.len() - limit);
-                                }
-                            }
-                            return libslop::ResponseBody::TranscriptPage { records };
-                        }
-                        Err(e) => return libslop::ResponseBody::Error { message: e },
-                    }
-                }
-            }
-
             let transcript_path = panes
                 .get(&pane_id)
                 .and_then(|state| state.transcript_path.lock().unwrap().clone());
@@ -5187,5 +5346,30 @@ mod tests {
         assert!(tail.ends_with("line99"));
         assert!(!tail.contains("line0\n"), "oldest lines should be dropped");
         assert!(tail.contains("line99") && tail.contains("line60"));
+    }
+
+    #[test]
+    fn backend_policy_keeps_protocol_quirks_at_the_boundary() {
+        assert!(libslop::Backend::Codex.serializes_fresh_runs());
+        assert!(!libslop::Backend::Claude.serializes_fresh_runs());
+        assert!(libslop::Backend::Opencode.fork_session_is_known_before_spawn());
+        assert!(!libslop::Backend::Claude.driver_owns_initial_state());
+        assert!(libslop::Backend::Codex.driver_owns_initial_state());
+    }
+
+    #[test]
+    fn prepared_opencode_run_normalizes_resume_arguments() {
+        let prepared = PreparedBackendRun::Opencode {
+            port: 4321,
+            resume_session: Some("session-1".to_string()),
+        };
+        assert_eq!(prepared.opencode_port(), Some(4321));
+        assert_eq!(
+            prepared.trailing_args(
+                vec!["--resume".to_string(), "old".to_string(), "--flag".to_string()],
+                std::path::Path::new("/tmp"),
+            ),
+            vec!["--flag", "-s", "session-1"],
+        );
     }
 }
