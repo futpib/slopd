@@ -77,11 +77,6 @@ enum Command {
         params: Value,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    Respond {
-        id: Value,
-        result: Value,
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
 }
 
 struct PendingRequest {
@@ -93,7 +88,7 @@ struct PendingRequest {
 
 fn fail_command(command: Command, message: &str) {
     let reply = match command {
-        Command::Request { reply, .. } | Command::Respond { reply, .. } => reply,
+        Command::Request { reply, .. } => reply,
     };
     let _ = reply.send(Err(message.to_string()));
 }
@@ -121,13 +116,6 @@ impl CodexClient {
                                 let message = json!({"method": method, "id": id, "params": params});
                                 match ws.send(Message::text(message.to_string())).await {
                                     Ok(()) => { pending.insert(id, PendingRequest { method, params, attempts: 0, reply }); }
-                                    Err(e) => { let _ = reply.send(Err(e.to_string())); break 'connected; }
-                                }
-                            }
-                            Command::Respond { id, result, reply } => {
-                                let message = json!({"id": id, "result": result});
-                                match ws.send(Message::text(message.to_string())).await {
-                                    Ok(()) => { let _ = reply.send(Ok(Value::Null)); }
                                     Err(e) => { let _ = reply.send(Err(e.to_string())); break 'connected; }
                                 }
                             }
@@ -163,8 +151,8 @@ impl CodexClient {
                                     }
                                 }
                             } else {
-                                // Server-initiated requests are forwarded with their
-                                // request id so slopctl can answer on this connection.
+                                // Observe server-initiated requests, but never answer
+                                // them: the visible TUI owns approval and elicitation.
                                 let _ = notifications_task.send(value);
                             }
                         } else {
@@ -232,19 +220,6 @@ impl CodexClient {
             .map_err(|_| "Codex app-server connection closed".to_string())?
     }
 
-    /// Answer a server-initiated approval or elicitation request.
-    pub async fn respond(&self, id: Value, result: Value) -> Result<(), String> {
-        let (reply, receive) = oneshot::channel();
-        self.commands
-            .send(Command::Respond { id, result, reply })
-            .await
-            .map_err(|_| "Codex app-server connection closed".to_string())?;
-        receive
-            .await
-            .map_err(|_| "Codex app-server connection closed".to_string())??;
-        Ok(())
-    }
-
     pub async fn resume_thread(&self, thread_id: &str) -> Result<Value, String> {
         self.request("thread/resume", json!({"threadId": thread_id}))
             .await
@@ -274,41 +249,6 @@ impl CodexClient {
             .request("thread/fork", json!({"threadId": thread_id}))
             .await?;
         response_thread_id(&result)
-    }
-
-    pub async fn start_turn(&self, thread_id: &str, prompt: &str) -> Result<String, String> {
-        let result = self
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{"type":"text", "text":prompt}]
-                }),
-            )
-            .await?;
-        result
-            .pointer("/turn/id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("Codex turn/start returned no turn id: {result}"))
-    }
-
-    pub async fn steer_turn(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        prompt: &str,
-    ) -> Result<(), String> {
-        self.request(
-            "turn/steer",
-            json!({
-                "threadId": thread_id,
-                "expectedTurnId": turn_id,
-                "input": [{"type":"text", "text":prompt}]
-            }),
-        )
-        .await
-        .map(|_| ())
     }
 
     pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), String> {

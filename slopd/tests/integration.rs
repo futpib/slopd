@@ -10545,13 +10545,6 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
 
     let send = env.slopctl(&["send", &source, "hello mock codex"]);
     assert!(send.status.success(), "Codex send failed: {:?}", send);
-    let overload = env.slopctl(&["send", &source, "__overload__"]);
-    assert!(overload.status.success(), "Codex overload retry failed: {}", String::from_utf8_lossy(&overload.stderr));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
-        assert!(Instant::now() < deadline, "overload turn did not finish");
-        std::thread::sleep(Duration::from_millis(25));
-    }
     let active = env.slopctl(&["send", &source, "__active__"]);
     assert!(active.status.success());
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -10584,24 +10577,14 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     // Cross at least one 2s status-poll interval. `thread/resume` replays a
     // pending approval; the non-mutating `thread/read` backstop must not.
     std::thread::sleep(Duration::from_millis(2500));
-    let response = env.slopctl(&["codex-respond", &source, "900", r#"{"decision":"accept"}"#]);
-    assert!(response.status.success(), "Codex approval response failed: {}", String::from_utf8_lossy(&response.stderr));
+    // Approval belongs to the TUI. Answer it as a terminal user would; there is
+    // intentionally no slopctl/app-server response RPC.
+    let response = env.tmux.tmux().args(["send-keys", "-t", &source, "y", "Enter"]).status().unwrap();
+    assert!(response.success(), "typing Codex approval into TUI failed");
     let deadline = Instant::now() + Duration::from_secs(5);
     while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
         assert!(Instant::now() < deadline, "approval replay left a second request pending");
         std::thread::sleep(Duration::from_millis(25));
-    }
-
-    // A dropped app-server connection is re-established by the client actor;
-    // after a short retry window the same pane remains sendable.
-    let disconnected = env.slopctl(&["send", &source, "__disconnect__"]);
-    assert!(!disconnected.status.success());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let recovered = env.slopctl(&["send", &source, "after reconnect"]);
-        if recovered.status.success() { break; }
-        assert!(Instant::now() < deadline, "Codex client did not reconnect");
-        std::thread::sleep(Duration::from_millis(100));
     }
 
     let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "20"]);

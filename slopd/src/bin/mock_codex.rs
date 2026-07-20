@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast};
 use tokio_websockets::{ClientBuilder, Message, ServerBuilder};
@@ -42,6 +43,7 @@ async fn connection(
     let mut event_rx = events.subscribe();
     let mut pending_approval: Option<(String, String)> = None;
     let mut overloaded_once = false;
+    let mut may_drive_turns = false;
     loop {
         tokio::select! {
             event = event_rx.recv() => if let Ok(event) = event {
@@ -61,7 +63,10 @@ async fn connection(
                 let Some(method) = value.get("method").and_then(Value::as_str) else { continue };
                 let id = value.get("id").cloned();
                 let result = match method {
-                    "initialize" => json!({"userAgent":"mock-codex","platformFamily":"unix","platformOs":"linux"}),
+                    "initialize" => {
+                        may_drive_turns = value.pointer("/params/clientInfo/name").and_then(Value::as_str) == Some("mock_codex_tui");
+                        json!({"userAgent":"mock-codex","platformFamily":"unix","platformOs":"linux"})
+                    },
                     "initialized" => continue,
                     "thread/start" => {
                         let id = format!("mock-thread-{}", state.next_thread.fetch_add(1, Ordering::Relaxed) + 1);
@@ -108,6 +113,10 @@ async fn connection(
                         json!({"thread":{"id":id,"turns":turns}})
                     }
                     "turn/start" => {
+                        if !may_drive_turns {
+                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"only the TUI may start turns"}})).await; }
+                            continue;
+                        }
                         let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("").to_string();
                         let prompt = value.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or("").to_string();
                         if prompt == "__disconnect__" { return Ok(()); }
@@ -129,7 +138,7 @@ async fn connection(
                             // Keep the turn active until a turn/steer request.
                         } else if prompt == "__approval__" {
                             pending_approval = Some((thread_id.clone(), turn_id.clone()));
-                            send_json(&mut ws, json!({"method":"item/commandExecution/requestApproval","id":900,"params":{"threadId":thread_id,"turnId":turn_id,"itemId":"mock-item","reason":"mock approval"}})).await;
+                            let _ = events.send(json!({"method":"item/commandExecution/requestApproval","id":900,"params":{"threadId":thread_id,"turnId":turn_id,"itemId":"mock-item","reason":"mock approval"}}));
                         } else {
                             state.active.lock().await.remove(&thread_id);
                             let _ = events.send(json!({"method":"turn/completed","params":{"threadId":thread_id,"turn":turn}}));
@@ -137,6 +146,10 @@ async fn connection(
                         json!({"turn":{"id":turn_id}})
                     }
                     "turn/steer" => {
+                        if !may_drive_turns {
+                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"only the TUI may steer turns"}})).await; }
+                            continue;
+                        }
                         let Some(turn_id) = value.pointer("/params/expectedTurnId").and_then(Value::as_str) else {
                             if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"missing expectedTurnId"}})).await; }
                             continue;
@@ -203,23 +216,60 @@ async fn tui(args: &[String]) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     send_json(&mut ws, json!({"method":"initialize","id":1,"params":{"clientInfo":{"name":"mock_codex_tui","title":"Mock Codex","version":"1"}}})).await;
-    while let Some(Ok(message)) = ws.next().await {
-        let Some(text) = message.as_text() else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(text).unwrap_or_default();
-        if value.get("id") == Some(&json!(1)) {
-            send_json(&mut ws, json!({"method":"initialized","params":{}})).await;
-            if let Some(index) = args.iter().position(|arg| arg == "resume")
-                && let Some(thread_id) = args.get(index + 1)
-            {
-                send_json(
-                    &mut ws,
-                    json!({"method":"thread/resume","id":2,"params":{"threadId":thread_id}}),
-                )
-                .await;
-            } else {
-                send_json(&mut ws, json!({"method":"thread/start","id":2,"params":{}})).await;
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut initialized = false;
+    let mut thread_id: Option<String> = None;
+    let mut active_turn: Option<String> = None;
+    let mut pending_dialog: Option<Value> = None;
+    let mut next_id = 3_u64;
+    loop {
+        tokio::select! {
+            line = lines.next_line(), if initialized && thread_id.is_some() => {
+                let Some(line) = line.map_err(|e| e.to_string())? else { break };
+                let prompt = line.trim_end_matches('\r');
+                if prompt.is_empty() { continue; }
+                if let Some(id) = pending_dialog.take() {
+                    let decision = if matches!(prompt.to_ascii_lowercase().as_str(), "y" | "yes" | "accept" | "approve") { "accept" } else { "decline" };
+                    send_json(&mut ws, json!({"id":id,"result":{"decision":decision}})).await;
+                    continue;
+                }
+                let id = next_id;
+                next_id += 1;
+                let thread_id = thread_id.as_deref().unwrap();
+                if let Some(turn_id) = active_turn.as_deref() {
+                    send_json(&mut ws, json!({"method":"turn/steer","id":id,"params":{"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":prompt}]}})).await;
+                } else {
+                    send_json(&mut ws, json!({"method":"turn/start","id":id,"params":{"threadId":thread_id,"input":[{"type":"text","text":prompt}]}})).await;
+                }
+            }
+            message = ws.next() => {
+                let Some(Ok(message)) = message else { break };
+                let Some(text) = message.as_text() else { continue };
+                let value: Value = serde_json::from_str(text).unwrap_or_default();
+                if value.get("id") == Some(&json!(1)) {
+                    initialized = true;
+                    send_json(&mut ws, json!({"method":"initialized","params":{}})).await;
+                    if let Some(index) = args.iter().position(|arg| arg == "resume")
+                        && let Some(resume_id) = args.get(index + 1)
+                    {
+                        thread_id = Some(resume_id.clone());
+                        send_json(&mut ws, json!({"method":"thread/resume","id":2,"params":{"threadId":resume_id}})).await;
+                    } else {
+                        send_json(&mut ws, json!({"method":"thread/start","id":2,"params":{}})).await;
+                    }
+                }
+                if value.get("id") == Some(&json!(2))
+                    && let Some(id) = value.pointer("/result/thread/id").and_then(Value::as_str) {
+                    thread_id = Some(id.to_string());
+                }
+                match value.get("method").and_then(Value::as_str) {
+                    Some("turn/started") => active_turn = value.pointer("/params/turn/id").and_then(Value::as_str).map(str::to_string),
+                    Some("turn/completed") => active_turn = None,
+                    Some(method) if method.ends_with("requestApproval") || method.contains("requestUserInput") => {
+                        pending_dialog = value.get("id").cloned();
+                    }
+                    _ => {}
+                }
             }
         }
     }

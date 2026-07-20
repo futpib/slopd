@@ -704,7 +704,8 @@ executable = "codex"         # needed when global [run] executable is Claude
 slopctl run --account codex
 ```
 
-`send` uses `turn/start` while idle and `turn/steer` during an active turn;
+`send` always types into the visible Codex TUI in tmux, so both new prompts and
+in-flight steering follow the same UI path as a person at the terminal.
 `interrupt` uses `turn/interrupt`; transcripts come from Codex thread history;
 and `fork` uses Codex's native `thread/fork`. On a slopd restart, the daemon
 reconnects to the recorded app-server socket and resumes its notification
@@ -717,17 +718,13 @@ and uses periodic non-mutating `thread/read` calls as a status backstop without
 replaying pending approval requests.
 
 Codex approval and elicitation requests are published as normalized
-`PermissionRequest` and `Elicitation` hook events. Answer the request ID on the
-same app-server connection with a complete Codex result object:
+`PermissionRequest` and `Elicitation` hook events for observation. They must be
+answered in the visible TUI; slopd deliberately does not answer app-server
+requests or provide a headless Codex interaction path:
 
 ```bash
 slopctl listen --pane-id %42 --hook PermissionRequest
-slopctl codex-respond %42 17 '{"decision":"accept"}'
 ```
-
-Other common decisions are `decline`, `cancel`, and `acceptForSession`.
-MCP elicitations use a result such as `{"action":"decline"}` or
-`{"action":"accept","content":{...}}`.
 
 OpenAI-hosted remote control is independent and optional. slopd never enables
 it itself. If the user enables it with `codex remote-control start`, ChatGPT

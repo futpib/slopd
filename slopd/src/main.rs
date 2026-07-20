@@ -409,9 +409,10 @@ struct PaneState {
     opencode_last_prompt: std::sync::Mutex<Option<String>>,
     /// Codex app-server client + thread bound to this pane.
     codex: std::sync::Mutex<Option<CodexState>>,
-    /// Most recently active Codex turn, used by interrupt and steer.
+    /// Most recently active Codex turn, used by interrupt and observation.
     codex_active_turn: std::sync::Mutex<Option<String>>,
-    /// Server-request IDs awaiting an explicit `slopctl codex-respond`.
+    /// Observed server requests that keep the pane in an awaiting-input state.
+    /// The visible Codex TUI, not slopd, owns answering them.
     codex_pending_requests: std::sync::Mutex<std::collections::HashMap<String, libslop::PaneDetailedState>>,
     codex_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     /// For a Claude pane created by `fork`: the fork's session id (which slopd
@@ -564,6 +565,7 @@ async fn run_codex_driver(
                 if let Some(id) = value.pointer("/params/turn/id").and_then(|v| v.as_str()) {
                     *state.codex_active_turn.lock().unwrap() = Some(id.to_string());
                 }
+                state.prompt_submitted.notify_waiters();
                 Some(libslop::PaneDetailedState::BusyProcessing)
             }
             "turn/completed" => {
@@ -4551,30 +4553,8 @@ async fn handle_request(
             }
             let state = panes.get_or_insert(&pane_id);
 
-            if state.is_codex() {
-                let runtime = state.codex.lock().unwrap().clone();
-                let Some(runtime) = runtime else {
-                    return libslop::ResponseBody::Error { message: format!("Codex pane {} has no app-server runtime", pane_id) };
-                };
-                let active = state.codex_active_turn.lock().unwrap().clone();
-                if interrupt {
-                    if let Some(turn) = active.as_deref()
-                        && let Err(e) = runtime.client.interrupt_turn(&runtime.thread_id, turn).await {
-                        return libslop::ResponseBody::Error { message: e };
-                    }
-                }
-                let result = match active.as_deref() {
-                    Some(turn) if !interrupt => runtime.client.steer_turn(&runtime.thread_id, turn, &prompt).await,
-                    _ => runtime.client.start_turn(&runtime.thread_id, &prompt).await.map(|_| ()),
-                };
-                return match result {
-                    Ok(()) => libslop::ResponseBody::Sent { pane_id },
-                    Err(message) => libslop::ResponseBody::Error { message },
-                };
-            }
-
             // OpenCode panes are HTTP-driven: handle the whole send here and
-            // return. Claude panes fall through to the tmux keystroke path below.
+            // return. Claude and Codex panes fall through to the tmux path.
             if state.is_opencode() {
                 let oc = state.opencode.lock().unwrap().clone();
                 let Some(oc) = oc else {
@@ -4732,6 +4712,21 @@ async fn handle_request(
                     libslop::ResponseBody::Error { message: msg }
                 }
                 Ok(_) => {
+                    // Codex has no hook equivalent that acknowledges every
+                    // composer submission (notably an in-flight steer). Submit
+                    // exactly once through its visible TUI and let app-server
+                    // notifications drive subsequent state.
+                    if state.is_codex() {
+                        // Ratatui can render the pasted text one event-loop tick
+                        // after tmux reports send-keys complete. An immediate
+                        // Enter is then ignored and leaves the text as a draft.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        return match tmux_send_keys(config, &pane_id, "Enter").await {
+                            Ok(out) if out.success() => libslop::ResponseBody::Sent { pane_id },
+                            Ok(_) => libslop::ResponseBody::Error { message: format!("tmux send-keys failed for pane {}", pane_id) },
+                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
+                        };
+                    }
                     // Send Enter repeatedly with exponential backoff until
                     // UserPromptSubmit fires, confirming the prompt was submitted.
                     // Real Claude may treat some newlines as literal (Ctrl+J) rather
@@ -4765,27 +4760,6 @@ async fn handle_request(
                             }
                         }
                     }
-                }
-            }
-        }
-
-        libslop::RequestBody::CodexRespond { pane_id, request_id, result } => {
-            let Some(state) = panes.get(&pane_id) else {
-                return libslop::ResponseBody::Error { message: format!("pane {} not found", pane_id) };
-            };
-            let Some(runtime) = state.codex.lock().unwrap().clone() else {
-                return libslop::ResponseBody::Error { message: format!("pane {} is not a Codex pane", pane_id) };
-            };
-            let key = request_id.to_string();
-            let pending_kind = state.codex_pending_requests.lock().unwrap().remove(&key);
-            if pending_kind.is_none() {
-                return libslop::ResponseBody::Error { message: format!("Codex request {} is not pending for pane {}", request_id, pane_id) };
-            }
-            match runtime.client.respond(request_id, result).await {
-                Ok(()) => libslop::ResponseBody::CodexResponded { pane_id },
-                Err(message) => {
-                    state.codex_pending_requests.lock().unwrap().insert(key, pending_kind.unwrap());
-                    libslop::ResponseBody::Error { message }
                 }
             }
         }

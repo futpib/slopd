@@ -197,17 +197,6 @@ pub enum CommonCommand {
         /// Tmux pane ID (e.g. %42).
         pane_id: String,
     },
-    /// Answer a pending Codex approval or elicitation request. Obtain REQUEST_ID
-    /// from `slopctl listen --hook PermissionRequest` (or Elicitation).
-    CodexRespond {
-        /// Codex tmux pane ID (e.g. %42).
-        pane_id: String,
-        /// JSON-RPC request ID shown in the event payload.
-        request_id: String,
-        /// Complete JSON result object required by Codex, for example
-        /// `{"decision":"accept"}` or `{"action":"decline"}`.
-        result: String,
-    },
     /// Subscribe to a stream of events and print each as a JSON line.
     Listen {
         /// Filter by hook event name (repeatable; omit for all events). Matches source:hook events.
@@ -818,18 +807,6 @@ impl<
     pub async fn interrupt(&mut self, pane_id: String) -> Result<String, Error> {
         match self.request(libslop::RequestBody::Interrupt { pane_id }).await? {
             libslop::ResponseBody::Interrupted { pane_id } => Ok(pane_id),
-            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
-        }
-    }
-
-    pub async fn codex_respond(
-        &mut self,
-        pane_id: String,
-        request_id: serde_json::Value,
-        result: serde_json::Value,
-    ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::CodexRespond { pane_id, request_id, result }).await? {
-            libslop::ResponseBody::CodexResponded { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -1973,13 +1950,6 @@ where
         }
         CommonCommand::Interrupt { pane_id } => {
             let pane_id = client.interrupt(pane_id).await?;
-            println!("{}", pane_id);
-        }
-        CommonCommand::CodexRespond { pane_id, request_id, result } => {
-            let request_id = serde_json::from_str(&request_id)
-                .unwrap_or(serde_json::Value::String(request_id));
-            let result = serde_json::from_str(&result).map_err(Error::Parse)?;
-            let pane_id = client.codex_respond(pane_id, request_id, result).await?;
             println!("{}", pane_id);
         }
         CommonCommand::Tag { pane_id, tag } => {

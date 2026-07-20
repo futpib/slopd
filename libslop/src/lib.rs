@@ -2468,8 +2468,6 @@ pub enum RequestBody {
     /// Notification from a tmux hook (called by slopctl tmux-hook).
     TmuxHook { event: String, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },
-    /// Answer a pending Codex app-server approval or elicitation request.
-    CodexRespond { pane_id: String, request_id: serde_json::Value, result: serde_json::Value },
     /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
     Interrupt { pane_id: String },
     /// Subscribe to a stream of lifecycle events (hook + slopd). An empty filters vec matches all.
@@ -2514,7 +2512,6 @@ pub enum ResponseBody {
     Forked { pane_id: String, session_id: String },
     Kill { pane_id: String },
     Sent { pane_id: String },
-    CodexResponded { pane_id: String },
     Interrupted { pane_id: String },
     Hooked,
     TmuxHooked,
