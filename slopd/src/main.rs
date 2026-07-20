@@ -8,6 +8,8 @@ use tracing::{debug, error, info, trace, warn};
 
 mod codex;
 mod opencode;
+mod backend;
+use backend::*;
 
 static CODEX_FRESH_RUN_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
@@ -281,265 +283,6 @@ impl RetryState {
     }
 }
 
-#[derive(Clone)]
-struct OpencodeState {
-    client: opencode::OpencodeClient,
-    session_id: String,
-    cancel: tokio_util::sync::CancellationToken,
-    last_prompt: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-impl OpencodeState {
-    fn new(client: opencode::OpencodeClient, session_id: String, cancel: tokio_util::sync::CancellationToken) -> Self {
-        Self { client, session_id, cancel, last_prompt: Arc::new(std::sync::Mutex::new(None)) }
-    }
-}
-
-#[derive(Clone)]
-struct CodexState {
-    client: codex::CodexClient,
-    thread_id: String,
-    cancel: tokio_util::sync::CancellationToken,
-    active_turn: Arc<std::sync::Mutex<Option<String>>>,
-    pending_requests: Arc<std::sync::Mutex<std::collections::HashMap<String, libslop::PaneDetailedState>>>,
-}
-
-impl CodexState {
-    fn new(client: codex::CodexClient, thread_id: String, cancel: tokio_util::sync::CancellationToken) -> Self {
-        Self {
-            client,
-            thread_id,
-            cancel,
-            active_turn: Arc::new(std::sync::Mutex::new(None)),
-            pending_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct ClaudeState;
-
-#[derive(Clone)]
-enum PaneRuntime {
-    Claude(ClaudeState),
-    Opencode(OpencodeState),
-    Codex(CodexState),
-}
-
-impl Default for PaneRuntime {
-    fn default() -> Self {
-        Self::Claude(ClaudeState)
-    }
-}
-
-/// Backend behavior attached to a live pane. The enum provides closed-world
-/// storage; this trait keeps backend operations out of request dispatch.
-trait BackendRuntime {
-    fn backend(&self) -> libslop::Backend;
-    fn cancel(&self);
-    fn send_transport(&self) -> SendTransport;
-    async fn interrupt(&self) -> Option<Result<(), String>>;
-    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>>;
-}
-
-#[derive(Clone)]
-enum SendTransport {
-    Tui { settle_before_enter: bool },
-    Opencode(OpencodeState),
-}
-
-impl BackendRuntime for ClaudeState {
-    fn backend(&self) -> libslop::Backend {
-        libslop::Backend::Claude
-    }
-
-    fn cancel(&self) {}
-
-    fn send_transport(&self) -> SendTransport {
-        SendTransport::Tui { settle_before_enter: false }
-    }
-
-    async fn interrupt(&self) -> Option<Result<(), String>> {
-        None
-    }
-
-    async fn transcript(&self, _pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
-        None
-    }
-}
-
-impl BackendRuntime for OpencodeState {
-    fn backend(&self) -> libslop::Backend {
-        libslop::Backend::Opencode
-    }
-
-    fn cancel(&self) {
-        self.cancel.cancel();
-    }
-
-    fn send_transport(&self) -> SendTransport {
-        SendTransport::Opencode(self.clone())
-    }
-
-    async fn interrupt(&self) -> Option<Result<(), String>> {
-        Some(self.client.abort(&self.session_id).await)
-    }
-
-    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
-        Some(self.client.messages(&self.session_id).await.map(|messages| {
-                opencode::messages_to_records(&messages)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (event_type, payload))| libslop::Record {
-                        cursor: Some(index as u64),
-                        source: "transcript".to_string(),
-                        event_type,
-                        pane_id: Some(pane_id.to_string()),
-                        payload,
-                    })
-                    .collect()
-            }))
-    }
-}
-
-impl BackendRuntime for CodexState {
-    fn backend(&self) -> libslop::Backend {
-        libslop::Backend::Codex
-    }
-
-    fn cancel(&self) {
-        self.cancel.cancel();
-    }
-
-    fn send_transport(&self) -> SendTransport {
-        SendTransport::Tui { settle_before_enter: true }
-    }
-
-    async fn interrupt(&self) -> Option<Result<(), String>> {
-        let turn = self.active_turn.lock().unwrap().clone();
-        Some(match turn {
-            Some(turn) => self.client.interrupt_turn(&self.thread_id, &turn).await,
-            None => Ok(()),
-        })
-    }
-
-    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
-        Some(self.client.resume_thread(&self.thread_id).await
-            .map(|thread| codex::thread_records(&thread, pane_id)))
-    }
-}
-
-impl BackendRuntime for PaneRuntime {
-    fn backend(&self) -> libslop::Backend {
-        match self {
-            Self::Claude(runtime) => runtime.backend(),
-            Self::Opencode(runtime) => runtime.backend(),
-            Self::Codex(runtime) => runtime.backend(),
-        }
-    }
-
-    fn cancel(&self) {
-        match self {
-            Self::Claude(runtime) => runtime.cancel(),
-            Self::Opencode(runtime) => runtime.cancel(),
-            Self::Codex(runtime) => runtime.cancel(),
-        }
-    }
-
-    fn send_transport(&self) -> SendTransport {
-        match self {
-            Self::Claude(runtime) => runtime.send_transport(),
-            Self::Opencode(runtime) => runtime.send_transport(),
-            Self::Codex(runtime) => runtime.send_transport(),
-        }
-    }
-
-    async fn interrupt(&self) -> Option<Result<(), String>> {
-        match self {
-            Self::Claude(runtime) => runtime.interrupt().await,
-            Self::Opencode(runtime) => runtime.interrupt().await,
-            Self::Codex(runtime) => runtime.interrupt().await,
-        }
-    }
-
-    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
-        match self {
-            Self::Claude(runtime) => runtime.transcript(pane_id).await,
-            Self::Opencode(runtime) => runtime.transcript(pane_id).await,
-            Self::Codex(runtime) => runtime.transcript(pane_id).await,
-        }
-    }
-}
-
-trait BackendPolicy {
-    fn serializes_fresh_runs(self) -> bool;
-    fn fork_session_is_known_before_spawn(self) -> bool;
-    fn driver_owns_initial_state(self) -> bool;
-}
-
-impl BackendPolicy for libslop::Backend {
-    fn serializes_fresh_runs(self) -> bool {
-        matches!(self, Self::Codex)
-    }
-
-    fn fork_session_is_known_before_spawn(self) -> bool {
-        !matches!(self, Self::Claude)
-    }
-
-    fn driver_owns_initial_state(self) -> bool {
-        !matches!(self, Self::Claude)
-    }
-}
-
-struct PreparedCodexRun {
-    client: codex::CodexClient,
-    thread_id: Option<String>,
-    socket: std::path::PathBuf,
-    events: tokio::sync::broadcast::Receiver<serde_json::Value>,
-    existing_threads: std::collections::HashSet<String>,
-}
-
-enum PreparedBackendRun {
-    Claude,
-    Opencode { port: u16, resume_session: Option<String> },
-    Codex(PreparedCodexRun),
-}
-
-impl PreparedBackendRun {
-    fn trailing_args(&self, extra_args: Vec<String>, cwd: &std::path::Path) -> Vec<String> {
-        match self {
-            Self::Claude => extra_args,
-            Self::Opencode { resume_session, .. } => {
-                let mut trailing = strip_resume_flags(extra_args);
-                if let Some(session_id) = resume_session {
-                    trailing.extend(["-s".to_string(), session_id.clone()]);
-                }
-                trailing
-            }
-            Self::Codex(runtime) => {
-                let mut trailing = strip_resume_flags(extra_args);
-                let mut prefix = vec![
-                    "--remote".to_string(), "unix://".to_string(),
-                    "--no-alt-screen".to_string(), "-C".to_string(),
-                    cwd.to_string_lossy().into_owned(),
-                ];
-                if let Some(thread_id) = &runtime.thread_id {
-                    prefix.extend(["resume".to_string(), thread_id.clone()]);
-                }
-                trailing.splice(0..0, prefix);
-                trailing
-            }
-        }
-    }
-
-    fn opencode_port(&self) -> Option<u16> {
-        match self {
-            Self::Opencode { port, .. } => Some(*port),
-            _ => None,
-        }
-    }
-}
-
 /// Why a managed pane was torn down. Recorded on every death so the systemd
 /// journal (and the `PaneDestroyed` event) can answer "what happened to pane
 /// %N?" without any surviving tmux state.
@@ -682,6 +425,14 @@ impl PaneState {
         self.runtime().cancel();
         self.identity.lock().unwrap().backend = runtime.backend();
         *self.runtime.lock().unwrap() = runtime;
+    }
+
+    fn mark_unbound_backend(&self, backend: libslop::Backend) {
+        let mut runtime = self.runtime.lock().unwrap();
+        if matches!(*runtime, PaneRuntime::Unbound(_)) {
+            *runtime = PaneRuntime::Unbound(UnboundState { backend });
+        }
+        self.identity.lock().unwrap().backend = backend;
     }
 
     fn opencode(&self) -> Option<OpencodeState> {
@@ -1715,6 +1466,8 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
             .resolve_account(opts.account.as_deref())
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
+        let recovered_backend = opts.backend.unwrap_or(libslop::Backend::Claude);
+        panes.get_or_insert(pane_id).mark_unbound_backend(recovered_backend);
         // Hooks are a Claude-only mechanism; a non-Claude backend has no
         // settings.json to inject into (and nothing to re-inject on recovery).
         if resolved.backend.uses_injected_hooks() {
@@ -1722,7 +1475,7 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         }
 
         // Replay the last N transcript records to recover the real state.
-        let transcript_path = opts.transcript_path;
+        let transcript_path = opts.transcript_path.clone();
         let recovered_state = match transcript_path.as_deref() {
             Some(path) => recover_state_from_transcript(path).await,
             None => None,
@@ -1766,60 +1519,10 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
             ));
         }
 
-        // OpenCode pane recovery: the embedded HTTP server is still running in
-        // the recovered tmux pane (a daemon restart doesn't kill it). Reattach
-        // the HTTP runtime from the stored port/token/session and resume the
-        // status-poll driver, which will advance BootingUp → the real state.
-        match opts.backend.unwrap_or(libslop::Backend::Claude) {
-        libslop::Backend::Opencode => {
-            if let (Some(port), Some(session_id)) = (opts.opencode_port, opts.session_id.as_deref()) {
-                if !session_id.is_empty() {
-                    let client = opencode::OpencodeClient::new(port, opts.opencode_token.clone());
-                    let driver_cancel = tokio_util::sync::CancellationToken::new();
-                    let state = panes.get_or_insert(pane_id);
-                    state.set_runtime(PaneRuntime::Opencode(OpencodeState::new(
-                        client.clone(), session_id.to_string(), driver_cancel.clone(),
-                    )));
-                    tokio::spawn(run_opencode_driver(
-                        client,
-                        session_id.to_string(),
-                        pane_id.to_string(),
-                        config.clone(),
-                        panes.clone(),
-                        event_tx.clone(),
-                        driver_cancel,
-                    ));
-                }
-            }
-        }
-        libslop::Backend::Codex => {
-            if let Some(session_id) = opts.session_id.as_deref().filter(|s| !s.is_empty()) {
-                let home = resolved.config_dir.as_deref().map(libslop::expand_path);
-                let socket = opts.codex_socket.as_deref().map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| codex::socket_path(home.as_deref()));
-                let path = std::env::var_os("PATH").unwrap_or_default();
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(program) = libslop::resolve_executable(resolved.executable.program(), &path, &cwd) {
-                    if let Err(e) = codex::ensure_daemon(&program, home.as_deref(), &socket).await {
-                        warn!("failed to recover Codex daemon for pane {}: {}", pane_id, e);
-                        continue;
-                    }
-                    match codex::CodexClient::connect(&socket).await {
-                        Ok(client) => {
-                            let state = panes.get_or_insert(pane_id);
-                            let driver_cancel = tokio_util::sync::CancellationToken::new();
-                            state.set_runtime(PaneRuntime::Codex(CodexState::new(
-                                client.clone(), session_id.to_string(), driver_cancel.clone(),
-                            )));
-                            tokio::spawn(run_codex_driver(client, session_id.to_string(), pane_id.to_string(),
-                                config.clone(), panes.clone(), event_tx.clone(), driver_cancel));
-                        }
-                        Err(e) => warn!("failed to reconnect Codex pane {}: {}", pane_id, e),
-                    }
-                }
-            }
-        }
-        libslop::Backend::Claude => {}
+        if let Err(error) = backend_lifecycle(recovered_backend).recover(RecoverContext {
+            pane_id, options: &opts, resolved: &resolved, config, panes, event_tx,
+        }).await {
+            warn!("failed to recover {} pane {}: {}", recovered_backend.canonical_executable(), pane_id, error);
         }
     }
     settings_paths
@@ -3727,128 +3430,16 @@ async fn restore_panes(
         // Resume the recorded session. Claude: `claude --resume` from the launch
         // cwd. OpenCode: `opencode -s <id>` over a freshly-allocated HTTP port,
         // then reattach the status-poll driver.
-        let new_id = match resolved.backend {
-        libslop::Backend::Opencode => {
-            let port = match opencode::alloc_port() {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("backup: failed to allocate opencode port for pane {} (session {}): {}", old_id, session_id, e);
-                    continue;
-                }
-            };
-            // No OPENCODE_SERVER_PASSWORD: the opencode TUI's internal client
-            // can't auth to its own server and would crash on startup (verified
-            // against real opencode). The server is open on 127.0.0.1.
-            let id = match spawn_pane(config, session_lock, &SpawnSpec {
-                working_dir: working_dir.clone(),
-                config_dir: resolved.config_dir.clone(),
-                backend: resolved.backend,
-                executable: resolved.executable.clone(),
-                extra_env: Vec::new(),
-                trailing_args: vec![
-                    "-s".to_string(),
-                    session_id.clone(),
-                    "--port".to_string(),
-                    port.to_string(),
-                    "--hostname".to_string(),
-                    "127.0.0.1".to_string(),
-                ],
-            }).await {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("backup: failed to restore opencode pane {} (session {}): {}", old_id, session_id, e);
-                    continue;
-                }
-            };
-            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdBackend.as_str(), "opencode").await;
-            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdOpencodePort.as_str(), &port.to_string()).await;
-            let client = opencode::OpencodeClient::new(port, None);
-            let driver_cancel = tokio_util::sync::CancellationToken::new();
-            let pane_state = panes.get_or_insert(&id);
-            pane_state.set_runtime(PaneRuntime::Opencode(OpencodeState::new(
-                client.clone(), session_id.clone(), driver_cancel.clone(),
-            )));
-            tokio::spawn(run_opencode_driver(
-                client,
-                session_id.clone(),
-                id.clone(),
-                config.clone(),
-                panes.clone(),
-                event_tx.clone(),
-                driver_cancel,
-            ));
-            id
-        }
-        libslop::Backend::Codex => {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let cwd = working_dir.as_deref().map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let Some(program) = libslop::resolve_executable(resolved.executable.program(), &path, &cwd) else {
-                warn!("backup: Codex executable missing for pane {}", old_id);
-                continue;
-            };
-            let home = resolved.config_dir.as_deref().map(libslop::expand_path);
-            let socket = codex::socket_path(home.as_deref());
-            if let Err(e) = codex::ensure_daemon(&program, home.as_deref(), &socket).await {
-                warn!("backup: failed to start Codex daemon for pane {}: {}", old_id, e);
+        let new_id = match backend_lifecycle(resolved.backend).restore(RestoreContext {
+            old_pane_id: &old_id, session_id: &session_id, working_dir: &working_dir,
+            transcript_path: &transcript_path, resolved: &resolved, config, session_lock,
+            panes, event_tx,
+        }).await {
+            Ok(id) => id,
+            Err(error) => {
+                warn!("backup: {}", error);
                 continue;
             }
-            let client = match codex::CodexClient::connect(&socket).await {
-                Ok(client) => client,
-                Err(e) => { warn!("backup: failed to connect Codex pane {}: {}", old_id, e); continue; }
-            };
-            if let Err(e) = client.resume_thread(&session_id).await {
-                warn!("backup: failed to resume Codex thread {}: {}", session_id, e);
-                continue;
-            }
-            let id = match spawn_pane(config, session_lock, &SpawnSpec {
-                working_dir: working_dir.clone(), config_dir: resolved.config_dir.clone(),
-                backend: resolved.backend, executable: resolved.executable.clone(), extra_env: Vec::new(),
-                trailing_args: vec!["--remote".to_string(), "unix://".to_string(), "--no-alt-screen".to_string(),
-                    "-C".to_string(), cwd.to_string_lossy().into_owned(),
-                    "resume".to_string(), session_id.clone()],
-            }).await {
-                Ok(id) => id,
-                Err(e) => { warn!("backup: failed to restore Codex pane {}: {}", old_id, e); continue; }
-            };
-            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdBackend.as_str(), "codex").await;
-            let _ = tmux_set_pane_option(config, &id, libslop::TmuxOption::SlopdCodexSocket.as_str(), &socket.to_string_lossy()).await;
-            let pane_state = panes.get_or_insert(&id);
-            let driver_cancel = tokio_util::sync::CancellationToken::new();
-            pane_state.set_runtime(PaneRuntime::Codex(CodexState::new(
-                client.clone(), session_id.clone(), driver_cancel.clone(),
-            )));
-            tokio::spawn(run_codex_driver(client, session_id.clone(), id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel));
-            id
-        }
-        libslop::Backend::Claude => {
-            let settings_path = config.resolved_settings_path(&resolved);
-            if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
-                warn!("backup: failed to inject hooks into {} for restored pane: {}", settings_path.display(), e);
-            }
-            // `claude --resume` finds the session via the project dir of its launch
-            // cwd (the dir Claude was started in). `working_dir` is pane_current_path,
-            // which drifts when the agent `cd`s, so prefer the transcript's recorded
-            // launch cwd; fall back to working_dir when there's no transcript.
-            let launch_dir = transcript_path
-                .as_deref()
-                .and_then(transcript_launch_cwd)
-                .or_else(|| working_dir.clone());
-            match spawn_pane(config, session_lock, &SpawnSpec {
-                working_dir: launch_dir,
-                config_dir: resolved.config_dir.clone(),
-                backend: resolved.backend,
-                executable: resolved.executable.clone(),
-                extra_env: Vec::new(),
-                trailing_args: vec!["--resume".to_string(), session_id.clone()],
-            }).await {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("backup: failed to restore pane {} (session {}): {}", old_id, session_id, e);
-                    continue;
-                }
-            }
-        }
         };
 
         managed_panes.insert(new_id.clone());
@@ -4118,6 +3709,7 @@ async fn handle_request(
 
             // Side effects for specific hooks (not state-related).
             if event == "SessionStart" {
+                panes.get_or_insert(pane).set_runtime(PaneRuntime::Claude(ClaudeState));
                 // A forked Claude pane pins the (minted) fork session id: real
                 // Claude reports the *resumed source* id in this hook, not the
                 // fork's, so trusting the payload would mis-bind the pane to the
@@ -4290,50 +3882,15 @@ async fn handle_request(
             //     live session in the shared store); the response carries the new
             //     id, which a pane spawned with `-s <id>` will then bind to via
             //     the existing resume path.
-            let (fork_args, new_session_id): (Vec<String>, String) = match src.backend {
-                libslop::Backend::Opencode => {
-                    let Some(port) = read_pane_opencode_port(config, &pane_id).await else {
-                        return libslop::ResponseBody::Error {
-                            message: format!("opencode pane {} has no recorded port; cannot fork", pane_id),
-                        };
-                    };
-                    let client = opencode::OpencodeClient::new(port, None);
-                    match client.fork_session(&src_session, None).await {
-                        Ok(new_id) => {
-                            let mut a = vec!["-s".to_string(), new_id.clone()];
-                            a.extend(extra_args);
-                            (a, new_id)
-                        }
-                        Err(e) => return libslop::ResponseBody::Error {
-                            message: format!("opencode fork of session {} failed: {}", src_session, e),
-                        },
-                    }
-                }
-                libslop::Backend::Codex => {
-                    let state = panes.get(&pane_id);
-                    let runtime = state.as_ref().and_then(|s| s.codex());
-                    let Some(runtime) = runtime else {
-                        return libslop::ResponseBody::Error { message: format!("Codex pane {} has no app-server runtime", pane_id) };
-                    };
-                    match runtime.client.fork_thread(&src_session).await {
-                        Ok(new_id) => {
-                            let mut args = vec!["--resume".to_string(), new_id.clone()];
-                            args.extend(extra_args);
-                            (args, new_id)
-                        }
-                        Err(message) => return libslop::ResponseBody::Error { message },
-                    }
-                }
-                _ => {
-                    let new_id = uuid::Uuid::new_v4().to_string();
-                    let mut a = vec![
-                        "--resume".to_string(), src_session,
-                        "--fork-session".to_string(),
-                        "--session-id".to_string(), new_id.clone(),
-                    ];
-                    a.extend(extra_args);
-                    (a, new_id)
-                }
+            let (fork_args, new_session_id) = match backend_lifecycle(src.backend).fork(ForkContext {
+                pane_id: &pane_id,
+                session_id: &src_session,
+                extra_args,
+                config,
+                panes,
+            }).await {
+                Ok(plan) => plan,
+                Err(message) => return libslop::ResponseBody::Error { message },
             };
             // Default the fork's cwd to the source pane's cwd. Claude resolves a
             // resumed transcript by (encoded) cwd, so a mismatch would make
@@ -4458,46 +4015,14 @@ async fn handle_request(
             // Codex panes are views onto a thread hosted by the managed local
             // app-server. Start/connect the daemon and establish the thread
             // before creating the tmux pane, so pane identity is deterministic.
-            let prepared = match resolved.backend {
-                libslop::Backend::Claude => PreparedBackendRun::Claude,
-                libslop::Backend::Opencode => match opencode::alloc_port() {
-                    Ok(port) => PreparedBackendRun::Opencode {
-                        port,
-                        resume_session: extract_resume_target(&extra_args),
-                    },
-                    Err(e) => return libslop::ResponseBody::Error {
-                        message: format!("failed to allocate opencode port: {}", e),
-                    },
-                },
-                libslop::Backend::Codex => {
-                    let lookup_path = merged_env.iter().rev().find(|(k, _)| k == "PATH")
-                        .map(|(_, v)| std::ffi::OsString::from(v))
-                        .or_else(|| std::env::var_os("PATH")).unwrap_or_default();
-                    let lookup_cwd = effective_start_dir.clone()
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    let Some(program) = libslop::resolve_executable(resolved.executable.program(), &lookup_path, &lookup_cwd) else {
-                        return libslop::ResponseBody::Error { message: format!("configured Codex executable {:?} not found", resolved.executable.program()) };
-                    };
-                    let home = resolved.config_dir.as_deref().map(libslop::expand_path);
-                    let socket = codex::socket_path(home.as_deref());
-                    if let Err(e) = codex::ensure_daemon(&program, home.as_deref(), &socket).await {
-                        return libslop::ResponseBody::Error { message: e };
-                    }
-                    let client = match codex::CodexClient::connect(&socket).await {
-                        Ok(client) => client,
-                        Err(e) => return libslop::ResponseBody::Error { message: e },
-                    };
-                    let events = client.subscribe();
-                    let existing_threads = client.thread_ids().await.unwrap_or_default();
-                    let thread_id = match extract_resume_target(&extra_args) {
-                        Some(id) => match client.resume_thread(&id).await {
-                            Ok(_) => Some(id),
-                            Err(e) => return libslop::ResponseBody::Error { message: e },
-                        },
-                        None => None,
-                    };
-                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, socket, events, existing_threads })
-                }
+            let prepared = match backend_lifecycle(resolved.backend).prepare_run(PrepareRunContext {
+                resolved: &resolved,
+                merged_env: &merged_env,
+                start_directory: effective_start_dir.as_deref(),
+                extra_args: &extra_args,
+            }).await {
+                Ok(prepared) => prepared,
+                Err(message) => return libslop::ResponseBody::Error { message },
             };
             // Detect a resume target in the passthrough args (any spelling:
             // `--resume <id>`, opencode's `-s <id>` / `--session <id>`). For
@@ -4565,6 +4090,7 @@ async fn handle_request(
                     // already has its session id (the pin); others fill it on bind.
                     {
                         let state = panes.get_or_insert(&pane_id);
+                        state.mark_unbound_backend(resolved.backend);
                         let mut id = state.identity.lock().unwrap();
                         id.backend = resolved.backend;
                         id.parent_pane_id = parent_pane_id.clone();
@@ -4771,6 +4297,11 @@ async fn handle_request(
             }
             let state = panes.get_or_insert(&pane_id);
             let send_transport = state.runtime().send_transport();
+            if let SendTransport::Unavailable(backend) = send_transport {
+                return libslop::ResponseBody::Error {
+                    message: format!("{} pane {} runtime is still attaching", backend.canonical_executable(), pane_id),
+                };
+            }
             let settle_before_enter = matches!(
                 send_transport,
                 SendTransport::Tui { settle_before_enter: true }
@@ -5371,5 +4902,19 @@ mod tests {
             ),
             vec!["--flag", "-s", "session-1"],
         );
+    }
+
+    #[test]
+    fn pane_runtime_is_explicitly_unbound_until_backend_attaches() {
+        let state = PaneState::new();
+        assert!(matches!(state.runtime(), PaneRuntime::Unbound(UnboundState {
+            backend: libslop::Backend::Claude,
+        })));
+        state.mark_unbound_backend(libslop::Backend::Codex);
+        assert!(matches!(state.runtime().send_transport(),
+            SendTransport::Unavailable(libslop::Backend::Codex)));
+        state.set_runtime(PaneRuntime::Claude(ClaudeState));
+        assert!(matches!(state.runtime().send_transport(),
+            SendTransport::Tui { settle_before_enter: false }));
     }
 }
