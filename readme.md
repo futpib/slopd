@@ -2,7 +2,7 @@
 
 [![Coverage Status](https://coveralls.io/repos/github/futpib/slopd/badge.svg?branch=master)](https://coveralls.io/github/futpib/slopd?branch=master)
 
-**slopd** is a Claude agent session manager daemon. It runs Claude CLI sessions inside [tmux](https://github.com/tmux/tmux) panes, exposes a Unix socket RPC API for controlling them, and streams lifecycle events (hook events from Claude) to subscribers.
+**slopd** is an agent session manager daemon for Claude Code, OpenCode, and Codex. It runs interactive sessions inside [tmux](https://github.com/tmux/tmux) panes, exposes a Unix socket RPC API for controlling them, and streams normalized lifecycle and transcript events to subscribers.
 
 `slopctl` is the companion CLI for talking to the daemon.
 
@@ -646,9 +646,9 @@ slopctl tags %1
 
 ---
 
-## Multi-backend support (OpenCode)
+## Multi-backend support (OpenCode and Codex)
 
-slopd can drive either [Claude Code](https://claude.com/claude-code) or [OpenCode](https://opencode.ai) panes. Each pane's backend is selected by its account (default `claude`).
+slopd can drive [Claude Code](https://claude.com/claude-code), [OpenCode](https://opencode.ai), or OpenAI Codex panes. Each pane's backend is selected by its account (default `claude`).
 
 OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drives an opencode pane over that API — no Claude-style hooks, no transcript file tailing. slopd spawns the pane with a pinned `--port` on `127.0.0.1`, then subscribes to the `GET /event` SSE stream (with a `/session/status` + `/session` poll as backstop) to track state, `POST /prompt_async` to send, `POST /abort` to interrupt, and `GET /message` for transcripts. opencode's signals normalize onto slopd's existing state machine, so the daemon core stays agent-agnostic.
 
@@ -684,6 +684,67 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir
 - **No server password (TUI mode)**: the opencode TUI is itself a client of its embedded server and can't authenticate to it, so slopd spawns the pane **without** `OPENCODE_SERVER_PASSWORD` (verified against real opencode 1.17.x). The server is therefore open on `127.0.0.1` — acceptable for the single-user local model slopd assumes, but it can't be locked down the way headless `opencode serve` can.
 - **Subagent transcript not surfaced**: opencode runs subagents as child sessions; slopd tracks the subagent *state* (`busy_subagent`) and emits `SubagentStart`/`SubagentStop` hooks, but the subagent's own messages are **not** folded into the pane's transcript (`slopctl transcript` / `listen --transcript` show the main session only).
 - **Rare events mapped per-doc**: the `permission.asked` and `session.compacted` mappings follow the opencode plugin docs but weren't individually triggered in a real-opencode smoke (auto-allowed bash; no compaction in short turns). The common path (idle/busy/tool/subagent/elicitation) is verified against real opencode 1.17.x.
+
+### Configuring a Codex account
+
+Codex uses its managed local app-server daemon. slopd starts that daemon when
+needed (without enabling OpenAI remote control), connects over its user-local
+Unix socket, and launches the pane as a TUI client with `codex --remote
+unix://`. Each pane is bound to a Codex thread ID recorded in the same
+`SESSION` field used by the other backends.
+
+```toml
+[accounts.codex]
+backend = "codex"
+config_dir = "~/.codex"      # exported as CODEX_HOME
+executable = "codex"         # needed when global [run] executable is Claude
+```
+
+```bash
+slopctl run --account codex
+```
+
+`send` uses `turn/start` while idle and `turn/steer` during an active turn;
+`interrupt` uses `turn/interrupt`; transcripts come from Codex thread history;
+and `fork` uses Codex's native `thread/fork`. On a slopd restart, the daemon
+reconnects to the recorded app-server socket and resumes its notification
+subscription without restarting the TUI. Backup restore relaunches a TUI onto
+the recorded thread. The socket client also reconnects and re-resumes its
+thread if app-server itself restarts. Overload responses are retried with a
+bounded exponential backoff. slopd passes the pane working directory through
+Codex's explicit `-C` option (remote mode otherwise inherits the daemon cwd)
+and uses periodic non-mutating `thread/read` calls as a status backstop without
+replaying pending approval requests.
+
+Codex approval and elicitation requests are published as normalized
+`PermissionRequest` and `Elicitation` hook events. Answer the request ID on the
+same app-server connection with a complete Codex result object:
+
+```bash
+slopctl listen --pane-id %42 --hook PermissionRequest
+slopctl codex-respond %42 17 '{"decision":"accept"}'
+```
+
+Other common decisions are `decline`, `cancel`, and `acceptForSession`.
+MCP elicitations use a result such as `{"action":"decline"}` or
+`{"action":"accept","content":{...}}`.
+
+OpenAI-hosted remote control is independent and optional. slopd never enables
+it itself. If the user enables it with `codex remote-control start`, ChatGPT
+mobile/desktop becomes another client of the same daemon and threads.
+
+Codex compatibility notes:
+
+- Codex app-server and remote TUI mode are experimental interfaces. slopd uses
+  the documented non-experimental thread/turn methods but compatibility must be
+  checked when upgrading Codex.
+- A new empty Codex thread is not resumable by a second client until its first
+  turn creates a durable rollout. slopd serializes fresh Codex launches, takes a
+  pre-launch thread snapshot, and attaches the detailed item stream when that
+  first turn begins so concurrent slopctl launches cannot cross-bind.
+- If a recorded thread was deleted or belongs to a different `CODEX_HOME`,
+  restore leaves it pending and logs the exact thread/account failure instead
+  of silently creating a replacement conversation.
 
 ---
 

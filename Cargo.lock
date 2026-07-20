@@ -3063,6 +3063,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.11.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3162,6 +3168,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dashmap",
+ "futures-util",
  "libc",
  "libslop",
  "libslopctl",
@@ -3170,6 +3177,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tokio-websockets",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3496,6 +3504,7 @@ dependencies = [
  "rand",
  "ring",
  "rustls-pki-types",
+ "sha1_smol",
  "simdutf8",
  "tokio",
  "tokio-rustls",

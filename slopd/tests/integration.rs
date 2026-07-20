@@ -10509,6 +10509,146 @@ fn fork_opencode_pane_binds_new_pane_to_forked_session() {
 }
 
 #[test]
+fn codex_mock_run_send_approval_transcript_fork_and_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let stale_socket = codex_home.path().join("app-server-control/app-server-control.sock");
+    std::fs::create_dir_all(stale_socket.parent().unwrap()).unwrap();
+    std::fs::write(&stale_socket, b"stale socket placeholder").unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(), codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "20"]);
+    assert!(run.status.success(), "Codex run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let (run_a, run_b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "20"]));
+        let b = scope.spawn(|| env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "20"]));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert!(run_a.status.success() && run_b.status.success(), "concurrent Codex runs failed");
+    let concurrent_a = String::from_utf8_lossy(&run_a.stdout).trim().to_string();
+    let concurrent_b = String::from_utf8_lossy(&run_b.stdout).trim().to_string();
+    let concurrent_ps: Vec<libslop::PaneInfo> = serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let session_a = concurrent_ps.iter().find(|p| p.pane_id == concurrent_a).and_then(|p| p.session_id.clone());
+    let session_b = concurrent_ps.iter().find(|p| p.pane_id == concurrent_b).and_then(|p| p.session_id.clone());
+    assert!(session_a.is_some() && session_b.is_some() && session_a != session_b,
+        "concurrent Codex runs must bind distinct threads: {session_a:?} {session_b:?}");
+
+    let send = env.slopctl(&["send", &source, "hello mock codex"]);
+    assert!(send.status.success(), "Codex send failed: {:?}", send);
+    let overload = env.slopctl(&["send", &source, "__overload__"]);
+    assert!(overload.status.success(), "Codex overload retry failed: {}", String::from_utf8_lossy(&overload.stderr));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline, "overload turn did not finish");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let active = env.slopctl(&["send", &source, "__active__"]);
+    assert!(active.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(Instant::now() < deadline, "mock turn never became active");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let steer = env.slopctl(&["send", &source, "steered input"]);
+    assert!(steer.status.success(), "Codex steer failed: {}", String::from_utf8_lossy(&steer.stderr));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline, "steered mock turn did not finish");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let transcript = env.slopctl(&["transcript", &source, "--limit", "1"]);
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let records = transcript["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["event_type"], "agentMessage");
+
+    let approval = env.slopctl(&["send", &source, "__approval__"]);
+    assert!(approval.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, detailed) = env.pane_state(&source);
+        if detailed == libslop::PaneDetailedState::AwaitingInputPermission { break; }
+        assert!(Instant::now() < deadline, "mock approval request was not surfaced: {detailed:?}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Cross at least one 2s status-poll interval. `thread/resume` replays a
+    // pending approval; the non-mutating `thread/read` backstop must not.
+    std::thread::sleep(Duration::from_millis(2500));
+    let response = env.slopctl(&["codex-respond", &source, "900", r#"{"decision":"accept"}"#]);
+    assert!(response.status.success(), "Codex approval response failed: {}", String::from_utf8_lossy(&response.stderr));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline, "approval replay left a second request pending");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // A dropped app-server connection is re-established by the client actor;
+    // after a short retry window the same pane remains sendable.
+    let disconnected = env.slopctl(&["send", &source, "__disconnect__"]);
+    assert!(!disconnected.status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let recovered = env.slopctl(&["send", &source, "after reconnect"]);
+        if recovered.status.success() { break; }
+        assert!(Instant::now() < deadline, "Codex client did not reconnect");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "20"]);
+    assert!(fork.status.success(), "Codex fork failed: {}", String::from_utf8_lossy(&fork.stderr));
+    let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
+    let ps: Vec<libslop::PaneInfo> = serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let source_info = ps.iter().find(|p| p.pane_id == source).unwrap();
+    let fork_info = ps.iter().find(|p| p.pane_id == fork_pane).unwrap();
+    assert_eq!(fork_info.backend, libslop::Backend::Codex);
+    assert_ne!(fork_info.session_id, source_info.session_id);
+    assert_eq!(fork_info.parent_pane_id.as_deref(), Some(source.as_str()));
+
+    kill_slopd(slopd);
+    let slopd = env.spawn_slopd();
+    let recovered = env.slopctl(&["send", &source, "after restart"]);
+    assert!(recovered.status.success(), "recovered Codex send failed: {}", String::from_utf8_lossy(&recovered.stderr));
+
+    // Manual backup/restore must not race the Codex driver back to BootingUp.
+    let before_restore: Vec<libslop::PaneInfo> = serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let source_session = before_restore.iter().find(|p| p.pane_id == source).and_then(|p| p.session_id.clone()).unwrap();
+    let fork_session = before_restore.iter().find(|p| p.pane_id == fork_pane).and_then(|p| p.session_id.clone()).unwrap();
+    assert!(env.slopctl(&["backup"]).status.success());
+    assert!(env.slopctl(&["kill", &source]).status.success());
+    assert!(env.slopctl(&["kill", &fork_pane]).status.success());
+    assert!(env.slopctl(&["restore"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let restored = loop {
+        let ps: Vec<libslop::PaneInfo> = serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let source = ps.iter().find(|p| p.session_id.as_deref() == Some(source_session.as_str()));
+        let fork = ps.iter().find(|p| p.session_id.as_deref() == Some(fork_session.as_str()));
+        if let (Some(source), Some(fork)) = (source, fork)
+            && source.detailed_state == libslop::PaneDetailedState::Ready
+            && fork.detailed_state == libslop::PaneDetailedState::Ready
+        {
+            break source.pane_id.clone();
+        }
+        assert!(Instant::now() < deadline, "restored Codex panes did not become ready: {ps:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(env.slopctl(&["send", &restored, "after backup restore"]).status.success());
+    kill_slopd(slopd);
+    if let Ok(pid) = std::fs::read_to_string(codex_home.path().join("app-server-control/mock-codex.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+}
+
+#[test]
 fn fork_claude_pane_mints_new_forked_session() {
     // Forking a Claude pane mints a fresh session id and spawns a pane with
     // `--resume <src> --fork-session --session-id <new>`. The new pane must track
@@ -11434,5 +11574,3 @@ fn opencode_subagent_emits_subagent_hooks() {
     assert!(saw_stop, "expected a synthesized SubagentStop hook");
     kill_slopd(slopd);
 }
-
-

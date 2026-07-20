@@ -224,6 +224,8 @@ pub enum TmuxOption {
     SlopdOpencodePort,
     /// For opencode panes: the per-pane basic-auth token for that server.
     SlopdOpencodeToken,
+    /// For Codex panes: the app-server Unix socket used by slopd and the TUI.
+    SlopdCodexSocket,
 }
 
 impl TmuxOption {
@@ -240,6 +242,7 @@ impl TmuxOption {
             TmuxOption::SlopdBackend => "@slopd_backend",
             TmuxOption::SlopdOpencodePort => "@slopd_opencode_port",
             TmuxOption::SlopdOpencodeToken => "@slopd_opencode_token",
+            TmuxOption::SlopdCodexSocket => "@slopd_codex_socket",
         }
     }
 }
@@ -1276,9 +1279,24 @@ mod tests {
     fn backend_infer_from_program_strips_path_and_exe() {
         assert_eq!(Backend::infer_from_program("claude"), Some(Backend::Claude));
         assert_eq!(Backend::infer_from_program("/usr/bin/opencode"), Some(Backend::Opencode));
+        assert_eq!(Backend::infer_from_program("/usr/local/bin/codex"), Some(Backend::Codex));
         assert_eq!(Backend::infer_from_program("opencode.exe"), Some(Backend::Opencode));
         assert_eq!(Backend::infer_from_program("/opt/my-fork"), None);
         assert_eq!(Backend::infer_from_program("opencode-ai"), None, "only exact canonical names match");
+    }
+
+    #[test]
+    fn backend_explicit_codex_defaults_and_uses_codex_home() {
+        let cfg: SlopdConfig = toml::from_str(r#"
+            [accounts.work]
+            backend = "codex"
+            config_dir = "/tmp/codex-work"
+        "#).unwrap();
+        let resolved = cfg.resolve_account(Some("work")).unwrap();
+        assert_eq!(resolved.backend, Backend::Codex);
+        assert_eq!(resolved.executable.program(), "codex");
+        assert_eq!(resolved.backend.config_dir_env_var(), "CODEX_HOME");
+        assert!(!resolved.backend.uses_injected_hooks());
     }
 
     // --- slopctl interactive-run config ---
@@ -1531,7 +1549,8 @@ pub enum AccountConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSettings {
     /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
-    /// for [`Backend::Claude`] or `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`]).
+    /// for [`Backend::Claude`], `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`],
+    /// or `CODEX_HOME` for [`Backend::Codex`]).
     #[serde(alias = "claude_config_dir")]
     pub config_dir: PathBuf,
     /// Agent backend for this account. When unset, the backend is derived — see
@@ -1634,6 +1653,9 @@ pub enum Backend {
     /// OpenCode (`opencode`). Runs the TUI with an embedded HTTP server; slopd
     /// drives it over HTTP/SSE — no hooks, no jsonl tailing.
     Opencode,
+    /// OpenAI Codex CLI. The TUI and slopd are clients of the managed local
+    /// app-server over its Unix socket; the pane is bound to a Codex thread.
+    Codex,
 }
 
 impl Backend {
@@ -1642,6 +1664,7 @@ impl Backend {
         match self {
             Backend::Claude => "claude",
             Backend::Opencode => "opencode",
+            Backend::Codex => "codex",
         }
     }
 
@@ -1654,6 +1677,7 @@ impl Backend {
         match base {
             "claude" => Some(Backend::Claude),
             "opencode" => Some(Backend::Opencode),
+            "codex" => Some(Backend::Codex),
             _ => None,
         }
     }
@@ -1663,6 +1687,7 @@ impl Backend {
         match self {
             Backend::Claude => "CLAUDE_CONFIG_DIR",
             Backend::Opencode => "OPENCODE_CONFIG_DIR",
+            Backend::Codex => "CODEX_HOME",
         }
     }
 
@@ -2443,6 +2468,8 @@ pub enum RequestBody {
     /// Notification from a tmux hook (called by slopctl tmux-hook).
     TmuxHook { event: String, pane_id: Option<String> },
     Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },
+    /// Answer a pending Codex app-server approval or elicitation request.
+    CodexRespond { pane_id: String, request_id: serde_json::Value, result: serde_json::Value },
     /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
     Interrupt { pane_id: String },
     /// Subscribe to a stream of lifecycle events (hook + slopd). An empty filters vec matches all.
@@ -2487,6 +2514,7 @@ pub enum ResponseBody {
     Forked { pane_id: String, session_id: String },
     Kill { pane_id: String },
     Sent { pane_id: String },
+    CodexResponded { pane_id: String },
     Interrupted { pane_id: String },
     Hooked,
     TmuxHooked,
