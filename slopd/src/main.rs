@@ -3289,6 +3289,24 @@ fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
     None
 }
 
+/// Return the main-thread transcript advertised by a hook.
+///
+/// Codex's `SubagentStart.transcript_path` is the child agent's rollout (unlike
+/// `SubagentStop`, which provides the child separately as
+/// `agent_transcript_path` and keeps `transcript_path` on the main thread).
+/// Switching the pane tailer to that child file corrupts main-thread state and
+/// can make backup persist the wrong session path.
+fn hook_transcript_path<'a>(
+    backend: libslop::Backend,
+    event: &str,
+    payload: &'a serde_json::Value,
+) -> Option<&'a str> {
+    if backend == libslop::Backend::Codex && event == "SubagentStart" {
+        return None;
+    }
+    payload.get("transcript_path").and_then(|value| value.as_str())
+}
+
 /// Re-spawn the panes recorded in `manifest` after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
@@ -3346,17 +3364,51 @@ async fn restore_panes(
     let mut ancestors_of_new: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     // Session ids we must not (re-)spawn. Seeded with the sessions of panes
     // already running, so a manual `slopctl restore` on a live daemon never puts
-    // a second Claude on an already-open session (for auto-restore into a fresh
-    // tmux session there are none). Two manifest entries can also share a session
-    // id — e.g. an in-pane `claude --resume` overwrites a pane's
-    // @slopd_claude_session_id — so we also add each as we restore it, resuming
-    // every session at most once.
-    let mut seen_sessions: std::collections::HashSet<String> = list_panes(config, managed_panes)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|p| p.session_id)
+    // a second agent on an already-open session. Also seed the old→live pane map:
+    // a missing child can then retain a parent that was skipped because it is
+    // still running, rather than being incorrectly promoted to a root pane.
+    let live_panes = list_panes(config, managed_panes).await.unwrap_or_default();
+    let live_by_session: std::collections::HashMap<String, String> = live_panes
+        .iter()
+        .filter_map(|p| {
+            p.session_id
+                .clone()
+                .map(|session| (session, p.pane_id.clone()))
+        })
         .collect();
+    let live_parent: std::collections::HashMap<String, String> = live_panes
+        .iter()
+        .filter_map(|p| {
+            p.parent_pane_id
+                .clone()
+                .map(|parent| (p.pane_id.clone(), parent))
+        })
+        .collect();
+    for live in &live_panes {
+        let mut chain = Vec::new();
+        let mut current = live.pane_id.as_str();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(parent) = live_parent.get(current) {
+            if !seen.insert(parent.clone()) {
+                break;
+            }
+            chain.push(parent.clone());
+            current = parent;
+        }
+        ancestors_of_new.insert(live.pane_id.clone(), chain);
+    }
+    for pane in &ordered {
+        if let Some(session) = pane.session_id.as_deref()
+            && let Some(live_id) = live_by_session.get(session)
+        {
+            old_to_new.insert(pane.pane_id.clone(), live_id.clone());
+        }
+    }
+    // Two manifest entries can also share a session id — e.g. an in-pane
+    // `claude --resume` overwrites a pane's recorded id — so add each session as
+    // we restore it and resume every session at most once.
+    let mut seen_sessions: std::collections::HashSet<String> =
+        live_by_session.into_keys().collect();
     let mut restored = 0usize;
 
     for p in ordered {
@@ -3448,9 +3500,30 @@ async fn restore_panes(
             let _ = tmux_set_pane_option(config, &new_id, &opt, "1").await;
         }
 
-        // Hook-driven Claude and Codex panes start booting here. OpenCode's
-        // HTTP driver owns its initial state and may already have advanced it.
-        if !resolved.backend.driver_owns_initial_state() {
+        // A resumed Codex TUI is usable as soon as its history is rendered, but
+        // (like a fresh/forked TUI) does not fire SessionStart until the next
+        // prompt. Mark it ready now so send can cause that hook. Claude still
+        // uses SessionStart as its boot authority; OpenCode's HTTP driver owns
+        // its initial state and may already have advanced it.
+        if resolved.backend == libslop::Backend::Codex {
+            let current = panes
+                .get_or_insert(&new_id)
+                .detailed_state
+                .lock()
+                .unwrap()
+                .clone();
+            if current == libslop::PaneDetailedState::BootingUp {
+                set_pane_detailed_state(
+                    config,
+                    &new_id,
+                    &libslop::PaneDetailedState::Ready,
+                    Some(&current),
+                    event_tx,
+                    panes,
+                )
+                .await;
+            }
+        } else if !resolved.backend.driver_owns_initial_state() {
             let current = panes
                 .get_or_insert(&new_id)
                 .detailed_state
@@ -3647,7 +3720,10 @@ async fn handle_request(
             // includes a transcript_path we haven't seen yet for this pane.
             // This covers both SessionStart and any hook fired after a slopd
             // restart where the tailer is no longer running.
-            if let Some(raw_transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) {
+            let hook_backend = panes.get_or_insert(pane).runtime().backend();
+            if let Some(raw_transcript_path) =
+                hook_transcript_path(hook_backend, &event, &payload)
+            {
                 let state = panes.get_or_insert(pane);
                 // A forked Claude pane: real Claude's hooks report the SOURCE
                 // transcript file until the fork's first turn writes its own file.
@@ -3925,39 +4001,13 @@ async fn handle_request(
                 pane_registered, session_lock, config_generation, pending_restore, hook_log,
             )).await {
                 libslop::ResponseBody::Run { pane_id } => {
-                    if src.backend != libslop::Backend::Codex {
-                        return libslop::ResponseBody::Forked {
-                            pane_id,
-                            session_id: new_session_id,
-                        };
-                    }
-                    let pane_state = panes.get_or_insert(&pane_id);
-                    let discovered = tokio::time::timeout(
-                        std::time::Duration::from_secs(20),
-                        async {
-                            loop {
-                                let notified = pane_state.session_bound.notified();
-                                if let Some(id) =
-                                    pane_state.identity.lock().unwrap().session_id.clone()
-                                    && id != src_session
-                                {
-                                    return id;
-                                }
-                                notified.await;
-                            }
-                        },
-                    )
-                    .await;
-                    match discovered {
-                        Ok(session_id) => {
-                            libslop::ResponseBody::Forked { pane_id, session_id }
-                        }
-                        Err(_) => libslop::ResponseBody::Error {
-                            message: format!(
-                                "Codex fork pane {} did not report its new session id",
-                                pane_id
-                            ),
-                        },
+                    // Standalone Codex, like a fresh TUI, materializes a fork's
+                    // new rollout lazily on its first submitted prompt. Return
+                    // the already-usable pane now; SessionStart binds the real
+                    // id later. Other backends already know the fork id here.
+                    libslop::ResponseBody::Forked {
+                        pane_id,
+                        session_id: new_session_id,
                     }
                 }
                 other => other,
@@ -4233,6 +4283,23 @@ async fn handle_request(
                         let pane_state = panes.get_or_insert(&pane_id);
                         if matches!(pane_state.runtime(), PaneRuntime::Unbound(_)) {
                             pane_state.set_runtime(PaneRuntime::Codex(CodexState));
+                        }
+                        // Interactive Codex creates or re-opens its rollout
+                        // lazily and fires SessionStart on the first submitted
+                        // prompt. This is true for fresh, fork, and resume TUIs.
+                        // The composer is already usable before that, so waiting
+                        // for SessionStart deadlocks `run` and `send`.
+                        let current = pane_state.detailed_state.lock().unwrap().clone();
+                        if current == libslop::PaneDetailedState::BootingUp {
+                            set_pane_detailed_state(
+                                config,
+                                &pane_id,
+                                &libslop::PaneDetailedState::Ready,
+                                Some(&current),
+                                event_tx,
+                                panes,
+                            )
+                            .await;
                         }
                     }
                     PreparedBackendRun::Claude => {}
@@ -4543,7 +4610,17 @@ async fn handle_request(
             // Acquire the type-mutex so we don't interleave with concurrent sends.
             let _guard = state.type_mutex.lock().await;
 
-            if let Err(e) = send_interrupt_keys(config, &pane_id).await {
+            if state.runtime().backend() == libslop::Backend::Codex {
+                // Ctrl-D exits the standalone Codex CLI, so the generic
+                // Claude sequence (Ctrl-C, Ctrl-D, Escape) destroys the pane.
+                // Escape is Codex's native in-turn cancel key and is harmless
+                // at the idle composer.
+                if let Err(e) = tmux_send_keys(config, &pane_id, "Escape").await {
+                    return libslop::ResponseBody::Error {
+                        message: e.to_string(),
+                    };
+                }
+            } else if let Err(e) = send_interrupt_keys(config, &pane_id).await {
                 return e;
             }
 
@@ -4895,6 +4972,29 @@ mod tests {
     fn backend_policy_keeps_protocol_quirks_at_the_boundary() {
         assert!(!libslop::Backend::Claude.driver_owns_initial_state());
         assert!(!libslop::Backend::Codex.driver_owns_initial_state());
+    }
+
+    #[test]
+    fn codex_subagent_start_does_not_replace_the_main_transcript() {
+        let payload = serde_json::json!({
+            "transcript_path": "/sessions/subagent.jsonl",
+        });
+        assert_eq!(
+            hook_transcript_path(
+                libslop::Backend::Codex,
+                "SubagentStart",
+                &payload,
+            ),
+            None,
+        );
+        assert_eq!(
+            hook_transcript_path(libslop::Backend::Codex, "SubagentStop", &payload),
+            Some("/sessions/subagent.jsonl"),
+        );
+        assert_eq!(
+            hook_transcript_path(libslop::Backend::Claude, "SubagentStart", &payload),
+            Some("/sessions/subagent.jsonl"),
+        );
     }
 
     #[test]

@@ -139,11 +139,17 @@ fn main() {
         }),
     );
 
-    fire_hooks(
-        &settings,
-        "SessionStart",
-        &hook_payload("SessionStart", &session_id, &cwd, &transcript),
-    );
+    // Real interactive Codex creates a fresh session lazily on the first
+    // submitted prompt. Tests can request that behavior explicitly while
+    // resume/fork and the older eager-path tests retain their startup hook.
+    let mut session_started = !args.iter().any(|arg| arg == "--lazy-session-start");
+    if session_started {
+        fire_hooks(
+            &settings,
+            "SessionStart",
+            &hook_payload("SessionStart", &session_id, &cwd, &transcript),
+        );
+    }
 
     let yolo = args
         .iter()
@@ -210,6 +216,14 @@ fn main() {
                     continue;
                 }
 
+                if !session_started {
+                    fire_hooks(
+                        &settings,
+                        "SessionStart",
+                        &hook_payload("SessionStart", &session_id, &cwd, &transcript),
+                    );
+                    session_started = true;
+                }
                 let mut submitted =
                     hook_payload("UserPromptSubmit", &session_id, &cwd, &transcript);
                 submitted["prompt"] = json!(prompt);

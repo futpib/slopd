@@ -713,7 +713,11 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir
 Each Codex pane is a standalone `codex` process. slopd does not start a shared
 Codex app-server, use `--remote`, or require systemd. It injects `slopctl hook`
 commands into `$CODEX_HOME/hooks.json`; `SessionStart` supplies the session ID
-and rollout transcript path, and slopd tails that per-session JSONL file.
+and rollout transcript path, and slopd tails that per-session JSONL file. The
+interactive Codex CLI creates fresh, forked, and resumed rollouts lazily: the
+pane is ready for input first, then its initial prompt fires `SessionStart` and
+binds the durable session ID. Consequently, `ps` can briefly show
+`session_id: null`, and backup skips that pane until it has received a prompt.
 
 This keeps failure domains independent: a signal, crash, or disconnect affecting
 one Codex process does not take the other Codex panes down with a shared service.
@@ -746,11 +750,13 @@ including `codex fork` and backup restore via `codex resume`.
 
 `send` always types into the visible Codex TUI in tmux, so both new prompts and
 in-flight steering follow the same UI path as a person at the terminal.
-`interrupt` sends the TUI's normal interrupt keys. `fork` launches Codex's
-native `codex fork <SESSION_ID>` and learns the new ID from its `SessionStart`
+`interrupt` sends Codex's native `Escape` cancel key; it never sends `Ctrl-D`,
+which would exit the standalone CLI. `fork` launches Codex's native
+`codex fork <SESSION_ID>` and learns the new ID from its first `SessionStart`
 hook. On a slopd restart, the existing pane remains untouched; slopd recovers
 its identity and state from tmux metadata plus the rollout transcript. Backup
-restore launches `codex resume <SESSION_ID>` in the recorded working directory.
+restore launches `codex resume <SESSION_ID>` in the recorded working directory
+and makes the restored composer immediately sendable.
 
 Codex approval requests are published as normalized `PermissionRequest` hook
 events for observation. They must be answered in the visible TUI; slopd
@@ -765,6 +771,9 @@ Codex compatibility notes:
 - slopd launches Codex with `--dangerously-bypass-hook-trust` because it
   programmatically installs and vets the hook commands. This flag bypasses the
   hook-source trust prompt; it does not change Codex approval or sandbox policy.
+- Codex's separate workspace-trust screen precedes session creation and hooks.
+  For unattended launches, trust the working directory in Codex first; slopd
+  does not silently trust project-local configuration on the user's behalf.
 - Codex's rollout JSONL format is not a stable public interface. Hook events are
   the lifecycle authority; transcript parsing is a recovery and transcript
   adapter that should be checked when upgrading Codex.

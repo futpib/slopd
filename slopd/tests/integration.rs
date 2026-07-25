@@ -10732,6 +10732,189 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = [{:?}, \"--lazy-session-start\"]\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-lazy",
+        "--ready-timeout",
+        "10",
+    ]);
+    assert!(
+        run.status.success(),
+        "fresh lazy Codex run should become ready before SessionStart: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let pane = panes.iter().find(|pane| pane.pane_id == pane_id).unwrap();
+    assert_eq!(pane.detailed_state, libslop::PaneDetailedState::Ready);
+    assert_eq!(
+        pane.session_id, None,
+        "fresh Codex must be usable even though it has not created a session yet"
+    );
+
+    assert!(
+        env.slopctl(&["send", &pane_id, "__active__"])
+            .status
+            .success(),
+        "first prompt should be accepted by a session-less fresh Codex pane"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let source_session = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let pane = panes.iter().find(|pane| pane.pane_id == pane_id).unwrap();
+        if pane.session_id.is_some()
+            && pane.detailed_state == libslop::PaneDetailedState::BusyProcessing
+        {
+            break pane.session_id.clone().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first prompt did not bind and activate the lazy Codex session"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let interrupt = env.slopctl(&["interrupt", &pane_id]);
+    assert!(
+        interrupt.status.success(),
+        "Codex interrupt failed: {}",
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        if let Some(pane) = panes.iter().find(|pane| pane.pane_id == pane_id)
+            && pane.detailed_state == libslop::PaneDetailedState::Ready
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Codex interrupt exited the pane or failed to return it to ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let resume = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-lazy",
+        "--ready-timeout",
+        "10",
+        "--",
+        "--resume",
+        &source_session,
+    ]);
+    assert!(
+        resume.status.success(),
+        "lazy Codex resume should be sendable before SessionStart: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let resume_pane = String::from_utf8_lossy(&resume.stdout).trim().to_string();
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let resume_info = panes
+        .iter()
+        .find(|pane| pane.pane_id == resume_pane)
+        .unwrap();
+    assert_eq!(resume_info.detailed_state, libslop::PaneDetailedState::Ready);
+    assert_eq!(resume_info.session_id, None);
+    assert!(env.slopctl(&["kill", &resume_pane]).status.success());
+
+    let fork = env.slopctl_raw(&["fork", &pane_id, "--ready-timeout", "10"]);
+    assert!(
+        fork.status.success(),
+        "lazy Codex fork should return before its first prompt creates a session: {}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let fork_info = panes
+        .iter()
+        .find(|pane| pane.pane_id == fork_pane)
+        .unwrap();
+    assert_eq!(fork_info.session_id, None);
+    assert_eq!(fork_info.parent_pane_id.as_deref(), Some(pane_id.as_str()));
+
+    assert!(
+        env.slopctl(&["send", &fork_pane, "forked first prompt"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let fork_session = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let fork_info = panes
+            .iter()
+            .find(|pane| pane.pane_id == fork_pane)
+            .unwrap();
+        if fork_info.session_id.is_some()
+            && fork_info.detailed_state == libslop::PaneDetailedState::Ready
+        {
+            break fork_info.session_id.clone().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first fork prompt did not bind its lazy Codex session"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    assert!(env.slopctl(&["backup"]).status.success());
+    assert!(env.slopctl(&["kill", &fork_pane]).status.success());
+    assert!(env.slopctl(&["restore"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let restored = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        if let Some(restored) = panes.iter().find(|pane| {
+            pane.session_id.as_deref() == Some(fork_session.as_str())
+                && pane.detailed_state == libslop::PaneDetailedState::Ready
+        }) {
+            break restored.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resumed lazy Codex pane did not become ready before SessionStart"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        restored.parent_pane_id.as_deref(),
+        Some(pane_id.as_str()),
+        "partial restore must preserve a parent that is already live"
+    );
+    assert!(
+        env.slopctl(&["send", &restored.pane_id, "restored first prompt"])
+            .status
+            .success(),
+        "restored lazy Codex pane should accept its first post-resume prompt"
+    );
+
+    kill_slopd(slopd);
+}
+
 fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
     let mut listener = Command::new(cargo_bin("slopctl"))
         .args(["listen", "--pane-id", pane_id])

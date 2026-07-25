@@ -28,6 +28,13 @@ pub fn transcript_record(record: &Value) -> Option<TranscriptRecord> {
                 _ => return None,
             };
             let text = content_text(payload.get("content"));
+            if role == "user"
+                && text
+                    .as_deref()
+                    .is_some_and(is_internal_environment_context)
+            {
+                return None;
+            }
             Some((
                 event_type.to_string(),
                 json!({
@@ -93,6 +100,12 @@ fn content_text(value: Option<&Value>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn is_internal_environment_context(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<environment_context>")
+        && text.ends_with("</environment_context>")
+}
+
 fn tool_event_type(name: &str) -> &'static str {
     match name {
         "exec_command" | "write_stdin" => "commandExecution",
@@ -152,6 +165,19 @@ mod tests {
             "payload": {"type":"message","role":"developer","content":[{"type":"input_text","text":"secret"}]}
         });
         assert!(transcript_record(&developer).is_none());
+
+        let environment = json!({
+            "type": "response_item",
+            "payload": {
+                "type":"message",
+                "role":"user",
+                "content":[{
+                    "type":"input_text",
+                    "text":"<environment_context>\n  <cwd>/work</cwd>\n</environment_context>"
+                }]
+            }
+        });
+        assert!(transcript_record(&environment).is_none());
     }
 
     #[test]
