@@ -704,6 +704,24 @@ executable = "codex"         # needed when global [run] executable is Claude
 slopctl run --account codex
 ```
 
+To run every pane for an account without approval prompts or sandboxing, put
+the Codex flag in that account's executable:
+
+```toml
+[accounts.codex-yolo]
+backend = "codex"
+config_dir = "~/.codex"
+executable = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+```
+
+slopd passes these arguments to the TUI and mirrors the effective approval and
+sandbox settings into every app-server `thread/resume` and `thread/fork`
+request. That includes explicit resumes, forks, daemon reattachment,
+app-server reconnects, transcript attachment, and backup restore. The
+equivalent explicit flags (`--ask-for-approval never --sandbox
+danger-full-access`) and top-level `-c approval_policy=...` /
+`-c sandbox_mode=...` overrides are handled the same way.
+
 `send` always types into the visible Codex TUI in tmux, so both new prompts and
 in-flight steering follow the same UI path as a person at the terminal.
 `interrupt` uses `turn/interrupt`; transcripts come from Codex thread history;

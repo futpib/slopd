@@ -14,6 +14,7 @@ use tokio_websockets::{ClientBuilder, Message, ServerBuilder};
 #[derive(Default)]
 struct State {
     threads: Mutex<HashMap<String, Vec<Value>>>,
+    thread_overrides: Mutex<HashMap<String, Value>>,
     active: Mutex<HashMap<String, String>>,
     next_thread: AtomicU64,
     next_turn: AtomicU64,
@@ -29,6 +30,26 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let _ = ws.send(Message::text(value.to_string())).await;
+}
+
+fn merge_policy_overrides(target: &mut Value, params: Option<&Value>) {
+    if !target.is_object() {
+        *target = json!({});
+    }
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for key in ["approvalPolicy", "sandbox"] {
+        if let Some(value) = params.and_then(|params| params.get(key)) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn policy_overrides(params: Option<&Value>) -> Value {
+    let mut result = json!({});
+    merge_policy_overrides(&mut result, params);
+    result
 }
 
 async fn connection(
@@ -71,12 +92,20 @@ async fn connection(
                     "thread/start" => {
                         let id = format!("mock-thread-{}", state.next_thread.fetch_add(1, Ordering::Relaxed) + 1);
                         state.threads.lock().await.insert(id.clone(), Vec::new());
+                        state.thread_overrides.lock().await.insert(
+                            id.clone(),
+                            policy_overrides(value.get("params")),
+                        );
                         let thread = json!({"id":id,"turns":[],"cwd":std::env::current_dir().unwrap_or_default()});
                         let _ = events.send(json!({"method":"thread/started","params":{"thread":thread.clone()}}));
                         json!({"thread":thread})
                     }
                     "thread/resume" => {
                         let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
+                        merge_policy_overrides(
+                            state.thread_overrides.lock().await.entry(thread_id.to_string()).or_default(),
+                            value.get("params"),
+                        );
                         if let Some((pending_thread, turn_id)) = pending_approval.as_ref()
                             && pending_thread == thread_id {
                             send_json(&mut ws, json!({"method":"item/commandExecution/requestApproval","id":901,"params":{"threadId":thread_id,"turnId":turn_id,"itemId":"mock-item-replay","reason":"replayed approval"}})).await;
@@ -110,6 +139,19 @@ async fn connection(
                         let turns = threads.get(source).cloned().unwrap_or_default();
                         let id = format!("mock-thread-{}", state.next_thread.fetch_add(1, Ordering::Relaxed) + 1);
                         threads.insert(id.clone(), turns.clone());
+                        let mut overrides = state
+                            .thread_overrides
+                            .lock()
+                            .await
+                            .get(source)
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        merge_policy_overrides(&mut overrides, value.get("params"));
+                        state
+                            .thread_overrides
+                            .lock()
+                            .await
+                            .insert(id.clone(), overrides);
                         json!({"thread":{"id":id,"turns":turns}})
                     }
                     "turn/start" => {
@@ -119,6 +161,9 @@ async fn connection(
                         }
                         let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("").to_string();
                         let prompt = value.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or("").to_string();
+                        // Double-underscore prompts are private test controls,
+                        // matching this mock's existing __active__/__approval__
+                        // convention; they are not simulated TUI slash commands.
                         if prompt == "__disconnect__" { return Ok(()); }
                         if prompt == "__overload__" && !overloaded_once {
                             overloaded_once = true;
@@ -128,9 +173,30 @@ async fn connection(
                         let turn_id = format!("mock-turn-{}", state.next_turn.fetch_add(1, Ordering::Relaxed) + 1);
                         state.active.lock().await.insert(thread_id.clone(), turn_id.clone());
                         let _ = events.send(json!({"method":"turn/started","params":{"threadId":thread_id,"turn":{"id":turn_id}}}));
+                        if prompt == "__restrict__" {
+                            state.thread_overrides.lock().await.insert(
+                                thread_id.clone(),
+                                json!({
+                                    "approvalPolicy": "on-request",
+                                    "sandbox": "workspace-write"
+                                }),
+                            );
+                        }
+                        let response = if prompt == "__policy__" {
+                            state
+                                .thread_overrides
+                                .lock()
+                                .await
+                                .get(&thread_id)
+                                .cloned()
+                                .unwrap_or_else(|| json!({}))
+                                .to_string()
+                        } else {
+                            format!("echo: {prompt}")
+                        };
                         let turn = json!({"id":turn_id,"items":[
                             {"type":"userMessage","content":[{"type":"text","text":prompt}]},
-                            {"type":"agentMessage","text":format!("echo: {prompt}")}
+                            {"type":"agentMessage","text":response}
                         ]});
                         state.threads.lock().await.entry(thread_id.clone()).or_default().push(turn.clone());
                         let _ = events.send(json!({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"item":turn["items"][1].clone()}}));

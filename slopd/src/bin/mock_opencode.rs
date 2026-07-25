@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SID: &str = "ses_mock";
 /// A child session id used to simulate an opencode subagent (parent = SID).
@@ -73,6 +73,10 @@ struct MockState {
     /// (rate-limit backoff) rather than plain busy — mirrors an opencode session
     /// that exhausted its quota and is auto-retrying.
     main_retry: bool,
+    /// Failure-injection hook: the listener is live immediately, but instance
+    /// API readiness is delayed. A premature POST /session hangs, matching the
+    /// real OpenCode startup race.
+    ready_at: Instant,
 }
 
 fn main() {
@@ -86,6 +90,7 @@ fn main() {
     // real opencode, where `opencode -s <id>` makes that exact session present.
     let mut resume_id: Option<String> = None;
     let mut ghost = false;
+    let mut startup_delay = Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -98,6 +103,13 @@ fn main() {
             // Test flag: list a garbage-collected "ghost" session in GET /session
             // that 404s on use — reproduces the ephemeral-boot-session bug.
             "--ghost-session" => ghost = true,
+            "--startup-delay-ms" => {
+                startup_delay = args
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_millis)
+                    .unwrap_or(Duration::ZERO);
+            }
             // Failure-injection mode (mirrors mock_claude --crash-output): print a
             // diagnostic line to the terminal then exit non-zero before binding the
             // port — simulating opencode crashing on launch with a visible error.
@@ -134,6 +146,7 @@ fn main() {
         child_exists: false,
         child_status: None,
         main_retry: false,
+        ready_at: Instant::now() + startup_delay,
     }));
 
     for stream in listener.incoming() {
@@ -239,6 +252,18 @@ fn stream_sse(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
 }
 
 fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> String {
+    let ready = Instant::now() >= state.lock().unwrap().ready_at;
+    if !ready && method == "GET" && path == "/session" {
+        return json_response(503, r#"{"error":"instance bootstrapping"}"#);
+    }
+    if !ready && method == "POST" && path == "/session" {
+        // The TCP listener accepts the request, but the instance serving the
+        // mutating API is not ready. Keep this longer than slopd's 20-second
+        // discovery deadline so an eager POST reliably reproduces the bug.
+        std::thread::sleep(Duration::from_secs(25));
+        return json_response(503, r#"{"error":"instance bootstrapping"}"#);
+    }
+
     let (status, body_out) = match (method, path) {
         ("GET", "/global/health") => (200, r#"{"healthy":true,"version":"mock"}"#.to_string()),
 
@@ -455,12 +480,20 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
     if status == 204 {
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     } else {
-        let reason = if status == 200 { "OK" } else { "Not Found" };
-        format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body_out}",
-            len = body_out.len(),
-        )
+        json_response(status, &body_out)
     }
+}
+
+fn json_response(status: u16, body: &str) -> String {
+    let reason = match status {
+        200 => "OK",
+        503 => "Service Unavailable",
+        _ => "Not Found",
+    };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        len = body.len(),
+    )
 }
 
 /// Build a `message.part.updated` event for a TOOL part with the given state

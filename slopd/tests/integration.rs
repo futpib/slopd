@@ -10338,6 +10338,90 @@ fn auto_continue_does_not_resend_during_long_turn() {
 }
 
 #[test]
+fn opencode_delayed_start_is_backed_up_and_restored() {
+    // Real OpenCode accepts TCP connections before its instance API finishes
+    // bootstrapping. In that window GET /session fails quickly, while an eager
+    // POST /session can hang. slopd must wait for readiness, record the durable
+    // session, include the pane in backup, and resume it after a reboot.
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n\
+         [backup]\nauto_restore = true\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd1 = env.spawn_slopd();
+    let run_out = env.slopctl_raw(&[
+        "run",
+        "--no-wait",
+        "--account",
+        "oc",
+        "--",
+        "--startup-delay-ms",
+        "800",
+    ]);
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    assert!(
+        run_out.status.success() && !pane_id.is_empty(),
+        "delayed OpenCode run failed: {:?} stdout={:?} stderr={:?}",
+        run_out.status,
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr),
+    );
+
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+    let pane = panes.iter().find(|pane| pane.pane_id == pane_id)
+        .expect("delayed OpenCode pane in ps");
+    assert_eq!(
+        pane.session_id.as_deref(),
+        Some("ses_mock"),
+        "slopd should wait for the instance API and record its durable session",
+    );
+
+    let backup = env.slopctl(&["backup"]);
+    assert!(
+        backup.status.success()
+            && String::from_utf8_lossy(&backup.stdout).contains("backed up 1"),
+        "durable OpenCode session should be backed up: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&backup.stdout),
+        String::from_utf8_lossy(&backup.stderr),
+    );
+
+    sigint_child(slopd1);
+    reboot_tmux(&env);
+    let slopd2 = env.spawn_slopd();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let restored = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        if let Some(pane) = panes.into_iter()
+            .find(|pane| pane.session_id.as_deref() == Some("ses_mock"))
+        {
+            break pane;
+        }
+        if Instant::now() >= deadline {
+            kill_slopd(slopd2);
+            panic!("OpenCode pane was not restored from the backup manifest");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    assert_eq!(restored.backend, libslop::Backend::Opencode);
+    assert_eq!(restored.account, "oc");
+    assert_ne!(restored.pane_id, pane_id, "restore should create a fresh tmux pane");
+
+    kill_slopd(slopd2);
+}
+
+#[test]
 fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     // End-to-end for the opencode backend: slopd spawns mock_opencode (which
     // binds the assigned --port and serves the API subset OpencodeClient uses),
@@ -10627,6 +10711,173 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     assert!(env.slopctl(&["send", &restored, "after backup restore"]).status.success());
     kill_slopd(slopd);
     if let Ok(pid) = std::fs::read_to_string(codex_home.path().join("app-server-control/mock-codex.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+}
+
+fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", pane_id])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn Codex policy listener");
+    let stdout = listener.stdout.as_mut().expect("listener has no stdout");
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        use std::io::Read;
+        stdout
+            .read_exact(&mut byte)
+            .expect("failed to read subscription confirmation");
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8_lossy(&line).contains("subscribed"),
+        "unexpected policy listener confirmation: {:?}",
+        line
+    );
+
+    let send = env.slopctl(&["send", pane_id, "__policy__"]);
+    assert!(
+        send.status.success(),
+        "Codex policy probe failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let pane_id = pane_id.to_string();
+    let event = wait_for_event(listener, move |value| {
+        value["source"] == "transcript"
+            && value["event_type"] == "agentMessage"
+            && value["pane_id"] == pane_id
+            && value
+                .pointer("/payload/text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| serde_json::from_str::<serde_json::Value>(text).is_ok())
+    });
+    let text = event
+        .pointer("/payload/text")
+        .and_then(serde_json::Value::as_str)
+        .expect("mock Codex policy event lacks text");
+    serde_json::from_str(text).expect("mock Codex returned invalid policy JSON")
+}
+
+fn restrict_mock_codex_thread(env: &TestEnv, pane_id: &str) {
+    let send = env.slopctl(&["send", pane_id, "__restrict__"]);
+    assert!(
+        send.status.success(),
+        "failed to restrict mock Codex thread: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    wait_until_ready(env, pane_id, Duration::from_secs(5));
+    let policy = mock_codex_policy(env, pane_id);
+    assert_eq!(policy["approvalPolicy"], "on-request");
+    assert_eq!(policy["sandbox"], "workspace-write");
+}
+
+fn assert_mock_codex_yolo(env: &TestEnv, pane_id: &str) {
+    let policy = mock_codex_policy(env, pane_id);
+    assert_eq!(
+        policy["approvalPolicy"], "never",
+        "Codex approval policy was not reapplied for pane {pane_id}: {policy}"
+    );
+    assert_eq!(
+        policy["sandbox"], "danger-full-access",
+        "Codex sandbox policy was not reapplied for pane {pane_id}: {policy}"
+    );
+}
+
+#[test]
+fn codex_yolo_policy_survives_fork_recovery_and_restore() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-yolo]\nbackend = \"codex\"\nexecutable = [{:?}, \"--dangerously-bypass-approvals-and-sandbox\"]\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-yolo",
+        "--ready-timeout",
+        "20",
+    ]);
+    assert!(
+        run.status.success(),
+        "Codex YOLO run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert_mock_codex_yolo(&env, &source);
+
+    // Prove the fork path overrides inherited source-thread policy rather than
+    // merely benefiting from an already-unrestricted source.
+    restrict_mock_codex_thread(&env, &source);
+    let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "20"]);
+    assert!(
+        fork.status.success(),
+        "Codex YOLO fork failed: {}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
+    assert_mock_codex_yolo(&env, &fork_pane);
+
+    // A daemon restart reattaches to surviving panes through thread/resume.
+    // Deliberately downgrade first so recovery has to reapply both fields.
+    restrict_mock_codex_thread(&env, &fork_pane);
+    kill_slopd(slopd);
+    let slopd = env.spawn_slopd();
+    wait_until_ready(&env, &fork_pane, Duration::from_secs(10));
+    assert_mock_codex_yolo(&env, &fork_pane);
+
+    // Manual backup/restore uses a separate resume-and-spawn path. Downgrade
+    // again to prove that path also restores the configured policy.
+    restrict_mock_codex_thread(&env, &fork_pane);
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let fork_session = panes
+        .iter()
+        .find(|pane| pane.pane_id == fork_pane)
+        .and_then(|pane| pane.session_id.clone())
+        .expect("fork pane lacks a Codex thread id");
+    assert!(env.slopctl(&["backup"]).status.success());
+    assert!(env.slopctl(&["kill", &source]).status.success());
+    assert!(env.slopctl(&["kill", &fork_pane]).status.success());
+    assert!(env.slopctl(&["restore"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let restored_fork = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap_or_default();
+        if let Some(pane) = panes.into_iter().find(|pane| {
+            pane.session_id.as_deref() == Some(fork_session.as_str())
+                && pane.detailed_state == libslop::PaneDetailedState::Ready
+        }) {
+            break pane.pane_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restored Codex YOLO fork did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_mock_codex_yolo(&env, &restored_fork);
+
+    kill_slopd(slopd);
+    if let Ok(pid) = std::fs::read_to_string(
+        codex_home
+            .path()
+            .join("app-server-control/mock-codex.pid"),
+    ) {
         let _ = Command::new("kill").arg(pid.trim()).status();
     }
 }

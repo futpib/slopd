@@ -474,6 +474,7 @@ impl PaneState {
 async fn run_codex_driver(
     client: codex::CodexClient,
     thread_id: String,
+    thread_overrides: codex::ThreadOverrides,
     pane_id: String,
     config: Arc<libslop::SlopdConfig>,
     panes: PaneMap,
@@ -484,7 +485,7 @@ async fn run_codex_driver(
     // A brand-new TUI thread has no durable rollout until its first turn, so a
     // second client cannot resume it immediately. Treat the visible composer as
     // ready and retry attachment when the first turn makes the rollout durable.
-    let initial_resume = client.resume_thread(&thread_id).await;
+    let initial_resume = client.resume_thread(&thread_id, &thread_overrides).await;
     let mut attached = match &initial_resume {
         Ok(_) => true,
         Err(e) => {
@@ -527,7 +528,10 @@ async fn run_codex_driver(
         if method == "slopd/codexConnection" {
             let connected = value.pointer("/params/status").and_then(|v| v.as_str()) == Some("connected");
             if connected {
-                attached = client.resume_thread(&thread_id).await.is_ok();
+                attached = client
+                    .resume_thread(&thread_id, &thread_overrides)
+                    .await
+                    .is_ok();
                 set_pane_detailed_state(&config, &pane_id, &libslop::PaneDetailedState::Ready,
                     None, &event_tx, &panes).await;
             } else {
@@ -544,7 +548,10 @@ async fn run_codex_driver(
         if event_thread.is_some() && event_thread != Some(thread_id.as_str()) { continue; }
         if !attached && method == "thread/status/changed"
             && value.pointer("/params/status/type").and_then(|v| v.as_str()) == Some("active") {
-            attached = client.resume_thread(&thread_id).await.is_ok();
+            attached = client
+                .resume_thread(&thread_id, &thread_overrides)
+                .await
+                .is_ok();
         }
         if value.get("id").is_some() && value.get("method").is_some() {
             let awaiting = if codex::normalized_event_type(&method) == "Elicitation" {
@@ -4136,10 +4143,19 @@ async fn handle_request(
                         } else {
                             match tokio::time::timeout(std::time::Duration::from_secs(20), async {
                                 loop {
-                                    match client.ensure_session().await {
-                                        Ok(id) if !id.is_empty() => return id,
-                                        _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+                                    // OpenCode binds its listener before the
+                                    // instance behind it has finished booting.
+                                    // A mutating POST /session sent during that
+                                    // gap can hang until our entire attachment
+                                    // deadline expires. Require a successful
+                                    // non-mutating listing before creating.
+                                    if client.session_ids().await.is_ok() {
+                                        match client.ensure_session().await {
+                                            Ok(id) if !id.is_empty() => return id,
+                                            _ => {}
+                                        }
                                     }
+                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                 }
                             }).await {
                                 Ok(id) => id,
@@ -4198,7 +4214,7 @@ async fn handle_request(
                             driver_cancel,
                         ));
                     }
-                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, socket, mut events, existing_threads }) => {
+                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, thread_overrides, socket, mut events, existing_threads }) => {
                         let thread_id = match thread_id {
                             Some(id) => id,
                             None => match codex::wait_for_thread_started(&mut events, std::time::Duration::from_secs(20), &existing_threads).await {
@@ -4216,10 +4232,10 @@ async fn handle_request(
                         pane_state.note_session_id(&thread_id);
                         let driver_cancel = tokio_util::sync::CancellationToken::new();
                         pane_state.set_runtime(PaneRuntime::Codex(CodexState::new(
-                            client.clone(), thread_id.clone(), driver_cancel.clone(),
+                            client.clone(), thread_id.clone(), thread_overrides.clone(), driver_cancel.clone(),
                         )));
                         tokio::spawn(run_codex_driver(
-                            client, thread_id, pane_id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel,
+                            client, thread_id, thread_overrides, pane_id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel,
                         ));
                     }
                     PreparedBackendRun::Claude => {}

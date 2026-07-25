@@ -27,6 +27,7 @@ impl OpencodeState {
 pub(super) struct CodexState {
     pub(super) client: codex::CodexClient,
     pub(super) thread_id: String,
+    pub(super) thread_overrides: codex::ThreadOverrides,
     pub(super) cancel: tokio_util::sync::CancellationToken,
     pub(super) active_turn: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) pending_requests:
@@ -37,11 +38,13 @@ impl CodexState {
     pub(super) fn new(
         client: codex::CodexClient,
         thread_id: String,
+        thread_overrides: codex::ThreadOverrides,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             client,
             thread_id,
+            thread_overrides,
             cancel,
             active_turn: Arc::new(std::sync::Mutex::new(None)),
             pending_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -199,7 +202,7 @@ impl BackendRuntime for CodexState {
     async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
         Some(
             self.client
-                .resume_thread(&self.thread_id)
+                .resume_thread(&self.thread_id, &self.thread_overrides)
                 .await
                 .map(|thread| codex::thread_records(&thread, pane_id)),
         )
@@ -276,6 +279,7 @@ impl BackendPolicy for libslop::Backend {
 pub(super) struct PreparedCodexRun {
     pub(super) client: codex::CodexClient,
     pub(super) thread_id: Option<String>,
+    pub(super) thread_overrides: codex::ThreadOverrides,
     pub(super) socket: std::path::PathBuf,
     pub(super) events: tokio::sync::broadcast::Receiver<serde_json::Value>,
     pub(super) existing_threads: std::collections::HashSet<String>,
@@ -635,9 +639,18 @@ impl BackendLifecycle for CodexBackend {
         let client = codex::CodexClient::connect(&socket).await?;
         let events = client.subscribe();
         let existing_threads = client.thread_ids().await.unwrap_or_default();
+        let thread_overrides = codex::ThreadOverrides::from_args(
+            context
+                .resolved
+                .executable
+                .args()
+                .iter()
+                .chain(context.extra_args.iter())
+                .map(String::as_str),
+        );
         let thread_id = match extract_resume_target(context.extra_args) {
             Some(id) => {
-                client.resume_thread(&id).await?;
+                client.resume_thread(&id, &thread_overrides).await?;
                 Some(id)
             }
             None => None,
@@ -645,6 +658,7 @@ impl BackendLifecycle for CodexBackend {
         Ok(PreparedBackendRun::Codex(PreparedCodexRun {
             client,
             thread_id,
+            thread_overrides,
             socket,
             events,
             existing_threads,
@@ -657,7 +671,12 @@ impl BackendLifecycle for CodexBackend {
             .get(context.pane_id)
             .and_then(|state| state.codex())
             .ok_or_else(|| format!("Codex pane {} has no app-server runtime", context.pane_id))?;
-        let new_id = runtime.client.fork_thread(context.session_id).await?;
+        let mut thread_overrides = runtime.thread_overrides.clone();
+        thread_overrides.apply_args(context.extra_args.iter().map(String::as_str));
+        let new_id = runtime
+            .client
+            .fork_thread(context.session_id, &thread_overrides)
+            .await?;
         let mut args = vec!["--resume".to_string(), new_id.clone()];
         args.extend(context.extra_args);
         Ok((args, new_id))
@@ -693,6 +712,15 @@ impl BackendLifecycle for CodexBackend {
                 })?;
         codex::ensure_daemon(&program, home.as_deref(), &socket).await?;
         let client = codex::CodexClient::connect(&socket).await?;
+        let thread_overrides = codex::ThreadOverrides::from_args(
+            context
+                .resolved
+                .executable
+                .args()
+                .iter()
+                .map(String::as_str),
+        );
+        client.resume_thread(session_id, &thread_overrides).await?;
         let cancel = tokio_util::sync::CancellationToken::new();
         context
             .panes
@@ -700,11 +728,13 @@ impl BackendLifecycle for CodexBackend {
             .set_runtime(PaneRuntime::Codex(CodexState::new(
                 client.clone(),
                 session_id.to_string(),
+                thread_overrides.clone(),
                 cancel.clone(),
             )));
         tokio::spawn(run_codex_driver(
             client,
             session_id.to_string(),
+            thread_overrides,
             context.pane_id.to_string(),
             context.config.clone(),
             context.panes.clone(),
@@ -734,7 +764,17 @@ impl BackendLifecycle for CodexBackend {
         let socket = codex::socket_path(home.as_deref());
         codex::ensure_daemon(&program, home.as_deref(), &socket).await?;
         let client = codex::CodexClient::connect(&socket).await?;
-        client.resume_thread(context.session_id).await?;
+        let thread_overrides = codex::ThreadOverrides::from_args(
+            context
+                .resolved
+                .executable
+                .args()
+                .iter()
+                .map(String::as_str),
+        );
+        client
+            .resume_thread(context.session_id, &thread_overrides)
+            .await?;
         let id = spawn_pane(
             context.config,
             context.session_lock,
@@ -783,11 +823,13 @@ impl BackendLifecycle for CodexBackend {
             .set_runtime(PaneRuntime::Codex(CodexState::new(
                 client.clone(),
                 context.session_id.to_string(),
+                thread_overrides.clone(),
                 cancel.clone(),
             )));
         tokio::spawn(run_codex_driver(
             client,
             context.session_id.to_string(),
+            thread_overrides,
             id.clone(),
             context.config.clone(),
             context.panes.clone(),

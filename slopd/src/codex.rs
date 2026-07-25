@@ -11,6 +11,110 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_websockets::{ClientBuilder, Message};
 
+/// Thread-level execution overrides represented by Codex CLI flags.
+///
+/// The remote TUI receives the configured executable arguments, but slopd also
+/// talks to app-server directly for resume/fork/reconnect. Those RPCs must carry
+/// the same policy or app-server can retain or inherit a more restrictive
+/// profile before the TUI attaches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadOverrides {
+    approval_policy: Option<String>,
+    sandbox: Option<String>,
+}
+
+impl ThreadOverrides {
+    pub fn from_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut result = Self::default();
+        result.apply_args(args);
+        result
+    }
+
+    pub fn apply_args<'a>(&mut self, args: impl IntoIterator<Item = &'a str>) {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg {
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    self.approval_policy = Some("never".to_string());
+                    self.sandbox = Some("danger-full-access".to_string());
+                }
+                "-a" | "--ask-for-approval" => {
+                    if let Some(value) = args.next() {
+                        self.set_approval_policy(value);
+                    }
+                }
+                "-s" | "--sandbox" => {
+                    if let Some(value) = args.next() {
+                        self.set_sandbox(value);
+                    }
+                }
+                "-c" | "--config" => {
+                    if let Some(value) = args.next() {
+                        self.apply_config_override(value);
+                    }
+                }
+                _ => {
+                    if let Some(value) = arg
+                        .strip_prefix("--ask-for-approval=")
+                        .or_else(|| arg.strip_prefix("-a="))
+                    {
+                        self.set_approval_policy(value);
+                    } else if let Some(value) = arg
+                        .strip_prefix("--sandbox=")
+                        .or_else(|| arg.strip_prefix("-s="))
+                    {
+                        self.set_sandbox(value);
+                    } else if let Some(value) = arg
+                        .strip_prefix("--config=")
+                        .or_else(|| arg.strip_prefix("-c="))
+                    {
+                        self.apply_config_override(value);
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_approval_policy(&mut self, value: &str) {
+        if matches!(value, "untrusted" | "on-request" | "never") {
+            self.approval_policy = Some(value.to_string());
+        }
+    }
+
+    fn set_sandbox(&mut self, value: &str) {
+        if matches!(
+            value,
+            "read-only" | "workspace-write" | "danger-full-access"
+        ) {
+            self.sandbox = Some(value.to_string());
+        }
+    }
+
+    fn apply_config_override(&mut self, value: &str) {
+        let Some((key, value)) = value.split_once('=') else {
+            return;
+        };
+        let value = value.trim().trim_matches(|c| matches!(c, '"' | '\''));
+        match key.trim() {
+            "approval_policy" => self.set_approval_policy(value),
+            "sandbox_mode" => self.set_sandbox(value),
+            _ => {}
+        }
+    }
+
+    fn apply_to(&self, params: &mut Value) {
+        let Some(params) = params.as_object_mut() else {
+            return;
+        };
+        if let Some(value) = &self.approval_policy {
+            params.insert("approvalPolicy".to_string(), Value::String(value.clone()));
+        }
+        if let Some(value) = &self.sandbox {
+            params.insert("sandbox".to_string(), Value::String(value.clone()));
+        }
+    }
+}
+
 async fn connect_initialized(
     socket_path: &Path,
 ) -> Result<tokio_websockets::WebSocketStream<UnixStream>, String> {
@@ -220,9 +324,14 @@ impl CodexClient {
             .map_err(|_| "Codex app-server connection closed".to_string())?
     }
 
-    pub async fn resume_thread(&self, thread_id: &str) -> Result<Value, String> {
-        self.request("thread/resume", json!({"threadId": thread_id}))
-            .await
+    pub async fn resume_thread(
+        &self,
+        thread_id: &str,
+        overrides: &ThreadOverrides,
+    ) -> Result<Value, String> {
+        let mut params = json!({"threadId": thread_id});
+        overrides.apply_to(&mut params);
+        self.request("thread/resume", params).await
     }
 
     pub async fn read_thread(&self, thread_id: &str) -> Result<Value, String> {
@@ -244,10 +353,14 @@ impl CodexClient {
             .collect())
     }
 
-    pub async fn fork_thread(&self, thread_id: &str) -> Result<String, String> {
-        let result = self
-            .request("thread/fork", json!({"threadId": thread_id}))
-            .await?;
+    pub async fn fork_thread(
+        &self,
+        thread_id: &str,
+        overrides: &ThreadOverrides,
+    ) -> Result<String, String> {
+        let mut params = json!({"threadId": thread_id});
+        overrides.apply_to(&mut params);
+        let result = self.request("thread/fork", params).await?;
         response_thread_id(&result)
     }
 
@@ -448,5 +561,45 @@ mod tests {
             {"id":"done","status":"completed"},{"id":"live","status":"inProgress"}
         ]}});
         assert_eq!(thread_runtime(&result), (true, Some("live".to_string())));
+    }
+
+    #[test]
+    fn thread_overrides_parse_yolo_and_explicit_cli_flags() {
+        let yolo = ThreadOverrides::from_args(["--dangerously-bypass-approvals-and-sandbox"]);
+        let mut params = json!({"threadId":"thread-1"});
+        yolo.apply_to(&mut params);
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "danger-full-access");
+
+        // Later command-line values win, matching how the effective executable
+        // is assembled (configured args first, per-invocation args last).
+        let mut explicit = yolo;
+        explicit.apply_args([
+            "--ask-for-approval=on-request",
+            "-s=workspace-write",
+        ]);
+        let mut params = json!({});
+        explicit.apply_to(&mut params);
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandbox"], "workspace-write");
+    }
+
+    #[test]
+    fn thread_overrides_parse_config_cli_forms() {
+        let overrides = ThreadOverrides::from_args([
+            "-c",
+            "approval_policy=\"never\"",
+            "--config=sandbox_mode='danger-full-access'",
+        ]);
+        let mut params = json!({"threadId":"thread-2"});
+        overrides.apply_to(&mut params);
+        assert_eq!(
+            params,
+            json!({
+                "threadId":"thread-2",
+                "approvalPolicy":"never",
+                "sandbox":"danger-full-access"
+            })
+        );
     }
 }

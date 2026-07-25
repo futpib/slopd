@@ -9,9 +9,16 @@
 
 use libslop::PaneDetailedState;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Basic-auth username the opencode server expects (its default).
 const AUTH_USER: &str = "opencode";
+/// Discovery calls must not occupy the whole pane-attachment deadline.
+/// OpenCode binds its listener before the instance behind it finishes booting.
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Session creation should normally be fast once discovery succeeds, but leave
+/// more headroom than a read-only probe to avoid retrying a committed request.
+const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection details for one opencode pane's embedded HTTP server.
 ///
@@ -61,6 +68,7 @@ impl OpencodeClient {
     pub async fn ensure_session(&self) -> Result<String, String> {
         let resp = self
             .req(reqwest::Method::POST, "/session")
+            .timeout(CREATE_SESSION_TIMEOUT)
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -128,7 +136,12 @@ impl OpencodeClient {
     /// `GET /session` → every session id (used to tell "idle but exists" from
     /// "still booting", since idle sessions are absent from `/session/status`).
     pub async fn session_ids(&self) -> Result<Vec<String>, String> {
-        let resp = self.req(reqwest::Method::GET, "/session").send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .req(reqwest::Method::GET, "/session")
+            .timeout(DISCOVERY_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("GET /session {}: {}", status, resp.text().await.unwrap_or_default()));
