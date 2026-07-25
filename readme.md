@@ -155,14 +155,16 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Supports ~ and $VAR / ${VAR} expansion (as do all account config dirs).
 # config_dir = "~/.claude"
 
-# Account used by `slopctl run` when no --account is given and none is inherited
-# from the current pane. Omit to fall back to the "default" account above.
+# Pointer to the named account used by `slopctl run` when no --account is given
+# and none is inherited from the current pane. Switching the default then only
+# requires changing this one value. Omit it to use the reserved "default"
+# account above.
 # default_account = "work"
 
-# Named accounts: each maps an account name to its own config (at minimum a
-# Claude config dir). Pick one per pane with `slopctl run --account <name>`.
-# Both forms below are accepted; the table form leaves room for future
-# per-account options.
+# Named accounts: each maps an account name to its own config. Omit config_dir
+# to use the backend's standard location. Pick one per pane with
+# `slopctl run --account <name>`. Both forms below are accepted; the table form
+# leaves room for per-account options.
 # [accounts]
 # work = "~/.config/claude-work"            # shorthand: just the dir
 # [accounts.personal]
@@ -233,16 +235,37 @@ All defaults are fine for most setups. The only key you are likely to want to se
 
 #### Multiple accounts
 
-Run different panes under different Claude config dirs. There is always a
+Run different panes under different agent accounts and backends. There is always a
 reserved account named `default`, backed by the top-level `config_dir`
 (or `~/.claude`); define additional ones under `[accounts]`, each mapping a name
-to its own config (at minimum a config dir). The table form
+to its own config. The table form
 (`[accounts.<name>]`) is extensible — future per-account options live there.
 
+`default_account` is a pointer to one of those named accounts. Keeping every
+backend in a named account makes changing the default a one-line edit:
+
+```toml
+default_account = "codex" # change only this line to "claude" or "opencode"
+
+[accounts.claude]
+
+[accounts.codex]
+backend = "codex"
+
+[accounts.opencode]
+backend = "opencode"
+```
+
+The target account name—not the literal name `default`—is recorded on newly
+created panes, so their children continue to inherit the account they were
+launched with even if `default_account` changes later.
+
 Launch a pane under a specific account with `slopctl run --account <name>`:
-slopd points the pane at the account's config dir (exporting `CLAUDE_CONFIG_DIR`)
-and injects its hooks there. Every managed pane carries its account, shown in
-the `ACCOUNT` column of `slopctl ps`.
+when `config_dir` is set, slopd exports it through the backend's config
+environment variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or
+`OPENCODE_CONFIG_DIR`). When omitted, the variable is left unset and the backend
+uses its standard location. Every managed pane carries its account, shown in the
+`ACCOUNT` column of `slopctl ps`.
 
 slopd records the account on the pane itself, so a pane that spawns more panes
 with `slopctl run` passes its own account down by default — the child inherits

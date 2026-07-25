@@ -1034,7 +1034,7 @@ mod tests {
     fn account_config_accepts_bare_string() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/claude-work\"\n");
         let acct = cfg.accounts.get("work").expect("work account missing");
-        assert_eq!(acct.config_dir(), &PathBuf::from("/srv/claude-work"));
+        assert_eq!(acct.config_dir(), Some(&PathBuf::from("/srv/claude-work")));
     }
 
     #[test]
@@ -1043,7 +1043,14 @@ mod tests {
             "[accounts.personal]\nconfig_dir = \"/srv/claude-personal\"\n",
         );
         let acct = cfg.accounts.get("personal").expect("personal account missing");
-        assert_eq!(acct.config_dir(), &PathBuf::from("/srv/claude-personal"));
+        assert_eq!(acct.config_dir(), Some(&PathBuf::from("/srv/claude-personal")));
+    }
+
+    #[test]
+    fn account_config_accepts_table_without_config_dir() {
+        let cfg = config_from_toml("[accounts.codex]\nbackend = \"codex\"\n");
+        let acct = cfg.accounts.get("codex").expect("codex account missing");
+        assert_eq!(acct.config_dir(), None);
     }
 
     #[test]
@@ -1052,6 +1059,16 @@ mod tests {
         let resolved = cfg.resolve_account(Some("work")).unwrap();
         assert_eq!(resolved.name, "work");
         assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/work")));
+    }
+
+    #[test]
+    fn resolve_account_named_without_dir_uses_backend_default() {
+        let cfg = config_from_toml("[accounts.codex]\nbackend = \"codex\"\n");
+        let resolved = cfg.resolve_account(Some("codex")).unwrap();
+        assert_eq!(resolved.name, "codex");
+        assert_eq!(resolved.backend, Backend::Codex);
+        assert_eq!(resolved.config_dir, None);
+        assert_eq!(resolved.executable.program(), "codex");
     }
 
     #[test]
@@ -1069,6 +1086,34 @@ mod tests {
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(resolved.name, "work");
         assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/work")));
+    }
+
+    #[test]
+    fn default_account_pointer_switches_between_named_backends() {
+        let config = r#"
+            default_account = "codex"
+
+            [accounts.claude]
+
+            [accounts.codex]
+            backend = "codex"
+
+            [accounts.opencode]
+            backend = "opencode"
+        "#;
+        let mut cfg = config_from_toml(config);
+
+        for (name, backend) in [
+            ("codex", Backend::Codex),
+            ("claude", Backend::Claude),
+            ("opencode", Backend::Opencode),
+        ] {
+            cfg.default_account = Some(name.to_string());
+            let resolved = cfg.resolve_account(None).unwrap();
+            assert_eq!(resolved.name, name);
+            assert_eq!(resolved.backend, backend);
+            assert_eq!(resolved.config_dir, None);
+        }
     }
 
     #[test]
@@ -1482,8 +1527,8 @@ pub struct SlopdConfig {
     pub backup: SlopdBackupConfig,
     /// Agent config dir for the reserved [`DEFAULT_ACCOUNT`] (the account used
     /// when no account is selected). Exported as `CLAUDE_CONFIG_DIR` (Claude) or
-    /// `OPENCODE_CONFIG_DIR` (opencode). Supports `~` and `$VAR` / `${VAR}`
-    /// expansion.
+    /// `OPENCODE_CONFIG_DIR` (OpenCode), or `CODEX_HOME` (Codex). Supports `~`
+    /// and `$VAR` / `${VAR}` expansion.
     #[serde(alias = "claude_config_dir")]
     pub config_dir: Option<PathBuf>,
     /// Backend for the reserved [`DEFAULT_ACCOUNT`] (the account used when no
@@ -1493,9 +1538,9 @@ pub struct SlopdConfig {
     /// — see [`Backend::resolve`].
     #[serde(default)]
     pub backend: Option<Backend>,
-    /// Named Claude accounts. Each maps an account name to its own configuration
-    /// (at minimum a Claude config dir, the per-account equivalent of
-    /// `config_dir`). Select one for a pane with
+    /// Named agent accounts. Each maps an account name to its own configuration.
+    /// An omitted config dir lets the selected backend use its standard location.
+    /// Select one for a pane with
     /// `slopctl run --account <name>`; child panes inherit their parent's
     /// account unless overridden. The name `default` is reserved (see
     /// [`DEFAULT_ACCOUNT`]).
@@ -1520,7 +1565,7 @@ pub struct SlopdConfig {
 pub const DEFAULT_ACCOUNT: &str = "default";
 
 /// Configuration for a single named account. Accepts either a bare string (the
-/// Claude config dir, the common case) or a table for richer per-account
+/// agent config dir) or a table for richer per-account
 /// settings, so both of these are valid:
 ///
 /// ```toml
@@ -1533,11 +1578,12 @@ pub const DEFAULT_ACCOUNT: &str = "default";
 ///
 /// The table form is where future per-account options live (see
 /// [`AccountSettings`]); the bare-string form is sugar for a table with only
-/// `config_dir` set.
+/// `config_dir` set. In the table form, `config_dir` may be omitted to use the
+/// backend's standard config location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AccountConfig {
-    /// Shorthand: the account is just its Claude config directory.
+    /// Shorthand: the account is just its agent config directory.
     Dir(PathBuf),
     /// Full table form, extensible with further per-account keys over time.
     Settings(AccountSettings),
@@ -1550,9 +1596,11 @@ pub enum AccountConfig {
 pub struct AccountSettings {
     /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
     /// for [`Backend::Claude`], `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`],
-    /// or `CODEX_HOME` for [`Backend::Codex`]).
+    /// or `CODEX_HOME` for [`Backend::Codex`]). When omitted, that environment
+    /// variable is left unset and the backend uses its standard location.
     #[serde(alias = "claude_config_dir")]
-    pub config_dir: PathBuf,
+    #[serde(default)]
+    pub config_dir: Option<PathBuf>,
     /// Agent backend for this account. When unset, the backend is derived — see
     /// [`Backend::resolve`].
     #[serde(default)]
@@ -1565,10 +1613,10 @@ pub struct AccountSettings {
 
 impl AccountConfig {
     /// The account's agent config directory, as written in config (unexpanded).
-    pub fn config_dir(&self) -> &PathBuf {
+    pub fn config_dir(&self) -> Option<&PathBuf> {
         match self {
-            AccountConfig::Dir(p) => p,
-            AccountConfig::Settings(s) => &s.config_dir,
+            AccountConfig::Dir(p) => Some(p),
+            AccountConfig::Settings(s) => s.config_dir.as_ref(),
         }
     }
 
@@ -2005,8 +2053,8 @@ impl SlopdConfig {
         self.config_dir().join("settings.json")
     }
 
-    /// Resolve a requested account name into the account in effect and the
-    /// Claude config dir to export for a new pane.
+    /// Resolve a requested account name into the account, backend, executable,
+    /// and optional config dir in effect for a new pane.
     ///
     /// The account name is `requested`, else `default_account`, else
     /// [`DEFAULT_ACCOUNT`]. The dir is then:
@@ -2028,7 +2076,7 @@ impl SlopdConfig {
         if name == DEFAULT_ACCOUNT {
             let acct = self.accounts.get(DEFAULT_ACCOUNT);
             let config_dir = acct
-                .map(|a| expand_path(a.config_dir()))
+                .and_then(|a| a.config_dir().map(|path| expand_path(path)))
                 .or_else(|| self.config_dir.as_deref().map(expand_path));
             // Backend/executable: [accounts.default] wins over the top-level
             // `backend` / `[run] executable`; the top-level values back ONLY the
@@ -2058,7 +2106,7 @@ impl SlopdConfig {
         let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
         Ok(ResolvedAccount {
             name,
-            config_dir: Some(expand_path(account.config_dir())),
+            config_dir: account.config_dir().map(|path| expand_path(path)),
             backend,
             executable,
         })
@@ -2425,9 +2473,9 @@ pub enum RequestBody {
         /// Merged after the daemon's `[run.env]` config; later pairs win.
         #[serde(default)]
         env: Vec<(String, String)>,
-        /// Named account to launch the pane under. The daemon resolves it to a
-        /// Claude config dir via `[accounts]`. `None` means the daemon default
-        /// (`default_account`, else the unnamed `config_dir`).
+        /// Named account to launch the pane under. The daemon resolves it via
+        /// `[accounts]`. `None` means the daemon default (`default_account`,
+        /// else the reserved `default` account).
         #[serde(default)]
         account: Option<String>,
         /// Override the pane's agent backend (`--backend`). `None` = use the
