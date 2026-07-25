@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Forward a Claude lifecycle hook event to slopd (called by Claude hooks).
+    /// Forward an agent lifecycle hook event to slopd (called by Claude/Codex hooks).
     Hook {
         /// Hook event name (e.g. UserPromptSubmit).
         event: String,

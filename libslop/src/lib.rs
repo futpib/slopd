@@ -224,8 +224,6 @@ pub enum TmuxOption {
     SlopdOpencodePort,
     /// For opencode panes: the per-pane basic-auth token for that server.
     SlopdOpencodeToken,
-    /// For Codex panes: the app-server Unix socket used by slopd and the TUI.
-    SlopdCodexSocket,
 }
 
 impl TmuxOption {
@@ -242,7 +240,6 @@ impl TmuxOption {
             TmuxOption::SlopdBackend => "@slopd_backend",
             TmuxOption::SlopdOpencodePort => "@slopd_opencode_port",
             TmuxOption::SlopdOpencodeToken => "@slopd_opencode_token",
-            TmuxOption::SlopdCodexSocket => "@slopd_codex_socket",
         }
     }
 }
@@ -290,18 +287,51 @@ pub const HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Hook events currently emitted by Codex CLI. Keep this separate from
+/// [`HOOK_EVENTS`]: Codex rejects unknown event names in `hooks.json`.
+pub const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+];
+
 /// Idempotently inject slopctl hook entries into a Claude settings.json value.
 /// Adds our hook command for each event only if not already present.
 pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
+    inject_hook_events(settings, slopctl, HOOK_EVENTS);
+}
+
+/// Idempotently inject the hook set supported by `backend`.
+pub fn inject_backend_hooks(
+    settings: &mut serde_json::Value,
+    slopctl: &str,
+    backend: Backend,
+) {
+    inject_hook_events(settings, slopctl, backend.hook_events());
+}
+
+fn inject_hook_events(
+    settings: &mut serde_json::Value,
+    slopctl: &str,
+    hook_events: &[&str],
+) {
     let hooks = settings
         .as_object_mut()
-        .expect("settings.json must be an object")
+        .expect("hook configuration must be an object")
         .entry("hooks")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
         .as_object_mut()
         .expect("hooks must be an object");
 
-    for &event in HOOK_EVENTS {
+    for &event in hook_events {
         let command = format!("{} hook {}", slopctl, event);
         let our_hook = serde_json::json!({
             "type": "command",
@@ -364,11 +394,20 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
 /// Remove all slopctl hook entries from a Claude settings.json value.
 /// Entries from other tools are preserved.
 pub fn remove_hooks(settings: &mut serde_json::Value) {
+    remove_hook_events(settings, HOOK_EVENTS);
+}
+
+/// Remove slopctl hooks supported by `backend`, preserving foreign hooks.
+pub fn remove_backend_hooks(settings: &mut serde_json::Value, backend: Backend) {
+    remove_hook_events(settings, backend.hook_events());
+}
+
+fn remove_hook_events(settings: &mut serde_json::Value, hook_events: &[&str]) {
     let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return;
     };
 
-    for &event in HOOK_EVENTS {
+    for &event in hook_events {
         let Some(entries) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) else {
             continue;
         };
@@ -399,6 +438,21 @@ pub fn remove_hooks(settings: &mut serde_json::Value) {
 pub fn remove_hooks_from_file(
     settings_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    remove_hook_events_from_file(settings_path, HOOK_EVENTS)
+}
+
+/// Read, remove slopctl hooks for `backend`, and atomically write the file.
+pub fn remove_backend_hooks_from_file(
+    settings_path: &PathBuf,
+    backend: Backend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    remove_hook_events_from_file(settings_path, backend.hook_events())
+}
+
+fn remove_hook_events_from_file(
+    settings_path: &PathBuf,
+    hook_events: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     // If the settings file doesn't exist, there's nothing to remove.
     if !settings_path.exists() {
         return Ok(());
@@ -420,7 +474,7 @@ pub fn remove_hooks_from_file(
         Err(e) => return Err(e.into()),
     };
 
-    remove_hooks(&mut settings);
+    remove_hook_events(&mut settings, hook_events);
 
     let mut file = atomic_write_file::AtomicWriteFile::options().open(settings_path)?;
     use std::io::Write;
@@ -1341,7 +1395,28 @@ mod tests {
         assert_eq!(resolved.backend, Backend::Codex);
         assert_eq!(resolved.executable.program(), "codex");
         assert_eq!(resolved.backend.config_dir_env_var(), "CODEX_HOME");
-        assert!(!resolved.backend.uses_injected_hooks());
+        assert!(resolved.backend.uses_injected_hooks());
+        assert_eq!(
+            cfg.resolved_hook_path(&resolved),
+            PathBuf::from("/tmp/codex-work/hooks.json")
+        );
+    }
+
+    #[test]
+    fn codex_hook_injection_uses_only_supported_events() {
+        let mut hooks = serde_json::json!({});
+        inject_backend_hooks(&mut hooks, "slopctl", Backend::Codex);
+        for event in CODEX_HOOK_EVENTS {
+            assert_eq!(
+                hooks["hooks"][event].as_array().map(Vec::len),
+                Some(1),
+                "missing Codex hook {event}"
+            );
+        }
+        assert!(
+            hooks["hooks"].get("Notification").is_none(),
+            "Claude-only hook names must not be written to Codex hooks.json"
+        );
     }
 
     // --- slopctl interactive-run config ---
@@ -1483,6 +1558,23 @@ pub fn inject_hooks_into_file(
     settings_path: &PathBuf,
     slopctl: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    inject_hook_events_into_file(settings_path, slopctl, HOOK_EVENTS)
+}
+
+/// Read, inject, and atomically write the hook configuration for `backend`.
+pub fn inject_backend_hooks_into_file(
+    settings_path: &PathBuf,
+    slopctl: &str,
+    backend: Backend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    inject_hook_events_into_file(settings_path, slopctl, backend.hook_events())
+}
+
+fn inject_hook_events_into_file(
+    settings_path: &PathBuf,
+    slopctl: &str,
+    hook_events: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1503,7 +1595,7 @@ pub fn inject_hooks_into_file(
         Err(e) => return Err(e.into()),
     };
 
-    inject_hooks(&mut settings, slopctl);
+    inject_hook_events(&mut settings, slopctl, hook_events);
 
     let mut file = atomic_write_file::AtomicWriteFile::options().open(settings_path)?;
     use std::io::Write;
@@ -1690,7 +1782,7 @@ impl SlopdTmuxConfig {
 /// see [`Backend::resolve`]. Inference recognizes only the canonical binary
 /// names (`claude`, `opencode`); a custom path/wrapper needs an explicit
 /// `backend` and is treated as an executable override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     /// Anthropic's Claude Code CLI (default). Uses `~/.claude`, injects
@@ -1701,8 +1793,8 @@ pub enum Backend {
     /// OpenCode (`opencode`). Runs the TUI with an embedded HTTP server; slopd
     /// drives it over HTTP/SSE — no hooks, no jsonl tailing.
     Opencode,
-    /// OpenAI Codex CLI. The TUI and slopd are clients of the managed local
-    /// app-server over its Unix socket; the pane is bound to a Codex thread.
+    /// OpenAI Codex CLI. Runs as an independent local process; slopd observes it
+    /// through Codex hooks and the session rollout transcript.
     Codex,
 }
 
@@ -1739,10 +1831,18 @@ impl Backend {
         }
     }
 
-    /// Whether slopd injects `slopctl hook` entries into this backend's
-    /// settings file (Claude only; opencode is driven over HTTP instead).
+    /// Whether slopd injects `slopctl hook` entries for this backend.
     pub fn uses_injected_hooks(self) -> bool {
-        matches!(self, Backend::Claude)
+        matches!(self, Backend::Claude | Backend::Codex)
+    }
+
+    /// Hook event names accepted by this backend's configuration file.
+    pub fn hook_events(self) -> &'static [&'static str] {
+        match self {
+            Backend::Claude => HOOK_EVENTS,
+            Backend::Codex => CODEX_HOOK_EVENTS,
+            Backend::Opencode => &[],
+        }
     }
 
     /// Resolve `(explicit backend, explicit executable)` into the backend in
@@ -2123,11 +2223,33 @@ impl SlopdConfig {
             .join("settings.json")
     }
 
+    /// The backend-specific hook configuration file for a resolved account.
+    pub fn resolved_hook_path(&self, resolved: &ResolvedAccount) -> PathBuf {
+        match resolved.backend {
+            Backend::Claude => self.resolved_settings_path(resolved),
+            Backend::Codex => resolved
+                .config_dir
+                .clone()
+                .unwrap_or_else(|| home_dir().join(".codex"))
+                .join("hooks.json"),
+            Backend::Opencode => unreachable!("opencode does not use injected hooks"),
+        }
+    }
+
     /// Every distinct `settings.json` slopd may manage hooks in: the default
     /// account plus every configured account, deduplicated. Used at startup
     /// recovery, shutdown, and `uninject-hooks`, where the account of each
     /// (possibly recovered) pane is not individually known.
     pub fn all_settings_paths(&self) -> Vec<PathBuf> {
+        self.all_hook_paths()
+            .into_iter()
+            .filter_map(|(path, backend)| (backend == Backend::Claude).then_some(path))
+            .collect()
+    }
+
+    /// Every distinct backend hook file slopd may manage, paired with the
+    /// backend whose event vocabulary applies to that file.
+    pub fn all_hook_paths(&self) -> Vec<(PathBuf, Backend)> {
         let mut names: std::collections::BTreeSet<&str> =
             self.accounts.keys().map(String::as_str).collect();
         names.insert(DEFAULT_ACCOUNT);
@@ -2138,14 +2260,12 @@ impl SlopdConfig {
             // resolve_account only errors for unknown named accounts; every name
             // here comes from the config (or is DEFAULT_ACCOUNT), so this holds.
             if let Ok(resolved) = self.resolve_account(Some(name)) {
-                // Hooks are a Claude-only mechanism; opencode (and any future
-                // non-Claude backend) has no settings.json to inject into.
                 if !resolved.backend.uses_injected_hooks() {
                     continue;
                 }
-                let path = self.resolved_settings_path(&resolved);
-                if seen.insert(path.clone()) {
-                    out.push(path);
+                let path = self.resolved_hook_path(&resolved);
+                if seen.insert((path.clone(), resolved.backend)) {
+                    out.push((path, resolved.backend));
                 }
             }
         }

@@ -11,8 +11,6 @@ mod opencode;
 mod backend;
 use backend::*;
 
-static CODEX_FRESH_RUN_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-
 #[derive(Parser)]
 #[command(name = "slopd", about = "Agent session manager daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
 struct Cli {
@@ -42,7 +40,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Remove slopctl hook entries from Claude's settings.json.
+    /// Remove slopctl hook entries from Claude and Codex hook files.
     UninjectHooks,
 }
 
@@ -86,10 +84,14 @@ async fn tmux_send_keys(config: &libslop::SlopdConfig, pane_id: &str, keys: &str
 enum PaneStateEvent<'a> {
     /// slopd startup recovery or new pane creation.
     Init,
-    /// A hook fired by Claude (received via the hook socket).
+    /// A hook fired by a hook-driven agent (received via the hook socket).
     Hook { event: &'a str, notification_type: Option<&'a str> },
     /// A transcript record was observed.
-    TranscriptRecord { record_type: &'a str, record: &'a serde_json::Value },
+    TranscriptRecord {
+        backend: libslop::Backend,
+        record_type: &'a str,
+        record: &'a serde_json::Value,
+    },
 }
 
 /// Pure reducer: given the current state and an event, returns the new state
@@ -103,7 +105,30 @@ fn reduce_pane_state(
 
         PaneStateEvent::Hook { event, notification_type } => reduce_hook_event(event, *notification_type),
 
-        PaneStateEvent::TranscriptRecord { record_type, record } => {
+        PaneStateEvent::TranscriptRecord {
+            backend: libslop::Backend::Codex,
+            record,
+            ..
+        } => {
+            let next = codex::transcript_state(record);
+            if matches!(
+                current,
+                libslop::PaneDetailedState::AwaitingInputPermission
+                    | libslop::PaneDetailedState::AwaitingInputElicitation
+            ) && matches!(
+                next,
+                Some(
+                    libslop::PaneDetailedState::BusyProcessing
+                        | libslop::PaneDetailedState::BusyToolUse
+                )
+            ) {
+                None
+            } else {
+                next
+            }
+        }
+
+        PaneStateEvent::TranscriptRecord { record_type, record, .. } => {
             match *record_type {
                 // `progress` records with `data.type: "hook_progress"` carry the
                 // hook event name in `data.hookEvent`. Replay them like hooks.
@@ -366,6 +391,8 @@ struct PaneState {
     type_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
+    /// Notified whenever SessionStart binds or re-binds a session id.
+    session_bound: Notify,
     /// Cached detailed state, kept in sync by set_pane_detailed_state.
     detailed_state: std::sync::Mutex<libslop::PaneDetailedState>,
     /// Cancels the transcript tail task when the pane is killed or the tailer is restarted.
@@ -399,6 +426,7 @@ impl PaneState {
         Self {
             type_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
+            session_bound: Notify::new(),
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
             transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             transcript_path: std::sync::Mutex::new(None),
@@ -415,6 +443,7 @@ impl PaneState {
     /// fork pin) so a later death record names the right session.
     fn note_session_id(&self, session_id: &str) {
         self.identity.lock().unwrap().session_id = Some(session_id.to_string());
+        self.session_bound.notify_waiters();
     }
 
     fn runtime(&self) -> PaneRuntime {
@@ -453,13 +482,6 @@ impl PaneState {
         }
     }
 
-    fn codex(&self) -> Option<CodexState> {
-        match self.runtime() {
-            PaneRuntime::Codex(runtime) => Some(runtime),
-            _ => None,
-        }
-    }
-
     /// Stop every background task attached to this pane. Called from every
     /// teardown path (explicit kill + both reconcile-driven reaps) so a pane that
     /// exits keeps nothing running behind it. For opencode panes this is what
@@ -468,149 +490,6 @@ impl PaneState {
     fn cancel_drivers(&self) {
         self.transcript_cancel.lock().unwrap().cancel();
         self.runtime().cancel();
-    }
-}
-
-async fn run_codex_driver(
-    client: codex::CodexClient,
-    thread_id: String,
-    thread_overrides: codex::ThreadOverrides,
-    pane_id: String,
-    config: Arc<libslop::SlopdConfig>,
-    panes: PaneMap,
-    event_tx: EventTx,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    let mut events = client.subscribe();
-    // A brand-new TUI thread has no durable rollout until its first turn, so a
-    // second client cannot resume it immediately. Treat the visible composer as
-    // ready and retry attachment when the first turn makes the rollout durable.
-    let initial_resume = client.resume_thread(&thread_id, &thread_overrides).await;
-    let mut attached = match &initial_resume {
-        Ok(_) => true,
-        Err(e) => {
-            debug!("Codex thread {} is not resumable yet for pane {}: {}", thread_id, pane_id, e);
-            false
-        }
-    };
-    let state = panes.get_or_insert(&pane_id);
-    let runtime = state.codex().expect("Codex driver requires a Codex runtime");
-    let (initial_active, initial_turn) = initial_resume.as_ref().ok().map(|value| codex::thread_runtime(value))
-        .unwrap_or((false, None));
-    *runtime.active_turn.lock().unwrap() = initial_turn;
-    let initial_state = if initial_active { libslop::PaneDetailedState::BusyProcessing }
-        else { libslop::PaneDetailedState::Ready };
-    set_pane_detailed_state(&config, &pane_id, &initial_state,
-        None, &event_tx, &panes).await;
-    let mut poll = tokio::time::interval(std::time::Duration::from_secs(2));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        let value = tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = poll.tick() => {
-                if let Ok(result) = client.read_thread(&thread_id).await {
-                    let (active, turn) = codex::thread_runtime(&result);
-                    *runtime.active_turn.lock().unwrap() = turn;
-                    let next = if active { libslop::PaneDetailedState::BusyProcessing }
-                        else { libslop::PaneDetailedState::Ready };
-                    let previous = state.detailed_state.lock().unwrap().clone();
-                    set_pane_detailed_state(&config, &pane_id, &next, Some(&previous), &event_tx, &panes).await;
-                }
-                continue;
-            }
-            event = events.recv() => match event {
-                Ok(value) => value,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            }
-        };
-        let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if method == "slopd/codexConnection" {
-            let connected = value.pointer("/params/status").and_then(|v| v.as_str()) == Some("connected");
-            if connected {
-                attached = client
-                    .resume_thread(&thread_id, &thread_overrides)
-                    .await
-                    .is_ok();
-                set_pane_detailed_state(&config, &pane_id, &libslop::PaneDetailedState::Ready,
-                    None, &event_tx, &panes).await;
-            } else {
-                attached = false;
-                // Server-request IDs are scoped to the lost connection and can
-                // no longer be answered after reconnect.
-                runtime.pending_requests.lock().unwrap().clear();
-                set_pane_detailed_state(&config, &pane_id, &libslop::PaneDetailedState::BootingUp,
-                    None, &event_tx, &panes).await;
-            }
-            continue;
-        }
-        let event_thread = value.pointer("/params/threadId").and_then(|v| v.as_str());
-        if event_thread.is_some() && event_thread != Some(thread_id.as_str()) { continue; }
-        if !attached && method == "thread/status/changed"
-            && value.pointer("/params/status/type").and_then(|v| v.as_str()) == Some("active") {
-            attached = client
-                .resume_thread(&thread_id, &thread_overrides)
-                .await
-                .is_ok();
-        }
-        if value.get("id").is_some() && value.get("method").is_some() {
-            let awaiting = if codex::normalized_event_type(&method) == "Elicitation" {
-                libslop::PaneDetailedState::AwaitingInputElicitation
-            } else {
-                libslop::PaneDetailedState::AwaitingInputPermission
-            };
-            runtime.pending_requests.lock().unwrap().insert(value["id"].to_string(), awaiting);
-        }
-        let previous = state.detailed_state.lock().unwrap().clone();
-        let next = match method.as_str() {
-            "turn/started" => {
-                if let Some(id) = value.pointer("/params/turn/id").and_then(|v| v.as_str()) {
-                    *runtime.active_turn.lock().unwrap() = Some(id.to_string());
-                }
-                state.prompt_submitted.notify_waiters();
-                Some(libslop::PaneDetailedState::BusyProcessing)
-            }
-            "turn/completed" => {
-                *runtime.active_turn.lock().unwrap() = None;
-                runtime.pending_requests.lock().unwrap().clear();
-                Some(libslop::PaneDetailedState::Ready)
-            }
-            "thread/status/changed" if value.pointer("/params/status/type").and_then(|v| v.as_str()) == Some("idle") => {
-                Some(libslop::PaneDetailedState::Ready)
-            }
-            "thread/status/changed" if value.pointer("/params/status/type").and_then(|v| v.as_str()) == Some("active") => {
-                Some(libslop::PaneDetailedState::BusyProcessing)
-            }
-            "item/started" => match value.pointer("/params/item/type").and_then(|v| v.as_str()) {
-                Some("commandExecution" | "mcpToolCall" | "webSearch") => Some(libslop::PaneDetailedState::BusyToolUse),
-                Some("collabAgentToolCall") => Some(libslop::PaneDetailedState::BusySubagent),
-                _ => None,
-            },
-            "item/completed" => Some(libslop::PaneDetailedState::BusyProcessing),
-            m if codex::normalized_event_type(m) == "PermissionRequest" => Some(libslop::PaneDetailedState::AwaitingInputPermission),
-            m if codex::normalized_event_type(m) == "Elicitation" => Some(libslop::PaneDetailedState::AwaitingInputElicitation),
-            _ => None,
-        };
-        let next = runtime.pending_requests.lock().unwrap().values().next().cloned().or(next);
-        if let Some(next) = next {
-            set_pane_detailed_state(&config, &pane_id, &next, Some(&previous), &event_tx, &panes).await;
-        }
-        if method == "item/completed" {
-            let item_type = value.pointer("/params/item/type").and_then(|v| v.as_str()).unwrap_or("item");
-            let _ = event_tx.send(libslop::Record {
-                source: "transcript".to_string(), event_type: item_type.to_string(),
-                pane_id: Some(pane_id.clone()), payload: value.pointer("/params/item").cloned().unwrap_or(value.clone()),
-                cursor: None,
-            });
-        }
-        let mut payload = value;
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("codex_method".to_string(), serde_json::Value::String(method.clone()));
-        }
-        let _ = event_tx.send(libslop::Record {
-            source: "hook".to_string(), event_type: codex::normalized_event_type(&method).to_string(),
-            pane_id: Some(pane_id.clone()), payload, cursor: None,
-        });
     }
 }
 
@@ -1131,6 +1010,7 @@ async fn tail_transcript(
                 }
                 match serde_json::from_str::<serde_json::Value>(trimmed) {
                     Ok(record) => {
+                        let backend = pane_state.runtime().backend();
                         let record_type = record
                             .get("type")
                             .and_then(|v| v.as_str())
@@ -1140,7 +1020,8 @@ async fn tail_transcript(
                         // A queue-operation enqueue means a prompt was accepted
                         // while Claude was busy. Notify pending senders so
                         // slopctl send unblocks immediately.
-                        if record_type == "queue-operation"
+                        if backend == libslop::Backend::Claude
+                            && record_type == "queue-operation"
                             && record.get("operation").and_then(|v| v.as_str()) == Some("enqueue") {
                                 debug!("transcript enqueue: notifying pending senders for pane {}", pane_id);
                                 pane_state.prompt_submitted.notify_waiters();
@@ -1155,7 +1036,8 @@ async fn tail_transcript(
                         //     content starting with `<command-name>/` (e.g. /rename)
                         // Either is a prompt-accepted signal — notify pending
                         // senders so `slopctl send` confirms without timing out.
-                        let is_slash_command_record = match record_type.as_str() {
+                        let is_slash_command_record = backend == libslop::Backend::Claude
+                            && match record_type.as_str() {
                             "user" => record
                                 .get("message")
                                 .and_then(|m| m.get("content"))
@@ -1170,7 +1052,12 @@ async fn tail_transcript(
                                     .and_then(|c| c.as_str())
                                     .is_some_and(|content| content.starts_with("<command-name>/")),
                             _ => false,
-                        };
+                            };
+                        if backend == libslop::Backend::Codex
+                            && codex::prompt_submitted(&record)
+                        {
+                            pane_state.prompt_submitted.notify_waiters();
+                        }
                         if is_slash_command_record {
                             debug!("transcript slash-command: notifying pending senders for pane {}", pane_id);
                             pane_state.prompt_submitted.notify_waiters();
@@ -1179,7 +1066,11 @@ async fn tail_transcript(
                         // Check if this transcript record triggers a state transition.
                         {
                             let current = pane_state.detailed_state.lock().unwrap().clone();
-                            let event = PaneStateEvent::TranscriptRecord { record_type: &record_type, record: &record };
+                            let event = PaneStateEvent::TranscriptRecord {
+                                backend,
+                                record_type: &record_type,
+                                record: &record,
+                            };
                             if let Some(new_state) = reduce_pane_state(&current, &event) {
                                 debug!("transcript {} event while pane {} in {:?} — transitioning to {:?}", record_type, pane_id, current, new_state);
                                 set_pane_detailed_state(
@@ -1189,13 +1080,17 @@ async fn tail_transcript(
                             }
                         }
 
-                        let _ = event_tx.send(libslop::Record {
-                            source: "transcript".to_string(),
-                            event_type: record_type,
-                            pane_id: Some(pane_id.clone()),
-                            payload: record,
-                            cursor: Some(line_start),
-                        });
+                        if let Some((event_type, payload)) =
+                            decode_transcript_record(backend, &record)
+                        {
+                            let _ = event_tx.send(libslop::Record {
+                                source: "transcript".to_string(),
+                                event_type,
+                                pane_id: Some(pane_id.clone()),
+                                payload,
+                                cursor: Some(line_start),
+                            });
+                        }
                     }
                     Err(e) => {
                         debug!("failed to parse transcript line: {}", e);
@@ -1213,7 +1108,7 @@ async fn tail_transcript(
 /// Read the last `n` JSON records from a transcript JSONL file.
 /// Returns `(records, file_len)` where each record is `(byte_offset, parsed_json)`,
 /// ordered oldest-first, and `file_len` is the file size at read time.
-async fn read_transcript_tail(
+async fn read_raw_transcript_tail(
     path: &std::path::Path,
     n: u64,
 ) -> std::io::Result<(Vec<(u64, serde_json::Value)>, u64)> {
@@ -1221,6 +1116,9 @@ async fn read_transcript_tail(
 
     let file = tokio::fs::File::open(path).await?;
     let file_len = file.metadata().await?.len();
+    if n == 0 {
+        return Ok((Vec::new(), file_len));
+    }
     let mut reader = tokio::io::BufReader::new(file);
     let mut line = String::new();
     let mut byte_pos: u64 = 0;
@@ -1254,17 +1152,71 @@ async fn read_transcript_tail(
     Ok((window.into(), file_len))
 }
 
-/// Read up to `limit` JSON records from a transcript JSONL file that start
+fn decode_transcript_record(
+    backend: libslop::Backend,
+    record: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    match backend {
+        libslop::Backend::Codex => codex::transcript_record(record),
+        libslop::Backend::Claude => Some((
+            record
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            record.clone(),
+        )),
+        libslop::Backend::Opencode => None,
+    }
+}
+
+async fn read_transcript_tail(
+    path: &std::path::Path,
+    n: u64,
+    backend: libslop::Backend,
+) -> std::io::Result<(Vec<(u64, String, serde_json::Value)>, u64)> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    let file_len = file.metadata().await?.len();
+    if n == 0 {
+        return Ok((Vec::new(), file_len));
+    }
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut byte_pos = 0_u64;
+    let mut window = std::collections::VecDeque::with_capacity(n as usize + 1);
+    while reader.read_line(&mut line).await? != 0 {
+        let line_start = byte_pos;
+        byte_pos += line.len() as u64;
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line.trim())
+            && let Some((event_type, payload)) = decode_transcript_record(backend, &raw)
+        {
+            if window.len() == n as usize {
+                window.pop_front();
+            }
+            window.push_back((line_start, event_type, payload));
+        }
+        line.clear();
+    }
+    Ok((window.into(), file_len))
+}
+
+/// Read up to `limit` public transcript records that start
 /// strictly before `before_offset` bytes. Returns `(records, at_beginning)`
 /// where records are ordered oldest-first.
 async fn read_transcript_before(
     path: &std::path::Path,
     before_offset: u64,
     limit: u64,
-) -> std::io::Result<(Vec<(u64, serde_json::Value)>, bool)> {
+    backend: libslop::Backend,
+) -> std::io::Result<(Vec<(u64, String, serde_json::Value)>, bool)> {
     use tokio::io::AsyncBufReadExt;
 
     let file = tokio::fs::File::open(path).await?;
+    if limit == 0 {
+        return Ok((Vec::new(), before_offset == 0));
+    }
     let mut reader = tokio::io::BufReader::new(file);
     let mut line = String::new();
     let mut byte_pos: u64 = 0;
@@ -1288,17 +1240,20 @@ async fn read_transcript_before(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && let Some((event_type, payload)) =
+                        decode_transcript_record(backend, &record)
+                {
                     if window.len() == limit {
                         window.pop_front();
                     }
-                    window.push_back((line_start, record));
+                    window.push_back((line_start, event_type, payload));
                 }
             }
         }
     }
 
-    let at_beginning = window.front().is_none_or(|(offset, _)| *offset == 0);
+    let at_beginning = window.front().is_none_or(|(offset, _, _)| *offset == 0);
     Ok((window.into(), at_beginning))
 }
 
@@ -1428,15 +1383,15 @@ async fn read_pane_opencode_port(config: &libslop::SlopdConfig, pane_id: &str) -
 }
 
 /// Scan the slopd session for managed panes and return the distinct
-/// `settings.json` paths whose hooks must be re-injected — one per account a
-/// recovered pane belongs to (the unnamed default included).
+/// backend hook files whose hooks must be re-injected — one per account/backend
+/// a recovered pane belongs to (the unnamed default included).
 ///
 /// Only panes that have the `@slopd_managed` pane option set are considered managed
 /// (i.e. were registered via `slopctl run`). For each recovered pane, replays the
 /// last N transcript records through the state reducer to recover the real state
 /// instead of leaving it stuck at BootingUp.
-async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) -> std::collections::HashSet<std::path::PathBuf> {
-    let mut settings_paths = std::collections::HashSet::new();
+async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &ManagedPanes, event_tx: &EventTx, panes: &PaneMap) -> std::collections::HashSet<(std::path::PathBuf, libslop::Backend)> {
+    let mut hook_paths = std::collections::HashSet::new();
     let session = config.tmux.session();
     // Enumerate the session's pane ids, then read each pane's options with
     // `show-options -p` (pane scope, *no* inheritance).
@@ -1451,9 +1406,9 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         .args(["list-panes", "-s", "-t", &session, "-F", "#{pane_id}"])
         .output()
         .await;
-    let Ok(out) = output else { return settings_paths };
+    let Ok(out) = output else { return hook_paths };
     if !out.status.success() {
-        return settings_paths;
+        return hook_paths;
     }
     for pane_id in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|s| !s.is_empty()) {
         let opts = match tmux(config).args(["show-options", "-t", pane_id, "-p"]).output().await {
@@ -1469,25 +1424,29 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         // An unresolvable account (removed from config, or a misconfigured
         // default_account) falls back to the reserved default account, which
         // always resolves — recovery must never crash startup.
-        let resolved = config
+        let mut resolved = config
             .resolve_account(opts.account.as_deref())
             .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
             .expect("the reserved default account always resolves");
         let recovered_backend = opts.backend.unwrap_or(libslop::Backend::Claude);
+        resolved.backend = recovered_backend;
         panes.get_or_insert(pane_id).mark_unbound_backend(recovered_backend);
-        // Hooks are a Claude-only mechanism; a non-Claude backend has no
-        // settings.json to inject into (and nothing to re-inject on recovery).
-        if resolved.backend.uses_injected_hooks() {
-            settings_paths.insert(config.resolved_settings_path(&resolved));
+        if recovered_backend.uses_injected_hooks() {
+            hook_paths.insert((
+                config.resolved_hook_path(&resolved),
+                recovered_backend,
+            ));
         }
 
         // Replay the last N transcript records to recover the real state.
         let transcript_path = opts.transcript_path.clone();
         let recovered_state = match transcript_path.as_deref() {
-            Some(path) => recover_state_from_transcript(path).await,
+            Some(path) => recover_state_from_transcript(path, recovered_backend).await,
             None => None,
         };
-        let initial_state = recovered_state.unwrap_or(libslop::PaneDetailedState::BootingUp);
+        let initial_state = recovered_state
+            .or_else(|| opts.detailed_state.clone())
+            .unwrap_or(libslop::PaneDetailedState::BootingUp);
         set_pane_detailed_state(config, pane_id, &initial_state, None, event_tx, panes).await;
 
         // Rebuild the identity snapshot from the pane's tmux options so a pane
@@ -1527,21 +1486,22 @@ async fn load_managed_panes(config: &Arc<libslop::SlopdConfig>, managed: &Manage
         }
 
         if let Err(error) = backend_lifecycle(recovered_backend).recover(RecoverContext {
-            pane_id, options: &opts, resolved: &resolved, config, panes, event_tx,
+            pane_id, options: &opts, config, panes, event_tx,
         }).await {
             warn!("failed to recover {} pane {}: {}", recovered_backend.canonical_executable(), pane_id, error);
         }
     }
-    settings_paths
+    hook_paths
 }
 
 /// Replay the last N records from a transcript file through the state reducer
 /// to recover the pane's actual state after a slopd restart.
 async fn recover_state_from_transcript(
     transcript_path: &str,
+    backend: libslop::Backend,
 ) -> Option<libslop::PaneDetailedState> {
     let path = std::path::Path::new(transcript_path);
-    let (records, _) = read_transcript_tail(path, 100).await.ok()?;
+    let (records, _) = read_raw_transcript_tail(path, 100).await.ok()?;
     if records.is_empty() {
         return None;
     }
@@ -1550,7 +1510,11 @@ async fn recover_state_from_transcript(
     let mut state = libslop::PaneDetailedState::BootingUp;
     for (_offset, record) in &records {
         let record_type = record.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let event = PaneStateEvent::TranscriptRecord { record_type, record };
+        let event = PaneStateEvent::TranscriptRecord {
+            backend,
+            record_type,
+            record,
+        };
         if let Some(new_state) = reduce_pane_state(&state, &event) {
             state = new_state;
         }
@@ -2281,12 +2245,12 @@ async fn main() {
         // Clean every dir slopd might have injected into: the default plus all
         // configured accounts.
         let mut failed = false;
-        for settings_path in config.all_settings_paths() {
-            if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
-                error!("failed to remove hooks from {}: {}", settings_path.display(), e);
+        for (hook_path, backend) in config.all_hook_paths() {
+            if let Err(e) = libslop::remove_backend_hooks_from_file(&hook_path, backend) {
+                error!("failed to remove hooks from {}: {}", hook_path.display(), e);
                 failed = true;
             } else {
-                info!("removed slopctl hooks from {}", settings_path.display());
+                info!("removed slopctl hooks from {}", hook_path.display());
             }
         }
         if failed {
@@ -2417,15 +2381,19 @@ async fn main() {
     // before a slopd restart are still recognized. This must happen before
     // binding the socket so that clients cannot create panes in the slopd
     // session while the scan is in progress.
-    let recovered_settings_paths = load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
+    let recovered_hook_paths = load_managed_panes(&config, &managed_panes, &event_tx, &panes).await;
 
     // Re-inject hooks if there are recovered panes — the previous slopd instance
     // removed them on exit, but the Claude sessions are still running in tmux.
     // Each recovered pane reports its account, so we re-inject only the dirs that
     // are actually in use rather than every configured account.
-    for settings_path in &recovered_settings_paths {
-        if let Err(e) = libslop::inject_hooks_into_file(settings_path, &config.hook_slopctl()) {
-            warn!("failed to re-inject hooks into {}: {}", settings_path.display(), e);
+    for (hook_path, backend) in &recovered_hook_paths {
+        if let Err(e) = libslop::inject_backend_hooks_into_file(
+            hook_path,
+            &config.hook_slopctl(),
+            *backend,
+        ) {
+            warn!("failed to re-inject hooks into {}: {}", hook_path.display(), e);
         }
     }
 
@@ -2589,11 +2557,11 @@ async fn main() {
     // changed at reload time hooks may linger in the previous path — that's a
     // documented limitation of mid-run config reloads.
     let shutdown_config = config_rx.borrow().clone();
-    for settings_path in shutdown_config.all_settings_paths() {
-        if let Err(e) = libslop::remove_hooks_from_file(&settings_path) {
-            warn!("failed to remove hooks from {} on shutdown: {}", settings_path.display(), e);
+    for (hook_path, backend) in shutdown_config.all_hook_paths() {
+        if let Err(e) = libslop::remove_backend_hooks_from_file(&hook_path, backend) {
+            warn!("failed to remove hooks from {} on shutdown: {}", hook_path.display(), e);
         } else {
-            info!("removed slopctl hooks from {}", settings_path.display());
+            info!("removed slopctl hooks from {}", hook_path.display());
         }
     }
 }
@@ -2736,14 +2704,18 @@ async fn handle_connection(
                 let rx = event_tx.subscribe();
 
                 // Step 2: Read last N records from the transcript file on disk.
-                let transcript_path = panes
-                    .get(&pane_id)
+                let pane_state = panes.get(&pane_id);
+                let transcript_path = pane_state
+                    .as_ref()
                     .and_then(|state| state.transcript_path.lock().unwrap().clone());
+                let backend = pane_state
+                    .map(|state| state.runtime().backend())
+                    .unwrap_or(libslop::Backend::Claude);
 
                 let (records, file_end_offset) = match transcript_path {
                     Some(ref path) => {
                         let path = std::path::PathBuf::from(path);
-                        match read_transcript_tail(&path, last_n).await {
+                        match read_transcript_tail(&path, last_n, backend).await {
                             Ok((records, file_len)) => (records, file_len),
                             Err(e) => {
                                 warn!("failed to read transcript for replay: {}", e);
@@ -2760,16 +2732,11 @@ async fn handle_connection(
                 }
 
                 // Step 4: Send replayed records.
-                for (cursor, payload) in &records {
-                    let record_type = payload
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                for (cursor, event_type, payload) in &records {
                     let record = libslop::Record {
                         cursor: Some(*cursor),
                         source: "transcript".to_string(),
-                        event_type: record_type,
+                        event_type: event_type.clone(),
                         pane_id: Some(pane_id.clone()),
                         payload: payload.clone(),
                     };
@@ -2843,8 +2810,6 @@ struct ParsedPaneOptions {
     opencode_port: Option<u16>,
     /// For opencode panes: the per-pane auth token (@slopd_opencode_token).
     opencode_token: Option<String>,
-    /// For Codex panes: managed app-server control socket.
-    codex_socket: Option<String>,
 }
 
 impl ParsedPaneOptions {
@@ -2866,7 +2831,6 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
     let mut backend = None;
     let mut opencode_port = None;
     let mut opencode_token = None;
-    let mut codex_socket = None;
     for opt_line in stdout.lines() {
         let mut words = opt_line.splitn(2, ' ');
         let key = words.next().unwrap_or("").trim();
@@ -2903,13 +2867,11 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
             opencode_port = val.parse::<u16>().ok();
         } else if key == libslop::TmuxOption::SlopdOpencodeToken.as_str() {
             opencode_token = if val.is_empty() { None } else { Some(val.to_string()) };
-        } else if key == libslop::TmuxOption::SlopdCodexSocket.as_str() {
-            codex_socket = if val.is_empty() { None } else { Some(val.to_string()) };
         } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
             tags.push(tag.to_string());
         }
     }
-    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at, account, transcript_path, backend, opencode_port, opencode_token, codex_socket }
+    ParsedPaneOptions { slopd_managed, session_id, ancestor_panes, tags, detailed_state, created_at, account, transcript_path, backend, opencode_port, opencode_token }
 }
 
 /// Encode an ancestor list as a comma-separated string for tmux storage.
@@ -3305,13 +3267,8 @@ fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
     libslop::executable_exists(program, &path, &cwd)
 }
 
-/// The launch cwd recorded in a Claude transcript: the first record's `cwd`,
-/// i.e. the directory Claude was *started* in, which determines the project dir
-/// the session is stored under (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`).
-/// Restore must `claude --resume` from this dir, not the pane's drifted
-/// `pane_current_path`, or claude searches the wrong project and can't find the
-/// session (it then starts a fresh one and the pane dies). `None` if the file
-/// is unreadable or has no cwd in its first records.
+/// The launch cwd recorded in an agent transcript. Claude stores it at top
+/// level; Codex stores it in the `session_meta` payload.
 fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(transcript_path).ok()?;
@@ -3320,7 +3277,10 @@ fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
     for line in std::io::BufReader::new(file).lines().take(50) {
         let Ok(line) = line else { break };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-        if let Some(cwd) = value.get("cwd").and_then(|c| c.as_str())
+        if let Some(cwd) = value
+            .get("cwd")
+            .or_else(|| value.pointer("/payload/cwd"))
+            .and_then(|c| c.as_str())
             && !cwd.is_empty()
         {
             return Some(cwd.to_string());
@@ -3488,10 +3448,26 @@ async fn restore_panes(
             let _ = tmux_set_pane_option(config, &new_id, &opt, "1").await;
         }
 
-        // Hook-driven Claude panes start booting here. OpenCode and Codex
-        // drivers own their initial state and may already have advanced it.
+        // Hook-driven Claude and Codex panes start booting here. OpenCode's
+        // HTTP driver owns its initial state and may already have advanced it.
         if !resolved.backend.driver_owns_initial_state() {
-            set_pane_detailed_state(config, &new_id, &libslop::PaneDetailedState::BootingUp, None, event_tx, panes).await;
+            let current = panes
+                .get_or_insert(&new_id)
+                .detailed_state
+                .lock()
+                .unwrap()
+                .clone();
+            if current == libslop::PaneDetailedState::BootingUp {
+                set_pane_detailed_state(
+                    config,
+                    &new_id,
+                    &libslop::PaneDetailedState::BootingUp,
+                    None,
+                    event_tx,
+                    panes,
+                )
+                .await;
+            }
         }
 
         old_to_new.insert(old_id.clone(), new_id.clone());
@@ -3679,14 +3655,21 @@ async fn handle_request(
                 // fork's own file in the same directory — the tailer waits for it to
                 // appear. Non-fork panes, and hooks that already name the fork file,
                 // pass through unchanged.
-                let corrected = state.pinned_session_id.lock().unwrap().clone().and_then(|fork_id| {
-                    let p = std::path::Path::new(raw_transcript_path);
-                    if p.file_stem().and_then(|s| s.to_str()) == Some(fork_id.as_str()) {
-                        None
-                    } else {
-                        p.parent().map(|dir| dir.join(format!("{fork_id}.jsonl")).to_string_lossy().into_owned())
-                    }
-                });
+                let corrected = (state.runtime().backend() == libslop::Backend::Claude)
+                    .then(|| state.pinned_session_id.lock().unwrap().clone())
+                    .flatten()
+                    .and_then(|fork_id| {
+                        let p = std::path::Path::new(raw_transcript_path);
+                        if p.file_stem().and_then(|s| s.to_str()) == Some(fork_id.as_str()) {
+                            None
+                        } else {
+                            p.parent().map(|dir| {
+                                dir.join(format!("{fork_id}.jsonl"))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                        }
+                    });
                 let transcript_path: &str = corrected.as_deref().unwrap_or(raw_transcript_path);
                 let already_tailing = state.transcript_path.lock().unwrap().as_deref() == Some(transcript_path);
                 if !already_tailing {
@@ -3716,19 +3699,30 @@ async fn handle_request(
 
             // Side effects for specific hooks (not state-related).
             if event == "SessionStart" {
-                panes.get_or_insert(pane).set_runtime(PaneRuntime::Claude(ClaudeState));
+                let pane_state = panes.get_or_insert(pane);
+                match pane_state.runtime().backend() {
+                    libslop::Backend::Claude => {
+                        pane_state.set_runtime(PaneRuntime::Claude(ClaudeState))
+                    }
+                    libslop::Backend::Codex => {
+                        pane_state.set_runtime(PaneRuntime::Codex(CodexState))
+                    }
+                    libslop::Backend::Opencode => {}
+                }
                 // A forked Claude pane pins the (minted) fork session id: real
                 // Claude reports the *resumed source* id in this hook, not the
                 // fork's, so trusting the payload would mis-bind the pane to the
                 // source session. The pin wins when present; otherwise use the
                 // payload id (the normal fresh/resume path).
-                let pinned = panes.get_or_insert(pane).pinned_session_id.lock().unwrap().clone();
+                let pinned = (pane_state.runtime().backend() == libslop::Backend::Claude)
+                    .then(|| pane_state.pinned_session_id.lock().unwrap().clone())
+                    .flatten();
                 let session_id = pinned.or_else(|| {
                     payload.get("session_id").and_then(|v| v.as_str()).map(str::to_string)
                 });
                 if let Some(session_id) = session_id {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
-                    panes.get_or_insert(pane).note_session_id(&session_id);
+                    pane_state.note_session_id(&session_id);
                     if let Err(e) = tmux_set_pane_option(config, pane, libslop::TmuxOption::SlopdSessionId.as_str(), &session_id).await {
                         warn!("failed to set @slopd_claude_session_id on pane {}: {}", pane, e);
                     }
@@ -3894,7 +3888,6 @@ async fn handle_request(
                 session_id: &src_session,
                 extra_args,
                 config,
-                panes,
             }).await {
                 Ok(plan) => plan,
                 Err(message) => return libslop::ResponseBody::Error { message },
@@ -3913,10 +3906,10 @@ async fn handle_request(
             // hook (which reports the resumed source id, not the fork's, and would
             // otherwise mis-bind both the session id and the transcript path).
             // opencode tracks its id via the resume path, so it needs no pin.
-            let pin_session_id = if src.backend.fork_session_is_known_before_spawn() {
-                None
-            } else {
+            let pin_session_id = if src.backend == libslop::Backend::Claude {
                 Some(new_session_id.clone())
+            } else {
+                None
             };
             let run = libslop::RequestBody::Run {
                 parent_pane_id: Some(pane_id.clone()),
@@ -3932,7 +3925,40 @@ async fn handle_request(
                 pane_registered, session_lock, config_generation, pending_restore, hook_log,
             )).await {
                 libslop::ResponseBody::Run { pane_id } => {
-                    libslop::ResponseBody::Forked { pane_id, session_id: new_session_id }
+                    if src.backend != libslop::Backend::Codex {
+                        return libslop::ResponseBody::Forked {
+                            pane_id,
+                            session_id: new_session_id,
+                        };
+                    }
+                    let pane_state = panes.get_or_insert(&pane_id);
+                    let discovered = tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        async {
+                            loop {
+                                let notified = pane_state.session_bound.notified();
+                                if let Some(id) =
+                                    pane_state.identity.lock().unwrap().session_id.clone()
+                                    && id != src_session
+                                {
+                                    return id;
+                                }
+                                notified.await;
+                            }
+                        },
+                    )
+                    .await;
+                    match discovered {
+                        Ok(session_id) => {
+                            libslop::ResponseBody::Forked { pane_id, session_id }
+                        }
+                        Err(_) => libslop::ResponseBody::Error {
+                            message: format!(
+                                "Codex fork pane {} did not report its new session id",
+                                pane_id
+                            ),
+                        },
+                    }
                 }
                 other => other,
             }
@@ -3969,23 +3995,16 @@ async fn handle_request(
                 }
                 Err(message) => return libslop::ResponseBody::Error { message },
             };
-            // A fresh remote TUI does not accept a caller-provided thread id.
-            // Serialize creation so two slopctl runs cannot consume each other's
-            // global `thread/started` notification from the shared daemon.
-            let _codex_fresh_run_guard = if resolved.backend.serializes_fresh_runs()
-                && extract_resume_target(&extra_args).is_none()
-            {
-                Some(CODEX_FRESH_RUN_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await)
-            } else {
-                None
-            };
-            // Inject hooks into the account's settings.json (the dir the new pane
-            // will actually read), not necessarily the default one. Claude only —
-            // OpenCode, Codex, and other non-Claude backends are driven without hooks.
+            // Inject hooks into the backend-specific config file the pane reads:
+            // Claude settings.json or Codex hooks.json.
             if resolved.backend.uses_injected_hooks() {
-                let settings_path = config.resolved_settings_path(&resolved);
-                if let Err(e) = libslop::inject_hooks_into_file(&settings_path, &config.hook_slopctl()) {
-                    warn!("failed to inject hooks into {}: {}", settings_path.display(), e);
+                let hook_path = config.resolved_hook_path(&resolved);
+                if let Err(e) = libslop::inject_backend_hooks_into_file(
+                    &hook_path,
+                    &config.hook_slopctl(),
+                    resolved.backend,
+                ) {
+                    warn!("failed to inject hooks into {}: {}", hook_path.display(), e);
                 }
             }
             // Resolve start directory: per-session flag takes precedence over config default.
@@ -4019,13 +4038,8 @@ async fn handle_request(
             }
             merged_env.extend(env.iter().cloned());
 
-            // Codex panes are views onto a thread hosted by the managed local
-            // app-server. Start/connect the daemon and establish the thread
-            // before creating the tmux pane, so pane identity is deterministic.
+            // Prepare backend-specific standalone launch arguments/resources.
             let prepared = match backend_lifecycle(resolved.backend).prepare_run(PrepareRunContext {
-                resolved: &resolved,
-                merged_env: &merged_env,
-                start_directory: effective_start_dir.as_deref(),
                 extra_args: &extra_args,
             }).await {
                 Ok(prepared) => prepared,
@@ -4214,29 +4228,12 @@ async fn handle_request(
                             driver_cancel,
                         ));
                     }
-                    PreparedBackendRun::Codex(PreparedCodexRun { client, thread_id, thread_overrides, socket, mut events, existing_threads }) => {
-                        let thread_id = match thread_id {
-                            Some(id) => id,
-                            None => match codex::wait_for_thread_started(&mut events, std::time::Duration::from_secs(20), &existing_threads).await {
-                                Ok(id) => id,
-                                Err(message) => {
-                                    let _ = tmux(config).args(["kill-pane", "-t", &pane_id]).status().await;
-                                    return libslop::ResponseBody::Error { message };
-                                }
-                            },
-                        };
+                    PreparedBackendRun::Codex(_) => {
                         let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdBackend.as_str(), "codex").await;
-                        let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdSessionId.as_str(), &thread_id).await;
-                        let _ = tmux_set_pane_option(config, &pane_id, libslop::TmuxOption::SlopdCodexSocket.as_str(), &socket.to_string_lossy()).await;
                         let pane_state = panes.get_or_insert(&pane_id);
-                        pane_state.note_session_id(&thread_id);
-                        let driver_cancel = tokio_util::sync::CancellationToken::new();
-                        pane_state.set_runtime(PaneRuntime::Codex(CodexState::new(
-                            client.clone(), thread_id.clone(), thread_overrides.clone(), driver_cancel.clone(),
-                        )));
-                        tokio::spawn(run_codex_driver(
-                            client, thread_id, thread_overrides, pane_id.clone(), config.clone(), panes.clone(), event_tx.clone(), driver_cancel,
-                        ));
+                        if matches!(pane_state.runtime(), PaneRuntime::Unbound(_)) {
+                            pane_state.set_runtime(PaneRuntime::Codex(CodexState));
+                        }
                     }
                     PreparedBackendRun::Claude => {}
                     }
@@ -4476,10 +4473,10 @@ async fn handle_request(
                     libslop::ResponseBody::Error { message: msg }
                 }
                 Ok(_) => {
-                    // Codex has no hook equivalent that acknowledges every
-                    // composer submission (notably an in-flight steer). Submit
-                    // exactly once through its visible TUI and let app-server
-                    // notifications drive subsequent state.
+                    // Codex may not acknowledge every composer submission hook
+                    // before this RPC returns (notably an in-flight steer).
+                    // Submit exactly once through its visible TUI; hooks and the
+                    // rollout tail drive subsequent state.
                     if settle_before_enter {
                         // Ratatui can render the pasted text one event-loop tick
                         // after tmux reports send-keys complete. An immediate
@@ -4688,14 +4685,13 @@ async fn handle_request(
                         None => tokio::fs::metadata(&path).await
                             .map(|m| m.len()).unwrap_or(0),
                     };
-                    match read_transcript_before(&path, effective_before, limit).await {
+                    let backend = panes
+                        .get(&pane_id)
+                        .map(|state| state.runtime().backend())
+                        .unwrap_or(libslop::Backend::Claude);
+                    match read_transcript_before(&path, effective_before, limit, backend).await {
                         Ok((records, _at_beginning)) => {
-                            let records = records.into_iter().map(|(cursor, payload)| {
-                                let event_type = payload
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                            let records = records.into_iter().map(|(cursor, event_type, payload)| {
                                 libslop::Record {
                                     cursor: Some(cursor),
                                     source: "transcript".to_string(),
@@ -4897,11 +4893,8 @@ mod tests {
 
     #[test]
     fn backend_policy_keeps_protocol_quirks_at_the_boundary() {
-        assert!(libslop::Backend::Codex.serializes_fresh_runs());
-        assert!(!libslop::Backend::Claude.serializes_fresh_runs());
-        assert!(libslop::Backend::Opencode.fork_session_is_known_before_spawn());
         assert!(!libslop::Backend::Claude.driver_owns_initial_state());
-        assert!(libslop::Backend::Codex.driver_owns_initial_state());
+        assert!(!libslop::Backend::Codex.driver_owns_initial_state());
     }
 
     #[test]
@@ -4918,6 +4911,30 @@ mod tests {
             ),
             vec!["--flag", "-s", "session-1"],
         );
+    }
+
+    #[test]
+    fn prepared_codex_run_is_standalone_and_resumes_locally() {
+        let prepared = PreparedBackendRun::Codex(PreparedCodexRun {
+            resume_session: Some("session-1".to_string()),
+        });
+        let args = prepared.trailing_args(
+            vec!["--resume".to_string(), "old".to_string(), "--flag".to_string()],
+            std::path::Path::new("/work"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-bypass-hook-trust",
+                "--no-alt-screen",
+                "-C",
+                "/work",
+                "resume",
+                "session-1",
+                "--flag",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--remote"));
     }
 
     #[test]

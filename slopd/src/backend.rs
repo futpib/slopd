@@ -23,34 +23,8 @@ impl OpencodeState {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct CodexState {
-    pub(super) client: codex::CodexClient,
-    pub(super) thread_id: String,
-    pub(super) thread_overrides: codex::ThreadOverrides,
-    pub(super) cancel: tokio_util::sync::CancellationToken,
-    pub(super) active_turn: Arc<std::sync::Mutex<Option<String>>>,
-    pub(super) pending_requests:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, libslop::PaneDetailedState>>>,
-}
-
-impl CodexState {
-    pub(super) fn new(
-        client: codex::CodexClient,
-        thread_id: String,
-        thread_overrides: codex::ThreadOverrides,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        Self {
-            client,
-            thread_id,
-            thread_overrides,
-            cancel,
-            active_turn: Arc::new(std::sync::Mutex::new(None)),
-            pending_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-}
+#[derive(Clone, Default)]
+pub(super) struct CodexState;
 
 #[derive(Clone, Default)]
 pub(super) struct ClaudeState;
@@ -181,9 +155,7 @@ impl BackendRuntime for CodexState {
         libslop::Backend::Codex
     }
 
-    fn cancel(&self) {
-        self.cancel.cancel();
-    }
+    fn cancel(&self) {}
 
     fn send_transport(&self) -> SendTransport {
         SendTransport::Tui {
@@ -192,20 +164,11 @@ impl BackendRuntime for CodexState {
     }
 
     async fn interrupt(&self) -> Option<Result<(), String>> {
-        let turn = self.active_turn.lock().unwrap().clone();
-        Some(match turn {
-            Some(turn) => self.client.interrupt_turn(&self.thread_id, &turn).await,
-            None => Ok(()),
-        })
+        None
     }
 
-    async fn transcript(&self, pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
-        Some(
-            self.client
-                .resume_thread(&self.thread_id, &self.thread_overrides)
-                .await
-                .map(|thread| codex::thread_records(&thread, pane_id)),
-        )
+    async fn transcript(&self, _pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        None
     }
 }
 
@@ -257,32 +220,17 @@ impl BackendRuntime for PaneRuntime {
 }
 
 pub(super) trait BackendPolicy {
-    fn serializes_fresh_runs(self) -> bool;
-    fn fork_session_is_known_before_spawn(self) -> bool;
     fn driver_owns_initial_state(self) -> bool;
 }
 
 impl BackendPolicy for libslop::Backend {
-    fn serializes_fresh_runs(self) -> bool {
-        matches!(self, Self::Codex)
-    }
-
-    fn fork_session_is_known_before_spawn(self) -> bool {
-        !matches!(self, Self::Claude)
-    }
-
     fn driver_owns_initial_state(self) -> bool {
-        !matches!(self, Self::Claude)
+        matches!(self, Self::Opencode)
     }
 }
 
 pub(super) struct PreparedCodexRun {
-    pub(super) client: codex::CodexClient,
-    pub(super) thread_id: Option<String>,
-    pub(super) thread_overrides: codex::ThreadOverrides,
-    pub(super) socket: std::path::PathBuf,
-    pub(super) events: tokio::sync::broadcast::Receiver<serde_json::Value>,
-    pub(super) existing_threads: std::collections::HashSet<String>,
+    pub(super) resume_session: Option<String>,
 }
 
 pub(super) enum PreparedBackendRun {
@@ -312,14 +260,13 @@ impl PreparedBackendRun {
             Self::Codex(runtime) => {
                 let mut trailing = strip_resume_flags(extra_args);
                 let mut prefix = vec![
-                    "--remote".to_string(),
-                    "unix://".to_string(),
+                    "--dangerously-bypass-hook-trust".to_string(),
                     "--no-alt-screen".to_string(),
                     "-C".to_string(),
                     cwd.to_string_lossy().into_owned(),
                 ];
-                if let Some(thread_id) = &runtime.thread_id {
-                    prefix.extend(["resume".to_string(), thread_id.clone()]);
+                if let Some(session_id) = &runtime.resume_session {
+                    prefix.extend(["resume".to_string(), session_id.clone()]);
                 }
                 trailing.splice(0..0, prefix);
                 trailing
@@ -336,9 +283,6 @@ impl PreparedBackendRun {
 }
 
 pub(super) struct PrepareRunContext<'a> {
-    pub(super) resolved: &'a libslop::ResolvedAccount,
-    pub(super) merged_env: &'a [(String, String)],
-    pub(super) start_directory: Option<&'a std::path::Path>,
     pub(super) extra_args: &'a [String],
 }
 
@@ -347,13 +291,11 @@ pub(super) struct ForkContext<'a> {
     pub(super) session_id: &'a str,
     pub(super) extra_args: Vec<String>,
     pub(super) config: &'a libslop::SlopdConfig,
-    pub(super) panes: &'a PaneMap,
 }
 
 pub(super) struct RecoverContext<'a> {
     pub(super) pane_id: &'a str,
     pub(super) options: &'a ParsedPaneOptions,
-    pub(super) resolved: &'a libslop::ResolvedAccount,
     pub(super) config: &'a Arc<libslop::SlopdConfig>,
     pub(super) panes: &'a PaneMap,
     pub(super) event_tx: &'a EventTx,
@@ -606,190 +548,55 @@ impl BackendLifecycle for CodexBackend {
         &self,
         context: PrepareRunContext<'_>,
     ) -> Result<PreparedBackendRun, String> {
-        let lookup_path = context
-            .merged_env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| std::ffi::OsString::from(value))
-            .or_else(|| std::env::var_os("PATH"))
-            .unwrap_or_default();
-        let lookup_cwd = context
-            .start_directory
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let program = libslop::resolve_executable(
-            context.resolved.executable.program(),
-            &lookup_path,
-            &lookup_cwd,
-        )
-        .ok_or_else(|| {
-            format!(
-                "configured Codex executable {:?} not found",
-                context.resolved.executable.program()
-            )
-        })?;
-        let home = context
-            .resolved
-            .config_dir
-            .as_deref()
-            .map(libslop::expand_path);
-        let socket = codex::socket_path(home.as_deref());
-        codex::ensure_daemon(&program, home.as_deref(), &socket).await?;
-        let client = codex::CodexClient::connect(&socket).await?;
-        let events = client.subscribe();
-        let existing_threads = client.thread_ids().await.unwrap_or_default();
-        let thread_overrides = codex::ThreadOverrides::from_args(
-            context
-                .resolved
-                .executable
-                .args()
-                .iter()
-                .chain(context.extra_args.iter())
-                .map(String::as_str),
-        );
-        let thread_id = match extract_resume_target(context.extra_args) {
-            Some(id) => {
-                client.resume_thread(&id, &thread_overrides).await?;
-                Some(id)
-            }
-            None => None,
-        };
         Ok(PreparedBackendRun::Codex(PreparedCodexRun {
-            client,
-            thread_id,
-            thread_overrides,
-            socket,
-            events,
-            existing_threads,
+            resume_session: extract_resume_target(context.extra_args),
         }))
     }
 
     async fn fork(&self, context: ForkContext<'_>) -> Result<(Vec<String>, String), String> {
-        let runtime = context
-            .panes
-            .get(context.pane_id)
-            .and_then(|state| state.codex())
-            .ok_or_else(|| format!("Codex pane {} has no app-server runtime", context.pane_id))?;
-        let mut thread_overrides = runtime.thread_overrides.clone();
-        thread_overrides.apply_args(context.extra_args.iter().map(String::as_str));
-        let new_id = runtime
-            .client
-            .fork_thread(context.session_id, &thread_overrides)
-            .await?;
-        let mut args = vec!["--resume".to_string(), new_id.clone()];
+        let mut args = vec!["fork".to_string(), context.session_id.to_string()];
         args.extend(context.extra_args);
-        Ok((args, new_id))
+        // Standalone `codex fork` creates the new session in the child process.
+        // Its SessionStart hook binds the real id after spawn.
+        Ok((args, String::new()))
     }
 
     async fn recover(&self, context: RecoverContext<'_>) -> Result<(), String> {
-        let session_id = context
-            .options
-            .session_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| format!("Codex pane {} lacks a thread id", context.pane_id))?;
-        let home = context
-            .resolved
-            .config_dir
-            .as_deref()
-            .map(libslop::expand_path);
-        let socket = context
-            .options
-            .codex_socket
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| codex::socket_path(home.as_deref()));
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let program =
-            libslop::resolve_executable(context.resolved.executable.program(), &path, &cwd)
-                .ok_or_else(|| {
-                    format!(
-                        "Codex executable {:?} not found",
-                        context.resolved.executable.program()
-                    )
-                })?;
-        codex::ensure_daemon(&program, home.as_deref(), &socket).await?;
-        let client = codex::CodexClient::connect(&socket).await?;
-        let thread_overrides = codex::ThreadOverrides::from_args(
-            context
-                .resolved
-                .executable
-                .args()
-                .iter()
-                .map(String::as_str),
-        );
-        client.resume_thread(session_id, &thread_overrides).await?;
-        let cancel = tokio_util::sync::CancellationToken::new();
         context
             .panes
             .get_or_insert(context.pane_id)
-            .set_runtime(PaneRuntime::Codex(CodexState::new(
-                client.clone(),
-                session_id.to_string(),
-                thread_overrides.clone(),
-                cancel.clone(),
-            )));
-        tokio::spawn(run_codex_driver(
-            client,
-            session_id.to_string(),
-            thread_overrides,
-            context.pane_id.to_string(),
-            context.config.clone(),
-            context.panes.clone(),
-            context.event_tx.clone(),
-            cancel,
-        ));
+            .set_runtime(PaneRuntime::Codex(CodexState));
         Ok(())
     }
 
     async fn restore(&self, context: RestoreContext<'_>) -> Result<String, String> {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let cwd = context
-            .working_dir
+        let hook_path = context.config.resolved_hook_path(context.resolved);
+        if let Err(error) = libslop::inject_backend_hooks_into_file(
+            &hook_path,
+            &context.config.hook_slopctl(),
+            libslop::Backend::Codex,
+        ) {
+            warn!("failed to inject Codex hooks into {}: {}", hook_path.display(), error);
+        }
+        let launch_dir = context
+            .transcript_path
             .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let program =
-            libslop::resolve_executable(context.resolved.executable.program(), &path, &cwd)
-                .ok_or_else(|| {
-                    format!("Codex executable missing for pane {}", context.old_pane_id)
-                })?;
-        let home = context
-            .resolved
-            .config_dir
-            .as_deref()
-            .map(libslop::expand_path);
-        let socket = codex::socket_path(home.as_deref());
-        codex::ensure_daemon(&program, home.as_deref(), &socket).await?;
-        let client = codex::CodexClient::connect(&socket).await?;
-        let thread_overrides = codex::ThreadOverrides::from_args(
-            context
-                .resolved
-                .executable
-                .args()
-                .iter()
-                .map(String::as_str),
-        );
-        client
-            .resume_thread(context.session_id, &thread_overrides)
-            .await?;
+            .and_then(transcript_launch_cwd)
+            .or_else(|| context.working_dir.clone());
         let id = spawn_pane(
             context.config,
             context.session_lock,
             &SpawnSpec {
-                working_dir: context.working_dir.clone(),
+                working_dir: launch_dir.clone(),
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
                 executable: context.resolved.executable.clone(),
                 extra_env: Vec::new(),
                 trailing_args: vec![
-                    "--remote".to_string(),
-                    "unix://".to_string(),
+                    "--dangerously-bypass-hook-trust".to_string(),
                     "--no-alt-screen".to_string(),
                     "-C".to_string(),
-                    cwd.to_string_lossy().into_owned(),
+                    launch_dir.unwrap_or_else(|| ".".to_string()),
                     "resume".to_string(),
                     context.session_id.to_string(),
                 ],
@@ -809,33 +616,10 @@ impl BackendLifecycle for CodexBackend {
             "codex",
         )
         .await;
-        let _ = tmux_set_pane_option(
-            context.config,
-            &id,
-            libslop::TmuxOption::SlopdCodexSocket.as_str(),
-            &socket.to_string_lossy(),
-        )
-        .await;
-        let cancel = tokio_util::sync::CancellationToken::new();
         context
             .panes
             .get_or_insert(&id)
-            .set_runtime(PaneRuntime::Codex(CodexState::new(
-                client.clone(),
-                context.session_id.to_string(),
-                thread_overrides.clone(),
-                cancel.clone(),
-            )));
-        tokio::spawn(run_codex_driver(
-            client,
-            context.session_id.to_string(),
-            thread_overrides,
-            id.clone(),
-            context.config.clone(),
-            context.panes.clone(),
-            context.event_tx.clone(),
-            cancel,
-        ));
+            .set_runtime(PaneRuntime::Codex(CodexState));
         Ok(id)
     }
 }

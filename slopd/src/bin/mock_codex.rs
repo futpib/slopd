@@ -1,372 +1,275 @@
-//! Deterministic Codex app-server/TUI double used by integration tests.
+//! Deterministic standalone Codex CLI double used by integration tests.
+//!
+//! It reads `$CODEX_HOME/hooks.json`, emits Codex-shaped rollout JSONL, and
+//! runs entirely inside its tmux pane. There is intentionally no app-server.
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, broadcast};
-use tokio_websockets::{ClientBuilder, Message, ServerBuilder};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-#[derive(Default)]
-struct State {
-    threads: Mutex<HashMap<String, Vec<Value>>>,
-    thread_overrides: Mutex<HashMap<String, Value>>,
-    active: Mutex<HashMap<String, String>>,
-    next_thread: AtomicU64,
-    next_turn: AtomicU64,
-}
-
-fn socket_path() -> PathBuf {
-    PathBuf::from(std::env::var_os("CODEX_HOME").unwrap_or_else(|| ".codex".into()))
-        .join("app-server-control/app-server-control.sock")
-}
-
-async fn send_json<S>(ws: &mut tokio_websockets::WebSocketStream<S>, value: Value)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let _ = ws.send(Message::text(value.to_string())).await;
-}
-
-fn merge_policy_overrides(target: &mut Value, params: Option<&Value>) {
-    if !target.is_object() {
-        *target = json!({});
-    }
-    let Some(target) = target.as_object_mut() else {
+fn fire_hooks(settings: &Value, event: &str, payload: &Value) {
+    let Some(entries) = settings.pointer(&format!("/hooks/{event}")).and_then(Value::as_array)
+    else {
         return;
     };
-    for key in ["approvalPolicy", "sandbox"] {
-        if let Some(value) = params.and_then(|params| params.get(key)) {
-            target.insert(key.to_string(), value.clone());
-        }
-    }
-}
-
-fn policy_overrides(params: Option<&Value>) -> Value {
-    let mut result = json!({});
-    merge_policy_overrides(&mut result, params);
-    result
-}
-
-async fn connection(
-    stream: UnixStream,
-    state: Arc<State>,
-    events: broadcast::Sender<Value>,
-) -> Result<(), String> {
-    let (_, mut ws) = ServerBuilder::new()
-        .accept(stream)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut event_rx = events.subscribe();
-    let mut pending_approval: Option<(String, String)> = None;
-    let mut overloaded_once = false;
-    let mut may_drive_turns = false;
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => if let Ok(event) = event {
-                send_json(&mut ws, event).await;
-            },
-            message = ws.next() => {
-                let Some(Ok(message)) = message else { return Ok(()) };
-                let Some(text) = message.as_text() else { continue };
-                let Ok(value) = serde_json::from_str::<Value>(text) else { continue };
-                if value.get("method").is_none() && value.get("id") == Some(&json!(900)) {
-                    if let Some((thread_id, turn_id)) = pending_approval.take() {
-                        state.active.lock().await.remove(&thread_id);
-                        let _ = events.send(json!({"method":"turn/completed","params":{"threadId":thread_id,"turn":{"id":turn_id,"status":"completed"}}}));
-                    }
-                    continue;
-                }
-                let Some(method) = value.get("method").and_then(Value::as_str) else { continue };
-                let id = value.get("id").cloned();
-                let result = match method {
-                    "initialize" => {
-                        may_drive_turns = value.pointer("/params/clientInfo/name").and_then(Value::as_str) == Some("mock_codex_tui");
-                        json!({"userAgent":"mock-codex","platformFamily":"unix","platformOs":"linux"})
-                    },
-                    "initialized" => continue,
-                    "thread/start" => {
-                        let id = format!("mock-thread-{}", state.next_thread.fetch_add(1, Ordering::Relaxed) + 1);
-                        state.threads.lock().await.insert(id.clone(), Vec::new());
-                        state.thread_overrides.lock().await.insert(
-                            id.clone(),
-                            policy_overrides(value.get("params")),
-                        );
-                        let thread = json!({"id":id,"turns":[],"cwd":std::env::current_dir().unwrap_or_default()});
-                        let _ = events.send(json!({"method":"thread/started","params":{"thread":thread.clone()}}));
-                        json!({"thread":thread})
-                    }
-                    "thread/resume" => {
-                        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
-                        merge_policy_overrides(
-                            state.thread_overrides.lock().await.entry(thread_id.to_string()).or_default(),
-                            value.get("params"),
-                        );
-                        if let Some((pending_thread, turn_id)) = pending_approval.as_ref()
-                            && pending_thread == thread_id {
-                            send_json(&mut ws, json!({"method":"item/commandExecution/requestApproval","id":901,"params":{"threadId":thread_id,"turnId":turn_id,"itemId":"mock-item-replay","reason":"replayed approval"}})).await;
-                        }
-                        let threads = state.threads.lock().await;
-                        let Some(turns) = threads.get(thread_id) else {
-                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32000,"message":"thread not found"}})).await; }
-                            continue;
-                        };
-                        json!({"thread":{"id":thread_id,"turns":turns}})
-                    }
-                    "thread/read" => {
-                        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
-                        let threads = state.threads.lock().await;
-                        let mut turns = threads.get(thread_id).cloned().unwrap_or_default();
-                        let active_turn = state.active.lock().await.get(thread_id).cloned();
-                        if let Some(active_turn) = active_turn.as_deref()
-                            && let Some(turn) = turns.iter_mut().find(|turn| turn.get("id").and_then(Value::as_str) == Some(active_turn)) {
-                            turn["status"] = json!("inProgress");
-                        }
-                        let status = if active_turn.is_some() { "active" } else { "idle" };
-                        json!({"thread":{"id":thread_id,"status":{"type":status},"turns":turns}})
-                    }
-                    "thread/list" => {
-                        let threads = state.threads.lock().await;
-                        json!({"data":threads.keys().map(|id| json!({"id":id})).collect::<Vec<_>>(),"nextCursor":null})
-                    }
-                    "thread/fork" => {
-                        let source = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
-                        let mut threads = state.threads.lock().await;
-                        let turns = threads.get(source).cloned().unwrap_or_default();
-                        let id = format!("mock-thread-{}", state.next_thread.fetch_add(1, Ordering::Relaxed) + 1);
-                        threads.insert(id.clone(), turns.clone());
-                        let mut overrides = state
-                            .thread_overrides
-                            .lock()
-                            .await
-                            .get(source)
-                            .cloned()
-                            .unwrap_or_else(|| json!({}));
-                        merge_policy_overrides(&mut overrides, value.get("params"));
-                        state
-                            .thread_overrides
-                            .lock()
-                            .await
-                            .insert(id.clone(), overrides);
-                        json!({"thread":{"id":id,"turns":turns}})
-                    }
-                    "turn/start" => {
-                        if !may_drive_turns {
-                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"only the TUI may start turns"}})).await; }
-                            continue;
-                        }
-                        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("").to_string();
-                        let prompt = value.pointer("/params/input/0/text").and_then(Value::as_str).unwrap_or("").to_string();
-                        // Double-underscore prompts are private test controls,
-                        // matching this mock's existing __active__/__approval__
-                        // convention; they are not simulated TUI slash commands.
-                        if prompt == "__disconnect__" { return Ok(()); }
-                        if prompt == "__overload__" && !overloaded_once {
-                            overloaded_once = true;
-                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32001,"message":"Server overloaded; retry later."}})).await; }
-                            continue;
-                        }
-                        let turn_id = format!("mock-turn-{}", state.next_turn.fetch_add(1, Ordering::Relaxed) + 1);
-                        state.active.lock().await.insert(thread_id.clone(), turn_id.clone());
-                        let _ = events.send(json!({"method":"turn/started","params":{"threadId":thread_id,"turn":{"id":turn_id}}}));
-                        if prompt == "__restrict__" {
-                            state.thread_overrides.lock().await.insert(
-                                thread_id.clone(),
-                                json!({
-                                    "approvalPolicy": "on-request",
-                                    "sandbox": "workspace-write"
-                                }),
-                            );
-                        }
-                        let response = if prompt == "__policy__" {
-                            state
-                                .thread_overrides
-                                .lock()
-                                .await
-                                .get(&thread_id)
-                                .cloned()
-                                .unwrap_or_else(|| json!({}))
-                                .to_string()
-                        } else {
-                            format!("echo: {prompt}")
-                        };
-                        let turn = json!({"id":turn_id,"items":[
-                            {"type":"userMessage","content":[{"type":"text","text":prompt}]},
-                            {"type":"agentMessage","text":response}
-                        ]});
-                        state.threads.lock().await.entry(thread_id.clone()).or_default().push(turn.clone());
-                        let _ = events.send(json!({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"item":turn["items"][1].clone()}}));
-                        if prompt == "__active__" {
-                            // Keep the turn active until a turn/steer request.
-                        } else if prompt == "__approval__" {
-                            pending_approval = Some((thread_id.clone(), turn_id.clone()));
-                            let _ = events.send(json!({"method":"item/commandExecution/requestApproval","id":900,"params":{"threadId":thread_id,"turnId":turn_id,"itemId":"mock-item","reason":"mock approval"}}));
-                        } else {
-                            state.active.lock().await.remove(&thread_id);
-                            let _ = events.send(json!({"method":"turn/completed","params":{"threadId":thread_id,"turn":turn}}));
-                        }
-                        json!({"turn":{"id":turn_id}})
-                    }
-                    "turn/steer" => {
-                        if !may_drive_turns {
-                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"only the TUI may steer turns"}})).await; }
-                            continue;
-                        }
-                        let Some(turn_id) = value.pointer("/params/expectedTurnId").and_then(Value::as_str) else {
-                            if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32600,"message":"missing expectedTurnId"}})).await; }
-                            continue;
-                        };
-                        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
-                        state.active.lock().await.remove(thread_id);
-                        let _ = events.send(json!({"method":"turn/completed","params":{"threadId":thread_id,"turn":{"id":turn_id,"status":"completed"}}}));
-                        json!({})
-                    },
-                    "turn/interrupt" => {
-                        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str).unwrap_or("");
-                        state.active.lock().await.remove(thread_id);
-                        json!({})
-                    },
-                    "mock/disconnect" => return Ok(()),
-                    _ => {
-                        if let Some(id) = id { send_json(&mut ws, json!({"id":id,"error":{"code":-32601,"message":"method not found"}})).await; }
-                        continue;
-                    }
-                };
-                if let Some(id) = id { send_json(&mut ws, json!({"id":id,"result":result})).await; }
+    for entry in entries {
+        let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
+            continue;
+        };
+        for hook in hooks {
+            let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(mut child) = Command::new("sh")
+                .args(["-c", command])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(payload.to_string().as_bytes());
             }
+            let _ = child.wait();
         }
     }
 }
 
-async fn serve() -> Result<(), String> {
-    let socket = socket_path();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(
-        socket.parent().unwrap().join("mock-codex.pid"),
-        std::process::id().to_string(),
-    )
-    .map_err(|e| e.to_string())?;
-    if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
-    }
-    let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
-    let state = Arc::new(State::default());
-    let (events, _) = broadcast::channel(1024);
-    loop {
-        let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        tokio::spawn(connection(stream, state.clone(), events.clone()));
-    }
+fn hook_payload(event: &str, session_id: &str, cwd: &Path, transcript: &Path) -> Value {
+    json!({
+        "session_id": session_id,
+        "transcript_path": transcript,
+        "cwd": cwd,
+        "hook_event_name": event,
+        "model": "mock-codex",
+        "turn_id": format!("turn-{}", counter()),
+    })
 }
 
-async fn tui(args: &[String]) -> Result<(), String> {
-    let cwd = args
-        .iter()
-        .position(|arg| arg == "-C")
-        .and_then(|index| args.get(index + 1))
-        .ok_or_else(|| "remote TUI requires an explicit -C working directory".to_string())?;
-    if !PathBuf::from(cwd).is_absolute() {
-        return Err("remote TUI -C must be absolute".to_string());
-    }
-    let stream = UnixStream::connect(socket_path())
-        .await
-        .map_err(|e| e.to_string())?;
-    let uri = "ws://localhost/".parse().unwrap();
-    let (mut ws, _) = ClientBuilder::from_uri(uri)
-        .connect_on(stream)
-        .await
-        .map_err(|e| e.to_string())?;
-    send_json(&mut ws, json!({"method":"initialize","id":1,"params":{"clientInfo":{"name":"mock_codex_tui","title":"Mock Codex","version":"1"}}})).await;
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut initialized = false;
-    let mut thread_id: Option<String> = None;
-    let mut active_turn: Option<String> = None;
-    let mut pending_dialog: Option<Value> = None;
-    let mut next_id = 3_u64;
-    loop {
-        tokio::select! {
-            line = lines.next_line(), if initialized && thread_id.is_some() => {
-                let Some(line) = line.map_err(|e| e.to_string())? else { break };
-                let prompt = line.trim_end_matches('\r');
-                if prompt.is_empty() { continue; }
-                if let Some(id) = pending_dialog.take() {
-                    let decision = if matches!(prompt.to_ascii_lowercase().as_str(), "y" | "yes" | "accept" | "approve") { "accept" } else { "decline" };
-                    send_json(&mut ws, json!({"id":id,"result":{"decision":decision}})).await;
-                    continue;
-                }
-                let id = next_id;
-                next_id += 1;
-                let thread_id = thread_id.as_deref().unwrap();
-                if let Some(turn_id) = active_turn.as_deref() {
-                    send_json(&mut ws, json!({"method":"turn/steer","id":id,"params":{"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":prompt}]}})).await;
-                } else {
-                    send_json(&mut ws, json!({"method":"turn/start","id":id,"params":{"threadId":thread_id,"input":[{"type":"text","text":prompt}]}})).await;
-                }
-            }
-            message = ws.next() => {
-                let Some(Ok(message)) = message else { break };
-                let Some(text) = message.as_text() else { continue };
-                let value: Value = serde_json::from_str(text).unwrap_or_default();
-                if value.get("id") == Some(&json!(1)) {
-                    initialized = true;
-                    send_json(&mut ws, json!({"method":"initialized","params":{}})).await;
-                    if let Some(index) = args.iter().position(|arg| arg == "resume")
-                        && let Some(resume_id) = args.get(index + 1)
-                    {
-                        thread_id = Some(resume_id.clone());
-                        send_json(&mut ws, json!({"method":"thread/resume","id":2,"params":{"threadId":resume_id}})).await;
-                    } else {
-                        send_json(&mut ws, json!({"method":"thread/start","id":2,"params":{}})).await;
-                    }
-                }
-                if value.get("id") == Some(&json!(2))
-                    && let Some(id) = value.pointer("/result/thread/id").and_then(Value::as_str) {
-                    thread_id = Some(id.to_string());
-                }
-                match value.get("method").and_then(Value::as_str) {
-                    Some("turn/started") => active_turn = value.pointer("/params/turn/id").and_then(Value::as_str).map(str::to_string),
-                    Some("turn/completed") => active_turn = None,
-                    Some(method) if method.ends_with("requestApproval") || method.contains("requestUserInput") => {
-                        pending_dialog = value.get("id").cloned();
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(())
+fn write_record(path: &Path, record: Value) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open mock Codex rollout");
+    writeln!(file, "{}", record).expect("write mock Codex rollout");
 }
 
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = if args.first().map(String::as_str) == Some("serve") {
-        serve().await
-    } else if args.starts_with(&[
-        "app-server".to_string(),
-        "daemon".to_string(),
-        "start".to_string(),
-    ]) {
-        if UnixStream::connect(socket_path()).await.is_ok() {
-            return;
-        }
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("serve")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        child.map(|_| ()).map_err(|e| e.to_string())
+fn response_message(path: &Path, role: &str, text: &str) {
+    let text_kind = if role == "user" {
+        "input_text"
     } else {
-        tui(&args).await
+        "output_text"
     };
-    if let Err(error) = result {
-        eprintln!("mock_codex: {error}");
-        std::process::exit(1);
+    write_record(
+        path,
+        json!({
+            "type":"response_item",
+            "payload":{
+                "type":"message",
+                "role":role,
+                "content":[{"type":text_kind,"text":text}]
+            }
+        }),
+    );
+}
+
+fn counter() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn session_id(args: &[String]) -> String {
+    for command in ["resume", "fork"] {
+        if let Some(index) = args.iter().position(|arg| arg == command) {
+            if command == "resume" {
+                if let Some(id) = args.get(index + 1) {
+                    return id.clone();
+                }
+            } else {
+                return format!("mock-codex-{}", uuid::Uuid::new_v4());
+            }
+        }
+    }
+    format!("mock-codex-{}", uuid::Uuid::new_v4())
+}
+
+fn finish_turn(
+    settings: &Value,
+    session_id: &str,
+    cwd: &Path,
+    transcript: &Path,
+    response: &str,
+) {
+    response_message(transcript, "assistant", response);
+    write_record(
+        transcript,
+        json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+    );
+    fire_hooks(
+        settings,
+        "Stop",
+        &hook_payload("Stop", session_id, cwd, transcript),
+    );
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let codex_home = PathBuf::from(
+        std::env::var_os("CODEX_HOME")
+            .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| ".".into())),
+    );
+    let settings: Value = std::fs::read_to_string(codex_home.join("hooks.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_else(|| json!({}));
+    let session_id = session_id(&args);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let sessions = codex_home.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create mock Codex sessions");
+    let transcript = sessions.join(format!("rollout-{session_id}.jsonl"));
+    write_record(
+        &transcript,
+        json!({
+            "type":"session_meta",
+            "payload":{"id":session_id,"cwd":cwd,"originator":"mock_codex"}
+        }),
+    );
+
+    fire_hooks(
+        &settings,
+        "SessionStart",
+        &hook_payload("SessionStart", &session_id, &cwd, &transcript),
+    );
+
+    let yolo = args
+        .iter()
+        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox");
+    let mut policy = if yolo {
+        json!({"approvalPolicy":"never","sandbox":"danger-full-access"})
+    } else {
+        json!({"approvalPolicy":"on-request","sandbox":"workspace-write"})
+    };
+
+    let stdin_fd = 0;
+    let original = unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(stdin_fd, &mut termios);
+        let original = termios;
+        libc::cfmakeraw(&mut termios);
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
+        original
+    };
+
+    let mut stdin = std::io::stdin();
+    let mut byte = [0_u8; 1];
+    let mut line = Vec::new();
+    let mut active = false;
+    let mut awaiting_approval = false;
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        match byte[0] {
+            0x03 | 0x04 => break,
+            0x15 => line.clear(),
+            0x1b => {
+                if active || awaiting_approval {
+                    active = false;
+                    awaiting_approval = false;
+                    write_record(
+                        &transcript,
+                        json!({"type":"event_msg","payload":{"type":"turn_aborted"}}),
+                    );
+                    fire_hooks(
+                        &settings,
+                        "Stop",
+                        &hook_payload("Stop", &session_id, &cwd, &transcript),
+                    );
+                }
+            }
+            b'\r' | b'\n' => {
+                let prompt = String::from_utf8_lossy(&line).trim().to_string();
+                line.clear();
+                if prompt.is_empty() {
+                    continue;
+                }
+                if awaiting_approval {
+                    awaiting_approval = false;
+                    finish_turn(
+                        &settings,
+                        &session_id,
+                        &cwd,
+                        &transcript,
+                        "approval accepted",
+                    );
+                    continue;
+                }
+
+                let mut submitted =
+                    hook_payload("UserPromptSubmit", &session_id, &cwd, &transcript);
+                submitted["prompt"] = json!(prompt);
+                fire_hooks(&settings, "UserPromptSubmit", &submitted);
+                write_record(
+                    &transcript,
+                    json!({"type":"event_msg","payload":{"type":"task_started"}}),
+                );
+                response_message(&transcript, "user", &prompt);
+
+                if prompt == "__active__" {
+                    active = true;
+                    continue;
+                }
+                if prompt == "__approval__" {
+                    awaiting_approval = true;
+                    fire_hooks(
+                        &settings,
+                        "PermissionRequest",
+                        &hook_payload(
+                            "PermissionRequest",
+                            &session_id,
+                            &cwd,
+                            &transcript,
+                        ),
+                    );
+                    continue;
+                }
+                if prompt == "__restrict__" {
+                    policy =
+                        json!({"approvalPolicy":"on-request","sandbox":"workspace-write"});
+                    finish_turn(
+                        &settings,
+                        &session_id,
+                        &cwd,
+                        &transcript,
+                        "restricted",
+                    );
+                    continue;
+                }
+                let response = if prompt == "__policy__" {
+                    policy.to_string()
+                } else if active {
+                    active = false;
+                    format!("steered: {prompt}")
+                } else {
+                    format!("mock response: {prompt}")
+                };
+                finish_turn(&settings, &session_id, &cwd, &transcript, &response);
+            }
+            value => line.push(value),
+        }
+    }
+
+    fire_hooks(
+        &settings,
+        "SessionEnd",
+        &hook_payload("SessionEnd", &session_id, &cwd, &transcript),
+    );
+    unsafe {
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &original);
     }
 }

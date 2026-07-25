@@ -710,11 +710,15 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir
 
 ### Configuring a Codex account
 
-Codex uses its managed local app-server daemon. slopd starts that daemon when
-needed (without enabling OpenAI remote control), connects over its user-local
-Unix socket, and launches the pane as a TUI client with `codex --remote
-unix://`. Each pane is bound to a Codex thread ID recorded in the same
-`SESSION` field used by the other backends.
+Each Codex pane is a standalone `codex` process. slopd does not start a shared
+Codex app-server, use `--remote`, or require systemd. It injects `slopctl hook`
+commands into `$CODEX_HOME/hooks.json`; `SessionStart` supplies the session ID
+and rollout transcript path, and slopd tails that per-session JSONL file.
+
+This keeps failure domains independent: a signal, crash, or disconnect affecting
+one Codex process does not take the other Codex panes down with a shared service.
+The panes may run on different hosts when paired with the normal slopd/iroh
+remote path; no Codex-specific shared server is required.
 
 ```toml
 [accounts.codex]
@@ -737,52 +741,38 @@ config_dir = "~/.codex"
 executable = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
 ```
 
-slopd passes these arguments to the TUI and mirrors the effective approval and
-sandbox settings into every app-server `thread/resume` and `thread/fork`
-request. That includes explicit resumes, forks, daemon reattachment,
-app-server reconnects, transcript attachment, and backup restore. The
-equivalent explicit flags (`--ask-for-approval never --sandbox
-danger-full-access`) and top-level `-c approval_policy=...` /
-`-c sandbox_mode=...` overrides are handled the same way.
+slopd passes configured executable arguments to every standalone launch,
+including `codex fork` and backup restore via `codex resume`.
 
 `send` always types into the visible Codex TUI in tmux, so both new prompts and
 in-flight steering follow the same UI path as a person at the terminal.
-`interrupt` uses `turn/interrupt`; transcripts come from Codex thread history;
-and `fork` uses Codex's native `thread/fork`. On a slopd restart, the daemon
-reconnects to the recorded app-server socket and resumes its notification
-subscription without restarting the TUI. Backup restore relaunches a TUI onto
-the recorded thread. The socket client also reconnects and re-resumes its
-thread if app-server itself restarts. Overload responses are retried with a
-bounded exponential backoff. slopd passes the pane working directory through
-Codex's explicit `-C` option (remote mode otherwise inherits the daemon cwd)
-and uses periodic non-mutating `thread/read` calls as a status backstop without
-replaying pending approval requests.
+`interrupt` sends the TUI's normal interrupt keys. `fork` launches Codex's
+native `codex fork <SESSION_ID>` and learns the new ID from its `SessionStart`
+hook. On a slopd restart, the existing pane remains untouched; slopd recovers
+its identity and state from tmux metadata plus the rollout transcript. Backup
+restore launches `codex resume <SESSION_ID>` in the recorded working directory.
 
-Codex approval and elicitation requests are published as normalized
-`PermissionRequest` and `Elicitation` hook events for observation. They must be
-answered in the visible TUI; slopd deliberately does not answer app-server
-requests or provide a headless Codex interaction path:
+Codex approval requests are published as normalized `PermissionRequest` hook
+events for observation. They must be answered in the visible TUI; slopd
+deliberately does not provide a headless Codex interaction path:
 
 ```bash
 slopctl listen --pane-id %42 --hook PermissionRequest
 ```
 
-OpenAI-hosted remote control is independent and optional. slopd never enables
-it itself. If the user enables it with `codex remote-control start`, ChatGPT
-mobile/desktop becomes another client of the same daemon and threads.
-
 Codex compatibility notes:
 
-- Codex app-server and remote TUI mode are experimental interfaces. slopd uses
-  the documented non-experimental thread/turn methods but compatibility must be
-  checked when upgrading Codex.
-- A new empty Codex thread is not resumable by a second client until its first
-  turn creates a durable rollout. slopd serializes fresh Codex launches, takes a
-  pre-launch thread snapshot, and attaches the detailed item stream when that
-  first turn begins so concurrent slopctl launches cannot cross-bind.
-- If a recorded thread was deleted or belongs to a different `CODEX_HOME`,
-  restore leaves it pending and logs the exact thread/account failure instead
-  of silently creating a replacement conversation.
+- slopd launches Codex with `--dangerously-bypass-hook-trust` because it
+  programmatically installs and vets the hook commands. This flag bypasses the
+  hook-source trust prompt; it does not change Codex approval or sandbox policy.
+- Codex's rollout JSONL format is not a stable public interface. Hook events are
+  the lifecycle authority; transcript parsing is a recovery and transcript
+  adapter that should be checked when upgrading Codex.
+- `hooks.json` receives only event names supported by Codex. `slopd
+  uninject-hooks` and clean shutdown remove only slopd's entries and preserve
+  unrelated hooks.
+- If a recorded session was deleted or belongs to a different `CODEX_HOME`,
+  `codex resume` fails normally rather than silently creating a replacement.
 
 ---
 

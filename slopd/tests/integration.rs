@@ -10599,9 +10599,6 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     build_bin("mock_codex");
     let mock_codex = cargo_bin("mock_codex");
     let codex_home = tempfile::tempdir().unwrap();
-    let stale_socket = codex_home.path().join("app-server-control/app-server-control.sock");
-    std::fs::create_dir_all(stale_socket.parent().unwrap()).unwrap();
-    std::fs::write(&stale_socket, b"stale socket placeholder").unwrap();
     let env = TestEnv::new(None).expect("tmux required");
     env.append_config(&format!(
         "\n[accounts.codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
@@ -10612,6 +10609,29 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     let run = env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "20"]);
     assert!(run.status.success(), "Codex run failed: {}", String::from_utf8_lossy(&run.stderr));
     let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(
+        !codex_home.path().join("app-server-control").exists(),
+        "standalone Codex integration must not create a shared app-server"
+    );
+    let hooks: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(codex_home.path().join("hooks.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(hooks.pointer("/hooks/SessionStart").is_some());
+    assert!(
+        hooks.pointer("/hooks/Notification").is_none(),
+        "Claude-only hook names must not be injected into Codex hooks.json"
+    );
+    let hup = Command::new("kill")
+        .args(["-HUP", &slopd.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(hup.success(), "failed to send SIGHUP to slopd");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        env.slopctl(&["ps", "--json"]).status.success(),
+        "slopd or its standalone Codex pane did not survive SIGHUP"
+    );
 
     let (run_a, run_b) = std::thread::scope(|scope| {
         let a = scope.spawn(|| env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "20"]));
@@ -10662,7 +10682,7 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     // pending approval; the non-mutating `thread/read` backstop must not.
     std::thread::sleep(Duration::from_millis(2500));
     // Approval belongs to the TUI. Answer it as a terminal user would; there is
-    // intentionally no slopctl/app-server response RPC.
+    // intentionally no slopctl response RPC.
     let response = env.tmux.tmux().args(["send-keys", "-t", &source, "y", "Enter"]).status().unwrap();
     assert!(response.success(), "typing Codex approval into TUI failed");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -10686,7 +10706,7 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     let recovered = env.slopctl(&["send", &source, "after restart"]);
     assert!(recovered.status.success(), "recovered Codex send failed: {}", String::from_utf8_lossy(&recovered.stderr));
 
-    // Manual backup/restore must not race the Codex driver back to BootingUp.
+    // Manual backup/restore must recover hook-driven Codex state.
     let before_restore: Vec<libslop::PaneInfo> = serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
     let source_session = before_restore.iter().find(|p| p.pane_id == source).and_then(|p| p.session_id.clone()).unwrap();
     let fork_session = before_restore.iter().find(|p| p.pane_id == fork_pane).and_then(|p| p.session_id.clone()).unwrap();
@@ -10710,9 +10730,6 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     };
     assert!(env.slopctl(&["send", &restored, "after backup restore"]).status.success());
     kill_slopd(slopd);
-    if let Ok(pid) = std::fs::read_to_string(codex_home.path().join("app-server-control/mock-codex.pid")) {
-        let _ = Command::new("kill").arg(pid.trim()).status();
-    }
 }
 
 fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
@@ -10765,19 +10782,6 @@ fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
     serde_json::from_str(text).expect("mock Codex returned invalid policy JSON")
 }
 
-fn restrict_mock_codex_thread(env: &TestEnv, pane_id: &str) {
-    let send = env.slopctl(&["send", pane_id, "__restrict__"]);
-    assert!(
-        send.status.success(),
-        "failed to restrict mock Codex thread: {}",
-        String::from_utf8_lossy(&send.stderr)
-    );
-    wait_until_ready(env, pane_id, Duration::from_secs(5));
-    let policy = mock_codex_policy(env, pane_id);
-    assert_eq!(policy["approvalPolicy"], "on-request");
-    assert_eq!(policy["sandbox"], "workspace-write");
-}
-
 fn assert_mock_codex_yolo(env: &TestEnv, pane_id: &str) {
     let policy = mock_codex_policy(env, pane_id);
     assert_eq!(
@@ -10791,7 +10795,7 @@ fn assert_mock_codex_yolo(env: &TestEnv, pane_id: &str) {
 }
 
 #[test]
-fn codex_yolo_policy_survives_fork_recovery_and_restore() {
+fn codex_standalone_args_survive_fork_recovery_and_restore() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -10820,9 +10824,8 @@ fn codex_yolo_policy_survives_fork_recovery_and_restore() {
     let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
     assert_mock_codex_yolo(&env, &source);
 
-    // Prove the fork path overrides inherited source-thread policy rather than
-    // merely benefiting from an already-unrestricted source.
-    restrict_mock_codex_thread(&env, &source);
+    // A fork is another standalone CLI process and receives the configured
+    // executable arguments independently.
     let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "20"]);
     assert!(
         fork.status.success(),
@@ -10832,17 +10835,15 @@ fn codex_yolo_policy_survives_fork_recovery_and_restore() {
     let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
     assert_mock_codex_yolo(&env, &fork_pane);
 
-    // A daemon restart reattaches to surviving panes through thread/resume.
-    // Deliberately downgrade first so recovery has to reapply both fields.
-    restrict_mock_codex_thread(&env, &fork_pane);
+    // A daemon restart recovers hooks/transcript state; it does not reconnect
+    // either pane to a shared service or mutate the live process policy.
     kill_slopd(slopd);
     let slopd = env.spawn_slopd();
     wait_until_ready(&env, &fork_pane, Duration::from_secs(10));
     assert_mock_codex_yolo(&env, &fork_pane);
 
-    // Manual backup/restore uses a separate resume-and-spawn path. Downgrade
-    // again to prove that path also restores the configured policy.
-    restrict_mock_codex_thread(&env, &fork_pane);
+    // Manual backup/restore spawns standalone `codex resume` processes and
+    // reapplies the configured executable arguments.
     let panes: Vec<libslop::PaneInfo> =
         serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
     let fork_session = panes
@@ -10873,13 +10874,6 @@ fn codex_yolo_policy_survives_fork_recovery_and_restore() {
     assert_mock_codex_yolo(&env, &restored_fork);
 
     kill_slopd(slopd);
-    if let Ok(pid) = std::fs::read_to_string(
-        codex_home
-            .path()
-            .join("app-server-control/mock-codex.pid"),
-    ) {
-        let _ = Command::new("kill").arg(pid.trim()).status();
-    }
 }
 
 #[test]
