@@ -3,10 +3,12 @@
 //! slopd spawns the agent binary in a tmux pane and (for the opencode backend)
 //! passes `--port <P> --hostname 127.0.0.1` plus `OPENCODE_SERVER_PASSWORD`. This
 //! mock binds that port and serves the HTTP API subset slopd's [`OpencodeClient`]
-//! uses, with the REAL opencode shapes (busy = present in `/session/status` as
-//! `{"<sid>":{"type":"busy"}}`; idle = absent; an SSE `/event` stream carrying
-//! `session.status` / `message.*` / `session.idle`). It simulates a turn
-//! (idle → busy → idle) so the SSE driver has something real to observe.
+//! uses, plus a raw-mode TUI composer that only submits when tmux delivers a
+//! physical Enter. The API has the REAL opencode shapes (busy = present in
+//! `/session/status` as `{"<sid>":{"type":"busy"}}`; idle = absent; an SSE
+//! `/event` stream carrying `session.status` / `message.*` / `session.idle`).
+//! It simulates a turn (idle → busy → idle) so the SSE driver has something
+//! real to observe.
 //!
 //! Blocks on `incoming()` so the tmux pane stays alive for the test, like a real
 //! long-running agent. Connections are handled one-per-thread so a long-lived SSE
@@ -35,6 +37,9 @@ const FORK_SID: &str = "ses_mock_fork";
 
 struct MockState {
     busy: bool,
+    /// Text currently visible in the mock TUI composer. The real OpenCode
+    /// `/tui/{clear,append}-prompt` endpoints publish updates to this field.
+    prompt: String,
     /// (role, text) pairs — the conversation.
     messages: Vec<(String, String)>,
     /// SSE event broadcast (JSON strings). Only one subscriber (the driver).
@@ -134,6 +139,7 @@ fn main() {
     let (event_tx, event_rx) = mpsc::channel::<String>();
     let state: Arc<Mutex<MockState>> = Arc::new(Mutex::new(MockState {
         busy: false,
+        prompt: String::new(),
         messages: Vec::new(),
         event_rx: Some(event_rx),
         event_tx,
@@ -149,6 +155,9 @@ fn main() {
         ready_at: Instant::now() + startup_delay,
     }));
 
+    let tui_state = state.clone();
+    std::thread::spawn(move || run_tui(tui_state));
+
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -158,6 +167,100 @@ fn main() {
         std::thread::spawn(move || handle(st, stream));
     }
 }
+
+/// Minimal raw-mode TUI composer. HTTP events mutate `MockState::prompt`; a
+/// physical Enter submitted through tmux consumes it. Keeping these halves
+/// separate makes the integration tests catch regressions where slopd calls a
+/// session command/prompt endpoint without actually driving the TUI.
+fn run_tui(state: Arc<Mutex<MockState>>) {
+    let stdin_fd = 0;
+    let original = unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(stdin_fd, &mut termios);
+        let original = termios;
+        libc::cfmakeraw(&mut termios);
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
+        original
+    };
+
+    let mut stdin = std::io::stdin();
+    let mut byte = [0_u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        match byte[0] {
+            b'\r' | b'\n' => {
+                let prompt = std::mem::take(&mut state.lock().unwrap().prompt);
+                if prompt.is_empty() {
+                    continue;
+                }
+                record_tui_input(&prompt);
+                if prompt.trim() == "/compact" {
+                    state.lock().unwrap().busy = true;
+                    emit(
+                        &state,
+                        serde_json::json!({
+                            "type": "session.compacted",
+                            "properties": {"sessionID": SID}
+                        })
+                        .to_string(),
+                    );
+                    let st = state.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(400));
+                        st.lock().unwrap().busy = false;
+                        emit(
+                            &st,
+                            serde_json::json!({
+                                "type": "session.idle",
+                                "properties": {"sessionID": SID}
+                            })
+                            .to_string(),
+                        );
+                    });
+                } else {
+                    submit_prompt(state.clone(), prompt);
+                }
+            }
+            // A real OpenCode TUI uses Escape to abort an active turn.
+            0x1b => {
+                state.lock().unwrap().busy = false;
+                emit(
+                    &state,
+                    serde_json::json!({
+                        "type": "session.idle",
+                        "properties": {"sessionID": SID}
+                    })
+                    .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    unsafe {
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &original);
+    }
+}
+
+#[cfg(feature = "testing")]
+fn record_tui_input(prompt: &str) {
+    if let Ok(log_path) = std::env::var("MOCK_OPENCODE_INPUT_LOG") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            let _ = writeln!(file, "{}", serde_json::Value::String(prompt.to_string()));
+        }
+    }
+}
+
+#[cfg(not(feature = "testing"))]
+fn record_tui_input(_prompt: &str) {}
 
 fn emit(state: &Arc<Mutex<MockState>>, event_json: String) {
     // Ignore send errors (no SSE subscriber connected yet).
@@ -325,6 +428,17 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             (200, "true".to_string())
         }
 
+        ("POST", "/tui/clear-prompt") => {
+            state.lock().unwrap().prompt.clear();
+            (200, "true".to_string())
+        }
+
+        ("POST", "/tui/append-prompt") => {
+            let text = extract_prompt_text(body);
+            state.lock().unwrap().prompt.push_str(&text);
+            (200, "true".to_string())
+        }
+
         ("GET", "/session/status") => {
             // REAL shape: a map of every non-idle session. Busy → {"type":"busy"};
             // a rate-limited session auto-retrying → {"type":"retry",…}; idle
@@ -444,8 +558,6 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             }
         }
 
-        ("POST", p) if p == format!("/session/{SID}/command") => (200, "{}".to_string()),
-
         ("POST", p) if p == format!("/session/{SID}/abort") => {
             state.lock().unwrap().busy = false;
             emit(&state, format!(r#"{{"type":"session.idle","properties":{{"sessionID":"{SID}"}}}}"#));
@@ -482,6 +594,225 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
     } else {
         json_response(status, &body_out)
     }
+}
+
+/// Accept input consumed by the mock TUI's physical Enter key. This mirrors the
+/// turn simulation behind `prompt_async`, but it is intentionally reached from
+/// the terminal thread so tests prove slopd used the composer boundary.
+fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
+    // Test hook: a "switch" prompt simulates the human navigating the TUI to
+    // a different top-level session (SID_2).
+    if text == "switch" {
+        state.lock().unwrap().second_session = true;
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "tui.session.select",
+                "properties": {"sessionID": SID_2}
+            })
+            .to_string(),
+        );
+        return;
+    }
+
+    // A failed turn still creates/announces the user message before
+    // `session.error`, as real OpenCode does. That lets slopd promote the
+    // composer candidate to an automatic-retry candidate without inspecting
+    // the input text itself.
+    let fail_this = text == "boom" && !state.lock().unwrap().boom_failed;
+    if fail_this {
+        {
+            let mut s = state.lock().unwrap();
+            s.boom_failed = true;
+            s.busy = true;
+            s.messages.push(("user".to_string(), text.clone()));
+        }
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "session.status",
+                "properties": {"sessionID": SID, "status": {"type": "busy"}}
+            })
+            .to_string(),
+        );
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "message.updated",
+                "properties": {"sessionID": SID, "info": {"role": "user"}}
+            })
+            .to_string(),
+        );
+        emit(&state, part_updated_event(SID, "user", &text));
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "session.error",
+                "properties": {"sessionID": SID}
+            })
+            .to_string(),
+        );
+        state.lock().unwrap().busy = false;
+        return;
+    }
+
+    {
+        let mut s = state.lock().unwrap();
+        s.busy = true;
+        s.messages.push(("user".to_string(), text.clone()));
+        s.messages
+            .push(("assistant".to_string(), format!("echo: {text}")));
+    }
+    let uses_tool = text.contains("tool");
+    let uses_subagent = text.contains("subagent");
+    let leak_subagent = uses_subagent && text.contains("leak");
+    let retry_subagent = uses_subagent && text.contains("retry");
+    let asks_question = text.contains("question");
+
+    emit(
+        &state,
+        serde_json::json!({
+            "type": "session.status",
+            "properties": {"sessionID": SID, "status": {"type": "busy"}}
+        })
+        .to_string(),
+    );
+    emit(
+        &state,
+        serde_json::json!({
+            "type": "message.updated",
+            "properties": {"sessionID": SID, "info": {"role": "user"}}
+        })
+        .to_string(),
+    );
+    emit(&state, part_updated_event(SID, "user", &text));
+    if uses_subagent {
+        {
+            let mut s = state.lock().unwrap();
+            s.child_exists = true;
+            s.child_status = Some("busy".to_string());
+        }
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "session.created",
+                "properties": {
+                    "sessionID": CHILD_SID,
+                    "info": {
+                        "id": CHILD_SID,
+                        "parentID": SID,
+                        "agent": "general",
+                        "title": "mock subagent"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "session.status",
+                "properties": {"sessionID": CHILD_SID, "status": {"type": "busy"}}
+            })
+            .to_string(),
+        );
+        emit(
+            &state,
+            serde_json::json!({
+                "type": "message.updated",
+                "properties": {"sessionID": CHILD_SID, "info": {"role": "assistant"}}
+            })
+            .to_string(),
+        );
+    } else if asks_question {
+        emit(
+            &state,
+            tool_part_event(
+                SID,
+                "question",
+                "pending",
+                serde_json::json!({"input": {"message": "what size?"}}),
+            ),
+        );
+    } else if uses_tool {
+        emit(
+            &state,
+            tool_part_event(SID, "bash", "pending", serde_json::json!({})),
+        );
+        emit(
+            &state,
+            tool_part_event(
+                SID,
+                "bash",
+                "running",
+                serde_json::json!({"input": {"command": "cat sample.txt"}}),
+            ),
+        );
+    }
+    emit(
+        &state,
+        serde_json::json!({
+            "type": "message.updated",
+            "properties": {"sessionID": SID, "info": {"role": "assistant"}}
+        })
+        .to_string(),
+    );
+
+    let st = state.clone();
+    let echo = format!("echo: {text}");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        if uses_subagent {
+            if retry_subagent {
+                let mut s = st.lock().unwrap();
+                s.child_status = Some("retry".to_string());
+                s.main_retry = true;
+                s.busy = false;
+                return;
+            }
+            st.lock().unwrap().child_status = None;
+            if !leak_subagent {
+                emit(
+                    &st,
+                    serde_json::json!({
+                        "type": "session.idle",
+                        "properties": {"sessionID": CHILD_SID}
+                    })
+                    .to_string(),
+                );
+            }
+        } else if asks_question {
+            emit(
+                &st,
+                tool_part_event(
+                    SID,
+                    "question",
+                    "completed",
+                    serde_json::json!({"output": "large"}),
+                ),
+            );
+        } else if uses_tool {
+            emit(
+                &st,
+                tool_part_event(
+                    SID,
+                    "bash",
+                    "completed",
+                    serde_json::json!({"output": "hello-world"}),
+                ),
+            );
+        }
+        emit(&st, part_updated_event(SID, "assistant", &echo));
+        st.lock().unwrap().busy = false;
+        emit(
+            &st,
+            serde_json::json!({
+                "type": "session.idle",
+                "properties": {"sessionID": SID}
+            })
+            .to_string(),
+        );
+    });
 }
 
 fn json_response(status: u16, body: &str) -> String {
@@ -541,6 +872,14 @@ fn extract_text(body: &str) -> String {
         }
     }
     body.to_string()
+}
+
+/// Extract `text` from a `POST /tui/append-prompt` body.
+fn extract_prompt_text(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("text").and_then(|text| text.as_str()).map(str::to_string))
+        .unwrap_or_else(|| body.to_string())
 }
 
 /// Extract `sessionID` from a `{"sessionID":"ses_..."}` request body.

@@ -2,8 +2,10 @@
 //!
 //! `opencode` runs its TUI as a client of an embedded HTTP server (see
 //! <https://opencode.ai/docs/server>). slopd spawns the TUI pane with a pinned
-//! `--port` on 127.0.0.1 and drives it over that HTTP API instead of via
-//! Claude-style hooks + jsonl tailing. This module is the transport + mapping
+//! `--port` on 127.0.0.1 and uses that API for lifecycle/state plus composer
+//! insertion. Submission itself is a real Enter key in the pane so OpenCode's
+//! TUI—not slopd—interprets normal prompts, built-in slash commands, configured
+//! commands, and any future input forms. This module is the transport + mapping
 //! layer; the per-pane driver loop and RPC dispatch live in [`crate`]
 //! (they need the daemon's shared state/event types).
 
@@ -188,9 +190,48 @@ impl OpencodeClient {
         Ok(v.as_object().cloned().unwrap_or_default())
     }
 
-    /// `POST /session/:id/prompt_async` — non-blocking prompt submit. Returns once
-    /// the server acknowledges (204 / 2xx), which is slopd's "prompt accepted"
-    /// signal (the analogue of Claude's `UserPromptSubmit` hook).
+    /// Replace the OpenCode TUI's current composer contents with `text`.
+    ///
+    /// These are deliberately composer operations rather than session prompt or
+    /// command operations. The caller follows them with a physical Enter in the
+    /// pane, letting the TUI resolve autocomplete and built-in commands exactly as
+    /// it would for a human.
+    pub async fn replace_prompt(&self, text: &str) -> Result<(), String> {
+        let resp = self
+            .req(reqwest::Method::POST, "/tui/clear-prompt")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!(
+                "POST /tui/clear-prompt {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+
+        let resp = self
+            .req(reqwest::Method::POST, "/tui/append-prompt")
+            .json(&json!({ "text": text }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "POST /tui/append-prompt {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ))
+        }
+    }
+
+    /// `POST /session/:id/prompt_async` — non-blocking prompt submit used only
+    /// for internal automatic retries. User-supplied input always goes through
+    /// [`Self::replace_prompt`] and the visible TUI.
     pub async fn send_message(&self, session_id: &str, text: &str) -> Result<(), String> {
         let body = json!({ "parts": [{ "type": "text", "text": text }] });
         let resp = self
@@ -204,25 +245,6 @@ impl OpencodeClient {
             Ok(())
         } else {
             Err(format!("prompt_async {}: {}", status, resp.text().await.unwrap_or_default()))
-        }
-    }
-
-    /// `POST /session/:id/command` — execute a slash command.
-    pub async fn send_command(&self, session_id: &str, command: &str) -> Result<(), String> {
-        // A bare "/foo" becomes command="foo" (no leading slash) per the API shape.
-        let cmd = command.trim_start_matches('/');
-        let body = json!({ "command": cmd, "arguments": "" });
-        let resp = self
-            .req(reqwest::Method::POST, &format!("/session/{}/command", session_id))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(format!("command {}: {}", status, resp.text().await.unwrap_or_default()))
         }
     }
 

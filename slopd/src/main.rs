@@ -835,7 +835,14 @@ async fn read_opencode_sse(
             }
             // A clean turn end (session.idle) resets the auto-continue retry budget.
             if opencode::event_type(&event) == Some("session.idle") {
-                *panes.get_or_insert(pane_id).retry_state.lock().unwrap() = None;
+                let state = panes.get_or_insert(pane_id);
+                *state.retry_state.lock().unwrap() = None;
+                if let Some(oc) = state.opencode() {
+                    // A TUI-local command can finish without ever creating a
+                    // user message. Do not let its composer text leak into a
+                    // later prompt's retry bookkeeping.
+                    *oc.pending_prompt.lock().unwrap() = None;
+                }
             }
             // Transcript record (live `listen --transcript`).
             if let Some((rtype, payload)) = opencode::event_to_transcript(&event) {
@@ -851,6 +858,12 @@ async fn read_opencode_sse(
             // backends — opencode has no native hooks, so we emit hook-NAMED events
             // derived from its bus).
             if let Some((hook_name, payload)) = opencode::event_to_hook(&event) {
+                if hook_name == "UserPromptSubmit"
+                    && let Some(oc) = panes.get_or_insert(pane_id).opencode()
+                    && let Some(prompt) = oc.pending_prompt.lock().unwrap().take()
+                {
+                    *oc.last_prompt.lock().unwrap() = Some(prompt);
+                }
                 let _ = event_tx.send(libslop::Record {
                     source: "hook".to_string(),
                     event_type: hook_name.to_string(),
@@ -861,6 +874,9 @@ async fn read_opencode_sse(
             }
             // Auto-continue: a failed turn (session.error) re-sends the last prompt.
             if opencode::event_is_failure(&event) {
+                if let Some(oc) = panes.get_or_insert(pane_id).opencode() {
+                    *oc.pending_prompt.lock().unwrap() = None;
+                }
                 schedule_opencode_auto_continue(pane_id, config, panes).await;
             }
         }
@@ -4387,8 +4403,11 @@ async fn handle_request(
                 SendTransport::Tui { settle_before_enter: true }
             );
 
-            // OpenCode panes are HTTP-driven: handle the whole send here and
-            // return. Claude and Codex panes fall through to the tmux path.
+            // OpenCode lifecycle and composer insertion use its embedded HTTP
+            // server, but submission is a real Enter in the pane. This is one
+            // generic path for every input: OpenCode's own TUI decides whether
+            // it is a normal prompt, built-in slash command, configured command,
+            // or anything added in a future release.
             if let SendTransport::Opencode(oc) = send_transport {
                 if interrupt {
                     if let Err(e) = oc.client.abort(&oc.session_id).await {
@@ -4417,23 +4436,43 @@ async fn handle_request(
                         _ => break,
                     }
                 }
-                let is_command = prompt.starts_with('/');
-                let res = if is_command {
-                    oc.client.send_command(&oc.session_id, &prompt).await
-                } else {
-                    oc.client.send_message(&oc.session_id, &prompt).await
-                };
-                return match res {
-                    Ok(()) => {
-                        // Record the prompt so a `session.error` can auto-retry it.
-                        if !is_command {
-                            *oc.last_prompt.lock().unwrap() = Some(prompt.clone());
-                            *state.retry_state.lock().unwrap() = None;
+
+                // Keep clear → insert → Enter atomic with respect to other
+                // slopctl senders so their composer contents cannot interleave.
+                let _guard = state.type_mutex.lock().await;
+
+                // A new TUI submission supersedes any internal retry. Do not
+                // guess whether this input is retryable from its spelling:
+                // slash-command interpretation belongs exclusively to OpenCode.
+                *oc.last_prompt.lock().unwrap() = None;
+                *oc.pending_prompt.lock().unwrap() = Some(prompt.clone());
+                *state.retry_state.lock().unwrap() = None;
+
+                if let Err(e) = oc.client.replace_prompt(&prompt).await {
+                    *oc.pending_prompt.lock().unwrap() = None;
+                    return libslop::ResponseBody::Error { message: e };
+                }
+
+                // The HTTP calls publish composer events; allow the TUI one
+                // render/event-loop turn to consume them before Enter. Waiting
+                // for a later session event would deadlock when an agent sends
+                // to its own pane, so successful key injection is the generic
+                // acceptance boundary.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return match tmux_send_keys(config, &pane_id, "Enter").await {
+                    Ok(out) if out.success() => libslop::ResponseBody::Sent { pane_id },
+                    Ok(_) => {
+                        *oc.pending_prompt.lock().unwrap() = None;
+                        libslop::ResponseBody::Error {
+                            message: format!("tmux send-keys failed for pane {}", pane_id),
                         }
-                        state.prompt_submitted.notify_waiters();
-                        libslop::ResponseBody::Sent { pane_id }
                     }
-                    Err(e) => libslop::ResponseBody::Error { message: e },
+                    Err(e) => {
+                        *oc.pending_prompt.lock().unwrap() = None;
+                        libslop::ResponseBody::Error {
+                            message: e.to_string(),
+                        }
+                    }
                 };
             }
 

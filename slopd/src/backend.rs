@@ -5,6 +5,10 @@ pub(super) struct OpencodeState {
     pub(super) client: opencode::OpencodeClient,
     pub(super) session_id: String,
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// Most recent composer input waiting to become a real user message.
+    /// OpenCode TUI commands never produce that message, so they never become
+    /// automatic-retry candidates.
+    pub(super) pending_prompt: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) last_prompt: Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -18,6 +22,7 @@ impl OpencodeState {
             client,
             session_id,
             cancel,
+            pending_prompt: Arc::new(std::sync::Mutex::new(None)),
             last_prompt: Arc::new(std::sync::Mutex::new(None)),
         }
     }

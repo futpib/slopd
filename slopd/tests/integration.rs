@@ -10422,11 +10422,11 @@ fn opencode_delayed_start_is_backed_up_and_restored() {
 }
 
 #[test]
-fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
+fn opencode_pane_is_tracked_sendable_through_tui_and_interruptible_over_http() {
     // End-to-end for the opencode backend: slopd spawns mock_opencode (which
     // binds the assigned --port and serves the API subset OpencodeClient uses),
-    // tracks it via the status-poll driver, and drives send/interrupt/transcript
-    // over HTTP — exercising every dispatch branch the backend added.
+    // tracks it via the status-poll driver, submits through the visible TUI, and
+    // drives interrupt/transcript over HTTP.
     build_bin("slopctl");
     build_bin("mock_opencode");
     let mock_opencode = cargo_bin("mock_opencode");
@@ -10465,8 +10465,8 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
         "ensure_session should have created/reused session ses_mock; got {:?}", p.session_id);
     assert_eq!(p.backend, libslop::Backend::Opencode);
 
-    // Send over HTTP (prompt_async). mock_opencode acks 204 (the
-    // UserPromptSubmit-equivalent), then simulates a busy→idle turn.
+    // Send through OpenCode's composer. mock_opencode consumes the physical
+    // Enter from tmux, then simulates a busy→idle turn.
     let send = env.slopctl(&["send", &pane_id, "hello from slopd"]);
     assert!(send.status.success(), "slopctl send failed: {:?} stderr={:?}",
         send.status, String::from_utf8_lossy(&send.stderr));
@@ -10493,6 +10493,125 @@ fn opencode_pane_is_tracked_sendable_and_interruptible_over_http() {
     // Interrupt over HTTP (POST /abort).
     let interrupt = env.slopctl(&["interrupt", &pane_id]);
     assert!(interrupt.status.success(), "slopctl interrupt failed: {:?}", interrupt.status);
+
+    kill_slopd(slopd);
+}
+
+/// Every user-supplied OpenCode input must cross one generic composer boundary.
+/// In particular `/compact` must not be translated to `/session/:id/command`,
+/// and multiline/key-like/Unicode text must survive unchanged.
+#[test]
+fn opencode_send_routes_arbitrary_input_through_tui_composer() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let oc_config_dir = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let input_log = logs.path().join("tui-input.jsonl");
+    let connection_log = logs.path().join("http.log");
+
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+        oc_config_dir.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let input_env = format!("MOCK_OPENCODE_INPUT_LOG={}", input_log.display());
+    let connection_env = format!("MOCK_OPENCODE_CONN_LOG={}", connection_log.display());
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "oc",
+        "--env",
+        &input_env,
+        "--env",
+        &connection_env,
+    ]);
+    assert!(
+        run.status.success(),
+        "opencode run failed: {:?} stderr={:?}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr),
+    );
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let compact = env.slopctl(&["send", &pane_id, "/compact", "--timeout", "5"]);
+    assert!(
+        compact.status.success(),
+        "generic /compact send failed: {:?} stderr={:?}",
+        compact.status,
+        String::from_utf8_lossy(&compact.stderr),
+    );
+
+    let compact_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, state) = env.pane_state(&pane_id);
+        if state == libslop::PaneDetailedState::BusyCompacting {
+            break;
+        }
+        assert!(
+            Instant::now() < compact_deadline,
+            "mock OpenCode never executed /compact; final state was {:?}",
+            state,
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_until_ready(&env, &pane_id, Duration::from_secs(5));
+
+    let arbitrary = "Enter C-u /not-a-command\nsecond line 🦀";
+    let send = env.slopctl(&["send", &pane_id, arbitrary, "--timeout", "5"]);
+    assert!(
+        send.status.success(),
+        "arbitrary composer send failed: {:?} stderr={:?}",
+        send.status,
+        String::from_utf8_lossy(&send.stderr),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let accepted = loop {
+        let values: Vec<String> = std::fs::read_to_string(&input_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if values.len() >= 2 {
+            break values;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for mock OpenCode TUI submissions; got {:?}",
+            values,
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert_eq!(accepted[0], "/compact");
+    assert_eq!(accepted[1], arbitrary);
+
+    let requests = std::fs::read_to_string(&connection_log).unwrap_or_default();
+    assert!(
+        requests.matches("POST /tui/clear-prompt").count() >= 2,
+        "each send should clear the TUI composer; requests:\n{}",
+        requests,
+    );
+    assert!(
+        requests.matches("POST /tui/append-prompt").count() >= 2,
+        "each send should append exact text to the TUI composer; requests:\n{}",
+        requests,
+    );
+    assert!(
+        !requests.contains(&format!("POST /session/{}/command", "ses_mock")),
+        "slopd must not special-case slash commands; requests:\n{}",
+        requests,
+    );
+    assert!(
+        !requests.contains(&format!("POST /session/{}/prompt_async", "ses_mock")),
+        "ordinary user input must use the same TUI path; requests:\n{}",
+        requests,
+    );
 
     kill_slopd(slopd);
 }
@@ -11242,11 +11361,21 @@ fn opencode_creates_own_session_not_ephemeral_boot_session() {
     assert_eq!(p.session_id.as_deref(), Some("ses_mock"),
         "slopd should drive the session it POSTed; got {:?}", p.session_id);
 
-    // The decisive check: send must succeed over HTTP (the ghost would 404).
+    // The decisive check now crosses the TUI composer, then reads the resulting
+    // transcript from the tracked session. A ghost-bound driver would 404 that
+    // transcript request even if Enter itself reached the visible TUI.
     let send = env.slopctl(&["send", &pane_id, "hello"]);
     assert!(send.status.success(),
         "send failed — slopd is driving an unusable session: {:?} stderr={:?}",
         send.status, String::from_utf8_lossy(&send.stderr));
+    wait_until_ready(&env, &pane_id, Duration::from_secs(5));
+    let transcript = env.slopctl(&["transcript", &pane_id]);
+    assert!(
+        transcript.status.success()
+            && String::from_utf8_lossy(&transcript.stdout).contains("hello"),
+        "tracked OpenCode session did not contain the TUI-submitted prompt: {:?}",
+        transcript,
+    );
 
     kill_slopd(slopd);
 }
