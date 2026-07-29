@@ -428,9 +428,23 @@ fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
     );
     initialize(&mut harness);
     let first = new_session(&mut harness, env.config_dir.path(), "");
-    let second = new_session(&mut harness, env.config_dir.path(), "");
+    let second = new_session(
+        &mut harness,
+        env.config_dir.path(),
+        "RESUMED_SYSTEM_PROMPT_CANARY",
+    );
     let first_pane = session_pane_id(&first).to_string();
     let second_pane = session_pane_id(&second).to_string();
+
+    // Give the second pane conversation state worth resuming, including a
+    // system prompt that must not be injected again after native resume.
+    let (second_turn, _) = prompt(&mut harness, 9, &second, "SECOND_CONTEXT_CANARY");
+    assert_eq!(second_turn["result"]["stopReason"], "end_turn");
+    let second_native_session = panes(&env)
+        .into_iter()
+        .find(|pane| pane.pane_id == second_pane)
+        .and_then(|pane| pane.session_id)
+        .expect("second pane should expose its backend-native session id");
 
     // Make the first session newer than the second, so the second is the LRU
     // eviction victim when a third resident pane is requested.
@@ -456,12 +470,92 @@ fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
         streamed_text(&notifications).contains("RESTORED_SESSION_CANARY"),
         "restored session did not run its prompt: {notifications:?}"
     );
+    assert!(
+        !streamed_text(&notifications).contains("RESUMED_SYSTEM_PROMPT_CANARY"),
+        "native resume re-injected a system prompt already present in context: {notifications:?}"
+    );
 
     let resident = panes(&env);
     assert_eq!(resident.len(), 2, "live pane limit must remain enforced");
     assert!(resident.iter().any(|pane| pane.pane_id == third_pane));
     assert!(resident.iter().all(|pane| pane.pane_id != first_pane));
     assert!(resident.iter().all(|pane| pane.pane_id != second_pane));
+    let restored_pane = resident
+        .iter()
+        .find(|pane| pane.session_id.as_deref() == Some(second_native_session.as_str()))
+        .expect("restored pane should resume the original backend-native session");
+    assert_ne!(restored_pane.pane_id, second_pane);
+}
+
+#[test]
+fn evicted_session_without_native_context_restarts_fresh() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &[
+            "--account",
+            "acp-codex",
+            "--max-sessions",
+            "1",
+            "--agent-arg",
+            "--mock-session-start=lazy",
+        ],
+    );
+    initialize(&mut harness);
+    let empty = new_session(
+        &mut harness,
+        env.config_dir.path(),
+        "FRESH_SYSTEM_PROMPT_CANARY",
+    );
+    let empty_pane = session_pane_id(&empty).to_string();
+    assert_eq!(
+        panes(&env)
+            .into_iter()
+            .find(|pane| pane.pane_id == empty_pane)
+            .and_then(|pane| pane.session_id),
+        None,
+        "the test pane unexpectedly created native context before its first prompt"
+    );
+
+    let replacement = new_session(&mut harness, env.config_dir.path(), "");
+    assert_eq!(panes(&env).len(), 1);
+    assert!(panes(&env).iter().all(|pane| pane.pane_id != empty_pane));
+
+    let (restored, notifications) = prompt(&mut harness, 10, &empty, "FRESH_RESTORE_CANARY");
+    assert_eq!(restored["result"]["stopReason"], "end_turn");
+    let streamed = streamed_text(&notifications);
+    assert!(streamed.contains("FRESH_SYSTEM_PROMPT_CANARY"));
+    assert!(streamed.contains("FRESH_RESTORE_CANARY"));
+
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 1);
+    assert!(
+        resident
+            .iter()
+            .all(|pane| pane.pane_id != session_pane_id(&replacement))
+    );
+    assert!(
+        resident[0].session_id.is_some(),
+        "freshly restored pane did not create native context on its first prompt"
+    );
 }
 
 #[test]

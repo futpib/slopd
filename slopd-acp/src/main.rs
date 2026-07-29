@@ -110,7 +110,7 @@ struct Cli {
     turn_timeout: u64,
 
     /// Maximum live managed panes. The least-recently-used inactive pane is
-    /// evicted at the limit and restored if its ACP session is used again.
+    /// evicted at the limit, then natively resumed when possible if reused.
     #[arg(long, default_value_t = 64)]
     max_sessions: usize,
 }

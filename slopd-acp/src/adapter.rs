@@ -52,11 +52,18 @@ pub struct Adapter {
 struct Session {
     pane_id: Option<String>,
     backend: Option<libslop::Backend>,
+    native_session_id: Option<String>,
     start_directory: PathBuf,
     system_prompt: Option<String>,
     system_prompt_delivered: bool,
     active_turn: Option<ActiveTurn>,
     last_used: u64,
+}
+
+struct StartedPane {
+    pane_id: String,
+    backend: libslop::Backend,
+    native_session_id: Option<String>,
 }
 
 struct ActiveTurn {
@@ -298,17 +305,18 @@ impl Adapter {
         if let Err(error) = self.make_live_pane_room().await {
             return server_error(sender, id, format!("session/new: {error}")).await;
         }
-        let (pane_id, backend) = match self.start_pane(start_directory.clone()).await {
+        let started = match self.start_pane(start_directory.clone(), None).await {
             Ok(started) => started,
             Err(error) => return server_error(sender, id, error).await,
         };
-        let session_id = format!("slopd:{pane_id}");
+        let session_id = format!("slopd:{}", started.pane_id);
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             Session {
-                pane_id: Some(pane_id),
-                backend: Some(backend),
+                pane_id: Some(started.pane_id),
+                backend: Some(started.backend),
+                native_session_id: started.native_session_id,
                 start_directory,
                 system_prompt,
                 system_prompt_delivered: false,
@@ -550,7 +558,12 @@ impl Adapter {
                     );
                     match record.event_type.as_str() {
                         "PaneDestroyed" | "SessionEnd" => {
-                            self.mark_pane_gone(session_id, &lease.pane_id).await;
+                            self.mark_pane_gone(
+                                session_id,
+                                &lease.pane_id,
+                                record.payload.get("session_id").and_then(Value::as_str),
+                            )
+                            .await;
                             return Err(format!(
                                 "underlying pane {} ended during the turn",
                                 lease.pane_id
@@ -648,7 +661,8 @@ impl Adapter {
     async fn start_pane(
         &self,
         start_directory: PathBuf,
-    ) -> Result<(String, libslop::Backend), String> {
+        native_session_id: Option<&str>,
+    ) -> Result<StartedPane, String> {
         let mut client = self.config.transport.connect().await?;
         let filters = vec![
             event_filter("slopd", "DetailedStateChange"),
@@ -662,7 +676,7 @@ impl Adapter {
         let pane_id = client
             .run(
                 None,
-                self.config.extra_args.clone(),
+                launch_args(&self.config.extra_args, native_session_id),
                 Some(start_directory),
                 self.config.env.clone(),
                 self.config.account.clone(),
@@ -700,9 +714,9 @@ impl Adapter {
                 return Err(error);
             }
         };
-        let backend = match client.ps().await {
+        let (backend, native_session_id) = match client.ps().await {
             Ok(panes) => match panes.into_iter().find(|pane| pane.pane_id == pane_id) {
-                Some(pane) => pane.backend,
+                Some(pane) => (pane.backend, pane.session_id),
                 None => {
                     if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
                         tracing::warn!(
@@ -726,11 +740,15 @@ impl Adapter {
         if let Err(error) = client.tag(pane_id.clone(), "acp".into()).await {
             tracing::warn!("could not tag ACP pane {pane_id}: {error}");
         }
-        Ok((pane_id, backend))
+        Ok(StartedPane {
+            pane_id,
+            backend,
+            native_session_id,
+        })
     }
 
     async fn ensure_session_resident(&self, session_id: &str) -> Result<(), String> {
-        let start_directory = {
+        let (start_directory, native_session_id) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(session_id)
@@ -741,26 +759,41 @@ impl Adapter {
             if session.active_turn.is_some() {
                 return Err("session is still releasing its previous pane".into());
             }
-            session.start_directory.clone()
+            (
+                session.start_directory.clone(),
+                session.native_session_id.clone(),
+            )
         };
 
         self.make_live_pane_room().await?;
-        let (pane_id, backend) = self.start_pane(start_directory).await?;
+        let started = self
+            .start_pane(start_directory, native_session_id.as_deref())
+            .await?;
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id) else {
             drop(sessions);
-            let _ = self.kill_pane(&pane_id).await;
+            let _ = self.kill_pane(&started.pane_id).await;
             return Err("session disappeared while restoring its pane".into());
         };
         if session.pane_id.is_some() {
             drop(sessions);
-            let _ = self.kill_pane(&pane_id).await;
+            let _ = self.kill_pane(&started.pane_id).await;
             return Err("session acquired another pane while it was being restored".into());
         }
-        tracing::info!(session_id, pane_id, "restored evicted ACP session");
-        session.pane_id = Some(pane_id);
-        session.backend = Some(backend);
-        session.system_prompt_delivered = false;
+        let resumed = native_session_id.is_some();
+        tracing::info!(
+            session_id,
+            pane_id = started.pane_id,
+            native_session_id = ?native_session_id,
+            resumed,
+            "restored evicted ACP session"
+        );
+        session.pane_id = Some(started.pane_id);
+        session.backend = Some(started.backend);
+        session.native_session_id = started.native_session_id.or(native_session_id);
+        if !resumed {
+            session.system_prompt_delivered = false;
+        }
         Ok(())
     }
 
@@ -797,14 +830,18 @@ impl Adapter {
                 .take()
                 .expect("selected eviction victim must have a pane");
             let backend = victim.backend.take();
-            let system_prompt_delivered = victim.system_prompt_delivered;
-            victim.system_prompt_delivered = false;
-            (victim_id, pane_id, backend, system_prompt_delivered)
+            (
+                victim_id,
+                pane_id,
+                backend,
+                victim.native_session_id.clone(),
+            )
         };
 
         tracing::info!(
             session_id = victim.0,
             pane_id = victim.1,
+            native_session_id = ?victim.3,
             "evicting least-recently-used inactive ACP pane"
         );
         if let Err(error) = self.kill_pane(&victim.1).await {
@@ -822,7 +859,6 @@ impl Adapter {
                 {
                     session.pane_id = Some(victim.1);
                     session.backend = victim.2;
-                    session.system_prompt_delivered = victim.3;
                 }
                 return Err(format!("failed to evict oldest pane: {error}"));
             }
@@ -831,13 +867,19 @@ impl Adapter {
     }
 
     async fn reconcile_live_sessions(&self, panes: &[libslop::PaneInfo]) {
-        let live_panes: HashSet<&str> = panes.iter().map(|pane| pane.pane_id.as_str()).collect();
+        let live_panes: HashMap<&str, &libslop::PaneInfo> = panes
+            .iter()
+            .map(|pane| (pane.pane_id.as_str(), pane))
+            .collect();
         let mut sessions = self.sessions.lock().await;
         for (session_id, session) in sessions.iter_mut() {
-            let Some(pane_id) = session.pane_id.as_deref() else {
+            let Some(pane_id) = session.pane_id.clone() else {
                 continue;
             };
-            if live_panes.contains(pane_id) {
+            if let Some(pane) = live_panes.get(pane_id.as_str()) {
+                if let Some(native_session_id) = pane.session_id.as_ref() {
+                    session.native_session_id = Some(native_session_id.clone());
+                }
                 continue;
             }
             tracing::info!(
@@ -847,14 +889,21 @@ impl Adapter {
             );
             session.pane_id = None;
             session.backend = None;
-            session.system_prompt_delivered = false;
+            if session.native_session_id.is_none() {
+                session.system_prompt_delivered = false;
+            }
             if let Some(active) = session.active_turn.as_ref() {
                 active.cancel.cancel();
             }
         }
     }
 
-    async fn mark_pane_gone(&self, session_id: &str, pane_id: &str) {
+    async fn mark_pane_gone(
+        &self,
+        session_id: &str,
+        pane_id: &str,
+        native_session_id: Option<&str>,
+    ) {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id) else {
             return;
@@ -862,9 +911,14 @@ impl Adapter {
         if session.pane_id.as_deref() != Some(pane_id) {
             return;
         }
+        if let Some(native_session_id) = native_session_id {
+            session.native_session_id = Some(native_session_id.to_string());
+        }
         session.pane_id = None;
         session.backend = None;
-        session.system_prompt_delivered = false;
+        if session.native_session_id.is_none() {
+            session.system_prompt_delivered = false;
+        }
     }
 
     async fn native_steer(&self, id: Value, params: Value, sender: &Sender) {
@@ -1235,6 +1289,36 @@ fn prompt_text(method: &str, blocks: &[Value]) -> Result<String, String> {
     Ok(parts.join("\n"))
 }
 
+fn launch_args(base: &[String], native_session_id: Option<&str>) -> Vec<String> {
+    let Some(native_session_id) = native_session_id else {
+        return base.to_vec();
+    };
+
+    // A restored ACP session owns its backend-native conversation identity.
+    // Remove any static resume selector before adding the captured one so
+    // Claude does not see duplicate flags and slopd's backend normalization
+    // cannot accidentally select an older value.
+    let mut filtered = Vec::with_capacity(base.len() + 2);
+    let mut args = base.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--resume" | "-s" | "--session" => {
+                let _ = args.next();
+            }
+            value
+                if value.starts_with("--resume=")
+                    || value.starts_with("--session=")
+                    || value.starts_with("-s=") => {}
+            _ => filtered.push(arg.clone()),
+        }
+    }
+    filtered.splice(
+        0..0,
+        ["--resume".to_string(), native_session_id.to_string()],
+    );
+    filtered
+}
+
 fn active_run_update(run_id: Option<&str>) -> Value {
     json!({
         "sessionUpdate": "session_info_update",
@@ -1592,6 +1676,22 @@ mod tests {
         assert!(framed.contains("[System]\nBe precise."));
         assert!(framed.ends_with("User request:\nFix it."));
         assert_eq!(frame_first_prompt(None, "Fix it."), "Fix it.");
+    }
+
+    #[test]
+    fn native_resume_overrides_static_resume_arguments() {
+        let base = vec![
+            "--foo".to_string(),
+            "--resume".to_string(),
+            "stale".to_string(),
+            "--session=also-stale".to_string(),
+            "--bar".to_string(),
+        ];
+        assert_eq!(
+            launch_args(&base, Some("native-42")),
+            ["--resume", "native-42", "--foo", "--bar"]
+        );
+        assert_eq!(launch_args(&base, None), base);
     }
 
     #[test]
