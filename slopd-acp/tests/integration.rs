@@ -262,6 +262,114 @@ fn codex_acp_session_streams_a_complete_turn() {
 }
 
 #[test]
+fn buzz_native_steer_reuses_the_existing_codex_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let pane_id = session_id
+        .strip_prefix("slopd:")
+        .expect("slopd session id should contain its pane id");
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "::mock active" }],
+        },
+    }));
+
+    let mut messages = Vec::new();
+    let active_run_id = loop {
+        let message = harness.receive();
+        assert_ne!(
+            message.get("id").and_then(Value::as_u64),
+            Some(3),
+            "the active prompt completed before Buzz could steer it: {message}"
+        );
+        if let Some(run_id) = message
+            .pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            messages.push(message);
+            break run_id;
+        }
+        messages.push(message);
+    };
+    assert!(active_run_id.starts_with("slopd-turn-"));
+
+    // This is the exact extension request Buzz sends after observing
+    // `_meta.goose.activeRunId`. slopd-acp must route it through slopd's
+    // ordinary send path, which steers a busy Codex pane without cancellation.
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "_goose/unstable/session/steer",
+        "params": {
+            "sessionId": session_id,
+            "expectedRunId": active_run_id,
+            "prompt": [{ "type": "text", "text": "BUZZ_STEER_CANARY" }],
+        },
+    }));
+
+    let mut prompt_response = None;
+    let mut steer_response = None;
+    let mut active_run_cleared = false;
+    while prompt_response.is_none() || steer_response.is_none() || !active_run_cleared {
+        let message = harness.receive();
+        match message.get("id").and_then(Value::as_u64) {
+            Some(3) => prompt_response = Some(message),
+            Some(4) => steer_response = Some(message),
+            _ => {
+                active_run_cleared |= message
+                    .pointer("/params/update/_meta/goose/activeRunId")
+                    .is_some_and(Value::is_null);
+                messages.push(message);
+            }
+        }
+    }
+
+    let steer_response = steer_response.unwrap();
+    assert!(
+        steer_response.get("error").is_none(),
+        "Buzz would fall back to cancel-and-reprompt after this response: {steer_response}"
+    );
+    assert!(steer_response.get("result").is_some());
+    assert_eq!(prompt_response.unwrap()["result"]["stopReason"], "end_turn");
+    let streamed = streamed_text(&messages);
+    assert!(
+        streamed.contains("steered: BUZZ_STEER_CANARY"),
+        "steered Codex response was not streamed through the original ACP turn: {streamed}"
+    );
+
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    assert_eq!(panes.len(), 1, "steering must not create another pane");
+    assert_eq!(panes[0].pane_id, pane_id);
+}
+
+#[test]
 fn opencode_acp_session_streams_only_the_assistant_turn() {
     build_bin("slopd");
     build_bin("slopctl");

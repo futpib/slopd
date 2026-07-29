@@ -13,6 +13,7 @@ use crate::transport::Transport;
 use crate::wire::{self, Sender};
 
 const PROTOCOL_VERSION: u32 = 2;
+const NATIVE_STEER_METHOD: &str = "_goose/unstable/session/steer";
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum SystemPromptMode {
@@ -56,11 +57,13 @@ struct Session {
 
 struct ActiveTurn {
     id: u64,
+    run_id: String,
     cancel: CancellationToken,
 }
 
 struct TurnLease {
     turn_id: u64,
+    run_id: String,
     pane_id: String,
     backend: libslop::Backend,
     prompt: String,
@@ -100,6 +103,14 @@ struct SessionPromptParams {
 #[serde(rename_all = "camelCase")]
 struct SessionCancelParams {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSteerParams {
+    session_id: String,
+    expected_run_id: String,
+    prompt: Vec<Value>,
 }
 
 impl Adapter {
@@ -149,6 +160,13 @@ impl Adapter {
                 let sender = sender.clone();
                 tokio::spawn(async move {
                     adapter.session_prompt(id, params, &sender).await;
+                });
+            }
+            NATIVE_STEER_METHOD => {
+                let adapter = Arc::clone(self);
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    adapter.native_steer(id, params, &sender).await;
                 });
             }
             "session/cancel" => {
@@ -416,7 +434,7 @@ impl Adapter {
                 .await;
             }
         };
-        let user_prompt = match prompt_text(&params.prompt) {
+        let user_prompt = match prompt_text("session/prompt", &params.prompt) {
             Ok(prompt) if !prompt.is_empty() => prompt,
             Ok(_) => {
                 return reject(sender, id, "session/prompt: prompt is empty".into()).await;
@@ -425,6 +443,7 @@ impl Adapter {
         };
 
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("slopd-turn-{turn_id}");
         let lease = {
             let mut sessions = self.sessions.lock().await;
             let Some(session) = sessions.get_mut(&params.session_id) else {
@@ -446,10 +465,12 @@ impl Adapter {
             let cancel = CancellationToken::new();
             session.active_turn = Some(ActiveTurn {
                 id: turn_id,
+                run_id: run_id.clone(),
                 cancel: cancel.clone(),
             });
             TurnLease {
                 turn_id,
+                run_id,
                 pane_id: session.pane_id.clone(),
                 backend: session.backend,
                 prompt,
@@ -473,7 +494,7 @@ impl Adapter {
             }
         };
 
-        {
+        let cleared_active_turn = {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&params.session_id)
                 && session
@@ -489,7 +510,17 @@ impl Adapter {
                 if lease.system_prompt_included && was_accepted {
                     session.system_prompt_delivered = true;
                 }
+                true
+            } else {
+                false
             }
+        };
+        if cleared_active_turn {
+            wire::send(
+                sender,
+                wire::session_update(&params.session_id, active_run_update(None)),
+            )
+            .await;
         }
 
         match result {
@@ -554,6 +585,11 @@ impl Adapter {
             }
         };
         accepted.store(true, Ordering::Release);
+        wire::send(
+            sender,
+            wire::session_update(session_id, active_run_update(Some(&lease.run_id))),
+        )
+        .await;
 
         let mut projection = Projection::default();
         let mut saw_busy = false;
@@ -690,6 +726,73 @@ impl Adapter {
                     });
                 }
             }
+        }
+    }
+
+    async fn native_steer(&self, id: Value, params: Value, sender: &Sender) {
+        let params: NativeSteerParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: invalid params: {error}"),
+                )
+                .await;
+            }
+        };
+        let prompt = match prompt_text(NATIVE_STEER_METHOD, &params.prompt) {
+            Ok(prompt) if !prompt.is_empty() => prompt,
+            Ok(_) => {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: prompt is empty"),
+                )
+                .await;
+            }
+            Err(error) => return reject(sender, id, error).await,
+        };
+
+        let pane_id = {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get(&params.session_id) else {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: unknown session"),
+                )
+                .await;
+            };
+            let Some(active_turn) = session.active_turn.as_ref() else {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: no prompt is in flight"),
+                )
+                .await;
+            };
+            if active_turn.run_id != params.expected_run_id {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: expectedRunId does not match the active turn"),
+                )
+                .await;
+            }
+            session.pane_id.clone()
+        };
+
+        let mut client = match self.config.transport.connect().await {
+            Ok(client) => client,
+            Err(error) => return server_error(sender, id, error).await,
+        };
+        match client
+            .send_prompt(pane_id, prompt, self.config.send_timeout_secs, false)
+            .await
+        {
+            Ok(_) => wire::send(sender, wire::ok(id, Value::Null)).await,
+            Err(error) => server_error(sender, id, error.to_string()).await,
         }
     }
 
@@ -936,27 +1039,39 @@ fn subscription_event(
     }
 }
 
-fn prompt_text(blocks: &[Value]) -> Result<String, String> {
+fn prompt_text(method: &str, blocks: &[Value]) -> Result<String, String> {
     let mut parts = Vec::with_capacity(blocks.len());
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
-                    "session/prompt: text content block is missing text".to_string()
-                })?;
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("{method}: text content block is missing text"))?;
                 parts.push(text);
             }
             Some(kind) => {
                 return Err(format!(
-                    "session/prompt: unsupported {kind:?} content block; only text is supported"
+                    "{method}: unsupported {kind:?} content block; only text is supported"
                 ));
             }
             None => {
-                return Err("session/prompt: content block is missing its type".to_string());
+                return Err(format!("{method}: content block is missing its type"));
             }
         }
     }
     Ok(parts.join("\n"))
+}
+
+fn active_run_update(run_id: Option<&str>) -> Value {
+    json!({
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+            "goose": {
+                "activeRunId": run_id,
+            },
+        },
+    })
 }
 
 fn frame_first_prompt(system_prompt: Option<&str>, user_prompt: &str) -> String {
@@ -1310,7 +1425,26 @@ mod tests {
     #[test]
     fn prompt_rejects_non_text_blocks() {
         let blocks = vec![json!({"type": "image", "data": "..."})];
-        assert!(prompt_text(&blocks).unwrap_err().contains("unsupported"));
+        assert!(
+            prompt_text("session/prompt", &blocks)
+                .unwrap_err()
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn active_run_update_matches_buzz_native_steer_contract() {
+        assert_eq!(
+            active_run_update(Some("slopd-turn-7"))
+                .pointer("/_meta/goose/activeRunId")
+                .and_then(Value::as_str),
+            Some("slopd-turn-7")
+        );
+        assert!(
+            active_run_update(None)
+                .pointer("/_meta/goose/activeRunId")
+                .is_some_and(Value::is_null)
+        );
     }
 
     #[test]
