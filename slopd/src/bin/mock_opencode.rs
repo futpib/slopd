@@ -20,6 +20,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod mock_support;
+
+use mock_support::{
+    MockCommand, OPENCODE_HELP as MOCK_HELP, SubagentMode, parse as parse_mock_command,
+    parse_duration, reject_unknown_mock_option,
+};
+
 const SID: &str = "ses_mock";
 /// A child session id used to simulate an opencode subagent (parent = SID).
 const CHILD_SID: &str = "ses_mock_child";
@@ -45,9 +52,9 @@ struct MockState {
     /// SSE event broadcast (JSON strings). Only one subscriber (the driver).
     event_rx: Option<mpsc::Receiver<String>>,
     event_tx: mpsc::Sender<String>,
-    /// Test hook: the first "boom" prompt fails (session.error) so slopd's
-    /// auto-continue can be exercised; subsequent "boom" prompts succeed.
-    boom_failed: bool,
+    /// Test hook: the first `::mock fail once` prompt fails (session.error) so
+    /// slopd's auto-continue can be exercised; subsequent attempts succeed.
+    fail_once_triggered: bool,
     /// Mirrors real opencode: a fresh TUI lists NO session until one is created
     /// (POST /session). Exercises slopd's ensure_session() create-if-absent path.
     session_created: bool,
@@ -107,33 +114,42 @@ fn main() {
             }
             // Test flag: list a garbage-collected "ghost" session in GET /session
             // that 404s on use — reproduces the ephemeral-boot-session bug.
-            "--ghost-session" => ghost = true,
-            "--startup-delay-ms" => {
-                startup_delay = args
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(Duration::from_millis)
-                    .unwrap_or(Duration::ZERO);
+            "--mock-ghost-session" => ghost = true,
+            "--mock-startup-delay" => {
+                let Some(value) = args.next() else {
+                    eprintln!("mock_opencode: `--mock-startup-delay` requires a duration");
+                    std::process::exit(2);
+                };
+                startup_delay = parse_duration(&value).unwrap_or_else(|error| {
+                    eprintln!("mock_opencode: {error}");
+                    std::process::exit(2);
+                });
             }
-            // Failure-injection mode (mirrors mock_claude --crash-output): print a
+            // Failure-injection mode (mirrors mock_claude --mock-crash-output): print a
             // diagnostic line to the terminal then exit non-zero before binding the
             // port — simulating opencode crashing on launch with a visible error.
             // The brief pause keeps the exit realistic (a real opencode takes
             // >100ms to reach a crash), comfortably outlasting slopd's
             // remain-on-exit set-option round-trip so the pane lingers as DEAD.
-            "--crash-output" => {
-                let msg = args.next()
-                    .unwrap_or_else(|| "mock_opencode: simulated startup crash".to_string());
+            "--mock-crash-output" => {
+                let Some(msg) = args.next() else {
+                    eprintln!("mock_opencode: `--mock-crash-output` requires a message");
+                    std::process::exit(2);
+                };
                 println!("{}", msg);
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 std::process::exit(37);
+            }
+            option if option.starts_with("--mock-") => {
+                reject_unknown_mock_option("mock_opencode", option);
             }
             _ => { /* ignore unknown flags (e.g. opencode passthrough) */ }
         }
     }
     let port = port.expect("mock_opencode: --port is required");
 
-    let listener = TcpListener::bind((hostname.as_str(), port)).expect("mock_opencode: bind failed");
+    let listener =
+        TcpListener::bind((hostname.as_str(), port)).expect("mock_opencode: bind failed");
     listener.set_nonblocking(false).ok();
 
     let (event_tx, event_rx) = mpsc::channel::<String>();
@@ -143,7 +159,7 @@ fn main() {
         messages: Vec::new(),
         event_rx: Some(event_rx),
         event_tx,
-        boom_failed: false,
+        fail_once_triggered: false,
         session_created: resumed_session,
         second_session: false,
         selected_session: None,
@@ -286,7 +302,11 @@ fn handle(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
     #[cfg(feature = "testing")]
     if let Ok(log_path) = std::env::var("MOCK_OPENCODE_CONN_LOG") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             let _ = writeln!(f, "{} {}", method, path);
         }
     }
@@ -334,7 +354,9 @@ fn stream_sse(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
         None => return, // another subscriber already took it
     };
     // server.connected first, matching real opencode.
-    let _ = stream.write_all(b"event: server.connected\ndata: {\"type\":\"server.connected\",\"properties\":{}}\n\n");
+    let _ = stream.write_all(
+        b"event: server.connected\ndata: {\"type\":\"server.connected\",\"properties\":{}}\n\n",
+    );
     loop {
         match rx.recv_timeout(Duration::from_millis(800)) {
             Ok(json) => {
@@ -458,104 +480,8 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
 
         ("POST", p) if p == format!("/session/{SID}/prompt_async") => {
             let text = extract_text(body);
-            // Test hook: a "switch" prompt simulates the human navigating the TUI to
-            // a different top-level session (SID_2). The server creates that session
-            // and emits the tui.session.select event slopd follows; the prompt
-            // itself produces no turn.
-            if text == "switch" {
-                state.lock().unwrap().second_session = true;
-                emit(&state, serde_json::json!({"type":"tui.session.select","properties":{"sessionID":SID_2}}).to_string());
-                (204, String::new())
-            } else {
-            // Test hook: a "boom" prompt fails the first time (session.error) so
-            // slopd's auto-continue retry can be exercised; it succeeds on retry.
-            let fail_this = text == "boom" && !state.lock().unwrap().boom_failed;
-            if fail_this {
-                state.lock().unwrap().boom_failed = true;
-                state.lock().unwrap().messages.push(("user".to_string(), text));
-                emit(&state, format!(r#"{{"type":"session.status","properties":{{"sessionID":"{SID}","status":{{"type":"busy"}}}}}}"#));
-                emit(&state, format!(r#"{{"type":"session.error","properties":{{"sessionID":"{SID}"}}}}"#));
-                state.lock().unwrap().busy = false;
-                (204, String::new())
-            } else {
-                {
-                    let mut s = state.lock().unwrap();
-                    s.busy = true;
-                    s.messages.push(("user".to_string(), text.clone()));
-                    s.messages.push(("assistant".to_string(), format!("echo: {text}")));
-                }
-                let uses_tool = text.contains("tool");
-                let uses_subagent = text.contains("subagent");
-                // Subagent failure modes that reproduce the busy_subagent leak:
-                // `leak`  → the child finishes (absent from /session/status) but its
-                //           session.idle SSE event is DROPPED (missed on a reconnect).
-                // `retry` → the child wedges in `{"type":"retry"}` (rate-limited) and
-                //           never emits a terminal event; the main session retries too.
-                // In both, only the backstop's /session/status reconcile can clear it.
-                let leak_subagent = uses_subagent && text.contains("leak");
-                let retry_subagent = uses_subagent && text.contains("retry");
-                let asks_question = text.contains("question");
-                // busy + user message
-                emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":SID,"status":{"type":"busy"}}}).to_string());
-                emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":SID,"info":{"role":"user"}}}).to_string());
-                emit(&state, part_updated_event(SID, "user", &text));
-                if uses_subagent {
-                    // Spawn a child session (opencode subagent): session.created with
-                    // parentID, and reflect it as a running child in /session/status.
-                    {
-                        let mut s = state.lock().unwrap();
-                        s.child_exists = true;
-                        s.child_status = Some("busy".to_string());
-                    }
-                    emit(&state, serde_json::json!({"type":"session.created","properties":{"sessionID":CHILD_SID,"info":{"id":CHILD_SID,"parentID":SID,"agent":"general","title":"mock subagent"}}}).to_string());
-                    emit(&state, serde_json::json!({"type":"session.status","properties":{"sessionID":CHILD_SID,"status":{"type":"busy"}}}).to_string());
-                    emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":CHILD_SID,"info":{"role":"assistant"}}}).to_string());
-                } else if asks_question {
-                    // The `question` tool is opencode's elicitation (agent asking the user).
-                    emit(&state, tool_part_event(SID, "question", "pending", serde_json::json!({"input":{"message":"what size?"}})));
-                } else if uses_tool {
-                    emit(&state, tool_part_event(SID, "bash", "pending", serde_json::json!({})));
-                    emit(&state, tool_part_event(SID, "bash", "running", serde_json::json!({"input":{"command":"cat sample.txt"}})));
-                }
-                emit(&state, serde_json::json!({"type":"message.updated","properties":{"sessionID":SID,"info":{"role":"assistant"}}}).to_string());
-                let st = state.clone();
-                let echo = format!("echo: {text}");
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(400));
-                    if uses_subagent {
-                        if retry_subagent {
-                            // Child wedges in `retry` and the main session retries too;
-                            // NEITHER emits a terminal event. Nothing on the SSE stream
-                            // can clear busy_subagent — only the backstop's
-                            // /session/status reconcile (child no longer "working").
-                            let mut s = st.lock().unwrap();
-                            s.child_status = Some("retry".to_string());
-                            s.main_retry = true;
-                            s.busy = false;
-                            return;
-                        }
-                        // Child finished → gone from /session/status.
-                        st.lock().unwrap().child_status = None;
-                        if !leak_subagent {
-                            // Normal subagent: emit the child's terminal event so the
-                            // SSE reader drops it immediately.
-                            emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":CHILD_SID}}).to_string());
-                        }
-                        // leak_subagent: the child's session.idle is DROPPED (never
-                        // sent), so the SSE reader keeps the stale entry — the backstop
-                        // prune is the only thing that can recover the pane.
-                    } else if asks_question {
-                        emit(&st, tool_part_event(SID, "question", "completed", serde_json::json!({"output":"large"})));
-                    } else if uses_tool {
-                        emit(&st, tool_part_event(SID, "bash", "completed", serde_json::json!({"output":"hello-world"})));
-                    }
-                    emit(&st, part_updated_event(SID, "assistant", &echo));
-                    st.lock().unwrap().busy = false;
-                    emit(&st, serde_json::json!({"type":"session.idle","properties":{"sessionID":SID}}).to_string());
-                });
-                (204, String::new())
-            }
-            }
+            submit_prompt(state.clone(), text);
+            (204, String::new())
         }
 
         ("POST", p) if p == format!("/session/{SID}/abort") => {
@@ -600,30 +526,53 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
 /// turn simulation behind `prompt_async`, but it is intentionally reached from
 /// the terminal thread so tests prove slopd used the composer boundary.
 fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
-    // Test hook: a "switch" prompt simulates the human navigating the TUI to
-    // a different top-level session (SID_2).
-    if text == "switch" {
-        state.lock().unwrap().second_session = true;
-        emit(
-            &state,
-            serde_json::json!({
-                "type": "tui.session.select",
-                "properties": {"sessionID": SID_2}
-            })
-            .to_string(),
-        );
-        return;
+    #[derive(Clone, Copy)]
+    enum Scenario {
+        Normal,
+        Tool,
+        Question,
+        Subagent(SubagentMode),
     }
+
+    let command = parse_mock_command(&text).unwrap_or_else(|error| {
+        eprintln!("mock_opencode: {error}");
+        std::process::exit(2);
+    });
+    let (scenario, response) = match command {
+        None => (Scenario::Normal, format!("echo: {text}")),
+        Some(MockCommand::Help) => (Scenario::Normal, MOCK_HELP.to_string()),
+        Some(MockCommand::SwitchSession) => {
+            state.lock().unwrap().second_session = true;
+            emit(
+                &state,
+                serde_json::json!({
+                    "type": "tui.session.select",
+                    "properties": {"sessionID": SID_2}
+                })
+                .to_string(),
+            );
+            return;
+        }
+        Some(MockCommand::FailOnce) => (Scenario::Normal, format!("echo: {text}")),
+        Some(MockCommand::Tool) => (Scenario::Tool, format!("echo: {text}")),
+        Some(MockCommand::Question) => (Scenario::Question, format!("echo: {text}")),
+        Some(MockCommand::Subagent(mode)) => (Scenario::Subagent(mode), format!("echo: {text}")),
+        Some(other) => {
+            eprintln!("mock_opencode: unsupported command {other:?}");
+            std::process::exit(2);
+        }
+    };
 
     // A failed turn still creates/announces the user message before
     // `session.error`, as real OpenCode does. That lets slopd promote the
     // composer candidate to an automatic-retry candidate without inspecting
     // the input text itself.
-    let fail_this = text == "boom" && !state.lock().unwrap().boom_failed;
+    let fail_this = matches!(command, Some(MockCommand::FailOnce))
+        && !state.lock().unwrap().fail_once_triggered;
     if fail_this {
         {
             let mut s = state.lock().unwrap();
-            s.boom_failed = true;
+            s.fail_once_triggered = true;
             s.busy = true;
             s.messages.push(("user".to_string(), text.clone()));
         }
@@ -660,14 +609,17 @@ fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
         let mut s = state.lock().unwrap();
         s.busy = true;
         s.messages.push(("user".to_string(), text.clone()));
-        s.messages
-            .push(("assistant".to_string(), format!("echo: {text}")));
+        s.messages.push(("assistant".to_string(), response.clone()));
     }
-    let uses_tool = text.contains("tool");
-    let uses_subagent = text.contains("subagent");
-    let leak_subagent = uses_subagent && text.contains("leak");
-    let retry_subagent = uses_subagent && text.contains("retry");
-    let asks_question = text.contains("question");
+    let uses_tool = matches!(scenario, Scenario::Tool);
+    let subagent_mode = match scenario {
+        Scenario::Subagent(mode) => Some(mode),
+        _ => None,
+    };
+    let uses_subagent = subagent_mode.is_some();
+    let leak_subagent = subagent_mode == Some(SubagentMode::Leak);
+    let retry_subagent = subagent_mode == Some(SubagentMode::Retry);
+    let asks_question = matches!(scenario, Scenario::Question);
 
     emit(
         &state,
@@ -759,7 +711,6 @@ fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
     );
 
     let st = state.clone();
-    let echo = format!("echo: {text}");
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
         if uses_subagent {
@@ -802,7 +753,7 @@ fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
                 ),
             );
         }
-        emit(&st, part_updated_event(SID, "assistant", &echo));
+        emit(&st, part_updated_event(SID, "assistant", &response));
         st.lock().unwrap().busy = false;
         emit(
             &st,
@@ -878,7 +829,12 @@ fn extract_text(body: &str) -> String {
 fn extract_prompt_text(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|value| value.get("text").and_then(|text| text.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("text")
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| body.to_string())
 }
 
@@ -886,5 +842,9 @@ fn extract_prompt_text(body: &str) -> String {
 fn extract_session_id(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("sessionID").and_then(|s| s.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("sessionID")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
 }

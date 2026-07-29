@@ -8,8 +8,16 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod mock_support;
+
+use mock_support::{
+    CODEX_HELP as MOCK_HELP, MockCommand, parse as parse_mock_command, reject_unknown_mock_option,
+};
+
 fn fire_hooks(settings: &Value, event: &str, payload: &Value) {
-    let Some(entries) = settings.pointer(&format!("/hooks/{event}")).and_then(Value::as_array)
+    let Some(entries) = settings
+        .pointer(&format!("/hooks/{event}"))
+        .and_then(Value::as_array)
     else {
         return;
     };
@@ -97,13 +105,7 @@ fn session_id(args: &[String]) -> String {
     format!("mock-codex-{}", uuid::Uuid::new_v4())
 }
 
-fn finish_turn(
-    settings: &Value,
-    session_id: &str,
-    cwd: &Path,
-    transcript: &Path,
-    response: &str,
-) {
+fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path, response: &str) {
     response_message(transcript, "assistant", response);
     write_record(
         transcript,
@@ -118,6 +120,12 @@ fn finish_turn(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
+        match arg.as_str() {
+            "--mock-session-start=lazy" => {}
+            _ => reject_unknown_mock_option("mock_codex", arg),
+        }
+    }
     let codex_home = PathBuf::from(
         std::env::var_os("CODEX_HOME")
             .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| ".".into())),
@@ -142,7 +150,7 @@ fn main() {
     // Real interactive Codex creates a fresh session lazily on the first
     // submitted prompt. Tests can request that behavior explicitly while
     // resume/fork and the older eager-path tests retain their startup hook.
-    let mut session_started = !args.iter().any(|arg| arg == "--lazy-session-start");
+    let mut session_started = !args.iter().any(|arg| arg == "--mock-session-start=lazy");
     if session_started {
         fire_hooks(
             &settings,
@@ -216,6 +224,33 @@ fn main() {
                     continue;
                 }
 
+                let mock_command = match parse_mock_command(&prompt) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        eprintln!("mock_codex: {error}");
+                        unsafe {
+                            libc::tcsetattr(stdin_fd, libc::TCSANOW, &original);
+                        }
+                        std::process::exit(2);
+                    }
+                };
+                if let Some(command) = mock_command
+                    && !matches!(
+                        command,
+                        MockCommand::Help
+                            | MockCommand::Active
+                            | MockCommand::Permission(None)
+                            | MockCommand::PolicyShow
+                            | MockCommand::PolicyRestrict
+                    )
+                {
+                    eprintln!("mock_codex: unsupported command {command:?}");
+                    unsafe {
+                        libc::tcsetattr(stdin_fd, libc::TCSANOW, &original);
+                    }
+                    std::process::exit(2);
+                }
+
                 if !session_started {
                     fire_hooks(
                         &settings,
@@ -234,38 +269,28 @@ fn main() {
                 );
                 response_message(&transcript, "user", &prompt);
 
-                if prompt == "__active__" {
+                if matches!(mock_command, Some(MockCommand::Active)) {
                     active = true;
                     continue;
                 }
-                if prompt == "__approval__" {
+                if matches!(mock_command, Some(MockCommand::Permission(None))) {
                     awaiting_approval = true;
                     fire_hooks(
                         &settings,
                         "PermissionRequest",
-                        &hook_payload(
-                            "PermissionRequest",
-                            &session_id,
-                            &cwd,
-                            &transcript,
-                        ),
+                        &hook_payload("PermissionRequest", &session_id, &cwd, &transcript),
                     );
                     continue;
                 }
-                if prompt == "__restrict__" {
-                    policy =
-                        json!({"approvalPolicy":"on-request","sandbox":"workspace-write"});
-                    finish_turn(
-                        &settings,
-                        &session_id,
-                        &cwd,
-                        &transcript,
-                        "restricted",
-                    );
+                if matches!(mock_command, Some(MockCommand::PolicyRestrict)) {
+                    policy = json!({"approvalPolicy":"on-request","sandbox":"workspace-write"});
+                    finish_turn(&settings, &session_id, &cwd, &transcript, "restricted");
                     continue;
                 }
-                let response = if prompt == "__policy__" {
+                let response = if matches!(mock_command, Some(MockCommand::PolicyShow)) {
                     policy.to_string()
+                } else if matches!(mock_command, Some(MockCommand::Help)) {
+                    MOCK_HELP.to_string()
                 } else if active {
                     active = false;
                     format!("steered: {prompt}")

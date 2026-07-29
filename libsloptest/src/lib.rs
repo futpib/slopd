@@ -51,9 +51,10 @@ pub fn build_bin(name: &str) {
     // CARGO_TARGET_DIR at the coverage target directory so the binary ends up
     // next to the test executable.
     if cfg!(coverage)
-        && let Some(target_dir) = cargo_bin(name).parent().and_then(|p| p.parent()) {
-            cmd.env("CARGO_TARGET_DIR", target_dir);
-        }
+        && let Some(target_dir) = cargo_bin(name).parent().and_then(|p| p.parent())
+    {
+        cmd.env("CARGO_TARGET_DIR", target_dir);
+    }
     let status = cmd.status().expect("failed to run cargo build");
     assert!(status.success(), "cargo build --bin {} failed", name);
     built.insert(name.to_string());
@@ -97,7 +98,14 @@ impl TmuxServer {
         let tmpdir = tempfile::tempdir().unwrap();
         let socket = tmpdir.path().join("tmux.sock");
         let result = Command::new("tmux")
-            .args(["-S", socket.to_str().unwrap(), "new-session", "-d", "-s", "test"])
+            .args([
+                "-S",
+                socket.to_str().unwrap(),
+                "new-session",
+                "-d",
+                "-s",
+                "test",
+            ])
             .env_remove("TMUX")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
@@ -107,7 +115,10 @@ impl TmuxServer {
             Err(e) => panic!("failed to start tmux: {}", e),
             Ok(status) => assert!(status.success(), "failed to start tmux server"),
         }
-        Some(TmuxServer { _tmpdir: tmpdir, socket })
+        Some(TmuxServer {
+            _tmpdir: tmpdir,
+            socket,
+        })
     }
 
     pub fn tmux(&self) -> Command {
@@ -135,10 +146,17 @@ impl TmuxServer {
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
         let mut config = String::new();
         if let Some(path) = claude_config_dir {
-            config.push_str(&format!("claude_config_dir = {:?}\n\n", path.to_str().unwrap()));
+            config.push_str(&format!(
+                "claude_config_dir = {:?}\n\n",
+                path.to_str().unwrap()
+            ));
         }
-        config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
-        let has_run_section = executable.is_some() || slopctl.is_some() || start_directory.is_some();
+        config.push_str(&format!(
+            "[tmux]\nsocket = {:?}\n",
+            self.socket.to_str().unwrap()
+        ));
+        let has_run_section =
+            executable.is_some() || slopctl.is_some() || start_directory.is_some();
         if has_run_section {
             config.push_str("\n[run]\n");
             if let Some(exe) = executable {
@@ -199,7 +217,10 @@ impl TmuxServer {
         if let Some(name) = default_account {
             config.push_str(&format!("default_account = {:?}\n\n", name));
         }
-        config.push_str(&format!("[tmux]\nsocket = {:?}\n", self.socket.to_str().unwrap()));
+        config.push_str(&format!(
+            "[tmux]\nsocket = {:?}\n",
+            self.socket.to_str().unwrap()
+        ));
         let has_run_section = executable.is_some() || slopctl.is_some();
         if has_run_section {
             config.push_str("\n[run]\n");
@@ -231,8 +252,10 @@ impl TmuxServer {
     ) {
         let slopd_config_dir = config_dir.path().join("slopd");
         std::fs::create_dir_all(&slopd_config_dir).unwrap();
+        let claude_config_dir = config_dir.path().join("mock-claude");
         let mut config = format!(
-            "[tmux]\nsocket = {:?}\n\n[run]\n",
+            "claude_config_dir = {:?}\n\n[tmux]\nsocket = {:?}\n\n[run]\n",
+            claude_config_dir.to_str().unwrap(),
             self.socket.to_str().unwrap(),
         );
         if let Some(exe) = executable {
@@ -273,7 +296,11 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config(&config_dir, executable);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     pub fn new_full(
@@ -285,7 +312,11 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_full(&config_dir, executable, slopctl, claude_config_dir, None);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     pub fn new_with_start_directory(
@@ -296,7 +327,11 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_full(&config_dir, executable, None, None, Some(start_directory));
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     /// Like `new_full` but configures named `[accounts]` and an optional
@@ -310,8 +345,18 @@ impl TestEnv {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config_accounts(&config_dir, executable, slopctl, accounts, default_account);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        tmux.write_slopd_config_accounts(
+            &config_dir,
+            executable,
+            slopctl,
+            accounts,
+            default_account,
+        );
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     /// Like `new_full` but configures a custom tmux `[tmux] session` name.
@@ -324,7 +369,11 @@ impl TestEnv {
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
         tmux.write_slopd_config_with_session(&config_dir, executable, slopctl, session);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     /// Create a test environment with auto-continue on StopFailure enabled.
@@ -339,8 +388,19 @@ impl TestEnv {
         let tmux = TmuxServer::start()?;
         let runtime_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        tmux.write_slopd_config_with_auto_continue(&config_dir, executable, slopctl, max_attempts, initial_backoff_ms, max_backoff_ms);
-        Some(TestEnv { tmux, runtime_dir, config_dir })
+        tmux.write_slopd_config_with_auto_continue(
+            &config_dir,
+            executable,
+            slopctl,
+            max_attempts,
+            initial_backoff_ms,
+            max_backoff_ms,
+        );
+        Some(TestEnv {
+            tmux,
+            runtime_dir,
+            config_dir,
+        })
     }
 
     pub fn spawn_slopd(&self) -> Child {
@@ -390,14 +450,22 @@ impl TestEnv {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                panic!("timed out waiting for slopd to accept connections at {}", socket.display());
+                panic!(
+                    "timed out waiting for slopd to accept connections at {}",
+                    socket.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         child
     }
 
-    fn spawn_slopd_inner(&self, run_yield_ms: Option<u64>, extra_args: &[&str], extra_envs: &[(&str, &str)]) -> Child {
+    fn spawn_slopd_inner(
+        &self,
+        run_yield_ms: Option<u64>,
+        extra_args: &[&str],
+        extra_envs: &[(&str, &str)],
+    ) -> Child {
         let mut cmd = Command::new(cargo_bin("slopd"));
         cmd.args(extra_args)
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
@@ -423,7 +491,10 @@ impl TestEnv {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                panic!("timed out waiting for slopd to accept connections at {}", socket.display());
+                panic!(
+                    "timed out waiting for slopd to accept connections at {}",
+                    socket.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -451,7 +522,10 @@ impl TestEnv {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                panic!("timed out waiting for slopd to listen on {}", socket.display());
+                panic!(
+                    "timed out waiting for slopd to listen on {}",
+                    socket.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -535,12 +609,20 @@ impl TestEnv {
         let mut buf = [0u8; 1];
         loop {
             use std::io::Read;
-            stdout.read_exact(&mut buf).expect("failed to read subscription confirmation");
-            if buf[0] == b'\n' { break; }
+            stdout
+                .read_exact(&mut buf)
+                .expect("failed to read subscription confirmation");
+            if buf[0] == b'\n' {
+                break;
+            }
             line.push(buf[0]);
         }
         let line = String::from_utf8_lossy(&line);
-        assert!(line.contains("subscribed"), "unexpected first line from slopctl listen: {:?}", line);
+        assert!(
+            line.contains("subscribed"),
+            "unexpected first line from slopctl listen: {:?}",
+            line
+        );
         child
     }
 
@@ -558,7 +640,10 @@ impl TestEnv {
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => { let _ = tx.send(Err(())); return; }
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Err(()));
+                        return;
+                    }
                     Ok(_) => {}
                 }
                 let v: serde_json::Value = match serde_json::from_str(line.trim()) {
@@ -575,7 +660,8 @@ impl TestEnv {
                 }
             }
         });
-        let session_id = rx.recv_timeout(Duration::from_secs(30))
+        let session_id = rx
+            .recv_timeout(Duration::from_secs(30))
             .expect("timed out waiting for SessionStart")
             .expect("slopctl listen closed before SessionStart");
         kill_child(listener);
@@ -586,10 +672,16 @@ impl TestEnv {
     /// Panics if the pane is not found.
     pub fn pane_state(&self, pane_id: &str) -> (libslop::PaneState, libslop::PaneDetailedState) {
         let output = self.slopctl(&["ps", "--json"]);
-        assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+        assert!(
+            output.status.success(),
+            "slopctl ps --json failed: {:?}",
+            output
+        );
         let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&output.stdout)
             .expect("failed to parse slopctl ps --json output");
-        let pane = panes.into_iter().find(|p| p.pane_id == pane_id)
+        let pane = panes
+            .into_iter()
+            .find(|p| p.pane_id == pane_id)
             .unwrap_or_else(|| panic!("pane {} not found in slopctl ps output", pane_id));
         (pane.state, pane.detailed_state)
     }
@@ -604,11 +696,15 @@ impl TestEnv {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
-            let mut remaining: std::collections::HashSet<String> = pane_ids_owned.into_iter().collect();
+            let mut remaining: std::collections::HashSet<String> =
+                pane_ids_owned.into_iter().collect();
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => { let _ = tx.send(Err(remaining)); return; }
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(Err(remaining));
+                        return;
+                    }
                     Ok(_) => {}
                 }
                 let v: serde_json::Value = match serde_json::from_str(line.trim()) {

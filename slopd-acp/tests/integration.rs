@@ -201,7 +201,7 @@ fn local_acp_session_streams_a_turn_and_cancels_the_next_one() {
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": "/busy 10" }],
+            "prompt": [{ "type": "text", "text": "::mock busy 10s" }],
         },
     }));
     // mock_claude writes its assistant record before entering the simulated

@@ -2,6 +2,13 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+mod mock_support;
+
+use mock_support::{
+    CLAUDE_HELP as MOCK_HELP, InputMode as NewlineMode, MockCommand, parse as parse_mock_command,
+    reject_unknown_mock_option,
+};
+
 /// How long the terminal waits after an Escape for a follow-up byte before
 /// deciding the Escape stood alone. An Escape immediately followed by another
 /// byte is an escape sequence (e.g. `ESC` + a printable char = `Alt-<char>`),
@@ -28,14 +35,6 @@ fn poll_byte(stdin_fd: i32, stdin: &mut std::io::Stdin, timeout_ms: i32) -> Opti
         Ok(0) | Err(_) => None,
         Ok(_) => Some(byte[0]),
     }
-}
-
-#[derive(Clone, Copy)]
-enum NewlineMode {
-    /// Every newline submits the line (original behaviour).
-    AlwaysSubmit,
-    /// Alternating: even-numbered newlines (0, 2, …) are literal, odd (1, 3, …) submit.
-    Alternating,
 }
 
 /// Result of reading input during a busy period.
@@ -71,7 +70,11 @@ fn read_busy_input(
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Queued(queued) };
+            return if queued.is_empty() {
+                BusyInput::Empty
+            } else {
+                BusyInput::Queued(queued)
+            };
         }
 
         // Poll stdin with timeout.
@@ -83,21 +86,33 @@ fn read_busy_input(
         let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
         let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if ret <= 0 {
-            return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Queued(queued) };
+            return if queued.is_empty() {
+                BusyInput::Empty
+            } else {
+                BusyInput::Queued(queued)
+            };
         }
 
         // Data available — read one byte.
         let mut byte = [0u8; 1];
         match stdin.read(&mut byte) {
             Ok(0) | Err(_) => {
-                return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Interrupted(queued) };
+                return if queued.is_empty() {
+                    BusyInput::Empty
+                } else {
+                    BusyInput::Interrupted(queued)
+                };
             }
             Ok(_) => {}
         }
         let b = byte[0];
         match b {
             0x03 | 0x04 | 0x1b => {
-                return if queued.is_empty() { BusyInput::Empty } else { BusyInput::Interrupted(queued) };
+                return if queued.is_empty() {
+                    BusyInput::Empty
+                } else {
+                    BusyInput::Interrupted(queued)
+                };
             }
             0x0d | 0x0a => {
                 let is_submit = match newline_mode {
@@ -116,12 +131,17 @@ fn read_busy_input(
                 line_buf.clear();
                 let prompt = raw.trim_start_matches('\n').to_string();
                 // Write enqueue immediately so slopd sees it in real time.
-                write_transcript_record(transcript_path, &transcript_record(
-                    "queue-operation", session_id, serde_json::json!({
-                        "operation": "enqueue",
-                        "content": &prompt,
-                    }),
-                ));
+                write_transcript_record(
+                    transcript_path,
+                    &transcript_record(
+                        "queue-operation",
+                        session_id,
+                        serde_json::json!({
+                            "operation": "enqueue",
+                            "content": &prompt,
+                        }),
+                    ),
+                );
                 queued.push(prompt);
             }
             0x15 => {
@@ -138,8 +158,15 @@ fn read_busy_input(
 /// Run all command hooks registered for the given event, passing payload as JSON on stdin.
 /// Mirrors real Claude's hook execution: each command is run via `sh -c` in a non-interactive
 /// shell with the JSON payload on stdin.
-fn fire_hooks(no_hooks: bool, settings: &serde_json::Value, event: &str, payload: &serde_json::Value) {
-    if no_hooks { return; }
+fn fire_hooks(
+    no_hooks: bool,
+    settings: &serde_json::Value,
+    event: &str,
+    payload: &serde_json::Value,
+) {
+    if no_hooks {
+        return;
+    }
     let Some(entries) = settings["hooks"][event].as_array() else {
         return;
     };
@@ -202,7 +229,11 @@ fn write_transcript_record(transcript_path: &PathBuf, record: &serde_json::Value
         .expect("failed to write transcript record");
 }
 
-fn transcript_record(record_type: &str, session_id: &str, extra: serde_json::Value) -> serde_json::Value {
+fn transcript_record(
+    record_type: &str,
+    session_id: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
     let mut record = serde_json::json!({
         "type": record_type,
         "uuid": format!("mock-uuid-{}", uuid_counter()),
@@ -231,15 +262,30 @@ fn write_slash_command(
 ) {
     let content = format!(
         "<command-name>/{n}</command-name>\n            <command-message>{n}</command-message>\n            <command-args>{a}</command-args>",
-        n = name, a = args,
+        n = name,
+        a = args,
     );
-    write_transcript_record(transcript_path, &transcript_record("user", session_id, serde_json::json!({
-        "message": { "role": "user", "content": content },
-    })));
+    write_transcript_record(
+        transcript_path,
+        &transcript_record(
+            "user",
+            session_id,
+            serde_json::json!({
+                "message": { "role": "user", "content": content },
+            }),
+        ),
+    );
     if let Some(out) = stdout {
-        write_transcript_record(transcript_path, &transcript_record("user", session_id, serde_json::json!({
-            "message": { "role": "user", "content": format!("<local-command-stdout>{}</local-command-stdout>", out) },
-        })));
+        write_transcript_record(
+            transcript_path,
+            &transcript_record(
+                "user",
+                session_id,
+                serde_json::json!({
+                    "message": { "role": "user", "content": format!("<local-command-stdout>{}</local-command-stdout>", out) },
+                }),
+            ),
+        );
     }
 }
 
@@ -255,7 +301,12 @@ fn chrono_now() -> String {
     format!("1970-01-01T00:00:{:02}.000Z", d.as_secs() % 60)
 }
 
-fn hook_payload(event: &str, session_id: &str, cwd: &std::path::Path, transcript_path: &PathBuf) -> serde_json::Value {
+fn hook_payload(
+    event: &str,
+    session_id: &str,
+    cwd: &std::path::Path,
+    transcript_path: &PathBuf,
+) -> serde_json::Value {
     serde_json::json!({
         "session_id": session_id,
         "hook_event_name": event,
@@ -273,11 +324,23 @@ fn fire_stop(
     cwd: &std::path::Path,
     transcript_path: &PathBuf,
 ) {
-    fire_hooks(no_hooks, settings, "Stop", &hook_payload("Stop", session_id, cwd, transcript_path));
-    write_transcript_record(transcript_path, &transcript_record("system", session_id, serde_json::json!({
-        "subtype": "turn_duration",
-        "durationMs": 0,
-    })));
+    fire_hooks(
+        no_hooks,
+        settings,
+        "Stop",
+        &hook_payload("Stop", session_id, cwd, transcript_path),
+    );
+    write_transcript_record(
+        transcript_path,
+        &transcript_record(
+            "system",
+            session_id,
+            serde_json::json!({
+                "subtype": "turn_duration",
+                "durationMs": 0,
+            }),
+        ),
+    );
 }
 
 /// Fire StopFailure instead of Stop, simulating a turn that failed to complete
@@ -289,16 +352,28 @@ fn fire_stop_failure(
     cwd: &std::path::Path,
     transcript_path: &PathBuf,
 ) {
-    fire_hooks(no_hooks, settings, "StopFailure", &hook_payload("StopFailure", session_id, cwd, transcript_path));
-    write_transcript_record(transcript_path, &transcript_record("system", session_id, serde_json::json!({
-        "subtype": "turn_duration",
-        "durationMs": 0,
-    })));
+    fire_hooks(
+        no_hooks,
+        settings,
+        "StopFailure",
+        &hook_payload("StopFailure", session_id, cwd, transcript_path),
+    );
+    write_transcript_record(
+        transcript_path,
+        &transcript_record(
+            "system",
+            session_id,
+            serde_json::json!({
+                "subtype": "turn_duration",
+                "durationMs": 0,
+            }),
+        ),
+    );
 }
 
 /// Fire UserPromptSubmit + Stop for an accepted prompt that produces no model
-/// turn — the mock test-harness control commands (/echo, /sleep, /env, /cwd,
-/// /newline-mode). This is how `slopctl send` of such a command is confirmed,
+/// turn — the mock test-harness `::mock` commands. This is how `slopctl send`
+/// of such a command is confirmed,
 /// mirroring that the input was accepted. (Real client-local slash commands
 /// like /model fire NO hooks and are confirmed via the transcript
 /// `<command-name>` signal instead.)
@@ -331,65 +406,91 @@ enum PromptResult {
     Handled,
     /// Exit with the given code.
     Exit(i32),
-    /// Not a recognized simple command; caller should try interactive commands.
-    Unhandled,
 }
 
-/// Dispatch prompt commands that work in both --print and interactive mode.
+/// Dispatch `::mock` commands that work in both --print and interactive mode.
 /// When `ctx` is Some, commands that need hooks/transcript use it.
-fn handle_prompt(prompt: &str, ctx: Option<&SessionContext>) -> PromptResult {
-    if let Some(text) = prompt.strip_prefix("/echo ") {
-        println!("{}", text.trim());
-        return PromptResult::Handled;
+fn handle_simple_mock_command(
+    command: &MockCommand<'_>,
+    ctx: Option<&SessionContext>,
+) -> Option<PromptResult> {
+    if let MockCommand::Echo(text) = command {
+        println!("{}", text);
+        return Some(PromptResult::Handled);
     }
-    if let Some(secs) = prompt.strip_prefix("/sleep ") {
-        let secs: u64 = secs.trim().parse().unwrap_or(0);
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        return PromptResult::Handled;
+    if let MockCommand::Sleep(duration) = command {
+        std::thread::sleep(*duration);
+        return Some(PromptResult::Handled);
     }
-    if let Some(key) = prompt.strip_prefix("/env ") {
-        let val = std::env::var(key.trim())
-            .unwrap_or_else(|_| "UNSET".to_string());
-        println!("/env:{}={}", key.trim(), val);
-        return PromptResult::Handled;
+    if let MockCommand::Env(key) = command {
+        let val = std::env::var(key).unwrap_or_else(|_| "UNSET".to_string());
+        println!("::mock env {}={}", key, val);
+        return Some(PromptResult::Handled);
     }
-    if prompt.trim() == "/cwd" {
+    if matches!(command, MockCommand::Cwd) {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "UNKNOWN".to_string());
-        println!("/cwd:{}", cwd);
-        return PromptResult::Handled;
+        println!("::mock cwd {}", cwd);
+        return Some(PromptResult::Handled);
     }
-    if let Some(code) = prompt.strip_prefix("/exit ") {
-        let code: i32 = code.trim().parse().unwrap_or(0);
+    if let MockCommand::ProcessExit(code) = command {
         if let Some(ctx) = ctx {
-            let mut payload = hook_payload("UserPromptSubmit", ctx.session_id, ctx.cwd, ctx.transcript_path);
-            payload["prompt"] = serde_json::json!(prompt);
+            let mut payload = hook_payload(
+                "UserPromptSubmit",
+                ctx.session_id,
+                ctx.cwd,
+                ctx.transcript_path,
+            );
+            payload["prompt"] = serde_json::json!(format!("::mock process exit {code}"));
             fire_hooks(ctx.no_hooks, ctx.settings, "UserPromptSubmit", &payload);
-            fire_stop(ctx.no_hooks, ctx.settings, ctx.session_id, ctx.cwd, ctx.transcript_path);
+            fire_stop(
+                ctx.no_hooks,
+                ctx.settings,
+                ctx.session_id,
+                ctx.cwd,
+                ctx.transcript_path,
+            );
         }
-        return PromptResult::Exit(code);
+        return Some(PromptResult::Exit(*code));
     }
-    PromptResult::Unhandled
+    None
 }
 
-const FLAGS: &[&str] = &["--print", "-p", "--no-session-start", "--break-hooks", "--exit-after-start", "--exit-immediately"];
+const FLAGS: &[&str] = &[
+    "--print",
+    "-p",
+    "--mock-session-start=skip",
+    "--mock-hooks=disabled",
+    "--mock-exit=after-session-start",
+    "--mock-exit=immediate",
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    for arg in args.iter().skip(1).filter(|arg| arg.starts_with("--mock-")) {
+        match arg.as_str() {
+            "--mock-session-start=skip"
+            | "--mock-hooks=disabled"
+            | "--mock-exit=after-session-start"
+            | "--mock-exit=immediate"
+            | "--mock-crash-output" => {}
+            _ => reject_unknown_mock_option("mock_claude", arg),
+        }
+    }
     let print_mode = args.iter().any(|a| a == "--print" || a == "-p");
-    let no_session_start = args.iter().any(|a| a == "--no-session-start");
-    let no_hooks = args.iter().any(|a| a == "--break-hooks");
+    let no_session_start = args.iter().any(|a| a == "--mock-session-start=skip");
+    let no_hooks = args.iter().any(|a| a == "--mock-hooks=disabled");
     // Failure-injection mode: fire SessionStart then SessionEnd and exit early,
     // simulating Claude bailing right after bootstrap (see the exit block below).
-    let exit_after_start = args.iter().any(|a| a == "--exit-after-start");
+    let exit_after_start = args.iter().any(|a| a == "--mock-exit=after-session-start");
     // Failure-injection mode: exit before firing ANY hook, simulating a Claude
     // binary that dies on launch (or an executable tmux can't find). The pane
     // dies with no SessionStart/SessionEnd, so slopd only learns of it via the
     // reconciler and emits PaneDestroyed — the bare "died before becoming ready"
-    // path with no session-ended reason. Distinct from --exit-after-start, which
+    // path with no session-ended reason. Distinct from --mock-exit=after-session-start, which
     // fires SessionStart→SessionEnd first.
-    if args.iter().any(|a| a == "--exit-immediately") {
+    if args.iter().any(|a| a == "--mock-exit=immediate") {
         std::process::exit(1);
     }
 
@@ -404,9 +505,11 @@ fn main() {
     // set-option round-trip. Exiting in microseconds (as a bare Rust binary
     // otherwise would) is unrealistic and would race slopd's remain-on-exit,
     // making the pane vanish before it can be marked to linger.
-    if let Some(pos) = args.iter().position(|a| a == "--crash-output") {
-        let msg = args.get(pos + 1).map(String::as_str)
-            .unwrap_or("mock_claude: simulated startup crash");
+    if let Some(pos) = args.iter().position(|a| a == "--mock-crash-output") {
+        let Some(msg) = args.get(pos + 1).map(String::as_str) else {
+            eprintln!("mock_claude: `--mock-crash-output` requires a message");
+            std::process::exit(2);
+        };
         println!("{}", msg);
         std::thread::sleep(std::time::Duration::from_millis(250));
         std::process::exit(37);
@@ -415,14 +518,27 @@ fn main() {
     if print_mode {
         // In --print mode, treat the last non-flag argument as the prompt,
         // process it, and exit immediately (no interactive loop).
-        let prompt = args.iter()
+        let prompt = args
+            .iter()
             .skip(1)
             .rfind(|a| !FLAGS.contains(&a.as_str()))
             .cloned()
             .unwrap_or_default();
-        match handle_prompt(&prompt, None) {
-            PromptResult::Exit(code) => std::process::exit(code),
-            _ => return,
+        let command = match parse_mock_command(&prompt) {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("mock_claude: {error}");
+                std::process::exit(2);
+            }
+        };
+        match handle_simple_mock_command(&command, None) {
+            Some(PromptResult::Exit(code)) => std::process::exit(code),
+            Some(PromptResult::Handled) => return,
+            _ => {
+                eprintln!("mock_claude: command is not supported in --print mode");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -462,7 +578,11 @@ fn main() {
     // points at the fork's new file. slopd must not trust that id (it pins the
     // minted fork id instead). A fresh run or a plain `--resume` reports its own id.
     let forking = args.iter().any(|a| a == "--fork-session");
-    let session_start_sid: &str = if forking { resume_src.unwrap_or(session_id) } else { session_id };
+    let session_start_sid: &str = if forking {
+        resume_src.unwrap_or(session_id)
+    } else {
+        session_id
+    };
     let cwd = std::env::current_dir().unwrap_or_default();
 
     // Create a transcript .jsonl file, mirroring real Claude behaviour.
@@ -502,7 +622,12 @@ fn main() {
         // In fork mode both diverge from the running session (see above): the hook
         // carries the resumed SOURCE id and the SOURCE transcript file; slopd must
         // rewrite both to the minted fork id / file. Non-fork: identical.
-        let mut payload = hook_payload("SessionStart", session_start_sid, &cwd, &session_start_transcript_path);
+        let mut payload = hook_payload(
+            "SessionStart",
+            session_start_sid,
+            &cwd,
+            &session_start_transcript_path,
+        );
         payload["source"] = serde_json::json!("startup");
         payload["model"] = serde_json::json!("mock");
         fire_hooks(no_hooks, &settings, "SessionStart", &payload);
@@ -518,7 +643,9 @@ fn main() {
         let mut payload = hook_payload("SessionEnd", session_id, &cwd, &transcript_path);
         payload["reason"] = serde_json::json!("prompt_input_exit");
         fire_hooks(no_hooks, &settings, "SessionEnd", &payload);
-        unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
+        unsafe {
+            libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+        }
         std::process::exit(1);
     }
 
@@ -536,16 +663,16 @@ fn main() {
     let mut pending: Option<u8> = None;
     let mut newline_mode = NewlineMode::Alternating;
     let mut newline_count: u64 = 0;
-    // When set (via /always-fail), every subsequent submitted prompt — including
+    // When set (via `::mock fail always`), every subsequent submitted prompt — including
     // slopd's own injected "continue" — ends in StopFailure, simulating a
     // persistent API outage. Used to test the auto-continue retry cap.
     let mut always_fail = false;
-    // When set (via /fail-then-busy <ms>), the NEXT prompt — slopd's injected
-    // "continue" — runs a busy turn of this many ms (deliberately longer than the
+    // When set (via `::mock fail-then-busy <duration>`), the NEXT prompt — slopd's
+    // injected "continue" — runs a busy turn this long (deliberately longer than the
     // retry backoff) before finishing with a clean Stop, instead of failing. Used
     // to test that slopd does NOT fire a second "continue" into a turn that
     // outlasts the backoff delay.
-    let mut fail_then_busy_ms: Option<u64> = None;
+    let mut fail_then_busy: Option<std::time::Duration> = None;
 
     loop {
         let b = match pending.take() {
@@ -629,19 +756,6 @@ fn main() {
                     continue;
                 }
 
-                if let Some(mode) = prompt.strip_prefix("/newline-mode ") {
-                    match mode.trim() {
-                        "always-submit" => newline_mode = NewlineMode::AlwaysSubmit,
-                        "alternating" => {
-                            newline_mode = NewlineMode::Alternating;
-                            newline_count = 0;
-                        }
-                        other => eprintln!("mock_claude: unknown newline mode {:?}", other),
-                    }
-                    fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
-                    continue;
-                }
-
                 let ctx = SessionContext {
                     no_hooks,
                     settings: &settings,
@@ -649,16 +763,64 @@ fn main() {
                     cwd: &cwd,
                     transcript_path: &transcript_path,
                 };
-                match handle_prompt(&prompt, Some(&ctx)) {
-                    PromptResult::Handled => {
-                        fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
-                        continue;
+                let mock_command = match parse_mock_command(&prompt) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        eprintln!("mock_claude: {error}");
+                        unsafe {
+                            libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+                        }
+                        std::process::exit(2);
                     }
-                    PromptResult::Exit(code) => {
-                        unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
-                        std::process::exit(code);
+                };
+                if let Some(command) = &mock_command {
+                    match handle_simple_mock_command(command, Some(&ctx)) {
+                        Some(PromptResult::Handled) => {
+                            fire_accepted_no_turn(
+                                no_hooks,
+                                &settings,
+                                session_id,
+                                &cwd,
+                                &transcript_path,
+                                &prompt,
+                            );
+                            continue;
+                        }
+                        Some(PromptResult::Exit(code)) => {
+                            unsafe {
+                                libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+                            }
+                            std::process::exit(code);
+                        }
+                        None => {}
                     }
-                    PromptResult::Unhandled => {}
+                }
+                if let Some(MockCommand::InputMode(mode)) = mock_command {
+                    newline_mode = mode;
+                    if mode == NewlineMode::Alternating {
+                        newline_count = 0;
+                    }
+                    fire_accepted_no_turn(
+                        no_hooks,
+                        &settings,
+                        session_id,
+                        &cwd,
+                        &transcript_path,
+                        &prompt,
+                    );
+                    continue;
+                }
+                if matches!(mock_command, Some(MockCommand::Help)) {
+                    println!("{MOCK_HELP}");
+                    fire_accepted_no_turn(
+                        no_hooks,
+                        &settings,
+                        session_id,
+                        &cwd,
+                        &transcript_path,
+                        &prompt,
+                    );
+                    continue;
                 }
 
                 // Client-local slash commands: write the transcript records
@@ -666,19 +828,34 @@ fn main() {
                 // slopd must detect these via the transcript tailer.
                 if let Some(id) = prompt.strip_prefix("/model ") {
                     let id = id.trim();
-                    write_slash_command(&transcript_path, session_id, "model", id,
-                        Some(&format!("Set model to {}", id)));
+                    write_slash_command(
+                        &transcript_path,
+                        session_id,
+                        "model",
+                        id,
+                        Some(&format!("Set model to {}", id)),
+                    );
                     continue;
                 }
                 if let Some(level) = prompt.strip_prefix("/effort ") {
                     let level = level.trim();
-                    write_slash_command(&transcript_path, session_id, "effort", level,
-                        Some(&format!("Set effort level to {}: mock", level)));
+                    write_slash_command(
+                        &transcript_path,
+                        session_id,
+                        "effort",
+                        level,
+                        Some(&format!("Set effort level to {}: mock", level)),
+                    );
                     continue;
                 }
                 if prompt.trim() == "/compact" {
-                    write_slash_command(&transcript_path, session_id, "compact", "",
-                        Some("Compacted."));
+                    write_slash_command(
+                        &transcript_path,
+                        session_id,
+                        "compact",
+                        "",
+                        Some("Compacted."),
+                    );
                     continue;
                 }
                 if prompt.trim() == "/clear" {
@@ -686,32 +863,87 @@ fn main() {
                     continue;
                 }
 
-                if let Some(secs) = prompt.strip_prefix("/permission ") {
+                if let Some(command) = mock_command {
+                    match command {
+                        MockCommand::Permission(Some(duration)) => {
+                            // Handled below.
+                            let _ = duration;
+                        }
+                        MockCommand::Permission(None) => {
+                            eprintln!("mock_claude: `::mock permission` requires a duration");
+                            unsafe {
+                                libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+                            }
+                            std::process::exit(2);
+                        }
+                        MockCommand::Busy(_)
+                        | MockCommand::Hook(_)
+                        | MockCommand::FailOnce
+                        | MockCommand::FailAlways
+                        | MockCommand::FailThenBusy(_)
+                        | MockCommand::TransportDisconnect
+                        | MockCommand::TransportStallHooks
+                        | MockCommand::SpawnPane => {}
+                        other => {
+                            eprintln!("mock_claude: unsupported command {other:?}");
+                            unsafe {
+                                libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+                            }
+                            std::process::exit(2);
+                        }
+                    }
+                }
+
+                if let Some(MockCommand::Permission(Some(duration))) = mock_command {
                     // Simulate Claude processing a tool use then awaiting permission.
-                    // Like /busy, but after the busy period fires PermissionRequest
+                    // Like `::mock busy`, but after the busy period fires PermissionRequest
                     // instead of finishing. When interrupted in the permission dialog,
                     // real Claude writes transcript `user` events but does NOT fire
                     // any hooks — so slopd never learns the state changed.
-                    let secs: u64 = secs.trim().parse().unwrap_or(0);
 
                     // Fire hooks for the prompt submission and tool use.
-                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                        "message": { "role": "user", "content": &prompt },
-                    })));
-                    let mut submit_payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "user", "content": &prompt },
+                            }),
+                        ),
+                    );
+                    let mut submit_payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     submit_payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(no_hooks, &settings, "UserPromptSubmit", &submit_payload);
-                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
-                    })));
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                            }),
+                        ),
+                    );
 
-                    fire_hooks(no_hooks, &settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path));
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PreToolUse",
+                        &hook_payload("PreToolUse", session_id, &cwd, &transcript_path),
+                    );
 
-                    // Busy period (tool use running), like /busy.
-                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    // Busy period (tool use running), like `::mock busy`.
+                    std::thread::sleep(duration);
 
                     // Now the tool needs permission — fire PermissionRequest.
-                    fire_hooks(no_hooks, &settings, "PermissionRequest", &hook_payload("PermissionRequest", session_id, &cwd, &transcript_path));
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PermissionRequest",
+                        &hook_payload("PermissionRequest", session_id, &cwd, &transcript_path),
+                    );
 
                     // Block waiting for interrupt (like the real permission dialog).
                     // When interrupted, write transcript events but NO hooks, just like real Claude.
@@ -725,27 +957,41 @@ fn main() {
                             0x03 | 0x04 | 0x1b => {
                                 // Interrupted — write transcript user events like real Claude.
                                 // First: tool_result rejection.
-                                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                                    "message": {
-                                        "role": "user",
-                                        "content": [{
-                                            "type": "tool_result",
-                                            "tool_use_id": format!("mock-tool-use-{}", uuid_counter()),
-                                            "content": "The user doesn't want to proceed with this tool use. The tool use was rejected.",
-                                            "is_error": true,
-                                        }],
-                                    },
-                                })));
+                                write_transcript_record(
+                                    &transcript_path,
+                                    &transcript_record(
+                                        "user",
+                                        session_id,
+                                        serde_json::json!({
+                                            "message": {
+                                                "role": "user",
+                                                "content": [{
+                                                    "type": "tool_result",
+                                                    "tool_use_id": format!("mock-tool-use-{}", uuid_counter()),
+                                                    "content": "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+                                                    "is_error": true,
+                                                }],
+                                            },
+                                        }),
+                                    ),
+                                );
                                 // Second: interrupt message.
-                                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                                    "message": {
-                                        "role": "user",
-                                        "content": [{
-                                            "type": "text",
-                                            "text": "[Request interrupted by user for tool use]",
-                                        }],
-                                    },
-                                })));
+                                write_transcript_record(
+                                    &transcript_path,
+                                    &transcript_record(
+                                        "user",
+                                        session_id,
+                                        serde_json::json!({
+                                            "message": {
+                                                "role": "user",
+                                                "content": [{
+                                                    "type": "text",
+                                                    "text": "[Request interrupted by user for tool use]",
+                                                }],
+                                            },
+                                        }),
+                                    ),
+                                );
                                 // NO hooks fired — this is the real Claude behaviour that
                                 // slopd must handle via transcript detection.
                                 break;
@@ -757,39 +1003,62 @@ fn main() {
                     }
                     continue;
                 }
-                if let Some(secs) = prompt.strip_prefix("/busy ") {
-                    // Simulate Claude running a tool use for `secs` seconds.
+                if let Some(MockCommand::Busy(duration)) = mock_command {
+                    // Simulate Claude running a tool use for the requested duration.
                     // During this time the real Claude still accepts terminal input and
                     // queues it; once the tool finishes, the queued prompt is submitted.
                     // Supports multiple queued prompts, interrupts (cancel), and the
                     // corresponding queue-operation transcript records.
-                    let secs: u64 = secs.trim().parse().unwrap_or(0);
-
-                    // Fire UserPromptSubmit for the /busy command itself (the user submitted it),
+                    // Fire UserPromptSubmit for the mock command itself (the user submitted it),
                     // and write user + assistant transcript records like real Claude does.
-                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                        "message": { "role": "user", "content": &prompt },
-                    })));
-                    let mut busy_payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "user", "content": &prompt },
+                            }),
+                        ),
+                    );
+                    let mut busy_payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     busy_payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(no_hooks, &settings, "UserPromptSubmit", &busy_payload);
-                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
-                    })));
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                            }),
+                        ),
+                    );
 
-                    fire_hooks(no_hooks, &settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path));
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PreToolUse",
+                        &hook_payload("PreToolUse", session_id, &cwd, &transcript_path),
+                    );
 
                     let busy_input = read_busy_input(
                         stdin_fd,
                         &mut stdin,
                         &mut newline_mode,
                         &mut newline_count,
-                        std::time::Duration::from_secs(secs),
+                        duration,
                         &transcript_path,
                         session_id,
                     );
 
-                    fire_hooks(no_hooks, &settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd, &transcript_path));
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PostToolUse",
+                        &hook_payload("PostToolUse", session_id, &cwd, &transcript_path),
+                    );
 
                     match busy_input {
                         BusyInput::Empty => {
@@ -801,11 +1070,16 @@ fn main() {
                             // records were already written in read_busy_input;
                             // write remove for each (cancelled).
                             for _ in &prompts {
-                                write_transcript_record(&transcript_path, &transcript_record(
-                                    "queue-operation", session_id, serde_json::json!({
-                                        "operation": "remove",
-                                    }),
-                                ));
+                                write_transcript_record(
+                                    &transcript_path,
+                                    &transcript_record(
+                                        "queue-operation",
+                                        session_id,
+                                        serde_json::json!({
+                                            "operation": "remove",
+                                        }),
+                                    ),
+                                );
                             }
                             fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
                         }
@@ -813,21 +1087,45 @@ fn main() {
                             // Enqueue records were already written in read_busy_input.
                             // Write dequeue for each (consumed).
                             for _ in &prompts {
-                                write_transcript_record(&transcript_path, &transcript_record(
-                                    "queue-operation", session_id, serde_json::json!({
-                                        "operation": "dequeue",
-                                    }),
-                                ));
+                                write_transcript_record(
+                                    &transcript_path,
+                                    &transcript_record(
+                                        "queue-operation",
+                                        session_id,
+                                        serde_json::json!({
+                                            "operation": "dequeue",
+                                        }),
+                                    ),
+                                );
                             }
                             // Process the last queued prompt (like real Claude — last wins).
                             let last = prompts.last().unwrap();
-                            write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                                "message": { "role": "user", "content": last },
-                            })));
-                            write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                                "message": { "role": "assistant", "content": format!("mock response to: {}", last) },
-                            })));
-                            let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                            write_transcript_record(
+                                &transcript_path,
+                                &transcript_record(
+                                    "user",
+                                    session_id,
+                                    serde_json::json!({
+                                        "message": { "role": "user", "content": last },
+                                    }),
+                                ),
+                            );
+                            write_transcript_record(
+                                &transcript_path,
+                                &transcript_record(
+                                    "assistant",
+                                    session_id,
+                                    serde_json::json!({
+                                        "message": { "role": "assistant", "content": format!("mock response to: {}", last) },
+                                    }),
+                                ),
+                            );
+                            let mut payload = hook_payload(
+                                "UserPromptSubmit",
+                                session_id,
+                                &cwd,
+                                &transcript_path,
+                            );
                             payload["prompt"] = serde_json::json!(last);
                             fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
                             fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
@@ -835,52 +1133,104 @@ fn main() {
                     }
                     continue;
                 }
-                if let Some(event) = prompt.strip_prefix("/hook ") {
-                    fire_hooks(no_hooks, &settings, event.trim(), &hook_payload(event.trim(), session_id, &cwd, &transcript_path));
+                if let Some(MockCommand::Hook(event)) = mock_command {
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        event,
+                        &hook_payload(event, session_id, &cwd, &transcript_path),
+                    );
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
                 }
 
                 // Toggle persistent-failure mode: every subsequent prompt fails.
-                if prompt == "/always-fail" {
+                if matches!(mock_command, Some(MockCommand::FailAlways)) {
                     always_fail = true;
-                    fire_accepted_no_turn(no_hooks, &settings, session_id, &cwd, &transcript_path, &prompt);
+                    fire_accepted_no_turn(
+                        no_hooks,
+                        &settings,
+                        session_id,
+                        &cwd,
+                        &transcript_path,
+                        &prompt,
+                    );
                     continue;
                 }
 
                 // Arm "fail this turn, then run a long busy turn on the next
-                // prompt": the /fail-then-busy command itself fails (first
+                // prompt": the mock command itself fails (first
                 // StopFailure), and the following prompt (slopd's injected
-                // "continue") runs busy for <ms> before a clean Stop.
-                if let Some(ms) = prompt.strip_prefix("/fail-then-busy ") {
-                    fail_then_busy_ms = Some(ms.trim().parse().unwrap_or(0));
-                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                        "message": { "role": "user", "content": &prompt },
-                    })));
-                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                // "continue") runs busy for the requested duration before a clean Stop.
+                if let Some(MockCommand::FailThenBusy(duration)) = mock_command {
+                    fail_then_busy = Some(duration);
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "user", "content": &prompt },
+                            }),
+                        ),
+                    );
+                    let mut payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
-                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                        "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
-                    })));
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
+                            }),
+                        ),
+                    );
                     fire_stop_failure(no_hooks, &settings, session_id, &cwd, &transcript_path);
                     continue;
                 }
 
-                // The prompt after /fail-then-busy (slopd's injected "continue")
+                // The prompt after `::mock fail-then-busy` (slopd's injected "continue")
                 // runs a busy turn longer than the backoff, then finishes cleanly.
-                if let Some(busy_ms) = fail_then_busy_ms.take() {
-                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                        "message": { "role": "user", "content": &prompt },
-                    })));
-                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                if let Some(busy_duration) = fail_then_busy.take() {
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "user", "content": &prompt },
+                            }),
+                        ),
+                    );
+                    let mut payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
-                    fire_hooks(no_hooks, &settings, "PreToolUse", &hook_payload("PreToolUse", session_id, &cwd, &transcript_path));
-                    std::thread::sleep(std::time::Duration::from_millis(busy_ms));
-                    fire_hooks(no_hooks, &settings, "PostToolUse", &hook_payload("PostToolUse", session_id, &cwd, &transcript_path));
-                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                        "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
-                    })));
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PreToolUse",
+                        &hook_payload("PreToolUse", session_id, &cwd, &transcript_path),
+                    );
+                    std::thread::sleep(busy_duration);
+                    fire_hooks(
+                        no_hooks,
+                        &settings,
+                        "PostToolUse",
+                        &hook_payload("PostToolUse", session_id, &cwd, &transcript_path),
+                    );
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                            }),
+                        ),
+                    );
                     fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
                     continue;
                 }
@@ -889,33 +1239,49 @@ fn main() {
                 // Used to test slopd's auto-continue functionality. In always_fail
                 // mode any prompt (including slopd's injected "continue") fails the
                 // same way, simulating a persistent outage.
-                if prompt == "/stop-failure" || always_fail {
-                    write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                        "message": { "role": "user", "content": &prompt },
-                    })));
-                    let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                if matches!(mock_command, Some(MockCommand::FailOnce)) || always_fail {
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "user", "content": &prompt },
+                            }),
+                        ),
+                    );
+                    let mut payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                     payload["prompt"] = serde_json::json!(&prompt);
                     fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
-                    write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                        "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
-                    })));
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({
+                                "message": { "role": "assistant", "content": "API Error: 500 Internal server error" },
+                            }),
+                        ),
+                    );
                     fire_stop_failure(no_hooks, &settings, session_id, &cwd, &transcript_path);
                     continue;
                 }
 
-                if prompt == "/break-stdin" {
+                if matches!(mock_command, Some(MockCommand::TransportDisconnect)) {
                     break;
                 }
-                if prompt == "/break-hooks" {
+                if matches!(mock_command, Some(MockCommand::TransportStallHooks)) {
                     let mut buf = [0u8; 256];
                     while stdin.read(&mut buf).unwrap_or(0) > 0 {}
                     break;
                 }
-                if prompt == "/run" {
+                if matches!(mock_command, Some(MockCommand::SpawnPane)) {
                     // Spawn a child pane via slopctl run. TMUX_PANE is set automatically
                     // by tmux in our environment, so the child will have @slopd_ancestor_panes
                     // pointing at us without any manual wiring.
-                    let slopctl = std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
+                    let slopctl =
+                        std::env::var("SLOPCTL").unwrap_or_else(|_| "slopctl".to_string());
                     // --no-wait: keep this child-spawn fire-and-forget (the test
                     // only needs the child pane id), independent of run's new
                     // wait-for-ready default.
@@ -926,9 +1292,10 @@ fn main() {
                         .and_then(|c| c.wait_with_output());
                     match output {
                         Ok(out) if out.status.success() => {
-                            let child_pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            let child_pane =
+                                String::from_utf8_lossy(&out.stdout).trim().to_string();
                             // Print child pane ID so the test can read it from tmux pane content.
-                            println!("/run:{}", child_pane);
+                            println!("::mock spawned-pane {}", child_pane);
                         }
                         Ok(out) => {
                             eprintln!("mock_claude: slopctl run failed: {:?}", out.status);
@@ -941,14 +1308,29 @@ fn main() {
                 }
 
                 // Write transcript records like real Claude does.
-                write_transcript_record(&transcript_path, &transcript_record("user", session_id, serde_json::json!({
-                    "message": { "role": "user", "content": &prompt },
-                })));
-                write_transcript_record(&transcript_path, &transcript_record("assistant", session_id, serde_json::json!({
-                    "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
-                })));
+                write_transcript_record(
+                    &transcript_path,
+                    &transcript_record(
+                        "user",
+                        session_id,
+                        serde_json::json!({
+                            "message": { "role": "user", "content": &prompt },
+                        }),
+                    ),
+                );
+                write_transcript_record(
+                    &transcript_path,
+                    &transcript_record(
+                        "assistant",
+                        session_id,
+                        serde_json::json!({
+                            "message": { "role": "assistant", "content": format!("mock response to: {}", &prompt) },
+                        }),
+                    ),
+                );
 
-                let mut payload = hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                let mut payload =
+                    hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
                 payload["prompt"] = serde_json::json!(prompt);
                 fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
                 fire_stop(no_hooks, &settings, session_id, &cwd, &transcript_path);
@@ -960,5 +1342,7 @@ fn main() {
         }
     }
 
-    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
+    unsafe {
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+    }
 }
