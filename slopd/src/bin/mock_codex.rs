@@ -121,11 +121,20 @@ fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
-        match arg.as_str() {
-            "--mock-session-start=lazy" => {}
-            _ => reject_unknown_mock_option("mock_codex", arg),
+        if arg == "--mock-session-start=lazy"
+            || arg
+                .strip_prefix("--mock-submit-after=")
+                .is_some_and(|value| value.parse::<u8>().is_ok_and(|count| count > 0))
+        {
+            continue;
         }
+        reject_unknown_mock_option("mock_codex", arg);
     }
+    let submit_after = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--mock-submit-after="))
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(1);
     let codex_home = PathBuf::from(
         std::env::var_os("CODEX_HOME")
             .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| ".".into())),
@@ -183,6 +192,7 @@ fn main() {
     let mut line = Vec::new();
     let mut active = false;
     let mut awaiting_approval = false;
+    let mut enters_until_submit = submit_after;
     loop {
         match stdin.read(&mut byte) {
             Ok(0) | Err(_) => break,
@@ -207,6 +217,11 @@ fn main() {
                 }
             }
             b'\r' | b'\n' => {
+                if enters_until_submit > 1 {
+                    enters_until_submit -= 1;
+                    continue;
+                }
+                enters_until_submit = submit_after;
                 let prompt = String::from_utf8_lossy(&line).trim().to_string();
                 line.clear();
                 if prompt.is_empty() {

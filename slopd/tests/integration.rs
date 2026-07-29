@@ -14118,6 +14118,70 @@ fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() 
     kill_slopd(slopd);
 }
 
+#[test]
+fn codex_send_retries_ignored_enters_until_prompt_is_submitted() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-enter-retry]\nbackend = \"codex\"\nexecutable = [{:?}, \"--mock-submit-after=3\"]\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-enter-retry",
+        "--ready-timeout",
+        "10",
+    ]);
+    assert!(
+        run.status.success(),
+        "Codex run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let send = env.slopctl(&["send", &pane_id, "ENTER_RETRY_CANARY"]);
+    assert!(
+        send.status.success(),
+        "Codex send failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let transcript = env.slopctl(&["transcript", &pane_id, "--limit", "20"]);
+        let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+        let submitted = transcript["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["event_type"] == "userMessage"
+                    && record
+                        .pointer("/payload/text")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("ENTER_RETRY_CANARY")
+            });
+        if submitted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Codex prompt was left as a draft after ignored Enter keys"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    kill_slopd(slopd);
+}
+
 fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
     let mut listener = Command::new(cargo_bin("slopctl"))
         .args(["listen", "--pane-id", pane_id])

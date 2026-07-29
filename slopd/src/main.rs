@@ -4579,20 +4579,39 @@ async fn handle_request(
                     libslop::ResponseBody::Error { message: msg }
                 }
                 Ok(_) => {
-                    // Codex may not acknowledge every composer submission hook
-                    // before this RPC returns (notably an in-flight steer).
-                    // Submit exactly once through its visible TUI; hooks and the
-                    // rollout tail drive subsequent state.
+                    // Codex can consume the first Enter or two while expanding
+                    // a multiline paste into its composer. Retry a small,
+                    // bounded number of times until task_started confirms the
+                    // submission. Empty Enters after an accepted prompt are
+                    // harmless, and the bound keeps in-flight steers (which do
+                    // not always emit a fresh task_started) from blocking this
+                    // RPC until its full timeout.
                     if settle_before_enter {
-                        // Ratatui can render the pasted text one event-loop tick
-                        // after tmux reports send-keys complete. An immediate
-                        // Enter is then ignored and leaves the text as a draft.
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        return match tmux_send_keys(config, &pane_id, "Enter").await {
-                            Ok(out) if out.success() => libslop::ResponseBody::Sent { pane_id },
-                            Ok(_) => libslop::ResponseBody::Error { message: format!("tmux send-keys failed for pane {}", pane_id) },
-                            Err(e) => libslop::ResponseBody::Error { message: e.to_string() },
-                        };
+                        let mut backoff = std::time::Duration::from_millis(150);
+                        for _ in 0..3 {
+                            let notified = state.prompt_submitted.notified();
+                            match tmux_send_keys(config, &pane_id, "Enter").await {
+                                Ok(out) if out.success() => {}
+                                Ok(_) => {
+                                    return libslop::ResponseBody::Error {
+                                        message: format!(
+                                            "tmux send-keys failed for pane {}",
+                                            pane_id
+                                        ),
+                                    };
+                                }
+                                Err(e) => {
+                                    return libslop::ResponseBody::Error {
+                                        message: e.to_string(),
+                                    };
+                                }
+                            }
+                            if tokio::time::timeout(backoff, notified).await.is_ok() {
+                                return libslop::ResponseBody::Sent { pane_id };
+                            }
+                            backoff *= 2;
+                        }
+                        return libslop::ResponseBody::Sent { pane_id };
                     }
                     // Send Enter repeatedly with exponential backoff until
                     // UserPromptSubmit fires, confirming the prompt was submitted.

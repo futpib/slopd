@@ -83,6 +83,11 @@ struct Cli {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
+    /// Forward Buzz credentials from this adapter process into each managed
+    /// pane. This is opt-in because iroh may target a different machine.
+    #[arg(long)]
+    forward_buzz_env: bool,
+
     /// Extra argument passed to the underlying agent CLI (repeatable).
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
     agent_args: Vec<String>,
@@ -121,13 +126,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let env = match parse_env(&cli.env) {
+    let mut env = match parse_env(&cli.env) {
         Ok(env) => env,
         Err(error) => {
             eprintln!("slopd-acp: {error}");
             std::process::exit(2);
         }
     };
+    if cli.forward_buzz_env {
+        inherit_buzz_env(&mut env);
+    }
     if cli.max_sessions == 0 {
         eprintln!("slopd-acp: --max-sessions must be greater than zero");
         std::process::exit(2);
@@ -241,6 +249,28 @@ fn parse_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
+fn inherit_buzz_env(env: &mut Vec<(String, String)>) {
+    merge_buzz_env(env, |key| std::env::var(key).ok());
+}
+
+fn merge_buzz_env(env: &mut Vec<(String, String)>, mut lookup: impl FnMut(&str) -> Option<String>) {
+    for key in [
+        "BUZZ_PRIVATE_KEY",
+        "BUZZ_RELAY_URL",
+        "BUZZ_AUTH_TAG",
+        "BUZZ_API_TOKEN",
+    ] {
+        if env.iter().any(|(existing, _)| existing == key) {
+            continue;
+        }
+        if let Some(value) = lookup(key)
+            && !value.is_empty()
+        {
+            env.push((key.to_string(), value));
+        }
+    }
+}
+
 fn init_logging(verbose: u8) {
     let fallback = match verbose {
         0 => "warn",
@@ -269,5 +299,25 @@ mod tests {
         );
         assert!(parse_env(&["1A=no".into()]).is_err());
         assert!(parse_env(&["missing".into()]).is_err());
+    }
+
+    #[test]
+    fn buzz_env_forwarding_is_allowlisted_and_preserves_explicit_values() {
+        let mut env = vec![("BUZZ_PRIVATE_KEY".into(), "explicit-secret".into())];
+        merge_buzz_env(&mut env, |key| match key {
+            "BUZZ_PRIVATE_KEY" => Some("ambient-secret".into()),
+            "BUZZ_RELAY_URL" => Some("https://relay.example".into()),
+            "BUZZ_AUTH_TAG" => Some(String::new()),
+            "NOT_ALLOWLISTED" => Some("must-not-leak".into()),
+            _ => None,
+        });
+
+        assert_eq!(
+            env,
+            vec![
+                ("BUZZ_PRIVATE_KEY".into(), "explicit-secret".into()),
+                ("BUZZ_RELAY_URL".into(), "https://relay.example".into()),
+            ]
+        );
     }
 }
