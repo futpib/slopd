@@ -80,6 +80,47 @@ async fn tmux_send_keys(config: &libslop::SlopdConfig, pane_id: &str, keys: &str
         .await
 }
 
+async fn tmux_paste_text(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    text: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    static NEXT_BUFFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let buffer = format!(
+        "slopd-paste-{}-{}",
+        std::process::id(),
+        NEXT_BUFFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut child = tmux(config)
+        .args([
+            "load-buffer",
+            "-b",
+            &buffer,
+            "-",
+            ";",
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            &buffer,
+            "-t",
+            pane_id,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "tmux load-buffer stdin was not piped",
+        )
+    })?;
+    stdin.write_all(text.as_bytes()).await?;
+    drop(stdin);
+    child.wait().await
+}
+
 /// Events that can cause a pane state transition.
 enum PaneStateEvent<'a> {
     /// slopd startup recovery or new pane creation.
@@ -4566,8 +4607,18 @@ async fn handle_request(
                 return libslop::ResponseBody::Error { message: e.to_string() };
             }
 
-            // Type the prompt text (without Enter) first.
-            let result = tmux_send_keys(config, &pane_id, &prompt).await;
+            // Codex detects a rapid tmux send-keys stream as a non-bracketed
+            // paste burst. Its composer intentionally consumes Enter as a
+            // newline while that burst is active, which can leave a Buzz
+            // prompt sitting unsubmitted forever. Use tmux's bracketed-paste
+            // path so Codex receives one explicit Paste event and clears that
+            // suppression state before the following Enter. Claude retains
+            // the historical literal-key path.
+            let result = if settle_before_enter {
+                tmux_paste_text(config, &pane_id, &prompt).await
+            } else {
+                tmux_send_keys(config, &pane_id, &prompt).await
+            };
 
             // Release the type-mutex before awaiting delivery so other senders can type.
             drop(_guard);
@@ -4579,16 +4630,18 @@ async fn handle_request(
                     libslop::ResponseBody::Error { message: msg }
                 }
                 Ok(_) => {
-                    // Codex can consume the first Enter or two while expanding
-                    // a multiline paste into its composer. Retry a small,
-                    // bounded number of times until task_started confirms the
-                    // submission. Empty Enters after an accepted prompt are
-                    // harmless, and the bound keeps in-flight steers (which do
-                    // not always emit a fresh task_started) from blocking this
-                    // RPC until its full timeout.
+                    // A successful paste is not a successful submission. Wait
+                    // for Codex's UserPromptSubmit/task_started signal and
+                    // report an error if it never arrives; returning Sent for
+                    // an unconfirmed draft strands the ACP turn indefinitely.
+                    // Repeated empty Enters are harmless after acceptance and
+                    // cover a briefly busy TUI event loop.
                     if settle_before_enter {
-                        let mut backoff = std::time::Duration::from_millis(150);
-                        for _ in 0..3 {
+                        let deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(timeout_secs);
+                        let mut backoff = std::time::Duration::from_millis(100);
+                        let max_backoff = std::time::Duration::from_secs(2);
+                        loop {
                             let notified = state.prompt_submitted.notified();
                             match tmux_send_keys(config, &pane_id, "Enter").await {
                                 Ok(out) if out.success() => {}
@@ -4606,12 +4659,23 @@ async fn handle_request(
                                     };
                                 }
                             }
-                            if tokio::time::timeout(backoff, notified).await.is_ok() {
+                            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if remaining.is_zero() {
+                                return libslop::ResponseBody::Error {
+                                    message: format!(
+                                        "timed out after {}s waiting for Codex to submit prompt on pane {}",
+                                        timeout_secs, pane_id
+                                    ),
+                                };
+                            }
+                            if tokio::time::timeout(backoff.min(remaining), notified)
+                                .await
+                                .is_ok()
+                            {
                                 return libslop::ResponseBody::Sent { pane_id };
                             }
-                            backoff *= 2;
+                            backoff = (backoff * 2).min(max_backoff);
                         }
-                        return libslop::ResponseBody::Sent { pane_id };
                     }
                     // Send Enter repeatedly with exponential backoff until
                     // UserPromptSubmit fires, confirming the prompt was submitted.

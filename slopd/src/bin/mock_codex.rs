@@ -121,10 +121,12 @@ fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
-        if arg == "--mock-session-start=lazy"
-            || arg
-                .strip_prefix("--mock-submit-after=")
-                .is_some_and(|value| value.parse::<u8>().is_ok_and(|count| count > 0))
+        if matches!(
+            arg.as_str(),
+            "--mock-session-start=lazy" | "--mock-require-bracketed-paste"
+        ) || arg
+            .strip_prefix("--mock-submit-after=")
+            .is_some_and(|value| value.parse::<u8>().is_ok_and(|count| count > 0))
         {
             continue;
         }
@@ -135,6 +137,9 @@ fn main() {
         .find_map(|arg| arg.strip_prefix("--mock-submit-after="))
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(1);
+    let require_bracketed_paste = args
+        .iter()
+        .any(|arg| arg == "--mock-require-bracketed-paste");
     let codex_home = PathBuf::from(
         std::env::var_os("CODEX_HOME")
             .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| ".".into())),
@@ -186,6 +191,13 @@ fn main() {
         libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
         original
     };
+    if require_bracketed_paste {
+        let mut stdout = std::io::stdout();
+        stdout
+            .write_all(b"\x1b[?2004h")
+            .expect("enable bracketed paste");
+        stdout.flush().expect("flush bracketed paste mode");
+    }
 
     let mut stdin = std::io::stdin();
     let mut byte = [0_u8; 1];
@@ -193,10 +205,44 @@ fn main() {
     let mut active = false;
     let mut awaiting_approval = false;
     let mut enters_until_submit = submit_after;
+    let mut bracket_sequence = Vec::new();
+    let mut in_bracketed_paste = false;
+    let mut saw_bracketed_paste = false;
     loop {
         match stdin.read(&mut byte) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
+        }
+        if require_bracketed_paste && (!bracket_sequence.is_empty() || byte[0] == 0x1b) {
+            const START: &[u8] = b"\x1b[200~";
+            const END: &[u8] = b"\x1b[201~";
+            bracket_sequence.push(byte[0]);
+            if bracket_sequence == START {
+                bracket_sequence.clear();
+                in_bracketed_paste = true;
+                saw_bracketed_paste = true;
+            } else if bracket_sequence == END {
+                bracket_sequence.clear();
+                in_bracketed_paste = false;
+            } else if !START.starts_with(&bracket_sequence) && !END.starts_with(&bracket_sequence) {
+                // This option is a focused transport test double. Treat any
+                // other escape sequence as Escape and discard its suffix.
+                bracket_sequence.clear();
+                if active || awaiting_approval {
+                    active = false;
+                    awaiting_approval = false;
+                    write_record(
+                        &transcript,
+                        json!({"type":"event_msg","payload":{"type":"turn_aborted"}}),
+                    );
+                    fire_hooks(
+                        &settings,
+                        "Stop",
+                        &hook_payload("Stop", &session_id, &cwd, &transcript),
+                    );
+                }
+            }
+            continue;
         }
         match byte[0] {
             0x03 | 0x04 => break,
@@ -217,11 +263,19 @@ fn main() {
                 }
             }
             b'\r' | b'\n' => {
+                if in_bracketed_paste {
+                    line.push(b'\n');
+                    continue;
+                }
+                if require_bracketed_paste && !saw_bracketed_paste {
+                    continue;
+                }
                 if enters_until_submit > 1 {
                     enters_until_submit -= 1;
                     continue;
                 }
                 enters_until_submit = submit_after;
+                saw_bracketed_paste = false;
                 let prompt = String::from_utf8_lossy(&line).trim().to_string();
                 line.clear();
                 if prompt.is_empty() {

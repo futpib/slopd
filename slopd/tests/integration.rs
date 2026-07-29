@@ -14119,7 +14119,7 @@ fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() 
 }
 
 #[test]
-fn codex_send_retries_ignored_enters_until_prompt_is_submitted() {
+fn codex_send_uses_bracketed_paste_and_waits_until_prompt_is_submitted() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -14127,7 +14127,7 @@ fn codex_send_retries_ignored_enters_until_prompt_is_submitted() {
     let codex_home = tempfile::tempdir().unwrap();
     let env = TestEnv::new(None).expect("tmux required");
     env.append_config(&format!(
-        "\n[accounts.codex-enter-retry]\nbackend = \"codex\"\nexecutable = [{:?}, \"--mock-submit-after=3\"]\nconfig_dir = {:?}\n",
+        "\n[accounts.codex-enter-retry]\nbackend = \"codex\"\nexecutable = [{:?}, \"--mock-require-bracketed-paste\", \"--mock-submit-after=3\"]\nconfig_dir = {:?}\n",
         mock_codex.to_str().unwrap(),
         codex_home.path().to_str().unwrap(),
     ));
@@ -14146,8 +14146,12 @@ fn codex_send_retries_ignored_enters_until_prompt_is_submitted() {
         String::from_utf8_lossy(&run.stderr)
     );
     let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let prompt = format!(
+        "BRACKETED_PASTE_CANARY\n{}",
+        vec!["multiline Buzz payload"; 80].join("\n")
+    );
 
-    let send = env.slopctl(&["send", &pane_id, "ENTER_RETRY_CANARY"]);
+    let send = env.slopctl(&["send", &pane_id, &prompt]);
     assert!(
         send.status.success(),
         "Codex send failed: {}",
@@ -14167,19 +14171,76 @@ fn codex_send_retries_ignored_enters_until_prompt_is_submitted() {
                     && record
                         .pointer("/payload/text")
                         .and_then(serde_json::Value::as_str)
-                        == Some("ENTER_RETRY_CANARY")
+                        == Some(prompt.as_str())
             });
         if submitted {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "Codex prompt was left as a draft after ignored Enter keys"
+            "Codex prompt was left as a draft after ignored Enter keys: {transcript}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
 
     kill_slopd(slopd);
+}
+
+#[test]
+fn codex_send_does_not_report_an_unsubmitted_draft_as_sent() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-never-submit]\nbackend = \"codex\"\nexecutable = [{:?}, \"--mock-require-bracketed-paste\", \"--mock-submit-after=255\"]\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-never-submit",
+        "--ready-timeout",
+        "10",
+    ]);
+    assert!(
+        run.status.success(),
+        "Codex run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let send = env.slopctl(&[
+        "send",
+        &pane_id,
+        "UNSUBMITTED_DRAFT_CANARY",
+        "--timeout",
+        "1",
+    ]);
+    let transcript = env.slopctl(&["transcript", &pane_id, "--limit", "20"]);
+    kill_slopd(slopd);
+
+    assert!(
+        !send.status.success(),
+        "slopctl send falsely reported an unsubmitted Codex draft as sent"
+    );
+    assert!(
+        String::from_utf8_lossy(&send.stderr).contains("timed out"),
+        "send failure did not explain the missing submission: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    assert!(
+        transcript["records"]
+            .as_array()
+            .is_none_or(|records| records.is_empty()),
+        "unsubmitted draft leaked into the transcript: {transcript}"
+    );
 }
 
 fn mock_codex_policy(env: &TestEnv, pane_id: &str) -> serde_json::Value {
