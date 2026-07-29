@@ -522,6 +522,7 @@ impl Adapter {
                 pane_event_filter(&lease.pane_id, "slopd", "StateChange"),
                 pane_event_filter(&lease.pane_id, "slopd", "DetailedStateChange"),
                 pane_event_filter(&lease.pane_id, "slopd", "PaneDestroyed"),
+                pane_event_filter(&lease.pane_id, "hook", "Stop"),
                 pane_event_filter(&lease.pane_id, "hook", "SessionEnd"),
             ]) => result.map_err(|error| error.to_string())?,
             _ = lease.cancel.cancelled() => {
@@ -560,23 +561,42 @@ impl Adapter {
         loop {
             tokio::select! {
                 item = transcript.next() => {
-                    let record = subscription_record(item)?;
-                    let Some(record) = record else {
-                        return Err("transcript subscription closed during turn".into());
-                    };
-                    saw_answer |= emit_record_updates(
-                        &mut projection,
-                        lease.backend,
-                        &record,
-                        session_id,
-                        sender,
-                    ).await;
+                    match subscription_event(item)? {
+                        SubscriptionEvent::Record(record) => {
+                            tracing::debug!(
+                                pane_id = lease.pane_id,
+                                event_type = record.event_type,
+                                cursor = record.cursor,
+                                "received transcript record"
+                            );
+                            saw_answer |= emit_record_updates(
+                                &mut projection,
+                                lease.backend,
+                                &record,
+                                session_id,
+                                sender,
+                            ).await;
+                        }
+                        SubscriptionEvent::Subscribed => continue,
+                        SubscriptionEvent::Closed => {
+                            return Err("transcript subscription closed during turn".into());
+                        }
+                    }
                 }
                 item = state.next() => {
-                    let record = subscription_record(item)?;
-                    let Some(record) = record else {
-                        return Err("state subscription closed during turn".into());
+                    let record = match subscription_event(item)? {
+                        SubscriptionEvent::Record(record) => record,
+                        SubscriptionEvent::Subscribed => continue,
+                        SubscriptionEvent::Closed => {
+                            return Err("state subscription closed during turn".into());
+                        }
                     };
+                    tracing::debug!(
+                        pane_id = lease.pane_id,
+                        event_type = record.event_type,
+                        payload = %record.payload,
+                        "received state record"
+                    );
                     match record.event_type.as_str() {
                         "PaneDestroyed" | "SessionEnd" => {
                             return Err(format!(
@@ -584,10 +604,25 @@ impl Adapter {
                                 lease.pane_id
                             ));
                         }
+                        "Stop" => {
+                            return complete_turn(
+                                &mut transcript,
+                                &mut projection,
+                                lease.backend,
+                                session_id,
+                                sender,
+                            ).await;
+                        }
                         "StateChange" => {
                             match record.payload.get("state").and_then(Value::as_str) {
                                 Some("busy") => saw_busy = true,
-                                Some("ready") if saw_busy || saw_answer => {
+                                Some("ready")
+                                    if state_ready_completes(
+                                        lease.backend,
+                                        saw_busy,
+                                        saw_answer,
+                                    ) =>
+                                {
                                     // State and transcript records travel through
                                     // independent slopd subscriptions. A fast
                                     // turn can deliver ready first even though
@@ -595,24 +630,13 @@ impl Adapter {
                                     // about to be tailed). Give transcript
                                     // delivery one short quiet window before
                                     // resolving the ACP prompt.
-                                    drain_transcript(
+                                    return complete_turn(
                                         &mut transcript,
                                         &mut projection,
                                         lease.backend,
                                         session_id,
                                         sender,
-                                    ).await?;
-                                    for update in projection.finish_open_tools() {
-                                        wire::send(
-                                            sender,
-                                            wire::session_update(session_id, update),
-                                        )
-                                        .await;
-                                    }
-                                    return Ok(TurnResult {
-                                        accepted: true,
-                                        stop_reason: "end_turn",
-                                    });
+                                    ).await;
                                 }
                                 _ => {}
                             }
@@ -721,6 +745,34 @@ impl Adapter {
     }
 }
 
+fn state_ready_completes(backend: libslop::Backend, saw_busy: bool, saw_answer: bool) -> bool {
+    // Codex emits a stale busy -> ready pair when its first SessionStart hook
+    // races the initial prompt. A Codex ready state is only sufficient after
+    // transcript output; otherwise its per-turn Stop hook is authoritative.
+    if backend == libslop::Backend::Codex {
+        saw_answer
+    } else {
+        saw_busy || saw_answer
+    }
+}
+
+async fn complete_turn(
+    transcript: &mut libslopctl::Subscription,
+    projection: &mut Projection,
+    backend: libslop::Backend,
+    session_id: &str,
+    sender: &Sender,
+) -> Result<TurnResult, String> {
+    drain_transcript(transcript, projection, backend, session_id, sender).await?;
+    for update in projection.finish_open_tools() {
+        wire::send(sender, wire::session_update(session_id, update)).await;
+    }
+    Ok(TurnResult {
+        accepted: true,
+        stop_reason: "end_turn",
+    })
+}
+
 async fn emit_record_updates(
     projection: &mut Projection,
     backend: libslop::Backend,
@@ -745,14 +797,29 @@ async fn drain_transcript(
     session_id: &str,
     sender: &Sender,
 ) -> Result<(), String> {
+    tracing::debug!("draining transcript after ready state");
     loop {
         match tokio::time::timeout(Duration::from_millis(300), transcript.next()).await {
-            Err(_) => return Ok(()),
+            Err(_) => {
+                tracing::debug!("transcript drain quiet window elapsed");
+                return Ok(());
+            }
             Ok(item) => {
-                let Some(record) = subscription_record(item)? else {
-                    return Ok(());
-                };
-                emit_record_updates(projection, backend, &record, session_id, sender).await;
+                match subscription_event(item)? {
+                    SubscriptionEvent::Record(record) => {
+                        tracing::debug!(
+                            event_type = record.event_type,
+                            cursor = record.cursor,
+                            "drained transcript record"
+                        );
+                        emit_record_updates(projection, backend, &record, session_id, sender).await;
+                    }
+                    // A subscription acknowledgement is not an EOF marker. Keep
+                    // the quiet-window drain open for the transcript record that
+                    // can race just behind the ready state transition.
+                    SubscriptionEvent::Subscribed => continue,
+                    SubscriptionEvent::Closed => return Ok(()),
+                }
             }
         }
     }
@@ -853,13 +920,19 @@ async fn wait_until_live(
     }
 }
 
-fn subscription_record(
+enum SubscriptionEvent {
+    Record(libslop::Record),
+    Subscribed,
+    Closed,
+}
+
+fn subscription_event(
     item: Result<Option<libslopctl::SubscriptionItem>, libslopctl::Error>,
-) -> Result<Option<libslop::Record>, String> {
+) -> Result<SubscriptionEvent, String> {
     match item.map_err(|error| error.to_string())? {
-        Some(libslopctl::SubscriptionItem::Record(record)) => Ok(Some(record)),
-        Some(libslopctl::SubscriptionItem::Subscribed) => Ok(None),
-        None => Ok(None),
+        Some(libslopctl::SubscriptionItem::Record(record)) => Ok(SubscriptionEvent::Record(record)),
+        Some(libslopctl::SubscriptionItem::Subscribed) => Ok(SubscriptionEvent::Subscribed),
+        None => Ok(SubscriptionEvent::Closed),
     }
 }
 
@@ -1238,6 +1311,25 @@ mod tests {
     fn prompt_rejects_non_text_blocks() {
         let blocks = vec![json!({"type": "image", "data": "..."})];
         assert!(prompt_text(&blocks).unwrap_err().contains("unsupported"));
+    }
+
+    #[test]
+    fn subscription_ack_is_distinct_from_stream_close() {
+        assert!(matches!(
+            subscription_event(Ok(Some(libslopctl::SubscriptionItem::Subscribed))).unwrap(),
+            SubscriptionEvent::Subscribed
+        ));
+        assert!(matches!(
+            subscription_event(Ok(None)).unwrap(),
+            SubscriptionEvent::Closed
+        ));
+    }
+
+    #[test]
+    fn codex_textless_ready_waits_for_the_stop_hook() {
+        assert!(!state_ready_completes(libslop::Backend::Codex, true, false));
+        assert!(state_ready_completes(libslop::Backend::Codex, true, true));
+        assert!(state_ready_completes(libslop::Backend::Claude, true, false));
     }
 
     #[test]
