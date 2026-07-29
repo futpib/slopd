@@ -109,7 +109,8 @@ struct Cli {
     #[arg(long, default_value_t = 3600)]
     turn_timeout: u64,
 
-    /// Maximum ACP sessions (and therefore managed panes) in this process.
+    /// Maximum live managed panes. The least-recently-used inactive pane is
+    /// evicted at the limit and restored if its ACP session is used again.
     #[arg(long, default_value_t = 64)]
     max_sessions: usize,
 }
@@ -186,6 +187,7 @@ async fn main() {
         }
     }
 
+    adapter.shutdown().await;
     drop(sender);
     let _ = writer.await;
 }

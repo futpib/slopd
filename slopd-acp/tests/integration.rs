@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 struct Harness {
     child: Option<Child>,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     receiver: mpsc::Receiver<Value>,
 }
 
@@ -39,15 +39,16 @@ impl Harness {
         });
         Self {
             child: Some(child),
-            stdin,
+            stdin: Some(stdin),
             receiver,
         }
     }
 
     fn send(&mut self, message: Value) {
-        serde_json::to_writer(&mut self.stdin, &message).unwrap();
-        self.stdin.write_all(b"\n").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("adapter stdin is closed");
+        serde_json::to_writer(&mut *stdin, &message).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
     }
 
     fn receive(&self) -> Value {
@@ -63,6 +64,27 @@ impl Harness {
                 return message;
             }
             notifications.push(message);
+        }
+    }
+
+    fn close_stdin_and_wait(mut self) {
+        drop(self.stdin.take());
+        let mut child = self.child.take().expect("adapter child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("wait for slopd-acp") {
+                Some(status) => {
+                    assert!(status.success(), "slopd-acp exited with {status}");
+                    return;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                None => {
+                    kill_child(child);
+                    panic!("slopd-acp did not exit after stdin closed");
+                }
+            }
         }
     }
 }
@@ -162,6 +184,16 @@ fn streamed_text(notifications: &[Value]) -> String {
                 .and_then(Value::as_str)
         })
         .collect()
+}
+
+fn session_pane_id(session_id: &str) -> &str {
+    session_id
+        .strip_prefix("slopd:")
+        .expect("slopd session id should contain its pane id")
+}
+
+fn panes(env: &TestEnv) -> Vec<libslop::PaneInfo> {
+    serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap()
 }
 
 #[test]
@@ -367,6 +399,214 @@ fn buzz_native_steer_reuses_the_existing_codex_pane() {
         serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
     assert_eq!(panes.len(), 1, "steering must not create another pane");
     assert_eq!(panes[0].pane_id, pane_id);
+}
+
+#[test]
+fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-codex", "--max-sessions", "2"],
+    );
+    initialize(&mut harness);
+    let first = new_session(&mut harness, env.config_dir.path(), "");
+    let second = new_session(&mut harness, env.config_dir.path(), "");
+    let first_pane = session_pane_id(&first).to_string();
+    let second_pane = session_pane_id(&second).to_string();
+
+    // Make the first session newer than the second, so the second is the LRU
+    // eviction victim when a third resident pane is requested.
+    let (first_turn, _) = prompt(&mut harness, 10, &first, "KEEP_FIRST_RECENT");
+    assert_eq!(first_turn["result"]["stopReason"], "end_turn");
+
+    let third = new_session(&mut harness, env.config_dir.path(), "");
+    let third_pane = session_pane_id(&third).to_string();
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 2);
+    assert!(resident.iter().any(|pane| pane.pane_id == first_pane));
+    assert!(resident.iter().any(|pane| pane.pane_id == third_pane));
+    assert!(
+        resident.iter().all(|pane| pane.pane_id != second_pane),
+        "the least-recently-used pane was not evicted: {resident:?}"
+    );
+
+    // Buzz still holds the second logical ACP session ID. Reusing it must
+    // restore a pane transparently instead of returning "unknown session".
+    let (restored, notifications) = prompt(&mut harness, 11, &second, "RESTORED_SESSION_CANARY");
+    assert_eq!(restored["result"]["stopReason"], "end_turn");
+    assert!(
+        streamed_text(&notifications).contains("RESTORED_SESSION_CANARY"),
+        "restored session did not run its prompt: {notifications:?}"
+    );
+
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 2, "live pane limit must remain enforced");
+    assert!(resident.iter().any(|pane| pane.pane_id == third_pane));
+    assert!(resident.iter().all(|pane| pane.pane_id != first_pane));
+    assert!(resident.iter().all(|pane| pane.pane_id != second_pane));
+}
+
+#[test]
+fn session_limit_never_evicts_an_active_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-codex", "--max-sessions", "1"],
+    );
+    initialize(&mut harness);
+    let active = new_session(&mut harness, env.config_dir.path(), "");
+    let active_pane = session_pane_id(&active).to_string();
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": active,
+            "prompt": [{ "type": "text", "text": "::mock active" }],
+        },
+    }));
+    loop {
+        let message = harness.receive();
+        if message
+            .pointer("/params/update/_meta/goose/activeRunId")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            break;
+        }
+    }
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "session/new",
+        "params": {
+            "cwd": env.config_dir.path(),
+            "mcpServers": [],
+        },
+    }));
+    let mut notifications = Vec::new();
+    let rejected = harness.response(11, &mut notifications);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("every pane has an active turn")),
+        "active pane should block eviction: {rejected}"
+    );
+
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 1);
+    assert_eq!(resident[0].pane_id, active_pane);
+}
+
+#[test]
+fn dead_panes_are_pruned_before_limit_eviction() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-codex", "--max-sessions", "1"],
+    );
+    initialize(&mut harness);
+    let dead = new_session(&mut harness, env.config_dir.path(), "");
+    let dead_pane = session_pane_id(&dead);
+    let killed = env.slopctl(&["kill", dead_pane]);
+    assert!(
+        killed.status.success(),
+        "failed to kill test pane: {killed:?}"
+    );
+
+    let replacement = new_session(&mut harness, env.config_dir.path(), "");
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 1);
+    assert_eq!(resident[0].pane_id, session_pane_id(&replacement));
+}
+
+#[test]
+fn graceful_adapter_eof_removes_owned_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut harness);
+    new_session(&mut harness, env.config_dir.path(), "");
+    assert_eq!(panes(&env).len(), 1);
+
+    harness.close_stdin_and_wait();
+    assert!(
+        panes(&env).is_empty(),
+        "graceful adapter shutdown left its managed pane behind"
+    );
 }
 
 #[test]

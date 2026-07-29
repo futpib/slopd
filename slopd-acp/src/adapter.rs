@@ -44,15 +44,19 @@ pub struct Config {
 pub struct Adapter {
     config: Config,
     sessions: Mutex<HashMap<String, Session>>,
+    session_creation: Mutex<()>,
+    next_activity_id: AtomicU64,
     next_turn_id: AtomicU64,
 }
 
 struct Session {
-    pane_id: String,
-    backend: libslop::Backend,
+    pane_id: Option<String>,
+    backend: Option<libslop::Backend>,
+    start_directory: PathBuf,
     system_prompt: Option<String>,
     system_prompt_delivered: bool,
     active_turn: Option<ActiveTurn>,
+    last_used: u64,
 }
 
 struct ActiveTurn {
@@ -118,6 +122,8 @@ impl Adapter {
         Arc::new(Self {
             config,
             sessions: Mutex::new(HashMap::new()),
+            session_creation: Mutex::new(()),
+            next_activity_id: AtomicU64::new(1),
             next_turn_id: AtomicU64::new(1),
         })
     }
@@ -254,17 +260,6 @@ impl Adapter {
             )
             .await;
         }
-        if self.sessions.lock().await.len() >= self.config.max_sessions {
-            return reject(
-                sender,
-                id,
-                format!(
-                    "session/new: maximum of {} sessions reached",
-                    self.config.max_sessions
-                ),
-            )
-            .await;
-        }
 
         let system_prompt = params
             .system_prompt
@@ -294,127 +289,31 @@ impl Adapter {
             (_, None) => None,
         };
 
-        let mut client = match self.config.transport.connect().await {
-            Ok(client) => client,
-            Err(error) => return server_error(sender, id, error).await,
-        };
-        let filters = vec![
-            event_filter("slopd", "DetailedStateChange"),
-            event_filter("slopd", "PaneDestroyed"),
-            event_filter("hook", "SessionEnd"),
-        ];
-        let mut subscription = match client.subscribe(filters).await {
-            Ok(subscription) => subscription,
-            Err(error) => return server_error(sender, id, error.to_string()).await,
-        };
-
         let start_directory = self
             .config
             .working_directory
             .clone()
             .unwrap_or_else(|| PathBuf::from(&params.cwd));
-        let pane_id = match client
-            .run(
-                None,
-                self.config.extra_args.clone(),
-                Some(start_directory),
-                self.config.env.clone(),
-                self.config.account.clone(),
-                self.config.backend,
-            )
-            .await
-        {
-            Ok(pane_id) => pane_id,
-            Err(error) => return server_error(sender, id, error.to_string()).await,
-        };
-
-        if let Err(error) = wait_until_live(
-            &self.config.transport,
-            &mut subscription,
-            &pane_id,
-            self.config.ready_timeout,
-        )
-        .await
-        {
-            drop(subscription);
-            drop(client);
-            if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
-                tracing::warn!("failed to remove pane after startup error: {cleanup_error}");
-            }
-            return server_error(sender, id, error).await;
+        let _creation = self.session_creation.lock().await;
+        if let Err(error) = self.make_live_pane_room().await {
+            return server_error(sender, id, format!("session/new: {error}")).await;
         }
-
-        drop(subscription);
-        drop(client);
-        let mut client = match self.config.transport.connect().await {
-            Ok(client) => client,
-            Err(error) => {
-                if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
-                    tracing::warn!(
-                        "failed to remove pane after metadata connection error: {cleanup_error}"
-                    );
-                }
-                return server_error(sender, id, error).await;
-            }
+        let (pane_id, backend) = match self.start_pane(start_directory.clone()).await {
+            Ok(started) => started,
+            Err(error) => return server_error(sender, id, error).await,
         };
-        let backend = match client.ps().await {
-            Ok(panes) => match panes.into_iter().find(|pane| pane.pane_id == pane_id) {
-                Some(pane) => pane.backend,
-                None => {
-                    if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
-                        tracing::warn!(
-                            "failed to remove pane after it disappeared from ps: {cleanup_error}"
-                        );
-                    }
-                    return server_error(
-                        sender,
-                        id,
-                        format!("pane {pane_id} disappeared while creating its ACP session"),
-                    )
-                    .await;
-                }
-            },
-            Err(error) => {
-                if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
-                    tracing::warn!(
-                        "failed to remove pane after backend lookup error: {cleanup_error}"
-                    );
-                }
-                return server_error(
-                    sender,
-                    id,
-                    format!("could not resolve backend for {pane_id}: {error}"),
-                )
-                .await;
-            }
-        };
-        if let Err(error) = client.tag(pane_id.clone(), "acp".into()).await {
-            tracing::warn!("could not tag ACP pane {pane_id}: {error}");
-        }
-
         let session_id = format!("slopd:{pane_id}");
         let mut sessions = self.sessions.lock().await;
-        if sessions.len() >= self.config.max_sessions {
-            drop(sessions);
-            let _ = client.kill(pane_id).await;
-            return reject(
-                sender,
-                id,
-                format!(
-                    "session/new: maximum of {} sessions reached",
-                    self.config.max_sessions
-                ),
-            )
-            .await;
-        }
         sessions.insert(
             session_id.clone(),
             Session {
-                pane_id,
-                backend,
+                pane_id: Some(pane_id),
+                backend: Some(backend),
+                start_directory,
                 system_prompt,
                 system_prompt_delivered: false,
                 active_turn: None,
+                last_used: self.next_activity_id.fetch_add(1, Ordering::Relaxed),
             },
         );
         drop(sessions);
@@ -444,6 +343,13 @@ impl Adapter {
 
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
         let run_id = format!("slopd-turn-{turn_id}");
+        let creation = self.session_creation.lock().await;
+        if !self.sessions.lock().await.contains_key(&params.session_id) {
+            return reject(sender, id, "session/prompt: unknown session".into()).await;
+        }
+        if let Err(error) = self.ensure_session_resident(&params.session_id).await {
+            return server_error(sender, id, format!("session/prompt: {error}")).await;
+        }
         let lease = {
             let mut sessions = self.sessions.lock().await;
             let Some(session) = sessions.get_mut(&params.session_id) else {
@@ -457,6 +363,13 @@ impl Adapter {
                 )
                 .await;
             }
+            let pane_id = session
+                .pane_id
+                .clone()
+                .expect("resident session must have a pane");
+            let backend = session
+                .backend
+                .expect("resident session must have a backend");
 
             let system_prompt = (!session.system_prompt_delivered)
                 .then_some(session.system_prompt.as_deref())
@@ -468,16 +381,18 @@ impl Adapter {
                 run_id: run_id.clone(),
                 cancel: cancel.clone(),
             });
+            session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
             TurnLease {
                 turn_id,
                 run_id,
-                pane_id: session.pane_id.clone(),
-                backend: session.backend,
+                pane_id,
+                backend,
                 prompt,
                 system_prompt_included: system_prompt.is_some(),
                 cancel,
             }
         };
+        drop(creation);
 
         let accepted = Arc::new(AtomicBool::new(false));
         let run = self.run_turn(&params.session_id, &lease, Arc::clone(&accepted), sender);
@@ -635,6 +550,7 @@ impl Adapter {
                     );
                     match record.event_type.as_str() {
                         "PaneDestroyed" | "SessionEnd" => {
+                            self.mark_pane_gone(session_id, &lease.pane_id).await;
                             return Err(format!(
                                 "underlying pane {} ended during the turn",
                                 lease.pane_id
@@ -729,6 +645,228 @@ impl Adapter {
         }
     }
 
+    async fn start_pane(
+        &self,
+        start_directory: PathBuf,
+    ) -> Result<(String, libslop::Backend), String> {
+        let mut client = self.config.transport.connect().await?;
+        let filters = vec![
+            event_filter("slopd", "DetailedStateChange"),
+            event_filter("slopd", "PaneDestroyed"),
+            event_filter("hook", "SessionEnd"),
+        ];
+        let mut subscription = client
+            .subscribe(filters)
+            .await
+            .map_err(|error| error.to_string())?;
+        let pane_id = client
+            .run(
+                None,
+                self.config.extra_args.clone(),
+                Some(start_directory),
+                self.config.env.clone(),
+                self.config.account.clone(),
+                self.config.backend,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if let Err(error) = wait_until_live(
+            &self.config.transport,
+            &mut subscription,
+            &pane_id,
+            self.config.ready_timeout,
+        )
+        .await
+        {
+            drop(subscription);
+            drop(client);
+            if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
+                tracing::warn!("failed to remove pane after startup error: {cleanup_error}");
+            }
+            return Err(error);
+        }
+
+        drop(subscription);
+        drop(client);
+        let mut client = match self.config.transport.connect().await {
+            Ok(client) => client,
+            Err(error) => {
+                if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
+                    tracing::warn!(
+                        "failed to remove pane after metadata connection error: {cleanup_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let backend = match client.ps().await {
+            Ok(panes) => match panes.into_iter().find(|pane| pane.pane_id == pane_id) {
+                Some(pane) => pane.backend,
+                None => {
+                    if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
+                        tracing::warn!(
+                            "failed to remove pane after it disappeared from ps: {cleanup_error}"
+                        );
+                    }
+                    return Err(format!(
+                        "pane {pane_id} disappeared while creating its ACP session"
+                    ));
+                }
+            },
+            Err(error) => {
+                if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
+                    tracing::warn!(
+                        "failed to remove pane after backend lookup error: {cleanup_error}"
+                    );
+                }
+                return Err(format!("could not resolve backend for {pane_id}: {error}"));
+            }
+        };
+        if let Err(error) = client.tag(pane_id.clone(), "acp".into()).await {
+            tracing::warn!("could not tag ACP pane {pane_id}: {error}");
+        }
+        Ok((pane_id, backend))
+    }
+
+    async fn ensure_session_resident(&self, session_id: &str) -> Result<(), String> {
+        let start_directory = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| "unknown session".to_string())?;
+            if session.pane_id.is_some() {
+                return Ok(());
+            }
+            if session.active_turn.is_some() {
+                return Err("session is still releasing its previous pane".into());
+            }
+            session.start_directory.clone()
+        };
+
+        self.make_live_pane_room().await?;
+        let (pane_id, backend) = self.start_pane(start_directory).await?;
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            drop(sessions);
+            let _ = self.kill_pane(&pane_id).await;
+            return Err("session disappeared while restoring its pane".into());
+        };
+        if session.pane_id.is_some() {
+            drop(sessions);
+            let _ = self.kill_pane(&pane_id).await;
+            return Err("session acquired another pane while it was being restored".into());
+        }
+        tracing::info!(session_id, pane_id, "restored evicted ACP session");
+        session.pane_id = Some(pane_id);
+        session.backend = Some(backend);
+        session.system_prompt_delivered = false;
+        Ok(())
+    }
+
+    async fn make_live_pane_room(&self) -> Result<(), String> {
+        let mut client = self.config.transport.connect().await?;
+        let panes = client.ps().await.map_err(|error| error.to_string())?;
+        self.reconcile_live_sessions(&panes).await;
+
+        let victim = {
+            let mut sessions = self.sessions.lock().await;
+            let live_count = sessions
+                .values()
+                .filter(|session| session.pane_id.is_some())
+                .count();
+            if live_count < self.config.max_sessions {
+                return Ok(());
+            }
+            let Some(victim_id) = sessions
+                .iter()
+                .filter(|(_, session)| session.pane_id.is_some() && session.active_turn.is_none())
+                .min_by_key(|(_, session)| session.last_used)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                return Err(format!(
+                    "maximum of {} live panes reached and every pane has an active turn",
+                    self.config.max_sessions
+                ));
+            };
+            let victim = sessions
+                .get_mut(&victim_id)
+                .expect("selected eviction victim must still exist");
+            let pane_id = victim
+                .pane_id
+                .take()
+                .expect("selected eviction victim must have a pane");
+            let backend = victim.backend.take();
+            let system_prompt_delivered = victim.system_prompt_delivered;
+            victim.system_prompt_delivered = false;
+            (victim_id, pane_id, backend, system_prompt_delivered)
+        };
+
+        tracing::info!(
+            session_id = victim.0,
+            pane_id = victim.1,
+            "evicting least-recently-used inactive ACP pane"
+        );
+        if let Err(error) = self.kill_pane(&victim.1).await {
+            let pane_is_gone = match self.config.transport.connect().await {
+                Ok(mut client) => client
+                    .ps()
+                    .await
+                    .is_ok_and(|panes| panes.iter().all(|pane| pane.pane_id != victim.1)),
+                Err(_) => false,
+            };
+            if !pane_is_gone {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&victim.0)
+                    && session.pane_id.is_none()
+                {
+                    session.pane_id = Some(victim.1);
+                    session.backend = victim.2;
+                    session.system_prompt_delivered = victim.3;
+                }
+                return Err(format!("failed to evict oldest pane: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_live_sessions(&self, panes: &[libslop::PaneInfo]) {
+        let live_panes: HashSet<&str> = panes.iter().map(|pane| pane.pane_id.as_str()).collect();
+        let mut sessions = self.sessions.lock().await;
+        for (session_id, session) in sessions.iter_mut() {
+            let Some(pane_id) = session.pane_id.as_deref() else {
+                continue;
+            };
+            if live_panes.contains(pane_id) {
+                continue;
+            }
+            tracing::info!(
+                session_id,
+                pane_id,
+                "pruning dead ACP pane from resident session"
+            );
+            session.pane_id = None;
+            session.backend = None;
+            session.system_prompt_delivered = false;
+            if let Some(active) = session.active_turn.as_ref() {
+                active.cancel.cancel();
+            }
+        }
+    }
+
+    async fn mark_pane_gone(&self, session_id: &str, pane_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.pane_id.as_deref() != Some(pane_id) {
+            return;
+        }
+        session.pane_id = None;
+        session.backend = None;
+        session.system_prompt_delivered = false;
+    }
+
     async fn native_steer(&self, id: Value, params: Value, sender: &Sender) {
         let params: NativeSteerParams = match serde_json::from_value(params) {
             Ok(params) => params,
@@ -755,8 +893,8 @@ impl Adapter {
         };
 
         let pane_id = {
-            let sessions = self.sessions.lock().await;
-            let Some(session) = sessions.get(&params.session_id) else {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&params.session_id) else {
                 return reject(
                     sender,
                     id,
@@ -780,7 +918,16 @@ impl Adapter {
                 )
                 .await;
             }
-            session.pane_id.clone()
+            let Some(pane_id) = session.pane_id.clone() else {
+                return reject(
+                    sender,
+                    id,
+                    format!("{NATIVE_STEER_METHOD}: active pane is no longer live"),
+                )
+                .await;
+            };
+            session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+            pane_id
         };
 
         let mut client = match self.config.transport.connect().await {
@@ -793,6 +940,31 @@ impl Adapter {
         {
             Ok(_) => wire::send(sender, wire::ok(id, Value::Null)).await,
             Err(error) => server_error(sender, id, error.to_string()).await,
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _creation = self.session_creation.lock().await;
+        let panes = {
+            let mut sessions = self.sessions.lock().await;
+            let sessions = std::mem::take(&mut *sessions);
+            sessions
+                .into_values()
+                .filter_map(|session| {
+                    if let Some(active) = session.active_turn {
+                        active.cancel.cancel();
+                    }
+                    session.pane_id
+                })
+                .collect::<Vec<_>>()
+        };
+        for pane_id in panes {
+            if let Err(error) = self.kill_pane(&pane_id).await {
+                tracing::warn!(
+                    pane_id,
+                    "failed to remove ACP pane during shutdown: {error}"
+                );
+            }
         }
     }
 
