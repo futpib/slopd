@@ -1,13 +1,7 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use iroh::{Endpoint, PublicKey, SecretKey, endpoint::presets};
-use iroh::endpoint::ConnectionError;
-use serde::{Deserialize, Serialize};
 use tracing::debug;
-
-const ALPN: &[u8] = b"iroh-slopd/0";
 
 #[derive(Parser)]
 #[command(name = "iroh-slopctl", about = "Remote control for slopd via iroh", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
@@ -40,116 +34,23 @@ enum Command {
     Common(libslopctl::CommonCommand),
 }
 
-fn config_path() -> PathBuf {
-    libslop::config_dir().join("iroh-slopctl/config.toml")
+fn die_iroh(error: libslopiroh::Error) -> ! {
+    if let Some(client_id) = error.unauthorized_client() {
+        eprintln!("hint: the remote endpoint rejected this client as unauthorized");
+        eprintln!(
+            "hint: ask the remote to run: iroh-slopd authorize {}",
+            client_id
+        );
+    }
+    eprintln!("{error}");
+    std::process::exit(1);
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Config {
-    secret_key: Option<String>,
-    default: Option<String>,
-    #[serde(default)]
-    endpoints: HashMap<String, EndpointConfig>,
-    /// The file this config was loaded from / is saved to. Not serialized;
-    /// populated by [`Config::load`] so `save` honors the `--config` override.
-    #[serde(skip)]
-    path: PathBuf,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EndpointConfig {
-    endpoint_id: String,
-}
-
-impl Config {
-    fn load(path: PathBuf) -> Self {
-        let mut config = match std::fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-                eprintln!("warning: failed to parse {}: {}", path.display(), e);
-                Config::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(e) => {
-                eprintln!("warning: failed to read {}: {}", path.display(), e);
-                Config::default()
-            }
-        };
-        config.path = path;
-        config
+fn unwrap_iroh<T>(result: Result<T, libslopiroh::Error>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => die_iroh(error),
     }
-
-    fn save(&self) {
-        let path = &self.path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("failed to create config dir: {}", e);
-                std::process::exit(1);
-            });
-        }
-        let contents = toml::to_string_pretty(self).unwrap();
-        std::fs::write(path, contents).unwrap_or_else(|e| {
-            eprintln!("failed to write config: {}", e);
-            std::process::exit(1);
-        });
-    }
-
-    fn secret_key(&mut self) -> SecretKey {
-        if let Some(ref key_str) = self.secret_key {
-            let bytes = data_encoding::BASE32_NOPAD.decode(key_str.as_bytes()).unwrap_or_else(|e| {
-                eprintln!("invalid secret_key in config (bad base32): {}", e);
-                std::process::exit(1);
-            });
-            let bytes: [u8; 32] = bytes.try_into().unwrap_or_else(|_| {
-                eprintln!("invalid secret_key in config: expected 32 bytes");
-                std::process::exit(1);
-            });
-            SecretKey::from(bytes)
-        } else {
-            let mut bytes = [0u8; 32];
-            getrandom::fill(&mut bytes).expect("failed to generate random key");
-            let key = SecretKey::from(bytes);
-            self.secret_key = Some(data_encoding::BASE32_NOPAD.encode(&key.to_bytes()));
-            self.save();
-            key
-        }
-    }
-
-    fn resolve_endpoint(&self, override_endpoint: Option<&str>) -> iroh::EndpointAddr {
-        let endpoint_str = if let Some(name_or_id) = override_endpoint {
-            if let Some(ep) = self.endpoints.get(name_or_id) {
-                ep.endpoint_id.clone()
-            } else {
-                name_or_id.to_string()
-            }
-        } else if let Some(ref default_name) = self.default {
-            if let Some(ep) = self.endpoints.get(default_name) {
-                ep.endpoint_id.clone()
-            } else {
-                eprintln!("default endpoint {:?} not found in config", default_name);
-                std::process::exit(1);
-            }
-        } else {
-            eprintln!("no endpoint specified and no default configured");
-            eprintln!("use --endpoint <name-or-id> or set 'default' in config");
-            std::process::exit(1);
-        };
-
-        let id = endpoint_str.parse::<PublicKey>().unwrap_or_else(|e| {
-            eprintln!("invalid endpoint_id {:?}: {}", endpoint_str, e);
-            std::process::exit(1);
-        });
-        iroh::EndpointAddr::from(id)
-    }
-}
-
-fn check_unauthorized(close_reason: Option<&ConnectionError>, client_id: &PublicKey) {
-    let err = match close_reason {
-        Some(ConnectionError::ApplicationClosed(close))
-            if close.reason.as_ref() == b"unauthorized" => close,
-        _ => return,
-    };
-    eprintln!("hint: the remote endpoint rejected the connection as unauthorized ({})", err);
-    eprintln!("hint: ask the remote to run: iroh-slopd authorize {}", client_id);
 }
 
 #[tokio::main]
@@ -170,11 +71,11 @@ async fn main() {
         .config
         .as_deref()
         .map(libslop::expand_path)
-        .unwrap_or_else(config_path);
-    let mut config = Config::load(config_path);
+        .unwrap_or_else(libslopiroh::default_client_config_path);
+    let mut config = libslopiroh::ClientConfig::load(config_path);
 
     if let Command::Info = cli.command {
-        let secret_key = config.secret_key();
+        let secret_key = unwrap_iroh(config.secret_key());
         println!("{}", secret_key.public());
         return;
     }
@@ -188,45 +89,22 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let secret_key = config.secret_key();
+    let secret_key = unwrap_iroh(config.secret_key());
     let client_id = secret_key.public();
 
     let addr = if let Some(ref addr_file) = cli.addr_file {
-        let contents = std::fs::read_to_string(addr_file).unwrap_or_else(|e| {
-            eprintln!("failed to read addr file {}: {}", addr_file.display(), e);
-            std::process::exit(1);
-        });
-        serde_json::from_str::<iroh::EndpointAddr>(&contents).unwrap_or_else(|e| {
-            eprintln!("failed to parse addr file: {}", e);
-            std::process::exit(1);
-        })
+        unwrap_iroh(libslopiroh::read_addr_file(addr_file))
     } else {
-        config.resolve_endpoint(cli.endpoint.as_deref())
+        unwrap_iroh(config.resolve_endpoint(cli.endpoint.as_deref()))
     };
 
     debug!("connecting to endpoint {:?}", addr);
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("failed to bind iroh endpoint: {}", e);
-            std::process::exit(1);
-        });
+    let connector = unwrap_iroh(libslopiroh::Connector::bind(secret_key, addr).await);
+    let stream = unwrap_iroh(connector.open().await);
+    let connection = stream.connection.clone();
 
-    let connection = endpoint.connect(addr, ALPN).await.unwrap_or_else(|e| {
-        eprintln!("failed to connect to remote endpoint: {}", e);
-        std::process::exit(1);
-    });
-
-    let (send, recv) = connection.open_bi().await.unwrap_or_else(|e| {
-        check_unauthorized(Some(&e), &client_id);
-        eprintln!("failed to open stream: {}", e);
-        std::process::exit(1);
-    });
-
-    let mut client = libslopctl::Client::new(recv, send);
+    let mut client = libslopctl::Client::new(stream.recv, stream.send);
 
     if let Command::Common(cmd) = cli.command {
         let ctx = libslopctl::CommandContext {
@@ -240,10 +118,16 @@ async fn main() {
             local: false,
         };
         if let Err(e) = libslopctl::execute_command(&mut client, cmd, &ctx).await {
-            check_unauthorized(connection.close_reason().as_ref(), &client_id);
+            if libslopiroh::is_unauthorized(connection.close_reason().as_ref()) {
+                eprintln!("hint: the remote endpoint rejected this client as unauthorized");
+                eprintln!(
+                    "hint: ask the remote to run: iroh-slopd authorize {}",
+                    client_id
+                );
+            }
             libslopctl::die_err(e);
         }
     }
 
-    endpoint.close().await;
+    connector.close().await;
 }

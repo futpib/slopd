@@ -4,9 +4,11 @@ members = [
     "slopctl",
     "libslop",
     "libslopctl",
+    "libslopiroh",
     "libsloptest",
     "iroh-slopd",
     "iroh-slopctl",
+    "slopd-acp",
 ]
 resolver = "2"
 

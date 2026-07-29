@@ -8,10 +8,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
-const ALPN: &[u8] = b"iroh-slopd/0";
-
 #[derive(Parser)]
-#[command(name = "iroh-slopd", about = "Expose slopd over iroh with EndpointId allowlist auth")]
+#[command(
+    name = "iroh-slopd",
+    about = "Expose slopd over iroh with EndpointId allowlist auth"
+)]
 struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, help = "Increase log verbosity")]
     verbose: u8,
@@ -99,10 +100,12 @@ impl Config {
 
     fn secret_key(&mut self) -> SecretKey {
         if let Some(ref key_str) = self.secret_key {
-            let bytes = data_encoding::BASE32_NOPAD.decode(key_str.as_bytes()).unwrap_or_else(|e| {
-                eprintln!("invalid secret_key in config (bad base32): {}", e);
-                std::process::exit(1);
-            });
+            let bytes = data_encoding::BASE32_NOPAD
+                .decode(key_str.as_bytes())
+                .unwrap_or_else(|e| {
+                    eprintln!("invalid secret_key in config (bad base32): {}", e);
+                    std::process::exit(1);
+                });
             let bytes: [u8; 32] = bytes.try_into().unwrap_or_else(|_| {
                 eprintln!("invalid secret_key in config: expected 32 bytes");
                 std::process::exit(1);
@@ -224,7 +227,7 @@ async fn main() {
 
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![libslopiroh::ALPN.to_vec()])
         .bind()
         .await
         .unwrap_or_else(|e| {
@@ -251,9 +254,8 @@ async fn main() {
         .map(libslop::expand_path)
         .unwrap_or_else(libslop::socket_path);
 
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ).expect("failed to install SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
 
     loop {
         tokio::select! {

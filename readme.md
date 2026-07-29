@@ -21,6 +21,7 @@
 - [slopctl commands](#slopctl-commands)
 - [Claude hook integration](#claude-hook-integration)
 - [Event system](#event-system)
+- [ACP adapter](#acp-adapter)
 - [Remote access (iroh)](#remote-access-iroh)
   - [iroh-slopd](#iroh-slopd)
   - [iroh-slopctl](#iroh-slopctl)
@@ -67,6 +68,8 @@
 ```bash
 cargo install --path slopd
 cargo install --path slopctl
+# Optional: expose managed panes to ACP clients such as Buzz
+cargo install --path slopd-acp
 # Optional: remote access via iroh
 cargo install --path iroh-slopd
 cargo install --path iroh-slopctl
@@ -936,6 +939,93 @@ Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and
 
 ---
 
+## ACP adapter
+
+`slopd-acp` is a stdio [Agent Client Protocol (ACP)](https://agentclientprotocol.com/)
+adapter. An ACP host such as Buzz launches it as an agent process; each
+`session/new` creates a dedicated slopd pane, and later ACP prompts are sent to
+that pane.
+
+For a local daemon, configure the ACP host's custom agent executable as:
+
+```bash
+slopd-acp --account work --backend codex
+```
+
+The socket defaults to `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Use `--socket PATH`
+for another local instance.
+
+The adapter maps ACP onto slopd as follows:
+
+| ACP | slopd operation |
+|-----|-----------------|
+| `session/new` | `run` with ACP's cwd, selected account/backend, env, and agent args |
+| `session/prompt` | subscribe to pane state and transcript, then `send` |
+| `session/update` message/tool chunks | normalized transcript records |
+| prompt completion | the pane's busy-to-ready state transition |
+| `session/cancel` | `interrupt` |
+
+Every adapter-created pane receives the `acp` slopd tag. ACP session IDs have
+the form `slopd:%42`, but the mapping is intentionally process-local: if the ACP
+host restarts `slopd-acp`, the old pane remains managed by slopd while the new
+adapter process creates a new session. Automatic reattachment is not advertised
+as `loadSession`.
+
+### ACP limitations
+
+The slopd control protocol does not provide a backend-neutral system-role
+prompt. By default, `slopd-acp` preserves ACP's `systemPrompt` text by clearly
+framing it above the first user prompt, but the underlying CLI receives the
+combined text as a user message. Choose the failure policy explicitly when that
+is not acceptable:
+
+```bash
+slopd-acp --system-prompt-mode reject
+slopd-acp --system-prompt-mode ignore
+```
+
+The adapter also advertises no MCP or non-text prompt support. A non-empty
+`mcpServers` list and image/audio/resource content are rejected rather than
+silently discarded.
+
+Permission and elicitation states are observable but not answerable through
+slopctl. When an underlying CLI stops at one of those dialogs, the ACP stream
+explains that input is required in the terminal pane; it does not issue an ACP
+permission request or auto-approve anything. After the terminal interaction,
+the same ACP turn continues until the pane returns to ready.
+
+Transcript granularity is backend-dependent. OpenCode generally yields
+incremental text parts; Claude and Codex may yield complete message blocks.
+
+### ACP over iroh
+
+Iroh changes only the transport below the adapter. `slopd-acp` shares the ALPN,
+client config, persisted secret key, endpoint aliases, address-file format, and
+authorization identity used by `iroh-slopctl`. If `iroh-slopctl info` is already
+authorized on the server, `slopd-acp` is already authorized too.
+
+```bash
+# Use the default endpoint in ~/.config/iroh-slopctl/config.toml
+slopd-acp --iroh --account work --backend codex
+
+# Or select an alias/raw EndpointId/full EndpointAddr file
+slopd-acp --endpoint my-server
+slopd-acp --addr-file /path/to/iroh-addr.json
+```
+
+ACP's cwd names a path on the machine running the ACP host. When the remote
+slopd host has a different filesystem layout, override it with a path meaningful
+to that host:
+
+```bash
+slopd-acp --iroh --working-directory /srv/agents/project
+```
+
+Use `--iroh-config PATH` to select a different client identity/config instead of
+the shared `iroh-slopctl` default.
+
+---
+
 ## Remote access (iroh)
 
 `iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance by exposing the Unix socket over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine via an encrypted P2P connection with EndpointId allowlist authentication.
@@ -1047,6 +1137,8 @@ iroh-slopctl ps
 | `slopctl` | CLI client binary — all user-facing subcommands |
 | `libslop` | Shared library — protocol types, config, hook injection, path helpers |
 | `libslopctl` | Transport-agnostic client library — JSON-RPC protocol, typed methods, streaming |
+| `libslopiroh` | Shared iroh client transport — ALPN, identity/config, endpoint resolution |
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
+| `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as Buzz |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |

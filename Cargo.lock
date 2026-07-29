@@ -1719,16 +1719,11 @@ name = "iroh-slopctl"
 version = "0.1.0"
 dependencies = [
  "clap",
- "data-encoding",
- "dirs",
- "getrandom 0.4.2",
- "iroh",
  "libslop",
  "libslopctl",
- "serde",
+ "libslopiroh",
  "serde_json",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1743,6 +1738,7 @@ dependencies = [
  "getrandom 0.4.2",
  "iroh",
  "libslop",
+ "libslopiroh",
  "libsloptest",
  "serde",
  "serde_json",
@@ -1837,6 +1833,19 @@ dependencies = [
  "timeago",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "libslopiroh"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "getrandom 0.4.2",
+ "iroh",
+ "libslop",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -3174,6 +3183,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "slopd-acp"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "iroh",
+ "libslop",
+ "libslopctl",
+ "libslopiroh",
+ "libsloptest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

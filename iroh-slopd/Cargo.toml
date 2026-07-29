@@ -6,6 +6,7 @@ description = "iroh-based tunnel proxy for slopd — exposes slopd over iroh wit
 
 [dependencies]
 libslop = { path = "../libslop" }
+libslopiroh = { path = "../libslopiroh" }
 iroh = "0.97"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
