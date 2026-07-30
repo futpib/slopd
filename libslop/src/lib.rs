@@ -34,7 +34,11 @@ pub fn runtime_dir() -> PathBuf {
         // Our own fallback must satisfy the spec's owner-only (0700) requirement,
         // since it holds the control socket and may live in a shared temp dir.
         if let Err(e) = ensure_private_dir(&dir) {
-            eprintln!("warning: failed to create runtime dir {}: {}", dir.display(), e);
+            eprintln!(
+                "warning: failed to create runtime dir {}: {}",
+                dir.display(),
+                e
+            );
         }
     }
     dir
@@ -59,9 +63,15 @@ fn resolve_runtime_fallback(
     temp_dir: &std::path::Path,
 ) -> (PathBuf, RuntimeDirSource) {
     if run_user_exists {
-        (PathBuf::from(format!("/run/user/{uid}")), RuntimeDirSource::RunUser)
+        (
+            PathBuf::from(format!("/run/user/{uid}")),
+            RuntimeDirSource::RunUser,
+        )
     } else {
-        (temp_dir.join(format!("slopd-{uid}")), RuntimeDirSource::Temp)
+        (
+            temp_dir.join(format!("slopd-{uid}")),
+            RuntimeDirSource::Temp,
+        )
     }
 }
 
@@ -146,7 +156,11 @@ pub fn expand_path(path: &std::path::Path) -> PathBuf {
 /// (where `claude` lives), so every restored pane's `claude` was not found and
 /// the pane died instantly. Resolving up front against slopd's PATH removes the
 /// dependency entirely.
-pub fn resolve_executable(program: &str, path: &std::ffi::OsStr, cwd: &std::path::Path) -> Option<PathBuf> {
+pub fn resolve_executable(
+    program: &str,
+    path: &std::ffi::OsStr,
+    cwd: &std::path::Path,
+) -> Option<PathBuf> {
     which::which_in(program, Some(path), cwd).ok()
 }
 
@@ -180,8 +194,8 @@ pub fn parse_env_kv(raw: &str) -> Result<(String, String), String> {
     if key.is_empty() {
         return Err(format!("invalid --env {:?}: empty key", raw));
     }
-    let expanded = expand_env_value(value)
-        .map_err(|e| format!("invalid --env {:?}: {}", raw, e))?;
+    let expanded =
+        expand_env_value(value).map_err(|e| format!("invalid --env {:?}: {}", raw, e))?;
     Ok((key.to_string(), expanded))
 }
 
@@ -193,8 +207,8 @@ pub fn load_env_file(path: &std::path::Path) -> Result<Vec<(String, String)>, St
         .map_err(|e| format!("failed to open env file {}: {}", path.display(), e))?;
     let mut out = Vec::new();
     for item in iter {
-        let (k, v) = item
-            .map_err(|e| format!("failed to parse env file {}: {}", path.display(), e))?;
+        let (k, v) =
+            item.map_err(|e| format!("failed to parse env file {}: {}", path.display(), e))?;
         out.push((k, v));
     }
     Ok(out)
@@ -250,7 +264,10 @@ pub fn tag_option_name(tag: &str) -> Result<String, String> {
     if tag.is_empty() {
         return Err("tag name must not be empty".to_string());
     }
-    if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !tag
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
             "invalid tag {:?}: only ASCII letters, digits, '_', and '-' are allowed",
             tag
@@ -310,19 +327,11 @@ pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
 }
 
 /// Idempotently inject the hook set supported by `backend`.
-pub fn inject_backend_hooks(
-    settings: &mut serde_json::Value,
-    slopctl: &str,
-    backend: Backend,
-) {
+pub fn inject_backend_hooks(settings: &mut serde_json::Value, slopctl: &str, backend: Backend) {
     inject_hook_events(settings, slopctl, backend.hook_events());
 }
 
-fn inject_hook_events(
-    settings: &mut serde_json::Value,
-    slopctl: &str,
-    hook_events: &[&str],
-) {
+fn inject_hook_events(settings: &mut serde_json::Value, slopctl: &str, hook_events: &[&str]) {
     let hooks = settings
         .as_object_mut()
         .expect("hook configuration must be an object")
@@ -355,34 +364,40 @@ fn inject_hook_events(
         // (e.g. "foobar hook {event}") are never considered stale.
         let stale_suffix = format!(" hook {}", event);
         entries.retain(|entry| {
-            let is_stale = entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
-                hooks_arr.iter().any(|h| {
-                    if h.get("type").and_then(|t| t.as_str()) != Some("command") {
-                        return false;
-                    }
-                    let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    if !cmd.ends_with(&stale_suffix) || cmd == command {
-                        return false;
-                    }
-                    // Only remove entries whose executable is slopctl (plain or
-                    // absolute path). Match the first token so a command that
-                    // carries args (e.g. `slopctl --socket <path> hook ...`) is
-                    // still recognized as ours.
-                    let prefix = &cmd[..cmd.len() - stale_suffix.len()];
-                    let exe = prefix.split_whitespace().next().unwrap_or("");
-                    exe == "slopctl" || exe.ends_with("/slopctl")
-                })
-            });
+            let is_stale = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks_arr| {
+                    hooks_arr.iter().any(|h| {
+                        if h.get("type").and_then(|t| t.as_str()) != Some("command") {
+                            return false;
+                        }
+                        let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        if !cmd.ends_with(&stale_suffix) || cmd == command {
+                            return false;
+                        }
+                        // Only remove entries whose executable is slopctl (plain or
+                        // absolute path). Match the first token so a command that
+                        // carries args (e.g. `slopctl --socket <path> hook ...`) is
+                        // still recognized as ours.
+                        let prefix = &cmd[..cmd.len() - stale_suffix.len()];
+                        let exe = prefix.split_whitespace().next().unwrap_or("");
+                        exe == "slopctl" || exe.ends_with("/slopctl")
+                    })
+                });
             !is_stale
         });
 
         let already_present = entries.iter().any(|entry| {
-            entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
-                hooks_arr.iter().any(|h| {
-                    h.get("type").and_then(|t| t.as_str()) == Some("command")
-                        && h.get("command").and_then(|c| c.as_str()) == Some(&command)
+            entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks_arr| {
+                    hooks_arr.iter().any(|h| {
+                        h.get("type").and_then(|t| t.as_str()) == Some("command")
+                            && h.get("command").and_then(|c| c.as_str()) == Some(&command)
+                    })
                 })
-            })
         });
 
         if !already_present {
@@ -413,31 +428,32 @@ fn remove_hook_events(settings: &mut serde_json::Value, hook_events: &[&str]) {
         };
         let suffix = format!(" hook {}", event);
         entries.retain(|entry| {
-            let is_ours = entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks_arr| {
-                hooks_arr.iter().any(|h| {
-                    if h.get("type").and_then(|t| t.as_str()) != Some("command") {
-                        return false;
-                    }
-                    let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    if !cmd.ends_with(&suffix) {
-                        return false;
-                    }
-                    // Match the first token so `slopctl --socket <path> hook ...`
-                    // entries are removed too, not just the bare form.
-                    let prefix = &cmd[..cmd.len() - suffix.len()];
-                    let exe = prefix.split_whitespace().next().unwrap_or("");
-                    exe == "slopctl" || exe.ends_with("/slopctl")
-                })
-            });
+            let is_ours = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks_arr| {
+                    hooks_arr.iter().any(|h| {
+                        if h.get("type").and_then(|t| t.as_str()) != Some("command") {
+                            return false;
+                        }
+                        let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        if !cmd.ends_with(&suffix) {
+                            return false;
+                        }
+                        // Match the first token so `slopctl --socket <path> hook ...`
+                        // entries are removed too, not just the bare form.
+                        let prefix = &cmd[..cmd.len() - suffix.len()];
+                        let exe = prefix.split_whitespace().next().unwrap_or("");
+                        exe == "slopctl" || exe.ends_with("/slopctl")
+                    })
+                });
             !is_ours
         });
     }
 }
 
 /// Read, remove slopctl hooks, and write a Claude settings.json file.
-pub fn remove_hooks_from_file(
-    settings_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn remove_hooks_from_file(settings_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     remove_hook_events_from_file(settings_path, HOOK_EVENTS)
 }
 
@@ -491,15 +507,33 @@ mod tests {
     #[test]
     fn normalize_pane_title_strips_status_glyphs_and_oc_prefix() {
         // Real samples (verified against live panes).
-        assert_eq!(normalize_pane_title("OC | tg-dm-responder takeover").as_deref(), Some("tg-dm-responder takeover"));
-        assert_eq!(normalize_pane_title("✳ orchestrator").as_deref(), Some("orchestrator"));
+        assert_eq!(
+            normalize_pane_title("OC | tg-dm-responder takeover").as_deref(),
+            Some("tg-dm-responder takeover")
+        );
+        assert_eq!(
+            normalize_pane_title("✳ orchestrator").as_deref(),
+            Some("orchestrator")
+        );
         assert_eq!(normalize_pane_title("⠂ slopd").as_deref(), Some("slopd"));
-        assert_eq!(normalize_pane_title("⠐ Review z.ai models and usage billing").as_deref(), Some("Review z.ai models and usage billing"));
+        assert_eq!(
+            normalize_pane_title("⠐ Review z.ai models and usage billing").as_deref(),
+            Some("Review z.ai models and usage billing")
+        );
         // Spinner glyph in front of the opencode prefix (both stripped, either order).
-        assert_eq!(normalize_pane_title("⠐ OC | building").as_deref(), Some("building"));
+        assert_eq!(
+            normalize_pane_title("⠐ OC | building").as_deref(),
+            Some("building")
+        );
         // A plain title is preserved; a title starting with a digit is kept intact.
-        assert_eq!(normalize_pane_title("plain title").as_deref(), Some("plain title"));
-        assert_eq!(normalize_pane_title("42 fixes").as_deref(), Some("42 fixes"));
+        assert_eq!(
+            normalize_pane_title("plain title").as_deref(),
+            Some("plain title")
+        );
+        assert_eq!(
+            normalize_pane_title("42 fixes").as_deref(),
+            Some("42 fixes")
+        );
         // Nothing informative → None.
         assert_eq!(normalize_pane_title("✳"), None);
         assert_eq!(normalize_pane_title("   "), None);
@@ -524,7 +558,10 @@ mod tests {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let cwd = std::env::current_dir().unwrap();
         // `sh` is on PATH on any unix host the tests run on.
-        assert!(executable_exists("sh", &path, &cwd), "sh should resolve on PATH");
+        assert!(
+            executable_exists("sh", &path, &cwd),
+            "sh should resolve on PATH"
+        );
         // A bogus name resolves nowhere.
         assert!(
             !executable_exists("slopd-no-such-binary-zzz", &path, &cwd),
@@ -545,7 +582,11 @@ mod tests {
         // spawn that path and the pane never needs the program on its own PATH
         // (the architectural fix for the post-reboot restore failure).
         let resolved = resolve_executable("sh", &path, &cwd).expect("sh should resolve on PATH");
-        assert!(resolved.is_absolute(), "resolved executable must be absolute; got {:?}", resolved);
+        assert!(
+            resolved.is_absolute(),
+            "resolved executable must be absolute; got {:?}",
+            resolved
+        );
         // A bogus name resolves nowhere.
         assert!(resolve_executable("slopd-no-such-binary-zzz", &path, &cwd).is_none());
     }
@@ -570,24 +611,31 @@ mod tests {
             .collect();
 
         for h in handles {
-            h.join().unwrap().unwrap_or_else(|e| panic!("inject_hooks_into_file failed: {}", e));
+            h.join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("inject_hooks_into_file failed: {}", e));
         }
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            let count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["type"] == "command"
-                            && h["command"].as_str()
-                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+            let count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["type"] == "command"
+                                && h["command"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+                        })
                     })
                 })
-            }).count();
+                .count();
             assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
         }
 
@@ -595,17 +643,22 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            let count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["type"] == "command"
-                            && h["command"].as_str()
-                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+            let count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["type"] == "command"
+                                && h["command"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+                        })
                     })
                 })
-            }).count();
+                .count();
             assert_eq!(count, 1, "event {} has {} entries, want 1", event, count);
         }
     }
@@ -630,19 +683,32 @@ mod tests {
         let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
 
         // The foobar entry must still be present.
-        let foobar_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().is_some_and(|hooks| {
-                hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+        let foobar_count = stop_entries
+            .iter()
+            .filter(|entry| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+                })
             })
-        }).count();
-        assert_eq!(foobar_count, 1, "foobar hook Stop entry was incorrectly removed");
+            .count();
+        assert_eq!(
+            foobar_count, 1,
+            "foobar hook Stop entry was incorrectly removed"
+        );
 
         // The slopctl entry must also be present.
-        let slopctl_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().is_some_and(|hooks| {
-                hooks.iter().any(|h| h["command"].as_str() == Some("slopctl hook Stop"))
+        let slopctl_count = stop_entries
+            .iter()
+            .filter(|entry| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|h| h["command"].as_str() == Some("slopctl hook Stop"))
+                })
             })
-        }).count();
+            .count();
         assert_eq!(slopctl_count, 1, "slopctl hook Stop entry is missing");
     }
 
@@ -662,30 +728,47 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
 
             // Old path entry must be gone.
-            let old_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["command"].as_str()
-                            .is_some_and(|c| c.contains("/home/claude/.local/bin/slopctl"))
+            let old_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("/home/claude/.local/bin/slopctl"))
+                        })
                     })
                 })
-            }).count();
-            assert_eq!(old_count, 0, "event {} still has stale absolute-path entry", event);
+                .count();
+            assert_eq!(
+                old_count, 0,
+                "event {} still has stale absolute-path entry",
+                event
+            );
 
             // New entry must be present exactly once.
-            let new_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["command"].as_str()
-                            .is_some_and(|c| c == format!("slopctl hook {}", event))
+            let new_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c == format!("slopctl hook {}", event))
+                        })
                     })
                 })
-            }).count();
-            assert_eq!(new_count, 1, "event {} has {} new-path entries, want 1", event, new_count);
+                .count();
+            assert_eq!(
+                new_count, 1,
+                "event {} has {} new-path entries, want 1",
+                event, new_count
+            );
         }
     }
 
@@ -698,14 +781,25 @@ mod tests {
         inject_hooks(&mut settings, with_sock);
         inject_hooks(&mut settings, with_sock);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1, "re-injecting the same --socket command must not duplicate");
-        assert_eq!(stop[0]["hooks"][0]["command"], "slopctl --socket /run/x/slopd.sock hook Stop");
+        assert_eq!(
+            stop.len(),
+            1,
+            "re-injecting the same --socket command must not duplicate"
+        );
+        assert_eq!(
+            stop[0]["hooks"][0]["command"],
+            "slopctl --socket /run/x/slopd.sock hook Stop"
+        );
 
         // Switching back to the bare command removes the stale --socket entry
         // (first-token match), leaving exactly the bare one.
         inject_hooks(&mut settings, "slopctl");
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1, "stale --socket entry should be replaced, not kept alongside");
+        assert_eq!(
+            stop.len(),
+            1,
+            "stale --socket entry should be replaced, not kept alongside"
+        );
         assert_eq!(stop[0]["hooks"][0]["command"], "slopctl hook Stop");
 
         // A foreign tool's entry is never touched by either transition.
@@ -713,10 +807,19 @@ mod tests {
             arr.push(serde_json::json!({"matcher": "", "hooks": [{"type": "command", "command": "claudex hook Stop"}]}));
         }
         inject_hooks(&mut settings, "slopctl --socket /run/y.sock");
-        let has_foreign = settings["hooks"]["Stop"].as_array().unwrap().iter().any(|e| {
-            e["hooks"].as_array().is_some_and(|h| h.iter().any(|x| x["command"] == "claudex hook Stop"))
-        });
-        assert!(has_foreign, "foreign (claudex) hook entry must be preserved across --socket re-injection");
+        let has_foreign = settings["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e["hooks"]
+                    .as_array()
+                    .is_some_and(|h| h.iter().any(|x| x["command"] == "claudex hook Stop"))
+            });
+        assert!(
+            has_foreign,
+            "foreign (claudex) hook entry must be preserved across --socket re-injection"
+        );
 
         // remove_hooks strips a --socket entry too (but leaves the foreign one).
         remove_hooks(&mut settings);
@@ -739,18 +842,27 @@ mod tests {
 
         // All slopctl entries must be gone.
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["type"] == "command"
-                            && h["command"].as_str()
-                                .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+            let slopctl_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h["type"] == "command"
+                                && h["command"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("slopctl") && c.contains(event))
+                        })
                     })
                 })
-            }).count();
-            assert_eq!(slopctl_count, 0, "event {} still has {} slopctl entries", event, slopctl_count);
+                .count();
+            assert_eq!(
+                slopctl_count, 0,
+                "event {} still has {} slopctl entries",
+                event, slopctl_count
+            );
         }
     }
 
@@ -771,12 +883,20 @@ mod tests {
         remove_hooks(&mut settings);
 
         let stop_entries = settings["hooks"]["Stop"].as_array().unwrap();
-        let foobar_count = stop_entries.iter().filter(|entry| {
-            entry["hooks"].as_array().is_some_and(|hooks| {
-                hooks.iter().any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+        let foobar_count = stop_entries
+            .iter()
+            .filter(|entry| {
+                entry["hooks"].as_array().is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|h| h["command"].as_str() == Some("foobar hook Stop"))
+                })
             })
-        }).count();
-        assert_eq!(foobar_count, 1, "foobar hook Stop entry was incorrectly removed");
+            .count();
+        assert_eq!(
+            foobar_count, 1,
+            "foobar hook Stop entry was incorrectly removed"
+        );
     }
 
     #[test]
@@ -787,17 +907,24 @@ mod tests {
         remove_hooks(&mut settings);
 
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["command"].as_str()
-                            .is_some_and(|c| c.contains("slopctl"))
+            let slopctl_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(|c| c.contains("slopctl")))
                     })
                 })
-            }).count();
-            assert_eq!(slopctl_count, 0, "event {} still has slopctl entries after removal", event);
+                .count();
+            assert_eq!(
+                slopctl_count, 0,
+                "event {} still has slopctl entries after removal",
+                event
+            );
         }
     }
 
@@ -825,16 +952,27 @@ mod tests {
         // Verify hooks exist.
         let contents = std::fs::read_to_string(&path).unwrap();
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert!(!settings["hooks"]["SessionStart"].as_array().unwrap().is_empty());
+        assert!(
+            !settings["hooks"]["SessionStart"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         remove_hooks_from_file(&path).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            assert_eq!(entries.len(), 0, "event {} still has entries after removal", event);
+            assert_eq!(
+                entries.len(),
+                0,
+                "event {} still has entries after removal",
+                event
+            );
         }
     }
 
@@ -900,12 +1038,18 @@ mod tests {
     #[test]
     fn expand_path_unknown_var_left_as_is() {
         let result = expand_path(std::path::Path::new("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
-        assert_eq!(result, std::path::PathBuf::from("/base/$__SLOPD_NONEXISTENT_VAR__/end"));
+        assert_eq!(
+            result,
+            std::path::PathBuf::from("/base/$__SLOPD_NONEXISTENT_VAR__/end")
+        );
     }
 
     #[test]
     fn resolve_slopctl_absolute_path_returned_as_is() {
-        assert_eq!(resolve_slopctl("/usr/local/bin/slopctl"), "/usr/local/bin/slopctl");
+        assert_eq!(
+            resolve_slopctl("/usr/local/bin/slopctl"),
+            "/usr/local/bin/slopctl"
+        );
     }
 
     #[test]
@@ -944,58 +1088,75 @@ mod tests {
         remove_hooks(&mut settings);
 
         for &event in HOOK_EVENTS {
-            let entries = settings["hooks"][event].as_array()
+            let entries = settings["hooks"][event]
+                .as_array()
                 .unwrap_or_else(|| panic!("missing hooks.{}", event));
-            let slopctl_count = entries.iter().filter(|entry| {
-                entry["hooks"].as_array().is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h["command"].as_str()
-                            .is_some_and(|c| c.contains("slopctl"))
+            let slopctl_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"].as_array().is_some_and(|hooks| {
+                        hooks
+                            .iter()
+                            .any(|h| h["command"].as_str().is_some_and(|c| c.contains("slopctl")))
                     })
                 })
-            }).count();
-            assert_eq!(slopctl_count, 0, "event {} still has {} slopctl entries after removal", event, slopctl_count);
+                .count();
+            assert_eq!(
+                slopctl_count, 0,
+                "event {} still has {} slopctl entries after removal",
+                event, slopctl_count
+            );
         }
     }
 
     // --- jq-style payload path tests ---
 
     fn p(s: &str) -> PayloadPath {
-        parse_payload_path(s).unwrap_or_else(|e| panic!("parse_payload_path({:?}) failed: {}", s, e))
+        parse_payload_path(s)
+            .unwrap_or_else(|e| panic!("parse_payload_path({:?}) failed: {}", s, e))
     }
 
     #[test]
     fn parse_path_simple_keys() {
         assert_eq!(p("foo"), vec![PathSegment::Key("foo".into())]);
-        assert_eq!(p("foo.bar"), vec![
-            PathSegment::Key("foo".into()),
-            PathSegment::Key("bar".into()),
-        ]);
+        assert_eq!(
+            p("foo.bar"),
+            vec![
+                PathSegment::Key("foo".into()),
+                PathSegment::Key("bar".into()),
+            ]
+        );
         // Leading dot is optional and equivalent.
         assert_eq!(p(".foo.bar"), p("foo.bar"));
     }
 
     #[test]
     fn parse_path_array_segments() {
-        assert_eq!(p("foo[]"), vec![
-            PathSegment::Key("foo".into()),
-            PathSegment::AnyElement,
-        ]);
-        assert_eq!(p("foo[0]"), vec![
-            PathSegment::Key("foo".into()),
-            PathSegment::Index(0),
-        ]);
-        assert_eq!(p("foo[].bar"), vec![
-            PathSegment::Key("foo".into()),
-            PathSegment::AnyElement,
-            PathSegment::Key("bar".into()),
-        ]);
-        assert_eq!(p("foo[0][1].bar"), vec![
-            PathSegment::Key("foo".into()),
-            PathSegment::Index(0),
-            PathSegment::Index(1),
-            PathSegment::Key("bar".into()),
-        ]);
+        assert_eq!(
+            p("foo[]"),
+            vec![PathSegment::Key("foo".into()), PathSegment::AnyElement,]
+        );
+        assert_eq!(
+            p("foo[0]"),
+            vec![PathSegment::Key("foo".into()), PathSegment::Index(0),]
+        );
+        assert_eq!(
+            p("foo[].bar"),
+            vec![
+                PathSegment::Key("foo".into()),
+                PathSegment::AnyElement,
+                PathSegment::Key("bar".into()),
+            ]
+        );
+        assert_eq!(
+            p("foo[0][1].bar"),
+            vec![
+                PathSegment::Key("foo".into()),
+                PathSegment::Index(0),
+                PathSegment::Index(1),
+                PathSegment::Key("bar".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1006,11 +1167,26 @@ mod tests {
 
     #[test]
     fn parse_path_rejects_malformed() {
-        assert!(parse_payload_path("foo..bar").is_err(), "double dot should fail");
-        assert!(parse_payload_path("[0]").is_err(), "leading bracket should fail");
-        assert!(parse_payload_path("foo[").is_err(), "unclosed bracket should fail");
-        assert!(parse_payload_path("foo[abc]").is_err(), "non-int index should fail");
-        assert!(parse_payload_path("foo[-1]").is_err(), "negative index not yet supported");
+        assert!(
+            parse_payload_path("foo..bar").is_err(),
+            "double dot should fail"
+        );
+        assert!(
+            parse_payload_path("[0]").is_err(),
+            "leading bracket should fail"
+        );
+        assert!(
+            parse_payload_path("foo[").is_err(),
+            "unclosed bracket should fail"
+        );
+        assert!(
+            parse_payload_path("foo[abc]").is_err(),
+            "non-int index should fail"
+        );
+        assert!(
+            parse_payload_path("foo[-1]").is_err(),
+            "negative index not yet supported"
+        );
     }
 
     #[test]
@@ -1093,11 +1269,15 @@ mod tests {
 
     #[test]
     fn account_config_accepts_table_form() {
-        let cfg = config_from_toml(
-            "[accounts.personal]\nconfig_dir = \"/srv/claude-personal\"\n",
+        let cfg = config_from_toml("[accounts.personal]\nconfig_dir = \"/srv/claude-personal\"\n");
+        let acct = cfg
+            .accounts
+            .get("personal")
+            .expect("personal account missing");
+        assert_eq!(
+            acct.config_dir(),
+            Some(&PathBuf::from("/srv/claude-personal"))
         );
-        let acct = cfg.accounts.get("personal").expect("personal account missing");
-        assert_eq!(acct.config_dir(), Some(&PathBuf::from("/srv/claude-personal")));
     }
 
     #[test]
@@ -1129,14 +1309,27 @@ mod tests {
     fn resolve_account_unknown_errors_and_lists_configured() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
         let err = cfg.resolve_account(Some("nope")).unwrap_err();
-        assert!(err.contains("nope"), "err should name the bad account: {}", err);
-        assert!(err.contains("work"), "err should list configured accounts: {}", err);
-        assert!(err.contains(DEFAULT_ACCOUNT), "err should list the default account: {}", err);
+        assert!(
+            err.contains("nope"),
+            "err should name the bad account: {}",
+            err
+        );
+        assert!(
+            err.contains("work"),
+            "err should list configured accounts: {}",
+            err
+        );
+        assert!(
+            err.contains(DEFAULT_ACCOUNT),
+            "err should list the default account: {}",
+            err
+        );
     }
 
     #[test]
     fn resolve_account_none_uses_default_account() {
-        let cfg = config_from_toml("default_account = \"work\"\n[accounts]\nwork = \"/srv/work\"\n");
+        let cfg =
+            config_from_toml("default_account = \"work\"\n[accounts]\nwork = \"/srv/work\"\n");
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(resolved.name, "work");
         assert_eq!(resolved.config_dir, Some(PathBuf::from("/srv/work")));
@@ -1217,8 +1410,12 @@ mod tests {
         // A misconfigured default_account makes resolve_account(None) error, but
         // the reserved DEFAULT_ACCOUNT must still resolve — startup recovery
         // (load_managed_panes) relies on this to avoid crashing the daemon.
-        let cfg = config_from_toml("default_account = \"ghost\"\n[accounts]\nwork = \"/srv/work\"\n");
-        assert!(cfg.resolve_account(None).is_err(), "None resolves to the bad default_account and errors");
+        let cfg =
+            config_from_toml("default_account = \"ghost\"\n[accounts]\nwork = \"/srv/work\"\n");
+        assert!(
+            cfg.resolve_account(None).is_err(),
+            "None resolves to the bad default_account and errors"
+        );
         let resolved = cfg.resolve_account(Some(DEFAULT_ACCOUNT)).unwrap();
         assert_eq!(resolved.name, DEFAULT_ACCOUNT);
         assert_eq!(resolved.config_dir, None);
@@ -1257,16 +1454,24 @@ mod tests {
         let cfg = SlopdConfig::default();
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(resolved.backend, Backend::Claude);
-        assert_eq!(resolved.executable, Executable::String("claude".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("claude".to_string())
+        );
     }
 
     #[test]
     fn backend_explicit_opencode_defaults_executable() {
         // `backend = "opencode"` alone → spawn opencode (vice-versa).
-        let cfg = config_from_toml("[accounts.oc]\nconfig_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n");
+        let cfg = config_from_toml(
+            "[accounts.oc]\nconfig_dir = \"~/.config/opencode\"\nbackend = \"opencode\"\n",
+        );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
-        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("opencode".to_string())
+        );
         assert_eq!(resolved.backend.config_dir_env_var(), "OPENCODE_CONFIG_DIR");
     }
 
@@ -1278,7 +1483,10 @@ mod tests {
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
-        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("opencode".to_string())
+        );
     }
 
     #[test]
@@ -1307,7 +1515,10 @@ mod tests {
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
-        assert_eq!(resolved.executable, Executable::String("/opt/my-oc-fork".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("/opt/my-oc-fork".to_string())
+        );
     }
 
     #[test]
@@ -1319,17 +1530,24 @@ mod tests {
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Claude);
-        assert_eq!(resolved.executable, Executable::String("/opt/my-oc-fork".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("/opt/my-oc-fork".to_string())
+        );
     }
 
     #[test]
     fn backend_per_account_does_not_inherit_top_level() {
         // Top-level `backend` backs only the default account, like config_dir.
-        let cfg = config_from_toml(
-            "backend = \"opencode\"\n[accounts.work]\nconfig_dir = \"x\"\n",
+        let cfg = config_from_toml("backend = \"opencode\"\n[accounts.work]\nconfig_dir = \"x\"\n");
+        assert_eq!(
+            cfg.resolve_account(None).unwrap().backend,
+            Backend::Opencode
         );
-        assert_eq!(cfg.resolve_account(None).unwrap().backend, Backend::Opencode);
-        assert_eq!(cfg.resolve_account(Some("work")).unwrap().backend, Backend::Claude);
+        assert_eq!(
+            cfg.resolve_account(Some("work")).unwrap().backend,
+            Backend::Claude
+        );
     }
 
     #[test]
@@ -1340,13 +1558,18 @@ mod tests {
         );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
-        assert_eq!(resolved.executable, Executable::String("opencode".to_string()));
+        assert_eq!(
+            resolved.executable,
+            Executable::String("opencode".to_string())
+        );
     }
 
     #[test]
     fn backend_shorthand_dir_account_derives_from_global_executable() {
         // Bare-string account has no backend/executable → derive from global.
-        let cfg = config_from_toml("[run]\nexecutable = \"opencode\"\n[accounts]\noc = \"~/.config/opencode\"\n");
+        let cfg = config_from_toml(
+            "[run]\nexecutable = \"opencode\"\n[accounts]\noc = \"~/.config/opencode\"\n",
+        );
         let resolved = cfg.resolve_account(Some("oc")).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
     }
@@ -1359,7 +1582,10 @@ mod tests {
         );
         let resolved = cfg.resolve_account(None).unwrap();
         assert_eq!(resolved.backend, Backend::Opencode);
-        assert_eq!(resolved.executable.args(), &["--dangerously-skip-permissions".to_string()]);
+        assert_eq!(
+            resolved.executable.args(),
+            &["--dangerously-skip-permissions".to_string()]
+        );
     }
 
     #[test]
@@ -1371,26 +1597,47 @@ mod tests {
         );
         let paths = cfg.all_settings_paths();
         // Only the default (claude) + work (claude) accounts; oc (opencode) skipped.
-        assert_eq!(paths.len(), 2, "opencode account must be skipped: {:?}", paths);
+        assert_eq!(
+            paths.len(),
+            2,
+            "opencode account must be skipped: {:?}",
+            paths
+        );
     }
 
     #[test]
     fn backend_infer_from_program_strips_path_and_exe() {
         assert_eq!(Backend::infer_from_program("claude"), Some(Backend::Claude));
-        assert_eq!(Backend::infer_from_program("/usr/bin/opencode"), Some(Backend::Opencode));
-        assert_eq!(Backend::infer_from_program("/usr/local/bin/codex"), Some(Backend::Codex));
-        assert_eq!(Backend::infer_from_program("opencode.exe"), Some(Backend::Opencode));
+        assert_eq!(
+            Backend::infer_from_program("/usr/bin/opencode"),
+            Some(Backend::Opencode)
+        );
+        assert_eq!(
+            Backend::infer_from_program("/usr/local/bin/codex"),
+            Some(Backend::Codex)
+        );
+        assert_eq!(
+            Backend::infer_from_program("opencode.exe"),
+            Some(Backend::Opencode)
+        );
         assert_eq!(Backend::infer_from_program("/opt/my-fork"), None);
-        assert_eq!(Backend::infer_from_program("opencode-ai"), None, "only exact canonical names match");
+        assert_eq!(
+            Backend::infer_from_program("opencode-ai"),
+            None,
+            "only exact canonical names match"
+        );
     }
 
     #[test]
     fn backend_explicit_codex_defaults_and_uses_codex_home() {
-        let cfg: SlopdConfig = toml::from_str(r#"
+        let cfg: SlopdConfig = toml::from_str(
+            r#"
             [accounts.work]
             backend = "codex"
             config_dir = "/tmp/codex-work"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let resolved = cfg.resolve_account(Some("work")).unwrap();
         assert_eq!(resolved.backend, Backend::Codex);
         assert_eq!(resolved.executable.program(), "codex");
@@ -1428,9 +1675,20 @@ mod tests {
         // Default socket → no -S; isolated grouped view focused on the new pane.
         assert_eq!(
             cfg.interactive_command(None, SLOPD_TMUX_SESSION),
-            vec!["tmux", "new-session", "-t", "slopd", ";",
-                 "set-option", "destroy-unattached", "on", ";",
-                 "select-window", "-t", "{{pane_id}}"],
+            vec![
+                "tmux",
+                "new-session",
+                "-t",
+                "slopd",
+                ";",
+                "set-option",
+                "destroy-unattached",
+                "on",
+                ";",
+                "select-window",
+                "-t",
+                "{{pane_id}}"
+            ],
         );
     }
 
@@ -1438,16 +1696,35 @@ mod tests {
     fn default_interactive_command_honors_socket() {
         assert_eq!(
             default_interactive_command(Some("/run/x.sock"), SLOPD_TMUX_SESSION),
-            vec!["tmux", "-S", "/run/x.sock", "new-session", "-t", "slopd", ";",
-                 "set-option", "destroy-unattached", "on", ";",
-                 "select-window", "-t", "{{pane_id}}"],
+            vec![
+                "tmux",
+                "-S",
+                "/run/x.sock",
+                "new-session",
+                "-t",
+                "slopd",
+                ";",
+                "set-option",
+                "destroy-unattached",
+                "on",
+                ";",
+                "select-window",
+                "-t",
+                "{{pane_id}}"
+            ],
         );
         // No socket → no -S prefix.
         assert_eq!(
-            default_interactive_command(None, SLOPD_TMUX_SESSION).first().map(String::as_str),
+            default_interactive_command(None, SLOPD_TMUX_SESSION)
+                .first()
+                .map(String::as_str),
             Some("tmux"),
         );
-        assert!(!default_interactive_command(None, SLOPD_TMUX_SESSION).iter().any(|a| a == "-S"));
+        assert!(
+            !default_interactive_command(None, SLOPD_TMUX_SESSION)
+                .iter()
+                .any(|a| a == "-S")
+        );
     }
 
     #[test]
@@ -1466,7 +1743,9 @@ mod tests {
     #[test]
     fn substitute_replaces_all_named_placeholders() {
         let cmd: Vec<String> = ["sh", "-c", "echo {{pane_id}} > /tmp/{{pane_id}}.log"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let out = SlopctlConfig::substitute(&cmd, &[("pane_id", "%42")]);
         assert_eq!(out, vec!["sh", "-c", "echo %42 > /tmp/%42.log"]);
     }
@@ -1482,19 +1761,30 @@ mod tests {
     #[test]
     fn substitute_fills_socket_and_session() {
         let cmd: Vec<String> = ["tmux", "-S", "{{socket}}", "attach", "-t", "{{session}}"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let out = SlopctlConfig::substitute(
             &cmd,
-            &[("pane_id", "%9"), ("socket", "/run/x.sock"), ("session", "slopd")],
+            &[
+                ("pane_id", "%9"),
+                ("socket", "/run/x.sock"),
+                ("session", "slopd"),
+            ],
         );
-        assert_eq!(out, vec!["tmux", "-S", "/run/x.sock", "attach", "-t", "slopd"]);
+        assert_eq!(
+            out,
+            vec!["tmux", "-S", "/run/x.sock", "attach", "-t", "slopd"]
+        );
     }
 
     #[test]
     fn substitute_does_not_touch_tmux_format_strings() {
         // `#{pane_id}` is a tmux format; double-brace placeholders must leave it intact.
         let cmd: Vec<String> = ["tmux", "display", "-p", "#{pane_id}"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let out = SlopctlConfig::substitute(&cmd, &[("pane_id", "%42")]);
         assert_eq!(out, vec!["tmux", "display", "-p", "#{pane_id}"]);
     }
@@ -1527,7 +1817,10 @@ mod tests {
         // claude_settings_path so startup/shutdown hook management stays consistent.
         let cfg = config_from_toml("config_dir = \"/srv/legacy\"\n");
         let resolved = cfg.resolve_account(None).unwrap();
-        assert_eq!(cfg.resolved_settings_path(&resolved), cfg.claude_settings_path());
+        assert_eq!(
+            cfg.resolved_settings_path(&resolved),
+            cfg.claude_settings_path()
+        );
     }
 
     #[test]
@@ -1545,7 +1838,11 @@ mod tests {
             .iter()
             .filter(|p| *p == &PathBuf::from("/srv/legacy/settings.json"))
             .count();
-        assert_eq!(legacy_count, 1, "duplicate dirs must be collapsed: {:?}", paths);
+        assert_eq!(
+            legacy_count, 1,
+            "duplicate dirs must be collapsed: {:?}",
+            paths
+        );
     }
 }
 
@@ -1771,7 +2068,9 @@ impl SlopdTmuxConfig {
 
     /// The tmux session name slopd manages (configured, else [`SLOPD_TMUX_SESSION`]).
     pub fn session(&self) -> String {
-        self.session.clone().unwrap_or_else(|| SLOPD_TMUX_SESSION.to_string())
+        self.session
+            .clone()
+            .unwrap_or_else(|| SLOPD_TMUX_SESSION.to_string())
     }
 }
 
@@ -1813,7 +2112,11 @@ impl Backend {
     /// custom paths/wrappers — those need an explicit `backend` and are treated
     /// as an executable override, never inferred or conflicted.
     pub fn infer_from_program(program: &str) -> Option<Backend> {
-        let base = program.rsplit('/').next().unwrap_or(program).trim_end_matches(".exe");
+        let base = program
+            .rsplit('/')
+            .next()
+            .unwrap_or(program)
+            .trim_end_matches(".exe");
         match base {
             "claude" => Some(Backend::Claude),
             "opencode" => Some(Backend::Opencode),
@@ -1862,15 +2165,15 @@ impl Backend {
         explicit_executable: Option<&Executable>,
     ) -> Result<(Backend, Executable), String> {
         let inferred = explicit_executable.and_then(|e| Backend::infer_from_program(e.program()));
-        if let (Some(asked), Some(inferred)) = (explicit_backend, inferred) {
-            if asked != inferred {
-                return Err(format!(
-                    "backend {:?} conflicts with executable {:?} (which implies backend {:?})",
-                    asked,
-                    explicit_executable.unwrap().program(),
-                    inferred,
-                ));
-            }
+        if let (Some(asked), Some(inferred)) = (explicit_backend, inferred)
+            && asked != inferred
+        {
+            return Err(format!(
+                "backend {:?} conflicts with executable {:?} (which implies backend {:?})",
+                asked,
+                explicit_executable.unwrap().program(),
+                inferred,
+            ));
         }
         let backend = explicit_backend.or(inferred).unwrap_or_default();
         let executable = explicit_executable
@@ -1908,8 +2211,6 @@ impl Default for Executable {
         Executable::String("claude".to_string())
     }
 }
-
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdRunConfig {
@@ -2186,7 +2487,12 @@ impl SlopdConfig {
                 .and_then(|a| a.executable())
                 .or(self.run.executable.as_ref());
             let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
-            return Ok(ResolvedAccount { name, config_dir, backend, executable });
+            return Ok(ResolvedAccount {
+                name,
+                config_dir,
+                backend,
+                executable,
+            });
         }
 
         let account = self.accounts.get(&name).ok_or_else(|| {
@@ -2328,9 +2634,19 @@ pub fn default_interactive_command(socket: Option<&str>, session: &str) -> Vec<S
         cmd.push("-S".to_string());
         cmd.push(socket.to_string());
     }
-    for arg in ["new-session", "-t", session, ";",
-                "set-option", "destroy-unattached", "on", ";",
-                "select-window", "-t", "{{pane_id}}"] {
+    for arg in [
+        "new-session",
+        "-t",
+        session,
+        ";",
+        "set-option",
+        "destroy-unattached",
+        "on",
+        ";",
+        "select-window",
+        "-t",
+        "{{pane_id}}",
+    ] {
         cmd.push(arg.to_string());
     }
     cmd
@@ -2448,7 +2764,10 @@ pub fn parse_payload_path(raw: &str) -> Result<PayloadPath, String> {
     let mut out: PayloadPath = Vec::new();
     for piece in trimmed.split('.') {
         if piece.is_empty() {
-            return Err(format!("invalid path {:?}: empty segment between dots", raw));
+            return Err(format!(
+                "invalid path {:?}: empty segment between dots",
+                raw
+            ));
         }
         // A piece is `name`, `name[]`, `name[3]`, `name[][3]`, etc.
         // Find the first `[` (if any); everything before it is the key, the
@@ -2467,7 +2786,10 @@ pub fn parse_payload_path(raw: &str) -> Result<PayloadPath, String> {
         let mut rest = brackets;
         while !rest.is_empty() {
             let close = rest.find(']').ok_or_else(|| {
-                format!("invalid path {:?}: unclosed `[` in segment {:?}", raw, piece)
+                format!(
+                    "invalid path {:?}: unclosed `[` in segment {:?}",
+                    raw, piece
+                )
             })?;
             let inside = &rest[1..close];
             if inside.is_empty() {
@@ -2538,11 +2860,11 @@ pub struct PayloadPredicate {
 /// Parse a single `KEY=VALUE` predicate where KEY is a jq-style path. Returns
 /// a human-readable error on malformed input.
 pub fn parse_payload_predicate(raw: &str) -> Result<PayloadPredicate, String> {
-    let (key, value) = raw.split_once('=').ok_or_else(|| {
-        format!("invalid predicate {:?}: expected KEY=VALUE", raw)
-    })?;
-    let path = parse_payload_path(key)
-        .map_err(|e| format!("invalid predicate {:?}: {}", raw, e))?;
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid predicate {:?}: expected KEY=VALUE", raw))?;
+    let path =
+        parse_payload_path(key).map_err(|e| format!("invalid predicate {:?}: {}", raw, e))?;
     Ok(PayloadPredicate {
         path,
         expected: value.to_string(),
@@ -2552,12 +2874,16 @@ pub fn parse_payload_predicate(raw: &str) -> Result<PayloadPredicate, String> {
 /// Parse many `KEY=VALUE` predicates in flag order. Used by both `--until`
 /// and `--where`.
 pub fn parse_payload_predicates(raw: Vec<String>) -> Result<Vec<PayloadPredicate>, String> {
-    raw.into_iter().map(|p| parse_payload_predicate(&p)).collect()
+    raw.into_iter()
+        .map(|p| parse_payload_predicate(&p))
+        .collect()
 }
 
 /// True iff every predicate matches the value (AND).
 pub fn predicates_match(value: &serde_json::Value, predicates: &[PayloadPredicate]) -> bool {
-    predicates.iter().all(|p| path_matches(value, &p.path, &p.expected))
+    predicates
+        .iter()
+        .all(|p| path_matches(value, &p.path, &p.expected))
 }
 
 /// Describes which events a subscriber wants to receive.
@@ -2631,24 +2957,55 @@ pub enum RequestBody {
         #[serde(default)]
         extra_args: Vec<String>,
     },
-    Kill { pane_id: String },
-    Hook { event: String, payload: serde_json::Value, pane_id: Option<String> },
+    Kill {
+        pane_id: String,
+    },
+    Hook {
+        event: String,
+        payload: serde_json::Value,
+        pane_id: Option<String>,
+    },
     /// Notification from a tmux hook (called by slopctl tmux-hook).
-    TmuxHook { event: String, pane_id: Option<String> },
-    Send { pane_id: String, prompt: String, timeout_secs: u64, interrupt: bool },
+    TmuxHook {
+        event: String,
+        pane_id: Option<String>,
+    },
+    Send {
+        pane_id: String,
+        prompt: String,
+        timeout_secs: u64,
+        interrupt: bool,
+    },
     /// Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
-    Interrupt { pane_id: String },
+    Interrupt {
+        pane_id: String,
+    },
     /// Subscribe to a stream of lifecycle events (hook + slopd). An empty filters vec matches all.
-    Subscribe { filters: Vec<EventFilter> },
+    Subscribe {
+        filters: Vec<EventFilter>,
+    },
     /// Subscribe to a pane's transcript: replay the last `last_n` records from
     /// disk, then stream new records live. All delivered as `Record`s.
-    SubscribeTranscript { pane_id: String, last_n: u64 },
+    SubscribeTranscript {
+        pane_id: String,
+        last_n: u64,
+    },
     /// Read a page of historical transcript records before a given cursor.
-    ReadTranscript { pane_id: String, before_cursor: Option<u64>, limit: u64 },
+    ReadTranscript {
+        pane_id: String,
+        before_cursor: Option<u64>,
+        limit: u64,
+    },
     /// Set or remove a user-defined tag on a pane.
-    Tag { pane_id: String, tag: String, remove: bool },
+    Tag {
+        pane_id: String,
+        tag: String,
+        remove: bool,
+    },
     /// List all user-defined tags on a pane.
-    Tags { pane_id: String },
+    Tags {
+        pane_id: String,
+    },
     /// List all panes in the slopd session.
     Ps,
     /// Write the backup manifest to disk now (manual `slopctl backup`),
@@ -2661,7 +3018,9 @@ pub enum RequestBody {
     /// Cancel a subscription previously created by Subscribe or SubscribeTranscript.
     /// The `id` field in the outer Request identifies the Unsubscribe request itself;
     /// `subscription_id` is the `id` of the original Subscribe/SubscribeTranscript request.
-    Unsubscribe { subscription_id: u64 },
+    Unsubscribe {
+        subscription_id: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2673,14 +3032,27 @@ pub struct Response {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponseBody {
-    Status { state: DaemonState },
-    Run { pane_id: String },
+    Status {
+        state: DaemonState,
+    },
+    Run {
+        pane_id: String,
+    },
     /// Response to Fork: the new pane and the backend session id it was bound to
     /// (minted by the daemon for Claude, returned by the fork API for opencode).
-    Forked { pane_id: String, session_id: String },
-    Kill { pane_id: String },
-    Sent { pane_id: String },
-    Interrupted { pane_id: String },
+    Forked {
+        pane_id: String,
+        session_id: String,
+    },
+    Kill {
+        pane_id: String,
+    },
+    Sent {
+        pane_id: String,
+    },
+    Interrupted {
+        pane_id: String,
+    },
     Hooked,
     TmuxHooked,
     /// Sent once to confirm a Subscribe or SubscribeTranscript request was accepted.
@@ -2688,19 +3060,40 @@ pub enum ResponseBody {
     /// Streamed to subscribers (both Subscribe and SubscribeTranscript).
     Record(Record),
     /// Response to ReadTranscript.
-    TranscriptPage { records: Vec<Record> },
-    Tagged { pane_id: String, tag: String },
-    Untagged { pane_id: String, tag: String },
-    Tags { pane_id: String, tags: Vec<String> },
-    Ps { panes: Vec<PaneInfo> },
+    TranscriptPage {
+        records: Vec<Record>,
+    },
+    Tagged {
+        pane_id: String,
+        tag: String,
+    },
+    Untagged {
+        pane_id: String,
+        tag: String,
+    },
+    Tags {
+        pane_id: String,
+        tags: Vec<String>,
+    },
+    Ps {
+        panes: Vec<PaneInfo>,
+    },
     /// Response to Backup: number of panes written to the manifest.
-    BackedUp { count: usize },
+    BackedUp {
+        count: usize,
+    },
     /// Response to Restore: number of panes re-spawned (sessions already running
     /// are skipped and not counted).
-    Restored { restored: usize },
+    Restored {
+        restored: usize,
+    },
     /// Confirms that a subscription has been cancelled.
-    Unsubscribed { subscription_id: u64 },
-    Error { message: String },
+    Unsubscribed {
+        subscription_id: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2854,7 +3247,9 @@ pub fn normalize_pane_title(raw: &str) -> Option<String> {
         let before = s;
         // Drop a leading status/spinner glyph run: leading non-alphanumeric chars
         // (stops at the first letter/digit, so real titles are preserved).
-        s = s.trim_start_matches(|c: char| !c.is_alphanumeric()).trim_start();
+        s = s
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .trim_start();
         if let Some(rest) = s.strip_prefix("OC | ") {
             s = rest.trim_start();
         }

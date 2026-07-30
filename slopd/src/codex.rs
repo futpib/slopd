@@ -28,11 +28,7 @@ pub fn transcript_record(record: &Value) -> Option<TranscriptRecord> {
                 _ => return None,
             };
             let text = content_text(payload.get("content"));
-            if role == "user"
-                && text
-                    .as_deref()
-                    .is_some_and(is_internal_environment_context)
-            {
+            if role == "user" && text.as_deref().is_some_and(is_internal_environment_context) {
                 return None;
             }
             Some((
@@ -102,8 +98,7 @@ fn content_text(value: Option<&Value>) -> Option<String> {
 
 fn is_internal_environment_context(text: &str) -> bool {
     let text = text.trim();
-    text.starts_with("<environment_context>")
-        && text.ends_with("</environment_context>")
+    text.starts_with("<environment_context>") && text.ends_with("</environment_context>")
 }
 
 fn tool_event_type(name: &str) -> &'static str {
@@ -133,10 +128,9 @@ pub fn transcript_state(record: &Value) -> Option<libslop::PaneDetailedState> {
         (Some("response_item"), Some("function_call" | "custom_tool_call")) => {
             Some(libslop::PaneDetailedState::BusyToolUse)
         }
-        (
-            Some("response_item"),
-            Some("function_call_output" | "custom_tool_call_output"),
-        ) => Some(libslop::PaneDetailedState::BusyProcessing),
+        (Some("response_item"), Some("function_call_output" | "custom_tool_call_output")) => {
+            Some(libslop::PaneDetailedState::BusyProcessing)
+        }
         _ => None,
     }
 }

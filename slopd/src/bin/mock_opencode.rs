@@ -495,11 +495,11 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             let arr: Vec<String> = msgs
                 .iter()
                 .map(|(role, text)| {
+                    let role_json = serde_json::Value::String(role.clone());
                     let text_json = serde_json::Value::String(text.clone()).to_string();
                     format!(
                         r#"{{"info":{{"role":{}}},"parts":[{{"type":"text","text":{}}}]}}"#,
-                        serde_json::Value::String(role.clone()).to_string(),
-                        text_json
+                        role_json, text_json
                     )
                 })
                 .collect();
@@ -783,11 +783,11 @@ fn json_response(status: u16, body: &str) -> String {
 /// how real opencode streams tool activity over the SSE bus.
 fn tool_part_event(sid: &str, tool: &str, status: &str, body: serde_json::Value) -> String {
     let mut state = serde_json::json!({ "status": status });
-    if let serde_json::Value::Object(m) = body {
-        if let serde_json::Value::Object(ref mut s) = state {
-            for (k, v) in m {
-                s.insert(k, v);
-            }
+    if let serde_json::Value::Object(m) = body
+        && let serde_json::Value::Object(ref mut s) = state
+    {
+        for (k, v) in m {
+            s.insert(k, v);
         }
     }
     serde_json::json!({
@@ -811,14 +811,14 @@ fn part_updated_event(sid: &str, _role: &str, text: &str) -> String {
 
 /// Extract the first `text` part from a `{"parts":[{"type":"text","text":...}]}` body.
 fn extract_text(body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(parts) = v.get("parts").and_then(|p| p.as_array()) {
-            for p in parts {
-                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                        return t.to_string();
-                    }
-                }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(parts) = v.get("parts").and_then(|p| p.as_array())
+    {
+        for p in parts {
+            if p.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(t) = p.get("text").and_then(|t| t.as_str())
+            {
+                return t.to_string();
             }
         }
     }

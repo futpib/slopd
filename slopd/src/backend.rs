@@ -367,7 +367,11 @@ impl BackendLifecycle for ClaudeBackend {
         Ok((args, new_id))
     }
 
-    async fn recover(&self, _context: RecoverContext<'_>) -> Result<(), String> {
+    async fn recover(&self, context: RecoverContext<'_>) -> Result<(), String> {
+        context
+            .panes
+            .get_or_insert(context.pane_id)
+            .set_runtime(PaneRuntime::Claude(ClaudeState));
         Ok(())
     }
 
@@ -387,7 +391,7 @@ impl BackendLifecycle for ClaudeBackend {
             .as_deref()
             .and_then(transcript_launch_cwd)
             .or_else(|| context.working_dir.clone());
-        spawn_pane(
+        let pane_id = spawn_pane(
             context.config,
             context.session_lock,
             &SpawnSpec {
@@ -405,7 +409,12 @@ impl BackendLifecycle for ClaudeBackend {
                 "failed to restore pane {} (session {}): {}",
                 context.old_pane_id, context.session_id, e
             )
-        })
+        })?;
+        context
+            .panes
+            .get_or_insert(&pane_id)
+            .set_runtime(PaneRuntime::Claude(ClaudeState));
+        Ok(pane_id)
     }
 }
 
@@ -581,7 +590,11 @@ impl BackendLifecycle for CodexBackend {
             &context.config.hook_slopctl(),
             libslop::Backend::Codex,
         ) {
-            warn!("failed to inject Codex hooks into {}: {}", hook_path.display(), error);
+            warn!(
+                "failed to inject Codex hooks into {}: {}",
+                hook_path.display(),
+                error
+            );
         }
         let launch_dir = context
             .transcript_path

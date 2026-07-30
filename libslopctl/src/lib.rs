@@ -375,39 +375,47 @@ pub fn build_cli_env(
 
 /// Parse "key=value" filter strings. Returns an error on malformed input.
 pub fn parse_filters(raw: Vec<String>) -> Result<Vec<(String, String)>, Error> {
-    raw.into_iter().map(|f| {
-        match f.split_once('=') {
+    raw.into_iter()
+        .map(|f| match f.split_once('=') {
             Some((k, v)) => {
                 if !matches!(k, "tag" | "backend" | "account") {
-                    return Err(Error::FilterError(
-                        format!("unknown filter key {:?}: supported keys are 'tag', 'backend', 'account'", k),
-                    ));
+                    return Err(Error::FilterError(format!(
+                        "unknown filter key {:?}: supported keys are 'tag', 'backend', 'account'",
+                        k
+                    )));
                 }
                 Ok((k.to_string(), v.to_string()))
             }
-            None => Err(Error::FilterError(
-                format!("invalid filter {:?}: expected key=value", f),
-            )),
-        }
-    }).collect()
+            None => Err(Error::FilterError(format!(
+                "invalid filter {:?}: expected key=value",
+                f
+            ))),
+        })
+        .collect()
 }
 
 /// Apply parsed filters to a pane list. AND semantics: pane must satisfy all filters.
-pub fn apply_filters(panes: Vec<libslop::PaneInfo>, filters: &[(String, String)]) -> Vec<libslop::PaneInfo> {
+pub fn apply_filters(
+    panes: Vec<libslop::PaneInfo>,
+    filters: &[(String, String)],
+) -> Vec<libslop::PaneInfo> {
     if filters.is_empty() {
         return panes;
     }
-    panes.into_iter().filter(|pane| {
-        filters.iter().all(|(key, value)| {
-            match key.as_str() {
-                "tag" => pane.tags.iter().any(|t| t == value),
-                // Match the backend by its canonical binary name (claude/opencode).
-                "backend" => pane.backend.canonical_executable() == value,
-                "account" => pane.account == *value,
-                _ => false,
-            }
+    panes
+        .into_iter()
+        .filter(|pane| {
+            filters.iter().all(|(key, value)| {
+                match key.as_str() {
+                    "tag" => pane.tags.iter().any(|t| t == value),
+                    // Match the backend by its canonical binary name (claude/opencode).
+                    "backend" => pane.backend.canonical_executable() == value,
+                    "account" => pane.account == *value,
+                    _ => false,
+                }
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Validate filters for a command before connecting.
@@ -416,7 +424,9 @@ pub fn validate_command_filters(command: &CommonCommand) -> Result<(), Error> {
         CommonCommand::Ps { filters, .. } => {
             parse_filters(filters.clone())?;
         }
-        CommonCommand::Send { pane_id, filters, .. } => {
+        CommonCommand::Send {
+            pane_id, filters, ..
+        } => {
             if pane_id.contains('=') {
                 let mut all = vec![pane_id.clone()];
                 all.extend(filters.clone());
@@ -425,11 +435,22 @@ pub fn validate_command_filters(command: &CommonCommand) -> Result<(), Error> {
                 parse_filters(filters.clone())?;
             }
         }
-        CommonCommand::Listen { where_preds, pane_id, session_id, .. } => {
+        CommonCommand::Listen {
+            where_preds,
+            pane_id,
+            session_id,
+            ..
+        } => {
             parse_payload_predicates(where_preds.clone())?;
             resolve_pane_id_or_session(pane_id.clone(), session_id.clone())?;
         }
-        CommonCommand::Wait { where_preds, until, pane_id, session_id, .. } => {
+        CommonCommand::Wait {
+            where_preds,
+            until,
+            pane_id,
+            session_id,
+            ..
+        } => {
             parse_payload_predicates(where_preds.clone())?;
             parse_payload_predicates(until.clone())?;
             resolve_pane_id_or_session(pane_id.clone(), session_id.clone())?;
@@ -448,9 +469,10 @@ fn looks_like_uuid(s: &str) -> bool {
         return false;
     }
     const EXPECTED: [usize; 5] = [8, 4, 4, 4, 12];
-    parts.iter().zip(EXPECTED.iter()).all(|(p, &n)| {
-        p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit())
-    })
+    parts
+        .iter()
+        .zip(EXPECTED.iter())
+        .all(|(p, &n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Validate the `--pane-id` argument shape. Accepts only tmux pane ids
@@ -459,9 +481,11 @@ fn looks_like_uuid(s: &str) -> bool {
 /// keep filter semantics explicit. Anything else is rejected as garbage.
 fn validate_pane_id_arg(arg: &str) -> Result<(), Error> {
     if let Some(rest) = arg.strip_prefix('%')
-        && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(());
-        }
+        && !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return Ok(());
+    }
     if looks_like_uuid(arg) {
         return Err(Error::FilterError(format!(
             "--pane-id {:?} looks like a Claude session UUID; use --session-id for UUIDs \
@@ -499,6 +523,7 @@ pub fn resolve_pane_id_or_session(
 /// Max width of the `TITLE` column in the human table; longer titles are cut with
 /// an ellipsis. `--json` is unaffected (it serializes the full `pane_title`).
 const TITLE_MAX: usize = 50;
+type PsColumn<'a> = (&'static str, Box<dyn Fn(&libslop::PaneInfo) -> String + 'a>);
 
 /// Truncate a title to [`TITLE_MAX`] display chars, appending `…` when cut.
 /// Char-based (not byte-based) so a multibyte title isn't split mid-codepoint.
@@ -520,21 +545,63 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     // Single ordered source of truth for the columns: (header, value-fn). Header
     // and rows are both derived from this, so they can never drift apart (no
     // magic indices) and the set never changes with state.
-    let cols: Vec<(&str, Box<dyn Fn(&libslop::PaneInfo) -> String>)> = vec![
+    let cols: Vec<PsColumn<'_>> = vec![
         ("PANE", Box::new(|p| p.pane_id.clone())),
-        ("CREATED", Box::new(|p| fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at))))),
-        ("LAST_ACTIVE", Box::new(|p| fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active))))),
-        ("SESSION", Box::new(|p| p.session_id.as_deref().unwrap_or("-").to_string())),
-        ("PARENT", Box::new(|p| p.parent_pane_id.as_deref().unwrap_or("-").to_string())),
-        ("BACKEND", Box::new(|p| p.backend.canonical_executable().to_string())),
+        (
+            "CREATED",
+            Box::new(|p| {
+                fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at)))
+            }),
+        ),
+        (
+            "LAST_ACTIVE",
+            Box::new(|p| {
+                fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active)))
+            }),
+        ),
+        (
+            "SESSION",
+            Box::new(|p| p.session_id.as_deref().unwrap_or("-").to_string()),
+        ),
+        (
+            "PARENT",
+            Box::new(|p| p.parent_pane_id.as_deref().unwrap_or("-").to_string()),
+        ),
+        (
+            "BACKEND",
+            Box::new(|p| p.backend.canonical_executable().to_string()),
+        ),
         ("ACCOUNT", Box::new(|p| p.account.clone())),
-        ("TAGS", Box::new(|p| if p.tags.is_empty() { "-".to_string() } else { p.tags.join(",") })),
+        (
+            "TAGS",
+            Box::new(|p| {
+                if p.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    p.tags.join(",")
+                }
+            }),
+        ),
         ("STATE", Box::new(|p| p.state.as_str().to_string())),
-        ("DETAILED_STATE", Box::new(|p| p.detailed_state.as_str().to_string())),
-        ("WORKING_DIR", Box::new(|p| p.working_dir.as_deref().unwrap_or("-").to_string())),
+        (
+            "DETAILED_STATE",
+            Box::new(|p| p.detailed_state.as_str().to_string()),
+        ),
+        (
+            "WORKING_DIR",
+            Box::new(|p| p.working_dir.as_deref().unwrap_or("-").to_string()),
+        ),
         // Last column: the agent's self-assigned pane title. Truncated so a long
         // title can't blow out the table; `--json` carries the full value.
-        ("TITLE", Box::new(|p| p.pane_title.as_deref().map(truncate_title).unwrap_or_else(|| "-".to_string()))),
+        (
+            "TITLE",
+            Box::new(|p| {
+                p.pane_title
+                    .as_deref()
+                    .map(truncate_title)
+                    .unwrap_or_else(|| "-".to_string())
+            }),
+        ),
     ];
 
     let header: Vec<&str> = cols.iter().map(|(h, _)| *h).collect();
@@ -628,10 +695,9 @@ pub struct Client<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Un
     demux: Option<Arc<Mutex<DemuxState>>>,
 }
 
-impl<
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-    W: tokio::io::AsyncWrite + Unpin,
-> Client<R, W> {
+impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite + Unpin>
+    Client<R, W>
+{
     const REQUEST_TIMEOUT_SECS: u64 = 15;
 
     pub fn new(reader: R, writer: W) -> Self {
@@ -654,7 +720,10 @@ impl<
         if self.demux.is_some() {
             return;
         }
-        let lines = self.lines.take().expect("lines must be present in direct mode");
+        let lines = self
+            .lines
+            .take()
+            .expect("lines must be present in direct mode");
         let state = Arc::new(Mutex::new(DemuxState {
             pending: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -673,12 +742,19 @@ impl<
     }
 
     /// Send a request and wait for the response with matching id.
-    pub async fn request(&mut self, body: libslop::RequestBody) -> Result<libslop::ResponseBody, Error> {
+    pub async fn request(
+        &mut self,
+        body: libslop::RequestBody,
+    ) -> Result<libslop::ResponseBody, Error> {
         let timeout = std::time::Duration::from_secs(Self::REQUEST_TIMEOUT_SECS);
         self.request_with_timeout(body, timeout).await
     }
 
-    async fn request_with_timeout(&mut self, body: libslop::RequestBody, timeout: std::time::Duration) -> Result<libslop::ResponseBody, Error> {
+    async fn request_with_timeout(
+        &mut self,
+        body: libslop::RequestBody,
+        timeout: std::time::Duration,
+    ) -> Result<libslop::ResponseBody, Error> {
         let id = self.alloc_id();
         let request = libslop::Request { id, body };
 
@@ -699,7 +775,10 @@ impl<
 
         // Direct mode: read lines until the matching response arrives.
         self.write_request(&request).await?;
-        let lines = self.lines.as_mut().expect("lines must be present in direct mode");
+        let lines = self
+            .lines
+            .as_mut()
+            .expect("lines must be present in direct mode");
         let read_loop = async {
             loop {
                 match lines.next_line().await? {
@@ -708,7 +787,9 @@ impl<
                         let response: libslop::Response = serde_json::from_str(&line)?;
                         if response.id == id {
                             return match response.body {
-                                libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
+                                libslop::ResponseBody::Error { message } => {
+                                    Err(Error::Server(message))
+                                }
                                 body => Ok(body),
                             };
                         }
@@ -762,7 +843,18 @@ impl<
         account: Option<String>,
         backend: Option<libslop::Backend>,
     ) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Run { parent_pane_id, extra_args, start_directory, env, account, backend, pin_session_id: None }).await? {
+        match self
+            .request(libslop::RequestBody::Run {
+                parent_pane_id,
+                extra_args,
+                start_directory,
+                env,
+                account,
+                backend,
+                pin_session_id: None,
+            })
+            .await?
+        {
             libslop::ResponseBody::Run { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -776,8 +868,19 @@ impl<
         env: Vec<(String, String)>,
         extra_args: Vec<String>,
     ) -> Result<(String, String), Error> {
-        match self.request(libslop::RequestBody::Fork { pane_id, start_directory, env, extra_args }).await? {
-            libslop::ResponseBody::Forked { pane_id, session_id } => Ok((pane_id, session_id)),
+        match self
+            .request(libslop::RequestBody::Fork {
+                pane_id,
+                start_directory,
+                env,
+                extra_args,
+            })
+            .await?
+        {
+            libslop::ResponseBody::Forked {
+                pane_id,
+                session_id,
+            } => Ok((pane_id, session_id)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -797,15 +900,30 @@ impl<
         interrupt: bool,
     ) -> Result<String, Error> {
         // Send waits for slopd's server-side timeout plus a margin.
-        let client_timeout = std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
-        match self.request_with_timeout(libslop::RequestBody::Send { pane_id, prompt, timeout_secs, interrupt }, client_timeout).await? {
+        let client_timeout =
+            std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
+        match self
+            .request_with_timeout(
+                libslop::RequestBody::Send {
+                    pane_id,
+                    prompt,
+                    timeout_secs,
+                    interrupt,
+                },
+                client_timeout,
+            )
+            .await?
+        {
             libslop::ResponseBody::Sent { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
 
     pub async fn interrupt(&mut self, pane_id: String) -> Result<String, Error> {
-        match self.request(libslop::RequestBody::Interrupt { pane_id }).await? {
+        match self
+            .request(libslop::RequestBody::Interrupt { pane_id })
+            .await?
+        {
             libslop::ResponseBody::Interrupted { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -817,32 +935,52 @@ impl<
         payload: serde_json::Value,
         pane_id: Option<String>,
     ) -> Result<(), Error> {
-        match self.request(libslop::RequestBody::Hook { event, payload, pane_id }).await? {
+        match self
+            .request(libslop::RequestBody::Hook {
+                event,
+                payload,
+                pane_id,
+            })
+            .await?
+        {
             libslop::ResponseBody::Hooked => Ok(()),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
 
-    pub async fn tmux_hook(
-        &mut self,
-        event: String,
-        pane_id: Option<String>,
-    ) -> Result<(), Error> {
-        match self.request(libslop::RequestBody::TmuxHook { event, pane_id }).await? {
+    pub async fn tmux_hook(&mut self, event: String, pane_id: Option<String>) -> Result<(), Error> {
+        match self
+            .request(libslop::RequestBody::TmuxHook { event, pane_id })
+            .await?
+        {
             libslop::ResponseBody::TmuxHooked => Ok(()),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
 
     pub async fn tag(&mut self, pane_id: String, tag: String) -> Result<(String, String), Error> {
-        match self.request(libslop::RequestBody::Tag { pane_id, tag, remove: false }).await? {
+        match self
+            .request(libslop::RequestBody::Tag {
+                pane_id,
+                tag,
+                remove: false,
+            })
+            .await?
+        {
             libslop::ResponseBody::Tagged { pane_id, tag } => Ok((pane_id, tag)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
 
     pub async fn untag(&mut self, pane_id: String, tag: String) -> Result<(String, String), Error> {
-        match self.request(libslop::RequestBody::Tag { pane_id, tag, remove: true }).await? {
+        match self
+            .request(libslop::RequestBody::Tag {
+                pane_id,
+                tag,
+                remove: true,
+            })
+            .await?
+        {
             libslop::ResponseBody::Untagged { pane_id, tag } => Ok((pane_id, tag)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -861,7 +999,14 @@ impl<
         before_cursor: Option<u64>,
         limit: u64,
     ) -> Result<Vec<libslop::Record>, Error> {
-        match self.request(libslop::RequestBody::ReadTranscript { pane_id, before_cursor, limit }).await? {
+        match self
+            .request(libslop::RequestBody::ReadTranscript {
+                pane_id,
+                before_cursor,
+                limit,
+            })
+            .await?
+        {
             libslop::ResponseBody::TranscriptPage { records } => Ok(records),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
@@ -881,14 +1026,19 @@ impl<
         let all_panes = self.ps().await?;
         let matched = apply_filters(all_panes, filters);
 
-        let filter_desc = filters.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
+        let filter_desc = filters
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let target_pane_ids: Vec<String> = match select {
             SelectMode::One => {
                 if matched.len() != 1 {
                     return Err(Error::SelectError(format!(
                         "expected exactly one pane matching {}, found {}",
-                        filter_desc, matched.len()
+                        filter_desc,
+                        matched.len()
                     )));
                 }
                 vec![matched.into_iter().next().unwrap().pane_id]
@@ -896,20 +1046,23 @@ impl<
             SelectMode::Any => {
                 if matched.is_empty() {
                     return Err(Error::SelectError(format!(
-                        "no panes match filter {}", filter_desc
+                        "no panes match filter {}",
+                        filter_desc
                     )));
                 }
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let idx = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .subsec_nanos() as usize % matched.len();
+                    .subsec_nanos() as usize
+                    % matched.len();
                 vec![matched.into_iter().nth(idx).unwrap().pane_id]
             }
             SelectMode::All => {
                 if matched.is_empty() {
                     return Err(Error::SelectError(format!(
-                        "no panes match filter {}", filter_desc
+                        "no panes match filter {}",
+                        filter_desc
                     )));
                 }
                 matched.into_iter().map(|p| p.pane_id).collect()
@@ -918,7 +1071,8 @@ impl<
 
         // In multiplexed mode we must go through request() one at a time,
         // since the demux task handles routing.
-        let client_timeout = std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
+        let client_timeout =
+            std::time::Duration::from_secs(timeout_secs + Self::REQUEST_TIMEOUT_SECS);
         if self.demux.is_some() {
             let mut out = Vec::new();
             for pane_id in target_pane_ids {
@@ -931,10 +1085,16 @@ impl<
                 match self.request_with_timeout(body, client_timeout).await? {
                     libslop::ResponseBody::Sent { pane_id } => out.push(pane_id),
                     libslop::ResponseBody::Error { message } => {
-                        return Err(Error::Server(format!("error sending to {}: {}", pane_id, message)));
+                        return Err(Error::Server(format!(
+                            "error sending to {}: {}",
+                            pane_id, message
+                        )));
                     }
                     _ => {
-                        return Err(Error::Server(format!("unexpected response for {}", pane_id)));
+                        return Err(Error::Server(format!(
+                            "unexpected response for {}",
+                            pane_id
+                        )));
                     }
                 }
             }
@@ -956,7 +1116,10 @@ impl<
             pending.insert(id, pane_id.clone());
         }
 
-        let lines = self.lines.as_mut().expect("lines must be present in direct mode");
+        let lines = self
+            .lines
+            .as_mut()
+            .expect("lines must be present in direct mode");
         let mut results: HashMap<u64, libslop::ResponseBody> = HashMap::new();
         let read_loop = async {
             while results.len() < pending.len() {
@@ -986,10 +1149,16 @@ impl<
             match &results[&req_id] {
                 libslop::ResponseBody::Sent { pane_id } => out.push(pane_id.clone()),
                 libslop::ResponseBody::Error { message } => {
-                    return Err(Error::Server(format!("error sending to {}: {}", pane_id, message)));
+                    return Err(Error::Server(format!(
+                        "error sending to {}: {}",
+                        pane_id, message
+                    )));
                 }
                 _ => {
-                    return Err(Error::Server(format!("unexpected response for {}", pane_id)));
+                    return Err(Error::Server(format!(
+                        "unexpected response for {}",
+                        pane_id
+                    )));
                 }
             }
         }
@@ -999,7 +1168,10 @@ impl<
 
     /// Subscribe to events. Returns a Subscription handle; the client remains
     /// usable for further requests on the same connection.
-    pub async fn subscribe(&mut self, filters: Vec<libslop::EventFilter>) -> Result<Subscription, Error> {
+    pub async fn subscribe(
+        &mut self,
+        filters: Vec<libslop::EventFilter>,
+    ) -> Result<Subscription, Error> {
         self.ensure_demux();
 
         let id = self.alloc_id();
@@ -1042,7 +1214,11 @@ impl<
 
     /// Subscribe to a pane's transcript with replay. Returns a Subscription
     /// handle; the client remains usable for further requests.
-    pub async fn subscribe_transcript(&mut self, pane_id: String, last_n: u64) -> Result<Subscription, Error> {
+    pub async fn subscribe_transcript(
+        &mut self,
+        pane_id: String,
+        last_n: u64,
+    ) -> Result<Subscription, Error> {
         self.ensure_demux();
 
         let id = self.alloc_id();
@@ -1089,7 +1265,10 @@ impl<
 
     /// Cancel an active subscription by its request ID.
     pub async fn unsubscribe_by_id(&mut self, subscription_id: u64) -> Result<(), Error> {
-        match self.request(libslop::RequestBody::Unsubscribe { subscription_id }).await? {
+        match self
+            .request(libslop::RequestBody::Unsubscribe { subscription_id })
+            .await?
+        {
             libslop::ResponseBody::Unsubscribed { .. } => {
                 if let Some(ref demux) = self.demux {
                     demux.lock().await.subscriptions.remove(&subscription_id);
@@ -1126,7 +1305,9 @@ impl Subscription {
             Some(response) => {
                 debug!("subscription {}: received {:?}", self.id, response.body);
                 match response.body {
-                    libslop::ResponseBody::Record(record) => Ok(Some(SubscriptionItem::Record(record))),
+                    libslop::ResponseBody::Record(record) => {
+                        Ok(Some(SubscriptionItem::Record(record)))
+                    }
                     libslop::ResponseBody::Subscribed => Ok(Some(SubscriptionItem::Subscribed)),
                     libslop::ResponseBody::Error { message } => Err(Error::Server(message)),
                     _ => Ok(None),
@@ -1152,7 +1333,13 @@ pub fn build_listen_filters(
     session_id: Option<String>,
     where_preds: Vec<libslop::PayloadPredicate>,
 ) -> Vec<libslop::EventFilter> {
-    if hooks.is_empty() && events.is_empty() && transcripts.is_empty() && pane_id.is_none() && session_id.is_none() && where_preds.is_empty() {
+    if hooks.is_empty()
+        && events.is_empty()
+        && transcripts.is_empty()
+        && pane_id.is_none()
+        && session_id.is_none()
+        && where_preds.is_empty()
+    {
         return vec![];
     }
     if hooks.is_empty() && events.is_empty() && transcripts.is_empty() {
@@ -1187,7 +1374,10 @@ pub fn build_listen_filters(
         payload_path_match: where_preds.clone(),
         ..Default::default()
     });
-    hook_filters.chain(event_filters).chain(transcript_filters).collect()
+    hook_filters
+        .chain(event_filters)
+        .chain(transcript_filters)
+        .collect()
 }
 
 /// CLI helper: parse `--until` / `--where` flag values into the shared
@@ -1285,13 +1475,15 @@ where
     let panes = client.ps().await?;
     for pane in &panes {
         if let Some(pid) = pane_id
-            && pane.pane_id != pid {
-                continue;
-            }
+            && pane.pane_id != pid
+        {
+            continue;
+        }
         if let Some(sid) = session_id
-            && pane.session_id.as_deref() != Some(sid) {
-                continue;
-            }
+            && pane.session_id.as_deref() != Some(sid)
+        {
+            continue;
+        }
         let record = build_seed_record(pane);
         if !libslop::predicates_match(&record.payload, where_preds) {
             continue;
@@ -1324,7 +1516,9 @@ where
     let (pane_id, session_id) = resolve_pane_id_or_session(pane_id, session_id)?;
     let mut subscription = if let Some(last_n) = replay {
         if !where_parsed.is_empty() {
-            eprintln!("error: --where is incompatible with --replay (transcript replay does not filter by payload)");
+            eprintln!(
+                "error: --where is incompatible with --replay (transcript replay does not filter by payload)"
+            );
             std::process::exit(2);
         }
         let replay_pane_id = match pane_id {
@@ -1333,7 +1527,9 @@ where
                 // The user may have passed a UUID for --pane-id; we already
                 // routed it to session_id, but --replay needs a real tmux pane.
                 if session_id.is_some() {
-                    eprintln!("error: --replay requires a tmux pane id (e.g. %42), not a session UUID");
+                    eprintln!(
+                        "error: --replay requires a tmux pane id (e.g. %42), not a session UUID"
+                    );
                 } else {
                     eprintln!("error: --replay requires --pane-id");
                 }
@@ -1342,13 +1538,19 @@ where
         };
         client.subscribe_transcript(replay_pane_id, last_n).await?
     } else {
-        let filters = build_listen_filters(hooks, events, transcripts, pane_id, session_id, where_parsed);
+        let filters = build_listen_filters(
+            hooks,
+            events,
+            transcripts,
+            pane_id,
+            session_id,
+            where_parsed,
+        );
         client.subscribe(filters).await?
     };
 
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ).expect("failed to install SIGTERM handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
 
     // listen never stops voluntarily, so should_stop is always false; only
     // SIGTERM or EOF (returned as Err::ConnectionClosed) breaks the loop.
@@ -1419,7 +1621,8 @@ where
             &transcripts,
             &where_parsed,
             &predicates,
-        ).await?;
+        )
+        .await?;
         if let Some(record) = seeded {
             println!("{}", serde_json::to_string(&record).unwrap());
             return Ok(());
@@ -1449,7 +1652,10 @@ where
     match tokio::time::timeout(duration, wait_loop).await {
         Ok(result) => result,
         Err(_) => {
-            eprintln!("error: timed out after {}s waiting for matching event", timeout_secs);
+            eprintln!(
+                "error: timed out after {}s waiting for matching event",
+                timeout_secs
+            );
             std::process::exit(2);
         }
     }
@@ -1584,14 +1790,32 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     if no_wait {
-        let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
+        let pane_id = client
+            .run(
+                parent_pane_id,
+                extra_args,
+                start_directory,
+                env,
+                account,
+                backend,
+            )
+            .await?;
         println!("{}", pane_id);
         return Ok(());
     }
 
     let mut subscription = client.subscribe(ready_event_filters()).await?;
 
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
+    let pane_id = client
+        .run(
+            parent_pane_id,
+            extra_args,
+            start_directory,
+            env,
+            account,
+            backend,
+        )
+        .await?;
 
     wait_pane_ready(&mut subscription, pane_id, ready_timeout_secs).await
 }
@@ -1631,8 +1855,8 @@ async fn wait_pane_ready(
     pane_id: String,
     ready_timeout_secs: u64,
 ) -> Result<(), Error> {
-    let overall_deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(ready_timeout_secs);
+    let overall_deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_secs);
     // Set once the pane first reaches a live (non-booting) state; thereafter the
     // wait races this settle deadline instead of the overall ready timeout.
     let mut settle_deadline: Option<std::time::Instant> = None;
@@ -1665,22 +1889,29 @@ async fn wait_pane_ready(
                 match (record.source.as_str(), record.event_type.as_str()) {
                     ("hook", "SessionEnd") => {
                         let reason = record.payload.get("reason").and_then(|v| v.as_str());
-                        return Err(run_died_error(&pane_id, PaneDeathDiagnostics {
-                            reason,
-                            ..Default::default()
-                        }));
+                        return Err(run_died_error(
+                            &pane_id,
+                            PaneDeathDiagnostics {
+                                reason,
+                                ..Default::default()
+                            },
+                        ));
                     }
                     ("slopd", "PaneDestroyed") => {
                         // slopd's reconciler enriches this with the dead pane's
                         // exit status and captured final screen (when remain-on-exit
                         // let it linger long enough to read). Surface both.
-                        let exit_status = record.payload.get("exit_status").and_then(|v| v.as_i64());
+                        let exit_status =
+                            record.payload.get("exit_status").and_then(|v| v.as_i64());
                         let output = record.payload.get("output").and_then(|v| v.as_str());
-                        return Err(run_died_error(&pane_id, PaneDeathDiagnostics {
-                            exit_status,
-                            output,
-                            ..Default::default()
-                        }));
+                        return Err(run_died_error(
+                            &pane_id,
+                            PaneDeathDiagnostics {
+                                exit_status,
+                                output,
+                                ..Default::default()
+                            },
+                        ));
                     }
                     ("slopd", "DetailedStateChange") => {
                         let live = record
@@ -1723,14 +1954,18 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     if no_wait {
-        let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
+        let (pane_id, _session_id) = client
+            .fork(source_pane_id, start_directory, env, extra_args)
+            .await?;
         println!("{}", pane_id);
         return Ok(());
     }
 
     let mut subscription = client.subscribe(ready_event_filters()).await?;
 
-    let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
+    let (pane_id, _session_id) = client
+        .fork(source_pane_id, start_directory, env, extra_args)
+        .await?;
 
     wait_pane_ready(&mut subscription, pane_id, ready_timeout_secs).await
 }
@@ -1750,8 +1985,14 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let (pane_id, _session_id) = client.fork(source_pane_id, start_directory, env, extra_args).await?;
-    let mut vars: Vec<(&str, &str)> = viewer.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (pane_id, _session_id) = client
+        .fork(source_pane_id, start_directory, env, extra_args)
+        .await?;
+    let mut vars: Vec<(&str, &str)> = viewer
+        .vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     vars.push(("pane_id", &pane_id));
     let argv = libslop::SlopctlConfig::substitute(&viewer.command, &vars);
     run_viewer_command(&argv, viewer.run_type, &pane_id)
@@ -1775,9 +2016,22 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let pane_id = client.run(parent_pane_id, extra_args, start_directory, env, account, backend).await?;
+    let pane_id = client
+        .run(
+            parent_pane_id,
+            extra_args,
+            start_directory,
+            env,
+            account,
+            backend,
+        )
+        .await?;
     // Pre-resolved vars (socket, session, …) plus the now-known pane id.
-    let mut vars: Vec<(&str, &str)> = viewer.vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut vars: Vec<(&str, &str)> = viewer
+        .vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     vars.push(("pane_id", &pane_id));
     let argv = libslop::SlopctlConfig::substitute(&viewer.command, &vars);
     run_viewer_command(&argv, viewer.run_type, &pane_id)
@@ -1786,7 +2040,11 @@ where
 /// Launch the (already pane-id-substituted) viewer command. `Exec` replaces this
 /// process with it (only returns on failure); `Forking` runs it detached in the
 /// background, prints the pane id, and returns.
-fn run_viewer_command(argv: &[String], run_type: libslop::RunType, pane_id: &str) -> Result<(), Error> {
+fn run_viewer_command(
+    argv: &[String],
+    run_type: libslop::RunType,
+    pane_id: &str,
+) -> Result<(), Error> {
     let Some((program, args)) = argv.split_first() else {
         return Err(Error::RunFailed("interactive_command is empty".to_string()));
     };
@@ -1798,7 +2056,8 @@ fn run_viewer_command(argv: &[String], run_type: libslop::RunType, pane_id: &str
             // Replaces the slopctl process on success; only returns on error.
             let err = cmd.exec();
             Err(Error::RunFailed(format!(
-                "failed to exec interactive command {:?}: {}", argv, err,
+                "failed to exec interactive command {:?}: {}",
+                argv, err,
             )))
         }
         libslop::RunType::Forking => {
@@ -1806,11 +2065,16 @@ fn run_viewer_command(argv: &[String], run_type: libslop::RunType, pane_id: &str
             use std::process::Stdio;
             // Detach: a fresh process group + null stdio so it survives slopctl
             // exiting and doesn't fight over the terminal.
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             cmd.process_group(0);
-            cmd.spawn().map_err(|e| Error::RunFailed(format!(
-                "failed to spawn interactive command {:?}: {}", argv, e,
-            )))?;
+            cmd.spawn().map_err(|e| {
+                Error::RunFailed(format!(
+                    "failed to spawn interactive command {:?}: {}",
+                    argv, e,
+                ))
+            })?;
             // Background mode reports the pane id like `run --no-wait` does.
             println!("{}", pane_id);
             Ok(())
@@ -1831,16 +2095,26 @@ where
     // Handle Send-with-filter first.
     if let CommonCommand::Send { ref pane_id, .. } = command
         && pane_id.contains('=')
-            && let CommonCommand::Send { pane_id, prompt, filters, select, timeout, interrupt } = command {
-                let mut all_filters = vec![pane_id];
-                all_filters.extend(filters);
-                let parsed = parse_filters(all_filters)?;
-                let pane_ids = client.send_filtered(&parsed, &prompt, &select, timeout, interrupt).await?;
-                for id in pane_ids {
-                    println!("{}", id);
-                }
-                return Ok(());
-            }
+        && let CommonCommand::Send {
+            pane_id,
+            prompt,
+            filters,
+            select,
+            timeout,
+            interrupt,
+        } = command
+    {
+        let mut all_filters = vec![pane_id];
+        all_filters.extend(filters);
+        let parsed = parse_filters(all_filters)?;
+        let pane_ids = client
+            .send_filtered(&parsed, &prompt, &select, timeout, interrupt)
+            .await?;
+        for id in pane_ids {
+            println!("{}", id);
+        }
+        return Ok(());
+    }
 
     match command {
         CommonCommand::Status => {
@@ -1862,14 +2136,26 @@ where
                 print_ps(panes);
             }
         }
-        CommonCommand::Run { extra_args, start_directory, envs, env_files, account, backend, interactive, no_wait, ready_timeout } => {
+        CommonCommand::Run {
+            extra_args,
+            start_directory,
+            envs,
+            env_files,
+            account,
+            backend,
+            interactive,
+            no_wait,
+            ready_timeout,
+        } => {
             let env = build_cli_env(&env_files, &envs)?;
             let backend = match backend.as_deref() {
                 Some("claude") => Some(libslop::Backend::Claude),
                 Some("opencode") => Some(libslop::Backend::Opencode),
-                Some(other) => return Err(Error::RunFailed(
-                    format!("invalid --backend {other:?}: expected \"claude\" or \"opencode\""),
-                )),
+                Some(other) => {
+                    return Err(Error::RunFailed(format!(
+                        "invalid --backend {other:?}: expected \"claude\" or \"opencode\""
+                    )));
+                }
                 None => None,
             };
             // Resolve / validate --start-directory before the value leaves this
@@ -1901,7 +2187,8 @@ where
                     account,
                     backend,
                     viewer,
-                ).await?;
+                )
+                .await?;
             } else {
                 execute_run(
                     client,
@@ -1913,10 +2200,20 @@ where
                     backend,
                     no_wait,
                     ready_timeout,
-                ).await?;
+                )
+                .await?;
             }
         }
-        CommonCommand::Fork { pane_id, start_directory, envs, env_files, interactive, no_wait, ready_timeout, extra_args } => {
+        CommonCommand::Fork {
+            pane_id,
+            start_directory,
+            envs,
+            env_files,
+            interactive,
+            no_wait,
+            ready_timeout,
+            extra_args,
+        } => {
             let env = build_cli_env(&env_files, &envs)?;
             // Resolve / validate --start-directory exactly like `run` (local cwd
             // vs. rejected-over-remote). When omitted, slopd defaults it to the
@@ -1935,17 +2232,35 @@ where
                         "`fork --interactive` is not supported for remote endpoints".to_string(),
                     ));
                 };
-                execute_fork_interactive(client, pane_id, start_directory, env, extra_args, viewer).await?;
+                execute_fork_interactive(client, pane_id, start_directory, env, extra_args, viewer)
+                    .await?;
             } else {
-                execute_fork(client, pane_id, start_directory, env, extra_args, no_wait, ready_timeout).await?;
+                execute_fork(
+                    client,
+                    pane_id,
+                    start_directory,
+                    env,
+                    extra_args,
+                    no_wait,
+                    ready_timeout,
+                )
+                .await?;
             }
         }
         CommonCommand::Kill { pane_id } => {
             let pane_id = client.kill(pane_id).await?;
             println!("{}", pane_id);
         }
-        CommonCommand::Send { pane_id, prompt, timeout, interrupt, .. } => {
-            let pane_id = client.send_prompt(pane_id, prompt, timeout, interrupt).await?;
+        CommonCommand::Send {
+            pane_id,
+            prompt,
+            timeout,
+            interrupt,
+            ..
+        } => {
+            let pane_id = client
+                .send_prompt(pane_id, prompt, timeout, interrupt)
+                .await?;
             println!("{}", pane_id);
         }
         CommonCommand::Interrupt { pane_id } => {
@@ -1967,16 +2282,60 @@ where
                 println!("{}", tag);
             }
         }
-        CommonCommand::Transcript { pane_id, before, limit } => {
+        CommonCommand::Transcript {
+            pane_id,
+            before,
+            limit,
+        } => {
             let records = client.read_transcript(pane_id, before, limit).await?;
             let out = serde_json::json!({ "records": records });
             println!("{}", out);
         }
-        CommonCommand::Listen { hooks, events, transcripts, pane_id, session_id, where_preds, replay } => {
-            execute_listen(client, hooks, events, transcripts, pane_id, session_id, where_preds, replay).await?;
+        CommonCommand::Listen {
+            hooks,
+            events,
+            transcripts,
+            pane_id,
+            session_id,
+            where_preds,
+            replay,
+        } => {
+            execute_listen(
+                client,
+                hooks,
+                events,
+                transcripts,
+                pane_id,
+                session_id,
+                where_preds,
+                replay,
+            )
+            .await?;
         }
-        CommonCommand::Wait { hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout } => {
-            execute_wait(client, hooks, events, transcripts, pane_id, session_id, where_preds, until, no_snapshot, timeout).await?;
+        CommonCommand::Wait {
+            hooks,
+            events,
+            transcripts,
+            pane_id,
+            session_id,
+            where_preds,
+            until,
+            no_snapshot,
+            timeout,
+        } => {
+            execute_wait(
+                client,
+                hooks,
+                events,
+                transcripts,
+                pane_id,
+                session_id,
+                where_preds,
+                until,
+                no_snapshot,
+                timeout,
+            )
+            .await?;
         }
         CommonCommand::Backup => {
             let count = client.backup().await?;
@@ -2003,14 +2362,22 @@ mod tests {
 
     #[test]
     fn run_died_error_bare_when_no_diagnostics() {
-        assert_eq!(died_msg(PaneDeathDiagnostics::default()),
-            "pane %28 died before becoming ready");
+        assert_eq!(
+            died_msg(PaneDeathDiagnostics::default()),
+            "pane %28 died before becoming ready"
+        );
     }
 
     #[test]
     fn run_died_error_includes_session_end_reason() {
-        let msg = died_msg(PaneDeathDiagnostics { reason: Some("prompt_input_exit"), ..Default::default() });
-        assert_eq!(msg, "pane %28 died before becoming ready (session ended: prompt_input_exit)");
+        let msg = died_msg(PaneDeathDiagnostics {
+            reason: Some("prompt_input_exit"),
+            ..Default::default()
+        });
+        assert_eq!(
+            msg,
+            "pane %28 died before becoming ready (session ended: prompt_input_exit)"
+        );
     }
 
     #[test]
@@ -2020,9 +2387,21 @@ mod tests {
             output: Some("Error: invalid setting in .claude/settings.json\n"),
             ..Default::default()
         });
-        assert!(msg.contains("pane %28 died before becoming ready (exit status 1)"), "got: {}", msg);
-        assert!(msg.contains("--- last output from the pane ---"), "got: {}", msg);
-        assert!(msg.contains("Error: invalid setting in .claude/settings.json"), "got: {}", msg);
+        assert!(
+            msg.contains("pane %28 died before becoming ready (exit status 1)"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--- last output from the pane ---"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Error: invalid setting in .claude/settings.json"),
+            "got: {}",
+            msg
+        );
         // Trailing newline in the captured output is trimmed, not doubled.
         assert!(msg.ends_with("settings.json"), "got: {:?}", msg);
     }
@@ -2065,7 +2444,8 @@ mod tests {
         if let Err(Error::RunFailed(msg)) = check_remote_start_directory(Path::new(".")) {
             assert!(
                 msg.contains("relative") && msg.contains("remote"),
-                "message should explain the relative/remote ambiguity; got: {}", msg
+                "message should explain the relative/remote ambiguity; got: {}",
+                msg
             );
         } else {
             panic!("a relative --start-directory should be rejected as RunFailed");
@@ -2098,9 +2478,12 @@ mod tests {
         match execute_command(&mut client, run, &ctx).await {
             Err(Error::RunFailed(msg)) => assert!(
                 msg.contains("relative") && msg.contains("remote"),
-                "should explain the relative/remote ambiguity; got: {}", msg
+                "should explain the relative/remote ambiguity; got: {}",
+                msg
             ),
-            Ok(()) => panic!("relative --start-directory over a remote connection must be rejected"),
+            Ok(()) => {
+                panic!("relative --start-directory over a remote connection must be rejected")
+            }
             Err(_) => panic!("expected RunFailed for a relative remote --start-directory"),
         }
     }
@@ -2134,18 +2517,34 @@ mod tests {
     fn validate_pane_id_arg_rejects_uuid_with_session_id_hint() {
         let err = validate_pane_id_arg("31a02dee-3e6d-42f0-b7c4-4382305b7e10").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("--pane-id"), "missing flag name in error: {}", msg);
+        assert!(
+            msg.contains("--pane-id"),
+            "missing flag name in error: {}",
+            msg
+        );
         assert!(msg.contains("UUID"), "missing UUID hint in error: {}", msg);
-        assert!(msg.contains("--session-id"), "must point at --session-id: {}", msg);
+        assert!(
+            msg.contains("--session-id"),
+            "must point at --session-id: {}",
+            msg
+        );
     }
 
     #[test]
     fn validate_pane_id_arg_rejects_garbage() {
         let err = validate_pane_id_arg("not-a-pane-id").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("--pane-id"), "missing flag name in error: {}", msg);
+        assert!(
+            msg.contains("--pane-id"),
+            "missing flag name in error: {}",
+            msg
+        );
         assert!(msg.contains("tmux pane id"), "missing shape hint: {}", msg);
-        assert!(msg.contains("--session-id"), "should still hint at session-id: {}", msg);
+        assert!(
+            msg.contains("--session-id"),
+            "should still hint at session-id: {}",
+            msg
+        );
     }
 
     #[test]
@@ -2178,7 +2577,10 @@ mod tests {
         assert!(parse_filters(vec!["tag=x".into()]).is_ok());
         assert!(parse_filters(vec!["backend=opencode".into()]).is_ok());
         assert!(parse_filters(vec!["account=work".into()]).is_ok());
-        assert!(parse_filters(vec!["agent=opencode".into()]).is_err(), "'agent' is not a filter key");
+        assert!(
+            parse_filters(vec!["agent=opencode".into()]).is_err(),
+            "'agent' is not a filter key"
+        );
         assert!(parse_filters(vec!["bogus=x".into()]).is_err());
     }
 
@@ -2193,7 +2595,13 @@ mod tests {
         assert_eq!(be_oc.len(), 1);
         let acct = apply_filters(panes.clone(), &[("account".into(), "work".into())]);
         assert_eq!(acct.len(), 1);
-        let claude_prod = apply_filters(panes, &[("backend".into(), "claude".into()), ("tag".into(), "prod".into())]);
+        let claude_prod = apply_filters(
+            panes,
+            &[
+                ("backend".into(), "claude".into()),
+                ("tag".into(), "prod".into()),
+            ],
+        );
         assert_eq!(claude_prod.len(), 1);
     }
 
@@ -2210,7 +2618,11 @@ mod tests {
         let err = resolve_pane_id_or_session(Some(uuid.into()), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("UUID"), "should explain it's a UUID: {}", msg);
-        assert!(msg.contains("--session-id"), "should point at --session-id: {}", msg);
+        assert!(
+            msg.contains("--session-id"),
+            "should point at --session-id: {}",
+            msg
+        );
     }
 
     #[test]
@@ -2227,7 +2639,11 @@ mod tests {
         assert!(err.to_string().contains("--pane-id"));
     }
 
-    fn fake_pane(pane_id: &str, state: libslop::PaneDetailedState, session_id: Option<&str>) -> libslop::PaneInfo {
+    fn fake_pane(
+        pane_id: &str,
+        state: libslop::PaneDetailedState,
+        session_id: Option<&str>,
+    ) -> libslop::PaneInfo {
         libslop::PaneInfo {
             pane_id: pane_id.to_string(),
             created_at: 0,
@@ -2270,11 +2686,15 @@ mod tests {
 
     #[test]
     fn build_seed_record_predicate_match_against_detailed_state() {
-        let pane = fake_pane("%79", libslop::PaneDetailedState::AwaitingInputPermission, None);
+        let pane = fake_pane(
+            "%79",
+            libslop::PaneDetailedState::AwaitingInputPermission,
+            None,
+        );
         let record = build_seed_record(&pane);
-        let predicates = parse_payload_predicates(
-            vec!["detailed_state=awaiting_input_permission".into()],
-        ).unwrap();
+        let predicates =
+            parse_payload_predicates(vec!["detailed_state=awaiting_input_permission".into()])
+                .unwrap();
         assert!(libslop::predicates_match(&record.payload, &predicates));
     }
 
@@ -2295,8 +2715,10 @@ mod tests {
     /// A nested path's leading dot is also optional (consistency with top-level).
     #[test]
     fn where_predicate_leading_dot_optional_nested() {
-        let with_dot = parse_payload_predicates(vec![".message.content[].type=text".into()]).unwrap();
-        let without_dot = parse_payload_predicates(vec!["message.content[].type=text".into()]).unwrap();
+        let with_dot =
+            parse_payload_predicates(vec![".message.content[].type=text".into()]).unwrap();
+        let without_dot =
+            parse_payload_predicates(vec!["message.content[].type=text".into()]).unwrap();
         assert_eq!(with_dot[0].path, without_dot[0].path);
     }
 }

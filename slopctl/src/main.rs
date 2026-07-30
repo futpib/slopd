@@ -62,10 +62,11 @@ async fn main() {
         libslopctl::validate_command_filters(cmd).unwrap_or_else(|e| libslopctl::die_err(e));
     }
     if let Command::Common(libslopctl::CommonCommand::Tags { pane_id: None }) = cli.command
-        && std::env::var("TMUX_PANE").is_err() {
-            eprintln!("error: <PANE_ID> is required when $TMUX_PANE is not set");
-            std::process::exit(2);
-        }
+        && std::env::var("TMUX_PANE").is_err()
+    {
+        eprintln!("error: <PANE_ID> is required when $TMUX_PANE is not set");
+        std::process::exit(2);
+    }
 
     // A single `--config` file (when given) configures both slopctl and the
     // slopd bits read below for the interactive viewer; each struct ignores keys
@@ -102,7 +103,11 @@ async fn main() {
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("slopctl hook: failed to connect to {}: {}", socket_path.display(), e);
+                eprintln!(
+                    "slopctl hook: failed to connect to {}: {}",
+                    socket_path.display(),
+                    e
+                );
                 std::process::exit(1);
             }
         };
@@ -122,7 +127,11 @@ async fn main() {
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("slopctl tmux-hook: failed to connect to {}: {}", socket_path.display(), e);
+                eprintln!(
+                    "slopctl tmux-hook: failed to connect to {}: {}",
+                    socket_path.display(),
+                    e
+                );
                 std::process::exit(1);
             }
         };
@@ -177,6 +186,7 @@ async fn main() {
             local: true,
         };
         libslopctl::execute_command(&mut client, cmd, &ctx)
-            .await.unwrap_or_else(|e| libslopctl::die_err(e));
+            .await
+            .unwrap_or_else(|e| libslopctl::die_err(e));
     }
 }

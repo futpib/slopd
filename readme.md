@@ -19,6 +19,7 @@
   - [slopctl](#slopctl-config)
 - [Backup and restore](#backup-and-restore)
 - [slopctl commands](#slopctl-commands)
+- [Multi-backend support](#multi-backend-support-opencode-and-codex)
 - [Claude hook integration](#claude-hook-integration)
 - [Event system](#event-system)
 - [ACP adapter](#acp-adapter)
@@ -36,9 +37,9 @@
 │                        tmux                            │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
 │  │  pane %1    │  │  pane %2    │  │  pane %3    │   │
-│  │  claude …   │  │  claude …   │  │  claude …   │   │
+│  │  claude …   │  │ opencode …  │  │   codex …   │   │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘   │
-│         │  hook events   │                │            │
+│         │ hooks / transcript / local API │            │
 └─────────┼────────────────┼────────────────┼────────────┘
           │                │                │
           └────────────────▼────────────────┘
@@ -49,21 +50,40 @@
 ```
 
 - **slopd** listens on a Unix domain socket and accepts JSON-RPC requests.
-- Each Claude process runs as a pane inside a dedicated `slopd` tmux session.
-- Claude's [lifecycle hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) are forwarded to `slopd` by `slopctl hook`, giving the daemon real-time knowledge of what every agent is doing.
-- Clients can subscribe to the event stream to react to hook events as they happen.
+- Each agent process runs in its own pane inside a dedicated `slopd` tmux session.
+- Claude Code and Codex report lifecycle events through injected hooks; OpenCode
+  is observed and controlled through the local API embedded in each TUI process.
+- Clients see one normalized state, lifecycle, and transcript event stream across
+  all three backends.
 
 ---
 
 ## Requirements
 
 - **Rust** (2024 edition) — to build from source
-- **tmux** — must be in `PATH`; slopd manages all Claude panes inside a tmux session
-- **XDG runtime directory** (`$XDG_RUNTIME_DIR`) — socket is placed there
+- **tmux** — must be in `PATH`
+- At least one supported agent CLI — `claude`, `opencode`, or `codex` — on
+  slopd's `PATH`, unless configured with an explicit executable path
+
+The control socket normally lives under `$XDG_RUNTIME_DIR`. If that variable is
+unset, all local slopd tools consistently fall back to an existing
+`/run/user/<uid>` or a private `0700` directory under the system temp directory.
 
 ---
 
 ## Installation
+
+On Arch Linux, install the [`slopd-git`](https://aur.archlinux.org/packages/slopd-git)
+package from the AUR:
+
+```bash
+yay -S slopd-git
+```
+
+The package installs `slopd`, `slopctl`, `iroh-slopd`, `iroh-slopctl`, and the
+systemd user service. Install from source if you also need `slopd-acp`.
+
+To install from source:
 
 ```bash
 cargo install --path slopd
@@ -100,10 +120,23 @@ slopd
 `slopd` will:
 
 1. Create (or attach to) a tmux session named `slopd`.
-2. Start listening on `$XDG_RUNTIME_DIR/slopd/slopd.sock`.
-3. Inject `slopctl hook <event>` entries into Claude's `~/.claude/settings.json` so that every Claude pane started by the daemon reports its lifecycle events back.
+2. Start listening on the default control socket
+   (`$XDG_RUNTIME_DIR/slopd/slopd.sock`, subject to the fallback described
+   above), or the path passed with `--socket`.
+3. Inject `slopctl hook <event>` entries for configured Claude Code and Codex
+   accounts as panes are launched. OpenCode panes use their embedded local API
+   instead of hook files.
 
-Verbosity can be increased with `-v` / `-vv` / `-vvv` (maps to INFO / DEBUG / TRACE).
+Verbosity can be increased with `-v` / `-vv` / `-vvv` (INFO / DEBUG / TRACE)
+or top-level `verbose` in the config; `RUST_LOG` is also honored. A one-off
+`--executable PROGRAM [ARGS]...` overrides `[run] executable`.
+
+slopd removes its injected hook entries on clean shutdown. To remove them
+without starting the daemon, while preserving hooks owned by other tools:
+
+```bash
+slopd uninject-hooks
+```
 
 ### Config file location
 
@@ -113,21 +146,31 @@ By default slopd reads `$XDG_CONFIG_HOME/slopd/config.toml`. Point it at any fil
 slopd --config /path/to/other.toml
 ```
 
-The path supports `~` and `$VAR` expansion. `slopctl --config <path>` reads the same file for the slopd settings it needs (the `[tmux]` socket/session used by `run --interactive`), so a single file can configure both. SIGHUP reloads from the `--config` path too. All four binaries (`slopd`, `slopctl`, `iroh-slopd`, `iroh-slopctl`) accept `--config`.
+The path supports `~` and `$VAR` expansion. `slopctl --config <path>` reads the
+same file for the slopd settings it needs (the `[tmux]` socket/session used by
+`run --interactive`), so a single file can configure both. SIGHUP reloads from
+the `--config` path too. `slopd`, `slopctl`, `iroh-slopd`, and `iroh-slopctl`
+all accept a `--config` override for their respective config.
 
 #### Running a second instance
 
-`--config` is what lets a second slopd run alongside the first without touching it. Give the second instance its own **tmux** socket/session (via `[tmux] socket` / `session`) and its own **control** socket. The control socket lives at `$XDG_RUNTIME_DIR/slopd/slopd.sock` — it is *not* read from the config file — so isolate it by pointing `XDG_RUNTIME_DIR` somewhere else for both the daemon and the `slopctl` commands that talk to it:
+Give each instance a distinct tmux socket/session in its config and a distinct
+control socket through `--socket`. The control socket is deliberately a CLI
+option rather than a config key:
 
 ```bash
-# second daemon (own config + own control socket)
-XDG_RUNTIME_DIR=/run/user/1000/slopd-b slopd --config ~/.config/slopd/b.toml
+# second daemon
+slopd --config ~/.config/slopd/b.toml --socket /run/user/1000/slopd-b.sock
 
 # talk to it
-XDG_RUNTIME_DIR=/run/user/1000/slopd-b slopctl ps
+slopctl --config ~/.config/slopd/b.toml \
+  --socket /run/user/1000/slopd-b.sock ps
 ```
 
-With a custom `[tmux] socket`, set `[tmux] start_server = true` if no tmux server is already listening on it.
+The daemon automatically includes its `--socket` value in injected hook
+commands. `iroh-slopd --socket PATH` can expose that same non-default instance.
+With a custom `[tmux] socket`, set `[tmux] start_server = true` if no tmux server
+is already listening on it.
 
 ### Reloading config
 
@@ -139,7 +182,15 @@ kill -HUP $(pgrep -x slopd)
 systemctl --user reload slopd
 ```
 
-The reload affects subsequent operations only — already-running Claude panes keep the executable, env, and `config_dir` they were spawned with. Verbosity / log level cannot be changed at reload (re-start to apply). A malformed `config.toml` keeps the previous config; check the daemon log for the parse error. `slopctl status` exposes a `config_generation` counter that bumps on each successful reload.
+The reload affects subsequent operations only — already-running panes keep the
+backend, executable, environment, and config directory they were spawned with.
+Logging and the startup-resolved `[backup]` toggles, interval, and manifest path
+require a restart. A malformed config keeps the previous generation; check the
+daemon log for the parse error. `slopctl status` exposes a `config_generation`
+counter that increments after every successful reload.
+
+If a reload changes an account's hook-file location, entries in the old location
+may remain. Clean them with `slopd --config <old-config> uninject-hooks`.
 
 ---
 
@@ -149,14 +200,23 @@ The reload affects subsequent operations only — already-running Claude panes k
 
 File: `~/.config/slopd/config.toml`
 
-All defaults are fine for most setups. The only key you are likely to want to set is `config_dir` if Claude's config lives somewhere other than `~/.claude`.
+All fields are optional. With an empty config, slopd uses the `claude` backend,
+the agent's standard config location, the default tmux server, and a tmux
+session named `slopd`.
 
 ```toml
-# Claude config dir (mirrors CLAUDE_CONFIG_DIR; default: ~/.claude). This sets
-# the dir for the reserved "default" account — the one used when no account is
-# selected. Equivalent to writing [accounts.default].
-# Supports ~ and $VAR / ${VAR} expansion (as do all account config dirs).
+# Log verbosity: 0 = WARN (default), 1 = INFO, 2 = DEBUG, 3 = TRACE.
+# CLI -v flags also control verbosity; RUST_LOG is honored.
+# verbose = 0
+
+# Backend and config dir for the reserved "default" account.
+# backend = "claude" # "claude", "opencode", or "codex"
 # config_dir = "~/.claude"
+#
+# config_dir is exported using the selected backend's variable:
+# CLAUDE_CONFIG_DIR, OPENCODE_CONFIG_DIR, or CODEX_HOME. When omitted, the
+# backend uses its own standard location.
+# Supports ~ and $VAR / ${VAR} expansion (as do all account config dirs).
 
 # Pointer to the named account used by `slopctl run` when no --account is given
 # and none is inherited from the current pane. Switching the default then only
@@ -164,14 +224,18 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # account above.
 # default_account = "work"
 
-# Named accounts: each maps an account name to its own config. Omit config_dir
-# to use the backend's standard location. Pick one per pane with
-# `slopctl run --account <name>`. Both forms below are accepted; the table form
-# leaves room for per-account options.
+# Named accounts. A bare string is shorthand for a config directory. The table
+# form can set config_dir, backend, and an account-specific executable.
 # [accounts]
 # work = "~/.config/claude-work"            # shorthand: just the dir
 # [accounts.personal]
 # config_dir = "~/.config/claude-personal"
+# backend = "claude"
+# executable = ["claude", "--model", "sonnet"]
+#
+# [accounts.codex]
+# backend = "codex"                         # config_dir may be omitted
+# executable = "codex"                     # overrides a global Claude executable
 
 # [tmux]
 # Path to a custom tmux socket. When omitted slopd uses its default server.
@@ -180,34 +244,39 @@ All defaults are fine for most setups. The only key you are likely to want to se
 # Name of the tmux session slopd manages (default: "slopd"). Mainly useful for
 # running more than one slopd instance against the same tmux server.
 # session = "slopd"
+# Run `tmux start-server` during startup. Defaults to true for the default tmux
+# server and false when a custom socket is configured.
+# start_server = true
 
 # [run]
-# Command used to launch Claude. Can be a string or an array.
+# Default agent command. A canonical executable name also selects its backend;
+# an account's backend/executable can override it. Can be a string or an array.
 # executable = "claude"
 # executable = ["claude", "--dangerously-skip-permissions", "--model", "sonnet", "--effort", "max", "--thinking-display", "summarized"]
 
-# Path to the slopctl binary injected into Claude hooks.
+# Path to the slopctl binary injected into Claude Code and Codex hooks.
 # slopctl = "slopctl"
 
-# Default working directory for every new Claude pane.
+# Default working directory for every new agent pane.
 # Supports ~ and $VAR / ${VAR} expansion.
 # Overridden per-session by `slopctl run --start-directory`.
 # start_directory = "~/code/my-project"
 
-# Extra environment variables for every new Claude pane.
+# Extra environment variables for every new agent pane.
 # Values support $VAR / ${VAR} expansion against slopd's environment.
 # [run.env]
 # FOO = "bar"
 # TOKEN = "${MY_TOKEN}"
 
-# Paths to dotenv-style files loaded for every new Claude pane.
+# Paths to dotenv-style files loaded for every new agent pane.
 # Paths support ~ and $VAR expansion. Files loaded in order; later entries win.
 # CLI `--env` / `--env-file` override these.
 # env_files = ["~/.config/slopd/pane.env"]
 
-# Auto-continue a turn that ends with StopFailure (e.g. an API 500): slopd
-# injects a "continue" prompt after an exponential backoff so an unattended pane
-# recovers on its own instead of stalling until you nudge it (default: true).
+# Retry a failed Claude Code or OpenCode turn after exponential backoff so an
+# unattended pane does not stall (default: true). Claude receives "continue";
+# OpenCode re-submits the failed prompt. Codex does not currently expose the
+# failure event needed for this policy.
 # auto_continue_on_failure = true
 # Give up after this many consecutive failed retries, then leave the pane idle
 # (default: 8 — with the defaults below, ~4m15s of retrying).
@@ -238,11 +307,10 @@ All defaults are fine for most setups. The only key you are likely to want to se
 
 #### Multiple accounts
 
-Run different panes under different agent accounts and backends. There is always a
-reserved account named `default`, backed by the top-level `config_dir`
-(or `~/.claude`); define additional ones under `[accounts]`, each mapping a name
-to its own config. The table form
-(`[accounts.<name>]`) is extensible — future per-account options live there.
+Run different panes under different agent accounts and backends. There is always
+a reserved account named `default`, backed by the top-level `backend`,
+`config_dir`, and `[run] executable`. Define additional entries under
+`[accounts]`; the table form accepts `backend`, `config_dir`, and `executable`.
 
 `default_account` is a pointer to one of those named accounts. Keeping every
 backend in a named account makes changing the default a one-line edit:
@@ -284,6 +352,20 @@ An unknown account name fails the `run` with an error listing the configured
 accounts, before any pane is spawned. Account config dirs support `~` and
 `$VAR` / `${VAR}` expansion.
 
+Backend and executable resolve together:
+
+- an explicit `backend` defaults to that backend's canonical executable;
+- a canonical executable (`claude`, `opencode`, or `codex`) selects its matching
+  backend when `backend` is omitted;
+- contradictory canonical values are rejected;
+- a custom executable path does not imply a backend, so pair it with an explicit
+  `backend`.
+
+Named accounts do not inherit the top-level `backend` or `config_dir`, but they
+do fall back to `[run] executable` when they do not define their own. At run
+time, `slopctl run --backend KIND` can override the resolved account backend;
+the pane still records and inherits the selected account.
+
 ### slopctl config
 
 File: `~/.config/slopctl/config.toml`
@@ -315,9 +397,16 @@ The default command picks up slopd's `[tmux] socket` and `[tmux] session` automa
 
 ## Backup and restore
 
-slopd keeps each pane's identity — Claude session id, account, tags, ancestry, working directory — in tmux pane options, and rebuilds its in-memory state from them whenever the daemon restarts. That makes a daemon restart transparent: the Claude processes keep running in tmux and slopd re-adopts them.
+slopd keeps each pane's identity — backend session ID, account, tags, ancestry,
+working directory, and transcript path — in tmux pane options, and rebuilds its
+in-memory state from them whenever the daemon restarts. That makes a daemon
+restart transparent: the agent processes keep running in tmux and slopd
+re-adopts them.
 
-A **reboot** is the one case that breaks: it destroys the whole tmux server, taking those pane options *and* the Claude processes with it. The conversations themselves are safe — Claude writes each session to a transcript on disk and `claude --resume <id>` continues it — but slopd's record of *which* sessions were running, and how, is gone with tmux. Backup/restore closes that gap by keeping a copy on durable storage.
+A **reboot** destroys the tmux server, taking those pane options and the agent
+processes with it. The backends keep their conversations on disk and can resume
+them by session ID, but slopd's record of *which* sessions were running is gone
+with tmux. Backup/restore closes that gap by keeping a durable manifest.
 
 Backup and restore each have an **automatic** toggle plus an always-available **manual** command, and the two automatic toggles are independent — all four combinations are valid:
 
@@ -326,21 +415,44 @@ Backup and restore each have an **automatic** toggle plus an always-available **
 | **`auto_backup = true`** (default) | back up automatically; restore only on demand | full reboot survival |
 | **`auto_backup = false`** | drive both by hand | restore on reboot from manifests you write by hand |
 
-**Backup.** With `auto_backup` on (the default), slopd writes the managed-pane set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every `[backup] interval_secs` seconds and once more on clean shutdown; `slopctl backup` writes it on demand at any time. Writes are atomic (temp file + rename), so a crash mid-write never corrupts the manifest, and only panes that have recorded a Claude session id — the ones that can actually be resumed — are written. The manifest lives in the XDG **state** dir, which survives reboot, unlike the runtime dir that holds the control socket.
+**Backup.** With `auto_backup` on (the default), slopd writes the managed-pane
+set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every
+`[backup] interval_secs` seconds and once more on clean shutdown; `slopctl
+backup` writes it on demand at any time. Writes are atomic (temp file + rename),
+and only panes with a recorded backend session ID — the ones that can actually
+be resumed — are written. The manifest lives in the XDG **state** directory,
+which survives reboot, unlike the runtime directory that holds the control
+socket.
 
-**Restore.** With `auto_restore` on, slopd restores when it finds it had to create its tmux session from scratch — the signature of a fresh server after a reboot: it re-spawns each recorded pane with `claude --resume <session_id>` in its original working directory and account, restoring tags and parent/child ancestry (remapped to the new tmux pane ids). On an ordinary daemon restart the tmux session still exists, so slopd recovers panes from tmux as usual and does not touch the manifest — panes are never duplicated. `slopctl restore` does the same on demand; it is safe on a live daemon because it skips any session that is already running.
+**Restore.** With `auto_restore` on, slopd restores when it has to create its
+tmux session from scratch — the signature of a fresh server after a reboot. It
+uses each recorded backend's native resume path (`claude --resume`, `opencode
+-s`, or `codex resume`) and restores the account, working directory, tags, and
+parent/child ancestry (remapped to the new pane IDs). On an ordinary daemon
+restart the tmux session still exists, so slopd recovers live panes from tmux
+and does not duplicate them. `slopctl restore` performs the same operation on
+demand and skips sessions that are already running.
 
 **Pending restore (with `auto_restore` off).** When slopd starts into a fresh session and `auto_restore` is off, it does *not* resurrect the panes — but it does mark the manifest as a **pending restore**: the count shows in `slopctl status`, and **auto-backup is suspended** so the restore point is preserved. This matters because otherwise auto-backup would immediately overwrite the manifest with the empty (or, once you start working, diverged) post-reboot pane set, destroying it before you could use it. With the pending hold, you can reboot, start working, and run `slopctl restore` whenever you remember — the pre-reboot set is still there. The pending state is recorded by a `<manifest>.pending` marker file, so it survives a *daemon* restart too (a crash, `systemctl restart`, or package update in the pending window won't resume auto-backup and clobber the restore point). It is resolved by `slopctl restore` (bring the panes back) or `slopctl backup` (replace the restore point with the current state); either one removes the marker and resumes normal auto-backup.
 
-Restore never starts two Claude processes on one session: it skips a session id that is already running *or* that it has already restored in this pass (a manifest can legitimately contain the same session id twice). It is otherwise best-effort — a pane whose session can no longer be resumed (e.g. its transcript was deleted) simply fails to come up and is reconciled away, without affecting the others.
+Restore never starts two agents on one backend session: it skips a session ID
+that is already running or that it has already restored in the same pass. It is
+otherwise best-effort — a pane whose session can no longer be resumed simply
+fails without preventing the other panes from being restored.
 
-Because plain `--resume` continues the *same* session id and appends to the *same* transcript, a restored pane keeps its identity and the manifest stays valid across repeated reboots. The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup but does not resurrect panes on reboot unless you opt in or run `slopctl restore`.
+Because restore continues the same backend session, a restored pane keeps its
+conversation identity and the manifest stays useful across repeated reboots.
+The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup
+but does not resurrect panes until you run `slopctl restore` or opt into
+automatic restore.
 
 ---
 
 ## slopctl commands
 
-All commands communicate with the running `slopd` daemon over its Unix socket.
+All commands communicate with the running daemon over its Unix socket. Global
+`--socket PATH` selects a non-default daemon and global `--config PATH` selects
+the config used by local client features such as `run --interactive`.
 
 ### `slopctl status`
 
@@ -366,15 +478,16 @@ pending_restore: 7 pane(s) — run `slopctl restore`
 List all panes managed by slopd.
 
 ```
-PANE  CREATED        LAST_ACTIVE    SESSION         PARENT  TAGS      STATE  DETAILED_STATE  WORKING_DIR
-%1    2 minutes ago  2 minutes ago  session-abc123  -       -         ready  ready           ~/code/project
-%2    5 seconds ago  5 seconds ago  -               %1      web,prod  busy   busy_tool_use   -
+PANE  CREATED        LAST_ACTIVE    SESSION         PARENT  BACKEND  ACCOUNT  TAGS      STATE  DETAILED_STATE  WORKING_DIR     TITLE
+%1    2 minutes ago  2 minutes ago  session-abc123  -       claude   work     -         ready  ready           ~/code/project  add login
+%2    5 seconds ago  5 seconds ago  ses_xyz          %1      opencode default  web,prod  busy   busy_tool_use   ~/code/project  fix tests
 ```
 
-Filter by tag:
+Filter by `tag`, `backend`, or `account`. Repeated filters use AND semantics:
 
 ```bash
 slopctl ps --filter tag=prod
+slopctl ps --filter backend=codex --filter account=work
 ```
 
 Output as a JSON array (one object per pane) instead of the default table:
@@ -383,9 +496,12 @@ Output as a JSON array (one object per pane) instead of the default table:
 slopctl ps --json
 ```
 
-### `slopctl run [--no-wait] [-i] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+### `slopctl run [--backend KIND] [--no-wait] [-i] [--ready-timeout SECS] [-a NAME] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
-Open a new Claude pane in the slopd tmux session. Prints the new pane's ID on stdout. The pane's window is created in the **background** (`tmux new-window -d`), so spawning a pane never yanks clients already watching the session to it — use `--interactive` (below) when you do want to land on the new pane.
+Open a new agent pane in the slopd tmux session. Prints the new pane's ID on
+stdout. The window is created in the **background** (`tmux new-window -d`), so
+spawning never moves clients already watching the session — use `--interactive`
+when you do want to land on the new pane.
 
 ```bash
 PANE=$(slopctl run)
@@ -411,6 +527,15 @@ Use `-a` / `--account NAME` to launch the pane under a named account from `[acco
 PANE=$(slopctl run --account work)
 ```
 
+Use `--backend KIND` for a one-off backend override without declaring another
+account. The account still supplies its config directory and custom executable;
+if that executable is a different canonical backend binary, slopd swaps it to
+the selected backend's canonical binary:
+
+```bash
+PANE=$(slopctl run --backend opencode)
+```
+
 Use `-c` / `--start-directory` to set the working directory for this session, overriding the global `[run] start_directory` from config:
 
 ```bash
@@ -418,10 +543,14 @@ PANE=$(slopctl run -c ~/code/other-project)
 PANE=$(slopctl run --start-directory ~/code/other-project)
 ```
 
+For local `slopctl`, relative paths are resolved against the client's current
+directory. A remote `iroh-slopctl` requires an absolute path because its local
+cwd has no meaning on the daemon host.
+
 Use `-e` / `--env KEY=VALUE` (repeatable) to add environment variables to the new pane. Values support `$VAR` / `${VAR}` expansion against slopctl's environment; a missing variable is an error:
 
 ```bash
-PANE=$(slopctl run --env FOO=bar --env TOKEN=${MY_TOKEN})
+PANE=$(slopctl run --env FOO=bar --env 'TOKEN=${MY_TOKEN}')
 ```
 
 Use `--env-file PATH` (repeatable) to load environment variables from a dotenv-style file (`KEY=VALUE` per line, `#` comments, blank lines ignored). Files are loaded in the order given; later files and `--env` flags override earlier ones, and CLI flags override `[run.env]` / `[run.env_files]` from config:
@@ -454,25 +583,39 @@ Open a new pane whose agent session **starts as a copy** of `PANE_ID`'s conversa
 FORK=$(slopctl fork %1)          # branch %1's conversation into a fresh pane
 ```
 
-How the copy is made is backend-specific, but both use the agent's own native fork so history is duplicated faithfully rather than re-sent:
+How the copy is made is backend-specific, using the agent's native fork rather
+than re-sending the conversation:
 
 - **Claude Code** — spawns `claude --resume <src> --fork-session` with a freshly minted `--session-id`, so the new pane is a distinct session whose transcript is copied from the source's.
 - **opencode** — calls the source pane's server `POST /session/:id/fork`, which creates a new top-level session copying the source's messages, then binds the new pane to it.
+- **Codex** — launches `codex fork <SESSION_ID>`; Codex creates the new rollout
+  lazily when its first prompt is submitted, and the resulting `SessionStart`
+  hook binds the new session ID.
 
-The fork records the source as its `PARENT` (visible in `ps`), so provenance is clear. Because Claude resolves a resumed transcript by working directory, `--start-directory` defaults to the source pane's cwd; overriding it to a different directory will usually make a Claude fork fail to find the history (opencode is unaffected). `-i` / `--no-wait` / `-e` / `--env-file` behave as they do for `run`.
+The fork records the source as its `PARENT` (visible in `ps`), so provenance is
+clear. Because Claude resolves a resumed transcript by working directory,
+`--start-directory` defaults to the source pane's cwd; overriding it to a
+different directory will usually make a Claude fork fail to find the history.
+OpenCode and Codex do not have that cwd-based transcript lookup constraint.
+`-i` / `--no-wait` / `-e` / `--env-file` behave as they do for `run`.
 
 ### `slopctl kill <PANE_ID>`
 
-Terminate a Claude pane.
+Terminate a managed agent pane.
 
 ```bash
 slopctl kill %2
 ```
 
 ### `slopctl send <PANE_ID> <PROMPT> [--interrupt] [--timeout SECS]`
-### `slopctl send <KEY=VALUE> <PROMPT> [--select one|any|all] [--interrupt] [--timeout SECS]`
+### `slopctl send <KEY=VALUE> <PROMPT> [--filter KEY=VALUE]... [--select one|any|all] [--interrupt] [--timeout SECS]`
 
-Type `PROMPT` into a pane (or panes matching a filter) and wait until Claude acknowledges it via the `UserPromptSubmit` hook. Defaults to a 60-second timeout. The input line is cleared (Ctrl+U) before the prompt is typed, so a stale draft or a ghosted autocomplete suggestion left in the box can't concatenate onto it — the prompt is submitted verbatim.
+Submit `PROMPT` to a pane or to panes matching filters. Claude Code and Codex
+use their visible tmux composers and wait for prompt-acceptance confirmation;
+Codex input uses bracketed paste to avoid treating the following Enter as a
+newline. OpenCode replaces the visible TUI composer through its local API and
+then sends a physical Enter, so slash commands retain normal TUI semantics.
+The default timeout is 60 seconds.
 
 When the first positional argument contains `=`, it is treated as a filter instead of a pane ID.
 
@@ -487,13 +630,17 @@ slopctl send %1 "Cancel that — do this instead" --interrupt
 # Send to all panes tagged "worker"
 slopctl send tag=worker "Report your status" --select all
 
-# Send to any one pane tagged "idle"
-slopctl send tag=idle "Start task X" --select one
+# Combine tag/backend/account filters with AND semantics
+slopctl send tag=worker "Run the tests" \
+  --filter backend=codex --filter account=work --select all
 
-# Compact the context of all running agents to reclaim context window
+# Send to any one idle worker
+slopctl send tag=idle "Start task X" --select any
+
+# Compact the context on backends that support this slash command
 slopctl send tag=worker "/compact" --select all
 
-# Reset a specific agent's conversation history entirely
+# Reset a pane's conversation where the backend supports this slash command
 slopctl send %1 "/clear"
 ```
 
@@ -505,11 +652,14 @@ slopctl send %1 "/clear"
 | `any` | Send to one arbitrarily chosen matching pane |
 | `all` | Send to all matching panes |
 
-`--interrupt` / `-i`: Preempt a running turn with Escape before sending, then let it settle before typing so the Escape isn't read as an escape sequence that swallows the first character. (This differs from the standalone `slopctl interrupt`, which sends the fuller Ctrl+C / Ctrl+D / Escape sequence but never types after — so the eaten-character hazard doesn't apply there.)
+Supported filter keys are `tag`, `backend`, and `account`; repeated filters use
+AND semantics. `--interrupt` / `-i` preempts the active turn before submitting
+the new prompt.
 
 ### `slopctl interrupt <PANE_ID>`
 
-Send Ctrl+C, Ctrl+D, and Escape to a pane to interrupt a running agent.
+Interrupt a running agent using its backend-native path: OpenCode's abort API,
+Codex's Escape cancel key, or Claude Code's Ctrl+C / Ctrl+D / Escape sequence.
 
 ```bash
 slopctl interrupt %1
@@ -535,7 +685,8 @@ slopctl restore
 
 ### `slopctl hook <EVENT>`
 
-Forward a Claude lifecycle hook event to slopd. Reads the JSON payload from stdin. Normally called automatically from Claude's settings hooks — you do not need to invoke this manually.
+Forward a Claude Code or Codex lifecycle hook event to slopd. Reads the JSON
+payload from stdin. This is normally called by injected hooks.
 
 ```bash
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
@@ -563,7 +714,7 @@ slopctl listen --hook Stop --pane-id %1
 # slopd state-change events only
 slopctl listen --event StateChange
 
-# Transcript records only (Claude conversation content)
+# Transcript records only
 slopctl listen --transcript user --transcript assistant
 
 # Mix sources: hook Stop events and state changes for a pane
@@ -596,7 +747,7 @@ One-shot version of `listen`: same filter surface and same output (the `{"subscr
 # Wait until pane reaches the ready state
 slopctl wait --event DetailedStateChange --pane-id %1 --until detailed_state=ready
 
-# Wait for the next UserPromptSubmit on a tagged pane (60s default timeout)
+# Wait for the next UserPromptSubmit on a pane (60s default timeout)
 slopctl wait --hook UserPromptSubmit --pane-id %1
 
 # Wait for an assistant message that contains a text block
@@ -674,9 +825,20 @@ slopctl tags %1
 
 ## Multi-backend support (OpenCode and Codex)
 
-slopd can drive [Claude Code](https://claude.com/claude-code), [OpenCode](https://opencode.ai), or OpenAI Codex panes. Each pane's backend is selected by its account (default `claude`).
+slopd can drive [Claude Code](https://claude.com/claude-code),
+[OpenCode](https://opencode.ai), or OpenAI Codex panes. Each pane's backend is
+selected by its account (default `claude`) or a one-off `slopctl run --backend`
+override. `slopctl ps` records both `BACKEND` and `ACCOUNT`, and either can be
+used as a filter.
 
-OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drives an opencode pane over that API — no Claude-style hooks, no transcript file tailing. slopd spawns the pane with a pinned `--port` on `127.0.0.1`, then subscribes to the `GET /event` SSE stream (with a `/session/status` + `/session` poll as backstop) to track state, `POST /prompt_async` to send, `POST /abort` to interrupt, and `GET /message` for transcripts. opencode's signals normalize onto slopd's existing state machine, so the daemon core stays agent-agnostic.
+OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd
+spawns each pane with a pinned port on `127.0.0.1` and subscribes to `GET /event`
+SSE, with `/session` and `/session/status` polling as a backstop. User input is
+placed in the visible composer through `/tui/clear-prompt` and
+`/tui/append-prompt`, then submitted with a physical Enter. Interrupt uses
+`POST /session/:id/abort`, while transcripts come from `GET
+/session/:id/message`. These signals are normalized onto the same state, hook,
+and transcript interfaces used by the other backends.
 
 > **No server password.** slopd deliberately does **not** set `OPENCODE_SERVER_PASSWORD`: the opencode TUI is itself a client of its embedded server, and its internal client does not authenticate — setting a password makes the TUI `401` against its own server and crash on startup (verified against real opencode 1.17.x). The embedded server is therefore open on `127.0.0.1`, which matches the local-only threat model slopd already assumes. (Headless `opencode serve` does support a password; slopd uses TUI mode.)
 
@@ -684,7 +846,7 @@ OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd drive
 
 ```toml
 [accounts.oc]
-backend = "opencode"                      # selects the opencode backend
+backend = "opencode"               # selects the opencode backend
 config_dir = "~/.config/opencode"  # agent config dir (exported as OPENCODE_CONFIG_DIR)
 ```
 
@@ -703,7 +865,10 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir
 
 ### What works identically
 
-`send`, `interrupt`, `listen`, `wait`, `transcript`, `tag`, `kill`, `ps`, and the iroh remote path are all agent-agnostic. An opencode pane's state (`ready` / `busy_processing` / …) means the same as a Claude pane's. `send` is in fact more reliable for opencode (HTTP POST, not keystroke-the-TUI-and-hope).
+`run`, `fork`, `send`, `interrupt`, `listen`, `wait`, `transcript`, tagging,
+backup/restore, `ps`, and the iroh remote path are backend-aware behind the same
+CLI. A state such as `ready`, `busy_tool_use`, or `awaiting_input_permission`
+has the same meaning regardless of backend.
 
 ### Current limitations
 
@@ -731,7 +896,7 @@ remote path; no Codex-specific shared server is required.
 [accounts.codex]
 backend = "codex"
 config_dir = "~/.codex"      # exported as CODEX_HOME
-executable = "codex"         # needed when global [run] executable is Claude
+executable = "codex"         # needed only if global [run] executable is another backend
 ```
 
 ```bash
@@ -790,7 +955,9 @@ Codex compatibility notes:
 
 ## Claude hook integration
 
-When slopd starts a Claude pane it automatically injects `slopctl hook <event>` entries into `~/.claude/settings.json` for **all** supported lifecycle events:
+When slopd starts a Claude Code pane it injects `slopctl hook <event>` entries
+into that account's `settings.json` (`$CLAUDE_CONFIG_DIR/settings.json`, or the
+standard `~/.claude/settings.json`) for all supported lifecycle events:
 
 | Category | Events |
 |----------|--------|
@@ -804,17 +971,29 @@ When slopd starts a Claude pane it automatically injects `slopctl hook <event>` 
 | Elicitation | `Elicitation`, `ElicitationResult` |
 | Misc | `Notification` |
 
-Hook injection is **idempotent** and **concurrency-safe**: an exclusive advisory lock prevents duplicate entries even if multiple slopd processes run simultaneously.
+Hook injection is **idempotent** and **concurrency-safe**: an exclusive advisory
+lock prevents duplicate entries even if multiple slopd processes target the
+same config directory.
 
-Because the hooks live in the shared `~/.claude/settings.json`, **any** Claude on the machine fires them — including sessions slopd never spawned. A hook from a pane that has just been spawned may arrive before slopd has finished registering it, so slopd briefly waits (up to a couple of seconds) for the pane to appear in its managed set before deciding the pane is external. The one exception is `SessionEnd`: it is a terminal event (the pane is exiting and, if it is not already managed, never will be), so slopd answers it immediately. Claude cancels a `SessionEnd` hook that runs past its ~1.5 s budget, and an external pane's exit would otherwise sit through the full registration wait and surface as `SessionEnd hook [...] failed: Hook cancelled`.
+Hooks are shared by every Claude process using that same config directory,
+including sessions slopd did not spawn. A hook from a newly-created pane can
+arrive before slopd has registered it, so the daemon briefly waits for the pane
+to enter its managed set before treating it as external. `SessionEnd` is handled
+immediately because it is terminal and Claude gives that hook a short deadline.
 
 ### Auto-continue on failure
 
-When a turn ends with `StopFailure` (e.g. Claude hit an API 500), it would otherwise just stop and wait for a human to resume it — bad for an unattended pane. slopd instead recovers on its own: it sends a `continue` prompt after an exponential backoff, retrying until the turn completes or the attempt cap is reached. The pane stays in the `ready` state throughout; the retry counter lives in per-pane metadata.
+When Claude Code emits `StopFailure`, slopd sends `continue` after an
+exponential backoff. OpenCode's corresponding `session.error` path re-submits
+the last accepted non-command prompt. Both retry until the turn succeeds or the
+attempt cap is reached. Codex does not currently expose an equivalent failure
+event to this policy.
 
-The resend is **edge-triggered** by `StopFailure` (the end of a turn), not a periodic timer — so a `continue` that kicks off a long-running turn never provokes a second one while that turn is still going. Retrying stops as soon as any of these happens:
+Retry is **edge-triggered** by the backend's failure event, not a periodic
+timer, so a long-running retry does not provoke another submission while it is
+still active. Retrying stops as soon as any of these happens:
 
-- the turn finally succeeds (a clean `Stop`) — the counter resets, ready for a future failure;
+- the turn succeeds (`Stop` / `session.idle`) — the counter resets;
 - `max_retry_attempts` consecutive failures are reached — slopd gives up and leaves the pane idle;
 - you submit a prompt yourself — taking over cancels any pending retry.
 
@@ -826,7 +1005,7 @@ All of this is configurable (or disabled) under `[run]` — see `auto_continue_o
 
 Clients can subscribe to the live event stream with `slopctl listen`. Events are delivered as newline-delimited JSON objects. There are three event sources:
 
-### `source:hook` — Claude lifecycle hook events
+### `source:hook` — normalized agent lifecycle events
 
 ```json
 {
@@ -837,11 +1016,15 @@ Clients can subscribe to the live event stream with `slopctl listen`. Events are
 }
 ```
 
-`event_type` is the Claude hook name (e.g. `SessionStart`, `Stop`, `PreToolUse`). `payload` is the raw JSON object Claude passed to the hook.
+`event_type` uses the Claude-style lifecycle vocabulary (for example,
+`SessionStart`, `Stop`, or `PreToolUse`) across all backends. Claude Code and
+Codex payloads come from their hooks. OpenCode has no hook file; slopd maps its
+SSE events onto the same names and includes the original OpenCode event data
+under `properties`.
 
 ### `source:slopd` — daemon state events
 
-Emitted by slopd itself whenever a pane's state changes.
+Emitted by slopd itself for pane lifecycle and state changes.
 
 ```json
 {
@@ -867,9 +1050,27 @@ Emitted by slopd itself whenever a pane's state changes.
 }
 ```
 
-`StateChange` fires when the coarse `state` transitions (`booting_up` → `ready` → `busy` → `awaiting_input`). `DetailedStateChange` fires on every hook event that updates the fine-grained state.
+`StateChange` fires when the coarse `state` transitions (`booting_up` → `ready`
+→ `busy` → `awaiting_input`). `DetailedStateChange` fires whenever a hook,
+transcript record, or backend driver changes the fine-grained state.
 
 Detailed state values: `booting_up`, `ready`, `busy_processing`, `busy_tool_use`, `busy_subagent`, `busy_compacting`, `awaiting_input_permission`, `awaiting_input_elicitation`.
+
+#### `PaneCreated` — a pane was launched
+
+Emitted after a new pane has been registered:
+
+```json
+{
+  "source": "slopd",
+  "event_type": "PaneCreated",
+  "pane_id": "%42",
+  "payload": {
+    "pane_id": "%42",
+    "parent_pane_id": "%7"
+  }
+}
+```
 
 #### `PaneDestroyed` — a managed pane died
 
@@ -918,9 +1119,12 @@ journalctl --user -u slopd | grep 'pane %119 died'
 #   cwd=/home/claude preceding_hook=after-kill-pane
 ```
 
-### `source:transcript` — Claude conversation transcript
+### `source:transcript` — normalized agent transcript
 
-slopd tails each pane's Claude transcript `.jsonl` file and re-broadcasts every record as an event. This lets subscribers read Claude's conversation in real time without polling the file system.
+Claude Code and Codex records are read from their JSONL transcript/rollout
+files. OpenCode records are mapped from its SSE stream and message API. The
+payload shape and granularity remain backend-specific, but all are published
+through the same source:
 
 ```json
 {
@@ -931,11 +1135,15 @@ slopd tails each pane's Claude transcript `.jsonl` file and re-broadcasts every 
 }
 ```
 
-`event_type` is the `type` field from the transcript record (e.g. `user`, `assistant`, `progress`, `queue-operation`).
+Typical `event_type` values include `user`, `assistant`, `progress`, and
+backend-specific part/tool types.
 
 ### Filtering
 
-Subscriptions can be filtered by any combination of `event_type`, `pane_id`, and `session_id`. Multiple filter objects are OR-ed; fields within a single filter object are AND-ed.
+Subscriptions can be filtered by source/event type, pane ID, session ID, and
+payload predicates. At the protocol level, multiple filter objects are OR-ed
+and fields within one filter are AND-ed; the `listen` and `wait` options build
+these filters for you.
 
 ---
 
@@ -952,8 +1160,18 @@ For a local daemon, configure the ACP host's custom agent executable as:
 slopd-acp --account work --backend codex
 ```
 
-The socket defaults to `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Use `--socket PATH`
-for another local instance.
+The socket normally defaults to `$XDG_RUNTIME_DIR/slopd/slopd.sock`, with the
+runtime-directory fallback described under [Requirements](#requirements). Use
+`--socket PATH` for another local instance.
+
+Useful adapter-wide launch options include:
+
+- `--account NAME` and `--backend claude|opencode|codex`;
+- repeatable `--env KEY=VALUE` and `--agent-arg ARG`;
+- `--working-directory PATH` to override every ACP-provided cwd;
+- `--ready-timeout`, `--send-timeout`, and `--turn-timeout`;
+- `--forward-buzz-env` to explicitly forward the adapter's allowlisted Buzz
+  credentials into panes (off by default, especially important over iroh).
 
 The adapter maps ACP onto slopd as follows:
 
@@ -965,11 +1183,24 @@ The adapter maps ACP onto slopd as follows:
 | prompt completion | the pane's busy-to-ready state transition |
 | `session/cancel` | `interrupt` |
 
+For Buzz, the adapter also implements the
+`_goose/unstable/session/steer` extension. It publishes the active run ID and
+routes steering text into the existing pane while the original ACP turn remains
+in flight, instead of opening a second session.
+
 Every adapter-created pane receives the `acp` slopd tag. ACP session IDs have
-the form `slopd:%42`, but the mapping is intentionally process-local: if the ACP
-host restarts `slopd-acp`, the old pane remains managed by slopd while the new
-adapter process creates a new session. Automatic reattachment is not advertised
-as `loadSession`.
+the form `slopd:%42`, but the mapping is intentionally process-local and the
+adapter advertises `loadSession: false`. On orderly stdin shutdown it interrupts
+active turns and kills its live panes. After an abrupt adapter crash, panes can
+remain managed by slopd, but a replacement adapter does not automatically
+reattach to them.
+
+`--max-sessions N` limits **live panes**, not logical ACP sessions (default 64).
+At the limit, the adapter kills the least-recently-used inactive pane while
+retaining its process-local ACP session. If that session is used again, it
+creates another pane and resumes the captured backend-native session ID when
+available. Active turns are never selected for eviction; if every live pane is
+active, the new session/prompt fails instead of disrupting one.
 
 ### ACP limitations
 
@@ -1035,7 +1266,10 @@ the shared `iroh-slopctl` default.
  iroh-slopctl ──── iroh ────► iroh-slopd ──► slopd.sock ──► slopd
 ```
 
-`iroh-slopctl` supports all the same subcommands as `slopctl` (plus `info`). It is a drop-in remote replacement.
+`iroh-slopctl` exposes the same common command set as `slopctl`, plus `info`.
+Remote `run`/`fork` require an absolute `--start-directory`, `--interactive` is
+not available because the tmux server is remote, and `tags` requires an
+explicit pane ID.
 
 ### iroh-slopd
 
@@ -1086,11 +1320,16 @@ Use `--addr-file PATH` to write the full `EndpointAddr` JSON to a file on startu
 iroh-slopd --addr-file /tmp/iroh-addr.json
 ```
 
+Use `iroh-slopd --socket PATH` to bridge a non-default local slopd control
+socket. `--config PATH` selects another iroh server identity/allowlist file.
 Verbosity can be increased with `-v` / `-vv` / `-vvv`.
 
 ### iroh-slopctl
 
-`iroh-slopctl` is a remote slopctl that connects to `iroh-slopd` instead of a local Unix socket. It supports all the same commands as `slopctl` (see [slopctl commands](#slopctl-commands)) plus an `info` subcommand.
+`iroh-slopctl` is a remote slopctl that connects to `iroh-slopd` instead of a
+local Unix socket. It exposes the common daemon commands described under
+[slopctl commands](#slopctl-commands), but not the local-only `hook` and
+`tmux-hook` commands, and adds an `info` subcommand.
 
 **Config file:** `~/.config/iroh-slopctl/config.toml`
 

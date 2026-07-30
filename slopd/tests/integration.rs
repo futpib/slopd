@@ -4020,7 +4020,7 @@ fn notification_non_idle_does_not_unstick() {
 }
 
 #[test]
-fn pane_state_resets_to_booting_up_on_slopd_restart() {
+fn pane_state_preserves_last_known_state_on_slopd_restart() {
     build_bin("slopd");
     build_bin("slopctl");
 
@@ -4056,18 +4056,19 @@ fn pane_state_resets_to_booting_up_on_slopd_restart() {
     kill_slopd(slopd);
     let slopd2 = env.spawn_slopd();
 
-    // State must be reset to booting_up
+    // With no transcript records to replay, recovery falls back to the durable
+    // tmux state instead of leaving a live pane stuck in booting_up.
     std::thread::sleep(Duration::from_millis(100));
     let (state, detailed) = env.pane_state(&pane_id);
     assert_eq!(
         state,
-        libslop::PaneState::BootingUp,
-        "expected booting_up after restart"
+        libslop::PaneState::Ready,
+        "expected ready after restart"
     );
     assert_eq!(
         detailed,
-        libslop::PaneDetailedState::BootingUp,
-        "expected booting_up after restart"
+        libslop::PaneDetailedState::Ready,
+        "expected ready after restart"
     );
 
     // Fire SessionStart again to confirm normal transitions still work after restart
@@ -15008,7 +15009,7 @@ fn opencode_listen_transcript_streams_live_over_sse() {
     std::thread::spawn(move || {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
                 break;
             }
@@ -15188,7 +15189,10 @@ fn opencode_listen_hook_fires_synthesized_events() {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines().flatten() {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             if tx.send(line).is_err() {
                 break;
             }
@@ -15383,7 +15387,10 @@ fn opencode_leaked_subagent_pruned_when_idle_event_missed() {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines().flatten() {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             if tx.send(line).is_err() {
                 break;
             }
@@ -15561,7 +15568,10 @@ fn opencode_subagent_emits_subagent_hooks() {
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines().flatten() {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             if tx.send(line).is_err() {
                 break;
             }

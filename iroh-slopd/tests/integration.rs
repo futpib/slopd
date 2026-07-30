@@ -1,4 +1,4 @@
-use libsloptest::{build_bin, cargo_bin, kill_child, kill_slopd, TestEnv};
+use libsloptest::{TestEnv, build_bin, cargo_bin, kill_child, kill_slopd};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -32,11 +32,15 @@ fn start_iroh_slopd(
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(contents) = std::fs::read_to_string(&addr_file)
-            && !contents.is_empty() {
-                break;
-            }
+            && !contents.is_empty()
+        {
+            break;
+        }
         if std::time::Instant::now() > deadline {
-            panic!("timed out waiting for iroh-slopd addr file at {}", addr_file.display());
+            panic!(
+                "timed out waiting for iroh-slopd addr file at {}",
+                addr_file.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -51,7 +55,11 @@ fn iroh_slopctl_info(iroh_slopctl_config_dir: &std::path::Path) -> String {
         .env("XDG_CONFIG_HOME", iroh_slopctl_config_dir)
         .output()
         .expect("failed to run iroh-slopctl info");
-    assert!(output.status.success(), "iroh-slopctl info failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "iroh-slopctl info failed: {:?}",
+        output
+    );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -62,7 +70,11 @@ fn iroh_slopd_authorize(iroh_config_dir: &std::path::Path, client_endpoint_id: &
         .env("XDG_CONFIG_HOME", iroh_config_dir)
         .output()
         .expect("failed to run iroh-slopd authorize");
-    assert!(output.status.success(), "iroh-slopd authorize failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "iroh-slopd authorize failed: {:?}",
+        output
+    );
 }
 
 /// Run iroh-slopctl with given args, config, and addr-file.
@@ -100,10 +112,8 @@ fn iroh_e2e_unauthorized_client_is_rejected() {
     let iroh_client_config_dir = libsloptest::tempfile::tempdir().unwrap();
 
     // Start iroh-slopd WITHOUT authorizing the client.
-    let (iroh_slopd, addr_file) = start_iroh_slopd(
-        env.runtime_dir.path(),
-        iroh_server_config_dir.path(),
-    );
+    let (iroh_slopd, addr_file) =
+        start_iroh_slopd(env.runtime_dir.path(), iroh_server_config_dir.path());
 
     // Ensure the client has a key generated.
     let _client_id = iroh_slopctl_info(iroh_client_config_dir.path());
@@ -154,16 +164,24 @@ fn iroh_e2e_authorized_client_can_list_panes() {
     iroh_slopd_authorize(iroh_server_config_dir.path(), &client_endpoint_id);
 
     // Start iroh-slopd.
-    let (iroh_slopd, addr_file) = start_iroh_slopd(
-        env.runtime_dir.path(),
-        iroh_server_config_dir.path(),
-    );
+    let (iroh_slopd, addr_file) =
+        start_iroh_slopd(env.runtime_dir.path(), iroh_server_config_dir.path());
 
     // Spawn a pane via local slopctl so there's something to list.
     let run_output = env.slopctl(&["run"]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-    assert!(pane_id.starts_with('%'), "expected pane_id, got: {}", pane_id);
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        pane_id.starts_with('%'),
+        "expected pane_id, got: {}",
+        pane_id
+    );
 
     // Use iroh-slopctl to list panes remotely.
     let output = iroh_slopctl(iroh_client_config_dir.path(), &addr_file, &["ps", "--json"]);
@@ -171,14 +189,25 @@ fn iroh_e2e_authorized_client_can_list_panes() {
     kill_child(iroh_slopd);
     kill_slopd(slopd);
 
-    assert!(output.status.success(), "iroh-slopctl ps --json failed: {:?}", output);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let panes: Vec<serde_json::Value> = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("failed to parse ps --json output: {} -- output: {}", e, stdout));
     assert!(
-        panes.iter().any(|p| p["pane_id"].as_str() == Some(&pane_id)),
+        output.status.success(),
+        "iroh-slopctl ps --json failed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let panes: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse ps --json output: {} -- output: {}",
+            e, stdout
+        )
+    });
+    assert!(
+        panes
+            .iter()
+            .any(|p| p["pane_id"].as_str() == Some(&pane_id)),
         "expected pane {} in remote ps output: {:?}",
-        pane_id, panes,
+        pane_id,
+        panes,
     );
 }
 
@@ -205,22 +234,42 @@ fn iroh_e2e_run_and_kill_via_iroh() {
     let client_endpoint_id = iroh_slopctl_info(iroh_client_config_dir.path());
     iroh_slopd_authorize(iroh_server_config_dir.path(), &client_endpoint_id);
 
-    let (iroh_slopd, addr_file) = start_iroh_slopd(
-        env.runtime_dir.path(),
-        iroh_server_config_dir.path(),
-    );
+    let (iroh_slopd, addr_file) =
+        start_iroh_slopd(env.runtime_dir.path(), iroh_server_config_dir.path());
 
     // Run a pane remotely via iroh-slopctl. --no-wait keeps this fire-and-forget
     // (the test only needs the pane to exist), independent of run's
     // wait-for-ready default.
-    let run_output = iroh_slopctl(iroh_client_config_dir.path(), &addr_file, &["run", "--no-wait"]);
-    assert!(run_output.status.success(), "iroh-slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
-    assert!(pane_id.starts_with('%'), "expected pane_id, got: {}", pane_id);
+    let run_output = iroh_slopctl(
+        iroh_client_config_dir.path(),
+        &addr_file,
+        &["run", "--no-wait"],
+    );
+    assert!(
+        run_output.status.success(),
+        "iroh-slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        pane_id.starts_with('%'),
+        "expected pane_id, got: {}",
+        pane_id
+    );
 
     // Kill it remotely.
-    let kill_output = iroh_slopctl(iroh_client_config_dir.path(), &addr_file, &["kill", &pane_id]);
-    assert!(kill_output.status.success(), "iroh-slopctl kill failed: {:?}", kill_output);
+    let kill_output = iroh_slopctl(
+        iroh_client_config_dir.path(),
+        &addr_file,
+        &["kill", &pane_id],
+    );
+    assert!(
+        kill_output.status.success(),
+        "iroh-slopctl kill failed: {:?}",
+        kill_output
+    );
     let kill_stdout = String::from_utf8_lossy(&kill_output.stdout);
     assert_eq!(kill_stdout.trim(), pane_id, "kill should print the pane_id");
 
@@ -230,7 +279,9 @@ fn iroh_e2e_run_and_kill_via_iroh() {
     let stdout = String::from_utf8_lossy(&ps_output.stdout);
     let panes: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
     assert!(
-        !panes.iter().any(|p| p["pane_id"].as_str() == Some(&pane_id)),
+        !panes
+            .iter()
+            .any(|p| p["pane_id"].as_str() == Some(&pane_id)),
         "pane {} should be gone after kill, but still in ps output",
         pane_id,
     );

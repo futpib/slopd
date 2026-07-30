@@ -53,9 +53,10 @@ fn parse_subcommands(help: &str) -> BTreeSet<String> {
             }
             // Each command line looks like "  status  Show slopd uptime..."
             if let Some(name) = trimmed.split_whitespace().next()
-                && name != "help" {
-                    commands.insert(name.to_string());
-                }
+                && name != "help"
+            {
+                commands.insert(name.to_string());
+            }
         }
     }
     commands
@@ -94,15 +95,17 @@ fn parse_options(help: &str) -> BTreeMap<String, String> {
         for token in flag_col.split_whitespace() {
             let token = token.trim_end_matches(',');
             if let Some(flag) = token.strip_prefix("--")
-                && !flag.is_empty() {
-                    options.insert(flag.to_string(), trimmed.to_string());
-                }
+                && !flag.is_empty()
+            {
+                options.insert(flag.to_string(), trimmed.to_string());
+            }
         }
         // Positional arguments look like: <PANE_ID> or [EXTRA_ARGS]...
         if let Some(first) = flag_col.split_whitespace().next()
-            && (first.starts_with('<') || first.starts_with('[')) {
-                options.insert(first.to_string(), trimmed.to_string());
-            }
+            && (first.starts_with('<') || first.starts_with('['))
+        {
+            options.insert(first.to_string(), trimmed.to_string());
+        }
     }
     options
 }
@@ -112,10 +115,11 @@ fn iroh_slopctl_is_superset_of_slopctl() {
     build_bin("slopctl");
     build_bin("iroh-slopctl");
 
-    let slopctl_only: BTreeSet<String> =
-        SLOPCTL_ONLY_COMMANDS.iter().map(|s| s.to_string()).collect();
-    let iroh_only: BTreeSet<String> =
-        IROH_ONLY_COMMANDS.iter().map(|s| s.to_string()).collect();
+    let slopctl_only: BTreeSet<String> = SLOPCTL_ONLY_COMMANDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let iroh_only: BTreeSet<String> = IROH_ONLY_COMMANDS.iter().map(|s| s.to_string()).collect();
 
     // --- Check subcommands ---
     let slopctl_help = help_output("slopctl", &["--help"]);
@@ -205,9 +209,7 @@ fn iroh_slopctl_is_superset_of_slopctl() {
     }
 
     // --- Check per-subcommand options ---
-    let shared_cmds: BTreeSet<_> = slopctl_cmds
-        .intersection(&iroh_cmds)
-        .collect();
+    let shared_cmds: BTreeSet<_> = slopctl_cmds.intersection(&iroh_cmds).collect();
     let mut failures = Vec::new();
     for cmd in &shared_cmds {
         let slopctl_cmd_help = help_output("slopctl", &[cmd, "--help"]);

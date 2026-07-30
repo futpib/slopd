@@ -10,7 +10,7 @@
 //! (they need the daemon's shared state/event types).
 
 use libslop::PaneDetailedState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 /// Basic-auth username the opencode server expects (its default).
@@ -77,7 +77,11 @@ impl OpencodeClient {
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("POST /session {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "POST /session {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
         v.get("id")
@@ -94,20 +98,32 @@ impl OpencodeClient {
     /// it is not confused with a subagent child). Because sessions live in the
     /// shared on-disk store, a pane spawned later with `-s <new id>` will find
     /// it.
-    pub async fn fork_session(&self, session_id: &str, message_id: Option<&str>) -> Result<String, String> {
+    pub async fn fork_session(
+        &self,
+        session_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<String, String> {
         let body = match message_id {
             Some(m) => json!({ "messageID": m }),
             None => json!({}),
         };
         let resp = self
-            .req(reqwest::Method::POST, &format!("/session/{}/fork", session_id))
+            .req(
+                reqwest::Method::POST,
+                &format!("/session/{}/fork", session_id),
+            )
             .json(&body)
             .send()
             .await
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("POST /session/{}/fork {}: {}", session_id, status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "POST /session/{}/fork {}: {}",
+                session_id,
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
         v.get("id")
@@ -130,7 +146,11 @@ impl OpencodeClient {
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("POST /tui/select-session {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "POST /tui/select-session {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         Ok(())
     }
@@ -146,7 +166,11 @@ impl OpencodeClient {
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("GET /session {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "GET /session {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let arr = resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?;
         Ok(arr
@@ -165,7 +189,11 @@ impl OpencodeClient {
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("GET /session/status {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "GET /session/status {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
         Ok(v.get(session_id).cloned())
@@ -184,7 +212,11 @@ impl OpencodeClient {
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("GET /session/status {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "GET /session/status {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
         Ok(v.as_object().cloned().unwrap_or_default())
@@ -235,7 +267,10 @@ impl OpencodeClient {
     pub async fn send_message(&self, session_id: &str, text: &str) -> Result<(), String> {
         let body = json!({ "parts": [{ "type": "text", "text": text }] });
         let resp = self
-            .req(reqwest::Method::POST, &format!("/session/{}/prompt_async", session_id))
+            .req(
+                reqwest::Method::POST,
+                &format!("/session/{}/prompt_async", session_id),
+            )
             .json(&body)
             .send()
             .await
@@ -244,14 +279,21 @@ impl OpencodeClient {
         if status.as_u16() == 204 || status.is_success() {
             Ok(())
         } else {
-            Err(format!("prompt_async {}: {}", status, resp.text().await.unwrap_or_default()))
+            Err(format!(
+                "prompt_async {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ))
         }
     }
 
     /// `POST /session/:id/abort` — interrupt the running turn.
     pub async fn abort(&self, session_id: &str) -> Result<(), String> {
         let resp = self
-            .req(reqwest::Method::POST, &format!("/session/{}/abort", session_id))
+            .req(
+                reqwest::Method::POST,
+                &format!("/session/{}/abort", session_id),
+            )
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -259,20 +301,31 @@ impl OpencodeClient {
         if status.is_success() {
             Ok(())
         } else {
-            Err(format!("abort {}: {}", status, resp.text().await.unwrap_or_default()))
+            Err(format!(
+                "abort {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ))
         }
     }
 
     /// `GET /session/:id/message` — full conversation as `{ info, parts }[]`.
     pub async fn messages(&self, session_id: &str) -> Result<Vec<Value>, String> {
         let resp = self
-            .req(reqwest::Method::GET, &format!("/session/{}/message", session_id))
+            .req(
+                reqwest::Method::GET,
+                &format!("/session/{}/message", session_id),
+            )
             .send()
             .await
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("GET /message {}: {}", status, resp.text().await.unwrap_or_default()));
+            return Err(format!(
+                "GET /message {}: {}",
+                status,
+                resp.text().await.unwrap_or_default()
+            ));
         }
         resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())
     }
@@ -459,7 +512,7 @@ pub fn event_to_detailed(event: &Value) -> Option<PaneDetailedState> {
         // stuck busy. (Auto-RETRY is handled separately on this event.)
         "session.error" => Some(PaneDetailedState::Ready),
         // session.status carries the status object in properties.status.
-        "session.status" => props.get("status").and_then(|s| status_to_detailed(s)),
+        "session.status" => props.get("status").and_then(status_to_detailed),
         "session.compacted" => Some(PaneDetailedState::BusyCompacting),
         "permission.asked" => Some(PaneDetailedState::AwaitingInputPermission),
         // A message is being produced → working. For a tool part, distinguish
@@ -514,7 +567,13 @@ pub fn event_to_hook(event: &Value) -> Option<(&'static str, Value)> {
         "session.error" => ("StopFailure", json!({})),
         "permission.asked" => ("PermissionRequest", json!({})),
         "session.compacted" => ("PreCompact", json!({})),
-        "message.updated" if props.get("info").and_then(|i| i.get("role")).and_then(|r| r.as_str()) == Some("user") => {
+        "message.updated"
+            if props
+                .get("info")
+                .and_then(|i| i.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("user") =>
+        {
             ("UserPromptSubmit", json!({}))
         }
         // Tool start/end ride on message.part.updated (part.type == "tool").
@@ -525,7 +584,11 @@ pub fn event_to_hook(event: &Value) -> Option<(&'static str, Value)> {
                 .and_then(|s| s.get("status"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("running");
-            let input = part().get("state").and_then(|s| s.get("input")).cloned().unwrap_or(Value::Null);
+            let input = part()
+                .get("state")
+                .and_then(|s| s.get("input"))
+                .cloned()
+                .unwrap_or(Value::Null);
             // The `question` tool is opencode's elicitation → Claude Elicitation hooks.
             if tool_name == "question" {
                 let name = match status {
@@ -566,12 +629,22 @@ pub fn event_to_transcript(event: &Value) -> Option<TranscriptRecord> {
     let props = event.get("properties").unwrap_or(&Value::Null);
     match t {
         "message.updated" => {
-            let role = props.get("info").and_then(|i| i.get("role")).and_then(|r| r.as_str()).unwrap_or("user").to_string();
+            let role = props
+                .get("info")
+                .and_then(|i| i.get("role"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("user")
+                .to_string();
             Some((role, props.clone()))
         }
         "message.part.updated" => {
             // A part (text/tool/etc.). Type it by the part's own type if present.
-            let part_type = props.get("part").and_then(|p| p.get("type")).and_then(|v| v.as_str()).unwrap_or("part").to_string();
+            let part_type = props
+                .get("part")
+                .and_then(|p| p.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("part")
+                .to_string();
             Some((part_type, props.clone()))
         }
         _ => None,
@@ -597,28 +670,57 @@ mod tests {
     #[test]
     fn status_to_detailed_idle_states() {
         for s in ["idle", "ready", "waiting", "completed"] {
-            assert_eq!(status_to_detailed(&json!({"status": s})), Some(PaneDetailedState::Ready), "{}", s);
+            assert_eq!(
+                status_to_detailed(&json!({"status": s})),
+                Some(PaneDetailedState::Ready),
+                "{}",
+                s
+            );
         }
     }
 
     #[test]
     fn status_to_detailed_busy_states() {
-        assert_eq!(status_to_detailed(&json!({"status": "running"})), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(status_to_detailed(&json!({"status": "tool"})), Some(PaneDetailedState::BusyToolUse));
-        assert_eq!(status_to_detailed(&json!({"status": "compacting"})), Some(PaneDetailedState::BusyCompacting));
-        assert_eq!(status_to_detailed(&json!({"status": "permission"})), Some(PaneDetailedState::AwaitingInputPermission));
+        assert_eq!(
+            status_to_detailed(&json!({"status": "running"})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"status": "tool"})),
+            Some(PaneDetailedState::BusyToolUse)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"status": "compacting"})),
+            Some(PaneDetailedState::BusyCompacting)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"status": "permission"})),
+            Some(PaneDetailedState::AwaitingInputPermission)
+        );
     }
 
     #[test]
     fn status_to_detailed_accepts_state_alias_and_case() {
-        assert_eq!(status_to_detailed(&json!({"state": "IDLE"})), Some(PaneDetailedState::Ready));
-        assert_eq!(status_to_detailed(&json!({"state": "Running"})), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            status_to_detailed(&json!({"state": "IDLE"})),
+            Some(PaneDetailedState::Ready)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"state": "Running"})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
     }
 
     #[test]
     fn status_to_detailed_boolean_fallbacks() {
-        assert_eq!(status_to_detailed(&json!({"busy": true})), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(status_to_detailed(&json!({"awaitingPermission": true})), Some(PaneDetailedState::AwaitingInputPermission));
+        assert_eq!(
+            status_to_detailed(&json!({"busy": true})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"awaitingPermission": true})),
+            Some(PaneDetailedState::AwaitingInputPermission)
+        );
     }
 
     #[test]
@@ -659,26 +761,55 @@ mod tests {
     #[test]
     fn event_to_detailed_maps_real_event_types() {
         let sid = "ses_x";
-        assert_eq!(event_to_detailed(&ev("session.idle", sid)), Some(PaneDetailedState::Ready));
         assert_eq!(
-            event_to_detailed(&json!({"type":"session.status","properties":{"sessionID":sid,"status":{"type":"busy"}}})),
+            event_to_detailed(&ev("session.idle", sid)),
+            Some(PaneDetailedState::Ready)
+        );
+        assert_eq!(
+            event_to_detailed(
+                &json!({"type":"session.status","properties":{"sessionID":sid,"status":{"type":"busy"}}})
+            ),
             Some(PaneDetailedState::BusyProcessing)
         );
-        assert_eq!(event_to_detailed(&ev("message.updated", sid)), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            event_to_detailed(&ev("message.updated", sid)),
+            Some(PaneDetailedState::BusyProcessing)
+        );
         // Real tool shape: message.part.updated with part.type=tool + state.status.
         let tool_running = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"running"}}}});
         let tool_completed = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"completed"}}}});
         let text_part = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"text","text":"hi"}}});
-        assert_eq!(event_to_detailed(&tool_running), Some(PaneDetailedState::BusyToolUse));
-        assert_eq!(event_to_detailed(&tool_completed), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(event_to_detailed(&text_part), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            event_to_detailed(&tool_running),
+            Some(PaneDetailedState::BusyToolUse)
+        );
+        assert_eq!(
+            event_to_detailed(&tool_completed),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            event_to_detailed(&text_part),
+            Some(PaneDetailedState::BusyProcessing)
+        );
         // plugin-event names (tool.execute.*) are NOT on the SSE bus → no transition.
         assert_eq!(event_to_detailed(&ev("tool.execute.before", sid)), None);
-        assert_eq!(event_to_detailed(&ev("step-start", sid)), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(event_to_detailed(&ev("permission.asked", sid)), Some(PaneDetailedState::AwaitingInputPermission));
-        assert_eq!(event_to_detailed(&ev("session.compacted", sid)), Some(PaneDetailedState::BusyCompacting));
+        assert_eq!(
+            event_to_detailed(&ev("step-start", sid)),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            event_to_detailed(&ev("permission.asked", sid)),
+            Some(PaneDetailedState::AwaitingInputPermission)
+        );
+        assert_eq!(
+            event_to_detailed(&ev("session.compacted", sid)),
+            Some(PaneDetailedState::BusyCompacting)
+        );
         // A failed turn recovers to Ready.
-        assert_eq!(event_to_detailed(&ev("session.error", sid)), Some(PaneDetailedState::Ready));
+        assert_eq!(
+            event_to_detailed(&ev("session.error", sid)),
+            Some(PaneDetailedState::Ready)
+        );
         // Unrelated event → no transition.
         assert_eq!(event_to_detailed(&ev("catalog.updated", sid)), None);
     }
@@ -691,9 +822,13 @@ mod tests {
         assert_eq!(n, "Stop");
         assert_eq!(p["hook_event_name"], "Stop");
         // session.error → StopFailure
-        assert_eq!(event_to_hook(&ev("session.error", sid)).unwrap().0, "StopFailure");
+        assert_eq!(
+            event_to_hook(&ev("session.error", sid)).unwrap().0,
+            "StopFailure"
+        );
         // user message → UserPromptSubmit (assistant message → no hook)
-        let user_msg = json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"user"}}});
+        let user_msg =
+            json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"user"}}});
         assert_eq!(event_to_hook(&user_msg).unwrap().0, "UserPromptSubmit");
         let asst_msg = json!({"type":"message.updated","properties":{"sessionID":sid,"info":{"role":"assistant"}}});
         assert!(event_to_hook(&asst_msg).is_none());
@@ -705,8 +840,14 @@ mod tests {
         let tool_done = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"tool","tool":"bash","state":{"status":"completed"}}}});
         assert_eq!(event_to_hook(&tool_done).unwrap().0, "PostToolUse");
         // permission/compaction
-        assert_eq!(event_to_hook(&ev("permission.asked", sid)).unwrap().0, "PermissionRequest");
-        assert_eq!(event_to_hook(&ev("session.compacted", sid)).unwrap().0, "PreCompact");
+        assert_eq!(
+            event_to_hook(&ev("permission.asked", sid)).unwrap().0,
+            "PermissionRequest"
+        );
+        assert_eq!(
+            event_to_hook(&ev("session.compacted", sid)).unwrap().0,
+            "PreCompact"
+        );
         // unrelated → none
         assert!(event_to_hook(&ev("server.heartbeat", sid)).is_none());
     }
@@ -716,8 +857,14 @@ mod tests {
         // opencode's `question` tool = Claude's elicitation.
         let pending = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"pending"}}}});
         let completed = json!({"type":"message.part.updated","properties":{"sessionID":"s","part":{"type":"tool","tool":"question","state":{"status":"completed"}}}});
-        assert_eq!(event_to_detailed(&pending), Some(PaneDetailedState::AwaitingInputElicitation));
-        assert_eq!(event_to_detailed(&completed), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            event_to_detailed(&pending),
+            Some(PaneDetailedState::AwaitingInputElicitation)
+        );
+        assert_eq!(
+            event_to_detailed(&completed),
+            Some(PaneDetailedState::BusyProcessing)
+        );
     }
 
     #[test]
@@ -757,7 +904,8 @@ mod tests {
         let (rtype, _payload) = event_to_transcript(&msg).expect("message.updated → transcript");
         assert_eq!(rtype, "assistant");
         let part = json!({"type":"message.part.updated","properties":{"sessionID":sid,"part":{"type":"text","text":"hi"}}});
-        let (rtype, payload) = event_to_transcript(&part).expect("message.part.updated → transcript");
+        let (rtype, payload) =
+            event_to_transcript(&part).expect("message.part.updated → transcript");
         assert_eq!(rtype, "text");
         assert_eq!(payload["part"]["text"], "hi");
         assert!(event_to_transcript(&ev("session.idle", sid)).is_none());
@@ -772,10 +920,19 @@ mod tests {
     #[test]
     fn status_to_detailed_matches_real_opencode_shape() {
         // Real shape: {"type":"busy"} for a busy session.
-        assert_eq!(status_to_detailed(&json!({"type":"busy"})), Some(PaneDetailedState::BusyProcessing));
-        assert_eq!(status_to_detailed(&json!({"type":"idle"})), Some(PaneDetailedState::Ready));
+        assert_eq!(
+            status_to_detailed(&json!({"type":"busy"})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            status_to_detailed(&json!({"type":"idle"})),
+            Some(PaneDetailedState::Ready)
+        );
         // status/state still accepted as aliases.
-        assert_eq!(status_to_detailed(&json!({"status":"busy"})), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            status_to_detailed(&json!({"status":"busy"})),
+            Some(PaneDetailedState::BusyProcessing)
+        );
     }
 
     #[test]
@@ -784,7 +941,10 @@ mod tests {
         // {"type":"retry","attempt":15,"message":"…Limit Exhausted…","next":<ts>}.
         // It is not ready, so it must surface as busy rather than leave state stale.
         let retry = json!({"type":"retry","attempt":15,"message":"Weekly/Monthly Limit Exhausted","next":1783384638319i64});
-        assert_eq!(status_to_detailed(&retry), Some(PaneDetailedState::BusyProcessing));
+        assert_eq!(
+            status_to_detailed(&retry),
+            Some(PaneDetailedState::BusyProcessing)
+        );
     }
 
     #[test]
@@ -804,7 +964,8 @@ mod tests {
 
     #[test]
     fn event_from_line_parses_data_payload() {
-        let v = event_from_line(r#"{"type":"session.idle","properties":{"sessionID":"s"}}"#).unwrap();
+        let v =
+            event_from_line(r#"{"type":"session.idle","properties":{"sessionID":"s"}}"#).unwrap();
         assert_eq!(v["type"], "session.idle");
         assert!(event_from_line("").is_none());
         assert!(event_from_line("not json").is_none());

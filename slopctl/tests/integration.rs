@@ -1,4 +1,4 @@
-use libsloptest::{build_bin, cargo_bin, kill_slopd, tempfile, TestEnv};
+use libsloptest::{TestEnv, build_bin, cargo_bin, kill_slopd, tempfile};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -11,10 +11,20 @@ fn slopctl_version_contains_commit_hash() {
         .output()
         .expect("failed to run slopctl --version");
 
-    assert!(output.status.success(), "slopctl --version failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopctl --version failed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let has_hash = stdout.split(|c: char| !c.is_ascii_hexdigit()).any(|tok| tok.len() >= 7);
-    assert!(has_hash, "no commit hash found in slopctl --version output: {:?}", stdout.trim());
+    let has_hash = stdout
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .any(|tok| tok.len() >= 7);
+    assert!(
+        has_hash,
+        "no commit hash found in slopctl --version output: {:?}",
+        stdout.trim()
+    );
 }
 
 #[test]
@@ -26,10 +36,20 @@ fn slopd_version_contains_commit_hash() {
         .output()
         .expect("failed to run slopd --version");
 
-    assert!(output.status.success(), "slopd --version failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopd --version failed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let has_hash = stdout.split(|c: char| !c.is_ascii_hexdigit()).any(|tok| tok.len() >= 7);
-    assert!(has_hash, "no commit hash found in slopd --version output: {:?}", stdout.trim());
+    let has_hash = stdout
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .any(|tok| tok.len() >= 7);
+    assert!(
+        has_hash,
+        "no commit hash found in slopd --version output: {:?}",
+        stdout.trim()
+    );
 }
 
 #[test]
@@ -46,26 +66,53 @@ fn ps_json_returns_valid_json_array() {
 
     // Spawn a pane so ps has something to return
     let run_output = env.slopctl(&["run"]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
 
     let output = env.slopctl(&["ps", "--json"]);
 
     kill_slopd(slopd);
 
-    assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopctl ps --json failed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("output is not valid JSON: {}\noutput was: {}", e, stdout));
 
-    let pane = panes.iter().find(|p| p["pane_id"] == pane_id)
-        .unwrap_or_else(|| panic!("spawned pane {} not found in ps --json output: {}", pane_id, stdout));
+    let pane = panes
+        .iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "spawned pane {} not found in ps --json output: {}",
+                pane_id, stdout
+            )
+        });
 
     assert!(pane["pane_id"].is_string(), "pane_id must be a string");
-    assert!(pane["created_at"].is_number(), "created_at must be a number");
-    assert!(pane["last_active"].is_number(), "last_active must be a number");
+    assert!(
+        pane["created_at"].is_number(),
+        "created_at must be a number"
+    );
+    assert!(
+        pane["last_active"].is_number(),
+        "last_active must be a number"
+    );
     assert!(pane["tags"].is_array(), "tags must be an array");
-    assert!(pane["working_dir"].is_string() || pane["working_dir"].is_null(), "working_dir must be a string or null: {:?}", pane);
+    assert!(
+        pane["working_dir"].is_string() || pane["working_dir"].is_null(),
+        "working_dir must be a string or null: {:?}",
+        pane
+    );
 }
 
 #[test]
@@ -81,12 +128,20 @@ fn ps_table_contains_expected_columns() {
     let slopd = env.spawn_slopd();
 
     let run_output = env.slopctl(&["run"]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
 
     // Give the pane a title with a leading status glyph, as a real agent would; ps
     // must surface it in the TITLE column with the glyph stripped (normalized).
-    let _ = env.tmux.tmux()
+    let _ = env
+        .tmux
+        .tmux()
         .args(["select-pane", "-t", &pane_id, "-T", "✳ my test title"])
         .output()
         .expect("set pane title");
@@ -98,16 +153,48 @@ fn ps_table_contains_expected_columns() {
     assert!(output.status.success(), "slopctl ps failed: {:?}", output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("PANE"), "missing PANE column: {}", stdout);
-    assert!(stdout.contains("CREATED"), "missing CREATED column: {}", stdout);
-    assert!(stdout.contains("LAST_ACTIVE"), "missing LAST_ACTIVE column: {}", stdout);
-    assert!(stdout.contains("SESSION"), "missing SESSION column: {}", stdout);
+    assert!(
+        stdout.contains("CREATED"),
+        "missing CREATED column: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("LAST_ACTIVE"),
+        "missing LAST_ACTIVE column: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("SESSION"),
+        "missing SESSION column: {}",
+        stdout
+    );
     assert!(stdout.contains("STATE"), "missing STATE column: {}", stdout);
-    assert!(stdout.contains("WORKING_DIR"), "missing WORKING_DIR column: {}", stdout);
+    assert!(
+        stdout.contains("WORKING_DIR"),
+        "missing WORKING_DIR column: {}",
+        stdout
+    );
     assert!(stdout.contains("TITLE"), "missing TITLE column: {}", stdout);
-    assert!(stdout.contains("my test title"), "missing normalized pane title: {}", stdout);
-    assert!(!stdout.contains('✳'), "status glyph should be stripped from the title: {}", stdout);
-    assert!(stdout.contains(&pane_id), "missing pane_id in output: {}", stdout);
-    assert!(stdout.contains("ago") || stdout.contains("now"), "missing time in output: {}", stdout);
+    assert!(
+        stdout.contains("my test title"),
+        "missing normalized pane title: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains('✳'),
+        "status glyph should be stripped from the title: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains(&pane_id),
+        "missing pane_id in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ago") || stdout.contains("now"),
+        "missing time in output: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -124,32 +211,65 @@ fn ps_json_filter_by_tag() {
 
     // Spawn a pane and tag it
     let run_output = env.slopctl(&["run"]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
     assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
 
     let tag_output = env.slopctl(&["tag", &pane_id, "testlabel"]);
-    assert!(tag_output.status.success(), "slopctl tag failed: {:?}", tag_output);
+    assert!(
+        tag_output.status.success(),
+        "slopctl tag failed: {:?}",
+        tag_output
+    );
 
     // ps --json --filter tag=testlabel should include our pane
     let filtered = env.slopctl(&["ps", "--json", "--filter", "tag=testlabel"]);
-    assert!(filtered.status.success(), "slopctl ps --json --filter failed: {:?}", filtered);
+    assert!(
+        filtered.status.success(),
+        "slopctl ps --json --filter failed: {:?}",
+        filtered
+    );
     let stdout = String::from_utf8_lossy(&filtered.stdout);
     let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("not valid JSON: {}\noutput: {}", e, stdout));
-    assert_eq!(panes.len(), 1, "expected exactly one pane with tag=testlabel, got {}", panes.len());
+    assert_eq!(
+        panes.len(),
+        1,
+        "expected exactly one pane with tag=testlabel, got {}",
+        panes.len()
+    );
     assert_eq!(panes[0]["pane_id"], pane_id);
-    assert!(panes[0]["created_at"].is_number(), "created_at must be a number");
+    assert!(
+        panes[0]["created_at"].is_number(),
+        "created_at must be a number"
+    );
     let tags = panes[0]["tags"].as_array().expect("tags must be an array");
-    assert!(tags.iter().any(|t| t == "testlabel"), "tags must contain 'testlabel', got {:?}", tags);
+    assert!(
+        tags.iter().any(|t| t == "testlabel"),
+        "tags must contain 'testlabel', got {:?}",
+        tags
+    );
 
     // ps --json --filter tag=other should return empty array
     let none = env.slopctl(&["ps", "--json", "--filter", "tag=other"]);
-    assert!(none.status.success(), "slopctl ps --json --filter tag=other failed: {:?}", none);
+    assert!(
+        none.status.success(),
+        "slopctl ps --json --filter tag=other failed: {:?}",
+        none
+    );
     let stdout2 = String::from_utf8_lossy(&none.stdout);
-    let panes2: Vec<serde_json::Value> = serde_json::from_str(stdout2.trim())
-        .unwrap_or_else(|e| panic!("not valid JSON: {}", e));
-    assert!(panes2.is_empty(), "expected empty array for unmatched filter");
+    let panes2: Vec<serde_json::Value> =
+        serde_json::from_str(stdout2.trim()).unwrap_or_else(|e| panic!("not valid JSON: {}", e));
+    assert!(
+        panes2.is_empty(),
+        "expected empty array for unmatched filter"
+    );
 
     kill_slopd(slopd);
 }
@@ -172,8 +292,14 @@ fn ps_working_dir_reflects_start_directory() {
     let slopd = env.spawn_slopd();
 
     let run_output = env.slopctl(&["run"]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
     assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
 
     // Give the pane a moment to start so pane_current_path is populated.
@@ -183,16 +309,31 @@ fn ps_working_dir_reflects_start_directory() {
 
     kill_slopd(slopd);
 
-    assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopctl ps --json failed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("output is not valid JSON: {}\noutput was: {}", e, stdout));
 
-    let pane = panes.iter().find(|p| p["pane_id"] == pane_id)
-        .unwrap_or_else(|| panic!("spawned pane {} not found in ps --json output: {}", pane_id, stdout));
+    let pane = panes
+        .iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "spawned pane {} not found in ps --json output: {}",
+                pane_id, stdout
+            )
+        });
 
-    let working_dir = pane["working_dir"].as_str()
-        .unwrap_or_else(|| panic!("working_dir must be a string, got: {:?}", pane["working_dir"]));
+    let working_dir = pane["working_dir"].as_str().unwrap_or_else(|| {
+        panic!(
+            "working_dir must be a string, got: {:?}",
+            pane["working_dir"]
+        )
+    });
 
     assert_eq!(
         std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.into()),
@@ -216,8 +357,14 @@ fn ps_working_dir_reflects_per_run_start_directory() {
     let slopd = env.spawn_slopd();
 
     let run_output = env.slopctl(&["run", "-c", work_dir.path().to_str().unwrap()]);
-    assert!(run_output.status.success(), "slopctl run failed: {:?}", run_output);
-    let pane_id = String::from_utf8_lossy(&run_output.stdout).trim().to_string();
+    assert!(
+        run_output.status.success(),
+        "slopctl run failed: {:?}",
+        run_output
+    );
+    let pane_id = String::from_utf8_lossy(&run_output.stdout)
+        .trim()
+        .to_string();
     assert!(!pane_id.is_empty(), "slopctl run returned empty pane_id");
 
     // Give the pane a moment to start so pane_current_path is populated.
@@ -227,16 +374,31 @@ fn ps_working_dir_reflects_per_run_start_directory() {
 
     kill_slopd(slopd);
 
-    assert!(output.status.success(), "slopctl ps --json failed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopctl ps --json failed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let panes: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("output is not valid JSON: {}\noutput was: {}", e, stdout));
 
-    let pane = panes.iter().find(|p| p["pane_id"] == pane_id)
-        .unwrap_or_else(|| panic!("spawned pane {} not found in ps --json output: {}", pane_id, stdout));
+    let pane = panes
+        .iter()
+        .find(|p| p["pane_id"] == pane_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "spawned pane {} not found in ps --json output: {}",
+                pane_id, stdout
+            )
+        });
 
-    let working_dir = pane["working_dir"].as_str()
-        .unwrap_or_else(|| panic!("working_dir must be a string, got: {:?}", pane["working_dir"]));
+    let working_dir = pane["working_dir"].as_str().unwrap_or_else(|| {
+        panic!(
+            "working_dir must be a string, got: {:?}",
+            pane["working_dir"]
+        )
+    });
 
     assert_eq!(
         std::fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.into()),
@@ -260,7 +422,11 @@ fn status_with_slopd_running() {
 
     kill_slopd(slopd);
 
-    assert!(output.status.success(), "slopctl exited with failure: {:?}", output);
+    assert!(
+        output.status.success(),
+        "slopctl exited with failure: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("uptime:"), "unexpected output: {}", stdout);
 }
@@ -275,7 +441,10 @@ fn status_without_slopd_running() {
         .output()
         .expect("failed to run slopctl");
 
-    assert!(!output.status.success(), "slopctl should have failed but succeeded");
+    assert!(
+        !output.status.success(),
+        "slopctl should have failed but succeeded"
+    );
 }
 
 /// slopctl times out when the server accepts the connection but never responds.
@@ -289,8 +458,8 @@ fn slopctl_times_out_on_unresponsive_server() {
     let socket_path = socket_dir.join("slopd.sock");
 
     // Create a listener that accepts connections but never responds.
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
-        .expect("failed to bind fake socket");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("failed to bind fake socket");
 
     // Accept connections in a background thread (hold them open, never write).
     let accept_thread = std::thread::spawn(move || {
@@ -320,7 +489,10 @@ fn slopctl_times_out_on_unresponsive_server() {
                 child.kill().expect("failed to kill slopctl");
                 child.wait().ok();
                 drop(accept_thread);
-                panic!("slopctl hung for {:?} — it should time out on its own", start.elapsed());
+                panic!(
+                    "slopctl hung for {:?} — it should time out on its own",
+                    start.elapsed()
+                );
             }
             None => std::thread::sleep(Duration::from_millis(100)),
         }
