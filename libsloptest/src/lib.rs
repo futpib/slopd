@@ -502,8 +502,14 @@ impl TestEnv {
     /// until it is listening on *that* socket instead of the default
     /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Used to exercise `--socket`.
     pub fn spawn_slopd_with_socket(&self, socket: &std::path::Path) -> Child {
+        self.spawn_slopd_at_socket(&["--socket", socket.to_str().unwrap()], socket)
+    }
+
+    /// Spawn slopd with arbitrary arguments and wait at an explicitly expected
+    /// control socket. Used when the socket comes from config rather than CLI.
+    pub fn spawn_slopd_at_socket(&self, extra_args: &[&str], socket: &std::path::Path) -> Child {
         let mut cmd = Command::new(cargo_bin("slopd"));
-        cmd.args(["--socket", socket.to_str().unwrap()])
+        cmd.args(extra_args)
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
             .env("XDG_CONFIG_HOME", self.config_dir.path())
             .env("HOME", self.config_dir.path())
@@ -558,7 +564,9 @@ impl TestEnv {
             .env_remove("TMUX_PANE")
             .env_remove("TMUX_TMPDIR")
             .env_remove("TMPDIR")
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path());
+            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env("HOME", self.config_dir.path());
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -594,6 +602,8 @@ impl TestEnv {
         let mut child = Command::new(cargo_bin("slopctl"))
             .args(["listen", "--hook", "SessionStart"])
             .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("XDG_CONFIG_HOME", self.config_dir.path())
+            .env("HOME", self.config_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()

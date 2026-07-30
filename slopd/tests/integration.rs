@@ -11864,13 +11864,15 @@ fn config_flag_overrides_config_file_location() {
     };
 
     // An alternate config at a non-default path, with a distinct session name
-    // (so the override is observable) but the same test tmux socket (so the
-    // instance is actually functional).
+    // and control socket (so the override is observable) but the same test tmux
+    // socket (so the instance is actually functional).
     let alt_config = env.config_dir.path().join("alt-config.toml");
+    let alt_socket = env.config_dir.path().join("from-flag.sock");
     std::fs::write(
         &alt_config,
         format!(
-            "[tmux]\nsocket = {:?}\nsession = \"from-flag\"\n\n[run]\nexecutable = [{:?}]\nslopctl = {:?}\n",
+            "[control]\nsocket = {:?}\n\n[tmux]\nsocket = {:?}\nsession = \"from-flag\"\n\n[run]\nexecutable = [{:?}]\nslopctl = {:?}\n",
+            alt_socket.to_str().unwrap(),
             env.tmux.socket.to_str().unwrap(),
             mock_claude_path,
             slopctl_path,
@@ -11878,9 +11880,9 @@ fn config_flag_overrides_config_file_location() {
     )
     .unwrap();
 
-    let slopd = env.spawn_slopd_with_args(&["--config", alt_config.to_str().unwrap()]);
+    let slopd = env.spawn_slopd_at_socket(&["--config", alt_config.to_str().unwrap()], &alt_socket);
 
-    let run_out = env.slopctl(&["run"]);
+    let run_out = env.slopctl_raw(&["--config", alt_config.to_str().unwrap(), "run", "--no-wait"]);
     assert!(run_out.status.success(), "run failed: {:?}", run_out);
     let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
 
@@ -11898,7 +11900,7 @@ fn config_flag_overrides_config_file_location() {
         .status()
         .unwrap();
 
-    let ps_out = env.slopctl(&["ps", "--json"]);
+    let ps_out = env.slopctl_raw(&["--config", alt_config.to_str().unwrap(), "ps", "--json"]);
     let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
 
     kill_slopd(slopd);
@@ -11918,10 +11920,162 @@ fn config_flag_overrides_config_file_location() {
     );
 }
 
-// `--socket <path>` moves slopd's control socket off the default and bakes
-// `--socket <path>` into the hook commands it injects, so a second instance is
-// reachable only via the matching `slopctl --socket <path>` and its panes report
-// back to *it* (not whichever socket `$XDG_RUNTIME_DIR` points at).
+// `[control].socket` selects the local instance for both slopd and slopctl.
+// slopd also bakes the effective path into injected hooks so agent lifecycle
+// events return to that same non-default instance.
+#[test]
+fn configured_control_socket_is_used_by_daemon_client_and_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let configured_socket = env.config_dir.path().join("configured-slopd.sock");
+    env.append_config(&format!(
+        "[control]\nsocket = {:?}",
+        configured_socket.to_str().unwrap()
+    ));
+    let slopd = env.spawn_slopd_at_socket(&[], &configured_socket);
+
+    // No --socket is needed: slopctl reads the same selected slopd config.
+    let run_out = env.slopctl_raw(&["run", "--no-wait"]);
+    assert!(
+        run_out.status.success(),
+        "run via configured socket failed: {:?}",
+        run_out
+    );
+    let pane_id = String::from_utf8_lossy(&run_out.stdout).trim().to_string();
+    let ps_out = env.slopctl_raw(&["ps", "--json"]);
+    let panes: Vec<libslop::PaneInfo> = serde_json::from_slice(&ps_out.stdout).expect("ps --json");
+
+    let settings_path = env.config_dir.path().join(".claude/settings.json");
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&settings_path).expect("settings.json should exist"),
+    )
+    .unwrap();
+    let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    kill_slopd(slopd);
+
+    assert!(
+        !env.socket_path().exists(),
+        "slopd must not also bind the default socket"
+    );
+    assert!(
+        panes.iter().any(|p| p.pane_id == pane_id),
+        "pane should be tracked: {:?}",
+        panes
+    );
+    assert!(
+        stop_cmd.contains(&format!("--socket {}", configured_socket.display())),
+        "injected hook should carry configured socket; got {:?}",
+        stop_cmd
+    );
+}
+
+#[test]
+fn configured_control_socket_change_on_sighup_requires_restart() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+
+    let Some(env) = TestEnv::new_full(Some(&[&mock_claude_path]), Some(&slopctl_path), None) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let startup_socket = env.config_dir.path().join("startup-slopd.sock");
+    let reloaded_socket = env.config_dir.path().join("reloaded-slopd.sock");
+    env.append_config(&format!(
+        "[control]\nsocket = {:?}",
+        startup_socket.to_str().unwrap()
+    ));
+    let slopd = env.spawn_slopd_at_socket(&[], &startup_socket);
+
+    let config_path = env.config_path();
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        config.replace(
+            startup_socket.to_str().unwrap(),
+            reloaded_socket.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    sighup_pid(slopd.id());
+
+    // Poll the startup socket explicitly because the on-disk config now names
+    // the path that will take effect after restart.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = env.slopctl_raw(&["--socket", startup_socket.to_str().unwrap(), "status"]);
+        let generation = String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("config_generation: ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        if status.status.success() && generation >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for SIGHUP reload on startup socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let run_out = env.slopctl_raw(&[
+        "--socket",
+        startup_socket.to_str().unwrap(),
+        "run",
+        "--no-wait",
+    ]);
+    assert!(
+        run_out.status.success(),
+        "daemon should remain reachable at startup socket: {:?}",
+        run_out
+    );
+
+    let settings_path = env.config_dir.path().join(".claude/settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
+    let stop_cmd = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or("");
+
+    kill_slopd(slopd);
+
+    assert!(
+        !reloaded_socket.exists(),
+        "SIGHUP must not bind the changed control socket"
+    );
+    assert!(
+        stop_cmd.contains(&format!("--socket {}", startup_socket.display())),
+        "post-reload hooks must keep the bound startup socket; got {stop_cmd:?}"
+    );
+    assert!(
+        !stop_cmd.contains(&reloaded_socket.display().to_string()),
+        "post-reload hooks must not point at the unbound config socket; got {stop_cmd:?}"
+    );
+}
+
+// `--socket <path>` takes precedence over `[control].socket` and is baked into
+// injected hooks, so an explicit one-off target cannot be redirected by config.
 #[test]
 fn socket_flag_overrides_control_socket_and_is_carried_into_hooks() {
     build_bin("slopd");
@@ -11936,15 +12090,23 @@ fn socket_flag_overrides_control_socket_and_is_carried_into_hooks() {
         return;
     };
 
-    // A control socket off the default `$XDG_RUNTIME_DIR/slopd/slopd.sock`.
+    let configured_socket = env.config_dir.path().join("from-config.sock");
+    env.append_config(&format!(
+        "[control]\nsocket = {:?}",
+        configured_socket.to_str().unwrap()
+    ));
+
+    // A different control socket explicitly selected on the command line.
     let custom_socket = env.config_dir.path().join("custom-slopd.sock");
     let slopd = env.spawn_slopd_with_socket(&custom_socket);
     let custom = custom_socket.to_str().unwrap();
 
-    // slopd did not bind the default socket, and slopctl without --socket (which
-    // resolves the default) cannot reach the instance.
+    // slopd did not bind either lower-precedence location. slopctl without
+    // --socket follows config and therefore cannot reach this CLI-selected
+    // instance.
     let default_exists = env.socket_path().exists();
-    let ps_default = env.slopctl_raw(&["ps", "--json"]);
+    let configured_exists = configured_socket.exists();
+    let ps_configured = env.slopctl_raw(&["ps", "--json"]);
 
     // With --socket, ps works and run spawns a tracked pane.
     let run_out = env.slopctl_raw(&["--socket", custom, "run", "--no-wait"]);
@@ -11977,8 +12139,12 @@ fn socket_flag_overrides_control_socket_and_is_carried_into_hooks() {
         "slopd must not bind the default socket when --socket is given"
     );
     assert!(
-        !ps_default.status.success(),
-        "slopctl without --socket must not reach the --socket instance"
+        !configured_exists,
+        "CLI --socket must override the configured socket"
+    );
+    assert!(
+        !ps_configured.status.success(),
+        "slopctl following config must not reach the CLI-selected instance"
     );
     assert!(
         panes.iter().any(|p| p.pane_id == pane_id),

@@ -14,10 +14,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<std::path::PathBuf>,
 
-    /// Connect to this slopd control socket instead of the default
-    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock` — use the same value the target
-    /// slopd was started with. This is how you talk to a second instance.
-    /// Supports `~` and `$VAR` expansion.
+    /// Connect to this slopd control socket, overriding `[control] socket` in
+    /// the selected slopd config and the default
+    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR` expansion.
     #[arg(long, value_name = "PATH", global = true)]
     socket: Option<std::path::PathBuf>,
 
@@ -76,12 +75,16 @@ async fn main() {
         Some(p) => libslop::SlopctlConfig::load_from(p),
         None => libslop::SlopctlConfig::load(),
     };
+    let slopd_config = match &config_override {
+        Some(p) => libslop::SlopdConfig::load_from(p),
+        None => libslop::SlopdConfig::load(),
+    };
 
     let socket_path = cli
         .socket
         .as_deref()
         .map(libslop::expand_path)
-        .unwrap_or_else(libslop::socket_path);
+        .unwrap_or_else(|| slopd_config.control_socket_path());
     debug!("connecting to {}", socket_path.display());
 
     // Hook must never exit 2 — that would block the Claude action.
@@ -158,10 +161,6 @@ async fn main() {
         // The interactive viewer attaches to slopd's tmux, so resolve its socket
         // (from slopd's config) and session name to build the default command and
         // expose them as {{socket}} / {{session}} substitutions.
-        let slopd_config = match &config_override {
-            Some(p) => libslop::SlopdConfig::load_from(p),
-            None => libslop::SlopdConfig::load(),
-        };
         let socket = slopd_config
             .tmux
             .socket

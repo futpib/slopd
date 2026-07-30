@@ -23,11 +23,12 @@ struct Cli {
     /// Read configuration from this file instead of the default
     /// `$XDG_CONFIG_HOME/slopd/config.toml`. Supports `~` and `$VAR` expansion.
     /// Lets a second slopd instance run from its own config (give it a distinct
-    /// `[tmux] socket`/`session`, and `--socket` for the control socket).
+    /// `[tmux] socket`/`session` and `[control] socket`).
     #[arg(long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
-    /// Listen on this control socket instead of the default
-    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR` expansion.
+    /// Listen on this control socket, overriding `[control] socket` and the
+    /// default `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR`
+    /// expansion.
     /// `slopctl` must be given the same `--socket` to reach this instance;
     /// injected hook commands carry it automatically so spawned panes report
     /// back here. This is the clean way to isolate a second instance's control
@@ -2505,7 +2506,12 @@ async fn main() {
     // config; capture as a closure so SIGHUP can re-apply the same massaging
     // to a freshly-loaded config.
     let executable_override = cli.executable.clone();
-    let socket_override = cli.socket.as_deref().map(libslop::expand_path);
+    let cli_socket_override = cli.socket.as_deref().map(libslop::expand_path);
+    let configured_socket_at_startup = config.configured_control_socket();
+    let startup_socket_override = cli_socket_override
+        .clone()
+        .or_else(|| configured_socket_at_startup.clone());
+    let frozen_socket_override = startup_socket_override.clone();
     let apply_overrides = move |cfg: &mut libslop::SlopdConfig| {
         if let Some(executable) = executable_override.clone() {
             cfg.run.executable = Some(if executable.len() == 1 {
@@ -2515,7 +2521,10 @@ async fn main() {
             });
         }
         cfg.run.slopctl = libslop::resolve_slopctl(&cfg.run.slopctl);
-        cfg.control_socket = socket_override.clone();
+        // The listener is bound once for the lifetime of this process. Freeze
+        // the startup-selected socket into every reloaded config so later hook
+        // injection cannot point at a path the daemon is not listening on.
+        cfg.control_socket = frozen_socket_override.clone();
     };
     apply_overrides(&mut config);
 
@@ -2855,6 +2864,18 @@ async fn main() {
                 let path = config_path.clone();
                 match libslop::SlopdConfig::try_load_from(&path) {
                     Ok(mut new_config) => {
+                        if cli_socket_override.is_none()
+                            && new_config.configured_control_socket()
+                                != configured_socket_at_startup
+                        {
+                            warn!(
+                                "SIGHUP: [control].socket changes require a restart; continuing to use {}",
+                                startup_socket_override
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| libslop::socket_path().display().to_string())
+                            );
+                        }
                         apply_overrides(&mut new_config);
                         let _ = config_tx.send(Arc::new(new_config));
                         let new_gen = config_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

@@ -26,8 +26,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
-    /// Bridge this slopd control socket instead of the default
-    /// `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR` expansion.
+    /// Bridge this slopd control socket, overriding `[control] socket` and the
+    /// default `$XDG_RUNTIME_DIR/slopd/slopd.sock`. Supports `~` and `$VAR`
+    /// expansion.
     #[arg(long, value_name = "PATH", global = true)]
     socket: Option<PathBuf>,
 
@@ -60,6 +61,9 @@ struct Config {
     secret_key: Option<String>,
     #[serde(default)]
     authorized_clients: Vec<String>,
+    /// Local slopd instance exposed by this bridge.
+    #[serde(default)]
+    control: libslop::SlopdControlConfig,
     /// The file this config was loaded from / is saved to. Not serialized;
     /// populated by [`Config::load`] so `save` honors the `--config` override.
     #[serde(skip)]
@@ -125,6 +129,13 @@ impl Config {
         let id_str = id.to_string();
         self.authorized_clients.iter().any(|c| c == &id_str)
     }
+}
+
+fn control_socket_path(cli_socket: Option<&std::path::Path>, config: &Config) -> PathBuf {
+    cli_socket
+        .map(libslop::expand_path)
+        .or_else(|| config.control.socket.as_deref().map(libslop::expand_path))
+        .unwrap_or_else(libslop::socket_path)
 }
 
 async fn proxy_connection(
@@ -248,11 +259,7 @@ async fn main() {
         });
     }
 
-    let socket_path = cli
-        .socket
-        .as_deref()
-        .map(libslop::expand_path)
-        .unwrap_or_else(libslop::socket_path);
+    let socket_path = control_socket_path(cli.socket.as_deref(), &config);
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
@@ -315,4 +322,23 @@ async fn main() {
     }
 
     endpoint.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_control_socket_is_used_and_cli_override_wins() {
+        let config: Config =
+            toml::from_str("[control]\nsocket = \"/run/configured-slopd.sock\"\n").unwrap();
+        assert_eq!(
+            control_socket_path(None, &config),
+            PathBuf::from("/run/configured-slopd.sock")
+        );
+        assert_eq!(
+            control_socket_path(Some(std::path::Path::new("/run/cli-slopd.sock")), &config),
+            PathBuf::from("/run/cli-slopd.sock")
+        );
+    }
 }

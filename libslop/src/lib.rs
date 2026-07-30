@@ -1802,6 +1802,32 @@ mod tests {
     }
 
     #[test]
+    fn control_socket_config_is_used_and_cli_runtime_override_wins() {
+        let mut cfg = config_from_toml(
+            "[control]\nsocket = \"/run/user/1000/slopd-config.sock\"\n\n[run]\nslopctl = \"slopctl\"\n",
+        );
+        assert_eq!(
+            cfg.control_socket_path(),
+            PathBuf::from("/run/user/1000/slopd-config.sock")
+        );
+        assert_eq!(
+            cfg.hook_slopctl(),
+            "slopctl --socket /run/user/1000/slopd-config.sock"
+        );
+
+        // slopd stores the startup-selected CLI value in the runtime-only field.
+        cfg.control_socket = Some(PathBuf::from("/run/user/1000/slopd-cli.sock"));
+        assert_eq!(
+            cfg.control_socket_path(),
+            PathBuf::from("/run/user/1000/slopd-cli.sock")
+        );
+        assert_eq!(
+            cfg.hook_slopctl(),
+            "slopctl --socket /run/user/1000/slopd-cli.sock"
+        );
+    }
+
+    #[test]
     fn resolved_settings_path_uses_account_dir() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
         let resolved = cfg.resolve_account(Some("work")).unwrap();
@@ -1910,6 +1936,10 @@ pub struct SlopdConfig {
     pub verbose: u8,
     #[serde(default)]
     pub tmux: SlopdTmuxConfig,
+    /// Local control endpoint configuration. The CLI `--socket` option takes
+    /// precedence over this section.
+    #[serde(default)]
+    pub control: SlopdControlConfig,
     #[serde(default)]
     pub run: SlopdRunConfig,
     #[serde(default)]
@@ -1939,11 +1969,9 @@ pub struct SlopdConfig {
     /// inherited from the parent pane. When unset, the [`DEFAULT_ACCOUNT`]
     /// account is used.
     pub default_account: Option<String>,
-    /// Control socket this slopd instance listens on, from the `--socket` CLI
-    /// override. Not read from the config file (so it never serializes); a
-    /// `None` means the default [`socket_path`] (`$XDG_RUNTIME_DIR/slopd/slopd.sock`).
-    /// When set, slopd bakes `--socket <path>` into the `slopctl` hook commands
-    /// it injects so spawned panes report back to *this* instance.
+    /// Effective non-default control socket selected at process startup, after
+    /// applying CLI-over-config precedence. Runtime-only so a SIGHUP reload
+    /// cannot move hooks away from the socket the process actually bound.
     #[serde(skip)]
     pub control_socket: Option<PathBuf>,
 }
@@ -2045,6 +2073,13 @@ pub struct ResolvedAccount {
     /// The executable to spawn for this account (already resolved against the
     /// backend per [`Backend::resolve`]).
     pub executable: Executable,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SlopdControlConfig {
+    /// Unix socket used by slopd and local clients. Supports `~` and `$VAR` /
+    /// `${VAR}` expansion. `slopd --socket` / `slopctl --socket` override it.
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -2410,11 +2445,24 @@ impl SlopdConfig {
         config_dir().join("slopd/config.toml")
     }
 
-    /// The control socket this instance listens on: the `--socket` override
-    /// ([`control_socket`](Self::control_socket)) if set, else the default
-    /// [`socket_path`].
+    /// Configured control-socket override, with path expansion applied.
+    pub fn configured_control_socket(&self) -> Option<PathBuf> {
+        self.control.socket.as_deref().map(expand_path)
+    }
+
+    /// The effective non-default control socket: the startup-frozen CLI/config
+    /// selection when running inside slopd, otherwise the value read directly
+    /// from `[control].socket`.
+    pub fn control_socket_override(&self) -> Option<PathBuf> {
+        self.control_socket
+            .clone()
+            .or_else(|| self.configured_control_socket())
+    }
+
+    /// The control socket this instance listens on: CLI override, then
+    /// `[control].socket`, then the XDG default [`socket_path`].
     pub fn control_socket_path(&self) -> PathBuf {
-        self.control_socket.clone().unwrap_or_else(socket_path)
+        self.control_socket_override().unwrap_or_else(socket_path)
     }
 
     /// The `slopctl` command prefix baked into injected hook commands. With a
@@ -2423,7 +2471,7 @@ impl SlopdConfig {
     /// `$XDG_RUNTIME_DIR` happens to point at; otherwise just the plain
     /// `run.slopctl` value, keeping the default instance's hooks byte-identical.
     pub fn hook_slopctl(&self) -> String {
-        match &self.control_socket {
+        match self.control_socket_override() {
             Some(sock) => format!("{} --socket {}", self.run.slopctl, sock.display()),
             None => self.run.slopctl.clone(),
         }

@@ -88,7 +88,7 @@ To install from source:
 ```bash
 cargo install --path slopd
 cargo install --path slopctl
-# Optional: expose managed panes to ACP clients such as Buzz
+# Optional: expose managed panes to ACP clients
 cargo install --path slopd-acp
 # Optional: remote access via iroh
 cargo install --path iroh-slopd
@@ -120,9 +120,10 @@ slopd
 `slopd` will:
 
 1. Create (or attach to) a tmux session named `slopd`.
-2. Start listening on the default control socket
+2. Start listening on the configured `[control] socket`, the path passed with
+   `--socket`, or the default control socket
    (`$XDG_RUNTIME_DIR/slopd/slopd.sock`, subject to the fallback described
-   above), or the path passed with `--socket`.
+   above). The CLI flag has highest precedence.
 3. Inject `slopctl hook <event>` entries for configured Claude Code and Codex
    accounts as panes are launched. OpenCode panes use their embedded local API
    instead of hook files.
@@ -147,30 +148,37 @@ slopd --config /path/to/other.toml
 ```
 
 The path supports `~` and `$VAR` expansion. `slopctl --config <path>` reads the
-same file for the slopd settings it needs (the `[tmux]` socket/session used by
-`run --interactive`), so a single file can configure both. SIGHUP reloads from
-the `--config` path too. `slopd`, `slopctl`, `iroh-slopd`, and `iroh-slopctl`
-all accept a `--config` override for their respective config.
+same file for the slopd settings it needs (the control socket and the `[tmux]`
+socket/session used by `run --interactive`), so a single file can configure
+both. SIGHUP reloads from the `--config` path too. `slopd`, `slopctl`,
+`iroh-slopd`, and `iroh-slopctl` all accept a `--config` override for their
+respective config.
 
 #### Running a second instance
 
-Give each instance a distinct tmux socket/session in its config and a distinct
-control socket through `--socket`. The control socket is deliberately a CLI
-option rather than a config key:
+Give each instance a distinct tmux socket/session and control socket in its
+config:
 
-```bash
-# second daemon
-slopd --config ~/.config/slopd/b.toml --socket /run/user/1000/slopd-b.sock
+```toml
+# ~/.config/slopd/b.toml
+[control]
+socket = "/run/user/1000/slopd-b.sock"
 
-# talk to it
-slopctl --config ~/.config/slopd/b.toml \
-  --socket /run/user/1000/slopd-b.sock ps
+[tmux]
+session = "slopd-b"
+socket = "/run/user/1000/slopd-b-tmux.sock"
+start_server = true
 ```
 
-The daemon automatically includes its `--socket` value in injected hook
-commands. `iroh-slopd --socket PATH` can expose that same non-default instance.
-With a custom `[tmux] socket`, set `[tmux] start_server = true` if no tmux server
-is already listening on it.
+```bash
+slopd --config ~/.config/slopd/b.toml
+slopctl --config ~/.config/slopd/b.toml ps
+```
+
+`--socket PATH` remains available on slopd and its local clients as a
+higher-precedence one-off override. The daemon automatically includes the
+effective control socket in injected hook commands. `iroh-slopd` can likewise
+read `[control] socket` from its own config or override it with `--socket`.
 
 ### Reloading config
 
@@ -184,10 +192,11 @@ systemctl --user reload slopd
 
 The reload affects subsequent operations only — already-running panes keep the
 backend, executable, environment, and config directory they were spawned with.
-Logging and the startup-resolved `[backup]` toggles, interval, and manifest path
-require a restart. A malformed config keeps the previous generation; check the
-daemon log for the parse error. `slopctl status` exposes a `config_generation`
-counter that increments after every successful reload.
+Logging, `[control] socket`, and the startup-resolved `[backup]` toggles,
+interval, and manifest path require a restart. A malformed config keeps the
+previous generation; check the daemon log for the parse error. `slopctl status`
+exposes a `config_generation` counter that increments after every successful
+reload.
 
 If a reload changes an account's hook-file location, entries in the old location
 may remain. Clean them with `slopd --config <old-config> uninject-hooks`.
@@ -223,6 +232,11 @@ session named `slopd`.
 # requires changing this one value. Omit it to use the reserved "default"
 # account above.
 # default_account = "work"
+
+# Local RPC endpoint. `--socket PATH` overrides this for both slopd and
+# slopctl. Changes require a daemon restart.
+# [control]
+# socket = "/run/user/1000/slopd.sock"
 
 # Named accounts. A bare string is shorthand for a config directory. The table
 # form can set config_dir, backend, and an account-specific executable.
@@ -451,8 +465,8 @@ automatic restore.
 ## slopctl commands
 
 All commands communicate with the running daemon over its Unix socket. Global
-`--socket PATH` selects a non-default daemon and global `--config PATH` selects
-the config used by local client features such as `run --interactive`.
+`--config PATH` selects the control socket and local client settings from a
+specific slopd config; `--socket PATH` overrides its socket for one invocation.
 
 ### `slopctl status`
 
@@ -1150,9 +1164,9 @@ these filters for you.
 ## ACP adapter
 
 `slopd-acp` is a stdio [Agent Client Protocol (ACP)](https://agentclientprotocol.com/)
-adapter. An ACP host such as Buzz launches it as an agent process; each
-`session/new` creates a dedicated slopd pane, and later ACP prompts are sent to
-that pane.
+adapter. An ACP host such as [Buzz](https://github.com/block/buzz) launches it
+as an agent process; each `session/new` creates a dedicated slopd pane, and
+later ACP prompts are sent to that pane.
 
 For a local daemon, configure the ACP host's custom agent executable as:
 
@@ -1170,8 +1184,9 @@ Useful adapter-wide launch options include:
 - repeatable `--env KEY=VALUE` and `--agent-arg ARG`;
 - `--working-directory PATH` to override every ACP-provided cwd;
 - `--ready-timeout`, `--send-timeout`, and `--turn-timeout`;
-- `--forward-buzz-env` to explicitly forward the adapter's allowlisted Buzz
-  credentials into panes (off by default, especially important over iroh).
+- `--forward-buzz-env` to explicitly forward the adapter's allowlisted
+  [Buzz](https://github.com/block/buzz) credentials into panes (off by default,
+  especially important over iroh).
 
 The adapter maps ACP onto slopd as follows:
 
@@ -1183,7 +1198,7 @@ The adapter maps ACP onto slopd as follows:
 | prompt completion | the pane's busy-to-ready state transition |
 | `session/cancel` | `interrupt` |
 
-For Buzz, the adapter also implements the
+For [Buzz](https://github.com/block/buzz), the adapter also implements the
 `_goose/unstable/session/steer` extension. It publishes the active run ID and
 routes steering text into the existing pane while the original ACP turn remains
 in flight, instead of opening a second session.
@@ -1283,6 +1298,10 @@ secret_key = "..."
 
 # List of authorized client EndpointIds (z-base-32 public keys).
 authorized_clients = []
+
+# Optional local slopd instance to expose. `--socket PATH` overrides it.
+# [control]
+# socket = "/run/user/1000/slopd-b.sock"
 ```
 
 **Subcommands:**
@@ -1320,9 +1339,10 @@ Use `--addr-file PATH` to write the full `EndpointAddr` JSON to a file on startu
 iroh-slopd --addr-file /tmp/iroh-addr.json
 ```
 
-Use `iroh-slopd --socket PATH` to bridge a non-default local slopd control
-socket. `--config PATH` selects another iroh server identity/allowlist file.
-Verbosity can be increased with `-v` / `-vv` / `-vvv`.
+Set `[control] socket` in iroh-slopd's config to bridge a non-default local
+slopd instance, or use `--socket PATH` as an override. `--config PATH` selects
+another iroh server identity/allowlist file. Verbosity can be increased with
+`-v` / `-vv` / `-vvv`.
 
 ### iroh-slopctl
 
@@ -1379,5 +1399,5 @@ iroh-slopctl ps
 | `libslopiroh` | Shared iroh client transport — ALPN, identity/config, endpoint resolution |
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
-| `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as Buzz |
+| `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |
