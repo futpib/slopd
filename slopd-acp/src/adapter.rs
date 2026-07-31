@@ -14,6 +14,13 @@ use crate::wire::{self, Sender};
 
 const PROTOCOL_VERSION: u32 = 2;
 const NATIVE_STEER_METHOD: &str = "_goose/unstable/session/steer";
+const ACP_TAG: &str = "acp";
+const ACP_RESUMABLE_TAG: &str = "acp-resumable";
+const ACP_DELETED_TAG: &str = "acp-deleted";
+const ACP_SESSION_TAG_PREFIX: &str = "acp-session-";
+const ACP_CWD_TAG_PREFIX: &str = "acp-cwd-";
+const ACP_OWNER_TAG_PREFIX: &str = "acp-owner-";
+const GRAVEYARD_RECOVERY_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum SystemPromptMode {
@@ -43,6 +50,7 @@ pub struct Config {
 
 pub struct Adapter {
     config: Config,
+    owner_tag: String,
     sessions: Mutex<HashMap<String, Session>>,
     session_creation: Mutex<()>,
     next_activity_id: AtomicU64,
@@ -51,13 +59,16 @@ pub struct Adapter {
 
 struct Session {
     pane_id: Option<String>,
+    grave_id: Option<String>,
     backend: Option<libslop::Backend>,
     native_session_id: Option<String>,
+    cwd: PathBuf,
     start_directory: PathBuf,
     system_prompt: Option<String>,
     system_prompt_delivered: bool,
     active_turn: Option<ActiveTurn>,
     last_used: u64,
+    title: Option<String>,
 }
 
 struct StartedPane {
@@ -118,6 +129,24 @@ struct SessionCancelParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionResumeParams {
+    session_id: String,
+    cwd: String,
+    #[serde(default)]
+    mcp_servers: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionListParams {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeSteerParams {
     session_id: String,
     expected_run_id: String,
@@ -128,11 +157,174 @@ impl Adapter {
     pub fn new(config: Config) -> Arc<Self> {
         Arc::new(Self {
             config,
+            owner_tag: format!("{ACP_OWNER_TAG_PREFIX}{}", uuid::Uuid::new_v4()),
             sessions: Mutex::new(HashMap::new()),
             session_creation: Mutex::new(()),
             next_activity_id: AtomicU64::new(1),
             next_turn_id: AtomicU64::new(1),
         })
+    }
+
+    /// Rebuild the logical ACP session catalog from live pane tags and slopd's
+    /// durable graveyard before accepting protocol requests. Live panes from
+    /// the pre-persistence adapter are migrated when they already expose a
+    /// backend-native session; an unprompted pane cannot be recovered safely
+    /// because its pending ACP system prompt lived only in the old process.
+    pub async fn recover_sessions(&self) -> Result<(), String> {
+        let mut client = self.config.transport.connect().await?;
+        let live_panes = client.ps().await.map_err(|error| error.to_string())?;
+        let graves = client
+            .graveyard(None, GRAVEYARD_RECOVERY_LIMIT)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let mut recovered = HashMap::new();
+        let mut seen_grave_sessions = HashSet::new();
+        for grave in graves {
+            if !self.pane_is_in_scope(&grave.pane) {
+                continue;
+            }
+            let Some(session_id) = tagged_session_id(&grave.pane.tags) else {
+                continue;
+            };
+            if !seen_grave_sessions.insert(session_id.clone()) {
+                continue;
+            }
+            if grave.pane.tags.iter().any(|tag| tag == ACP_DELETED_TAG)
+                || grave.revived_at.is_some()
+            {
+                continue;
+            }
+            if !grave.pane.tags.iter().any(|tag| tag == ACP_RESUMABLE_TAG)
+                || grave.pane.session_id.is_none()
+            {
+                continue;
+            }
+            let cwd = tagged_cwd(&grave.pane.tags)
+                .or_else(|| grave.pane.working_dir.as_deref().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let start_directory = self
+                .config
+                .working_directory
+                .clone()
+                .unwrap_or_else(|| cwd.clone());
+            recovered.entry(session_id).or_insert_with(|| Session {
+                pane_id: None,
+                grave_id: Some(grave.grave_id),
+                backend: None,
+                native_session_id: grave.pane.session_id,
+                cwd,
+                start_directory,
+                system_prompt: None,
+                system_prompt_delivered: true,
+                active_turn: None,
+                last_used: grave.destroyed_at.max(grave.pane.last_active),
+                title: grave.pane.pane_title,
+            });
+        }
+
+        let mut live_metadata = Vec::new();
+        let mut incomplete = Vec::new();
+        for pane in live_panes {
+            if !self.pane_is_in_scope(&pane) {
+                continue;
+            }
+            if pane.tags.iter().any(|tag| tag == ACP_DELETED_TAG) {
+                incomplete.push((pane.pane_id, pane.tags, true));
+                continue;
+            }
+            let tagged_id = tagged_session_id(&pane.tags);
+            let legacy = tagged_id.is_none();
+            let session_id = tagged_id.unwrap_or_else(|| format!("slopd:{}", pane.pane_id));
+            let explicitly_resumable = pane.tags.iter().any(|tag| tag == ACP_RESUMABLE_TAG);
+            if (!legacy && !explicitly_resumable) || (legacy && pane.session_id.is_none()) {
+                incomplete.push((pane.pane_id, pane.tags, false));
+                continue;
+            }
+            let cwd = tagged_cwd(&pane.tags)
+                .or_else(|| pane.working_dir.as_deref().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let start_directory = self
+                .config
+                .working_directory
+                .clone()
+                .unwrap_or_else(|| cwd.clone());
+            live_metadata.push((
+                pane.pane_id.clone(),
+                session_id.clone(),
+                cwd.to_string_lossy().into_owned(),
+            ));
+            recovered.insert(
+                session_id,
+                Session {
+                    pane_id: Some(pane.pane_id),
+                    grave_id: None,
+                    backend: Some(pane.backend),
+                    native_session_id: pane.session_id,
+                    cwd,
+                    start_directory,
+                    system_prompt: None,
+                    system_prompt_delivered: true,
+                    active_turn: None,
+                    last_used: pane.last_active.max(pane.created_at),
+                    title: pane.pane_title,
+                },
+            );
+        }
+
+        let next_activity = recovered
+            .values()
+            .map(|session| session.last_used)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        *self.sessions.lock().await = recovered;
+        self.next_activity_id
+            .store(next_activity.max(1), Ordering::Relaxed);
+
+        for (pane_id, session_id, cwd) in live_metadata {
+            self.tag_session_pane(&pane_id, &session_id, &cwd, true)
+                .await?;
+        }
+        for (pane_id, tags, preserve_tombstone) in incomplete {
+            tracing::warn!(
+                pane_id,
+                "discarding incomplete ACP pane after adapter restart"
+            );
+            if !preserve_tombstone {
+                self.remove_session_tags(&pane_id, &tags).await;
+            }
+            if let Err(error) = self.kill_pane(&pane_id).await {
+                tracing::warn!(pane_id, "failed to remove incomplete ACP pane: {error}");
+            }
+        }
+
+        self.trim_recovered_panes().await?;
+        let sessions = self.sessions.lock().await;
+        let live = sessions
+            .values()
+            .filter(|session| session.pane_id.is_some())
+            .count();
+        tracing::info!(
+            sessions = sessions.len(),
+            live,
+            "recovered durable ACP sessions"
+        );
+        Ok(())
+    }
+
+    fn pane_is_in_scope(&self, pane: &libslop::PaneInfo) -> bool {
+        let account = self
+            .config
+            .account
+            .as_deref()
+            .unwrap_or(libslop::DEFAULT_ACCOUNT);
+        pane.account == account
+            && self
+                .config
+                .backend
+                .is_none_or(|backend| pane.backend == backend)
+            && pane.tags.iter().any(|tag| tag == ACP_TAG)
     }
 
     pub async fn dispatch(self: &Arc<Self>, message: Value, sender: &Sender) {
@@ -166,6 +358,28 @@ impl Adapter {
                 let sender = sender.clone();
                 tokio::spawn(async move {
                     adapter.session_new(id, params, &sender).await;
+                });
+            }
+            "session/resume" => {
+                let adapter = Arc::clone(self);
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    adapter.session_resume(id, params, &sender).await;
+                });
+            }
+            "session/list" => self.session_list(id, params, sender).await,
+            "session/delete" => {
+                let adapter = Arc::clone(self);
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    adapter.session_delete(id, params, &sender).await;
+                });
+            }
+            "session/close" => {
+                let adapter = Arc::clone(self);
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    adapter.session_close(id, params, &sender).await;
                 });
             }
             "session/prompt" => {
@@ -224,6 +438,12 @@ impl Adapter {
                     "protocolVersion": params.protocol_version.min(PROTOCOL_VERSION),
                     "agentCapabilities": {
                         "loadSession": false,
+                        "sessionCapabilities": {
+                            "resume": {},
+                            "list": {},
+                            "delete": {},
+                            "close": {},
+                        },
                         "promptCapabilities": {
                             "image": false,
                             "audio": false,
@@ -309,24 +529,245 @@ impl Adapter {
             Ok(started) => started,
             Err(error) => return server_error(sender, id, error).await,
         };
-        let session_id = format!("slopd:{}", started.pane_id);
+        let session_id = format!("slopd:{}", uuid::Uuid::new_v4());
+        if let Err(error) = self
+            .tag_session_pane(&started.pane_id, &session_id, &params.cwd, false)
+            .await
+        {
+            let _ = self.kill_pane(&started.pane_id).await;
+            return server_error(
+                sender,
+                id,
+                format!("session/new: could not persist session metadata: {error}"),
+            )
+            .await;
+        }
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             Session {
                 pane_id: Some(started.pane_id),
+                grave_id: None,
                 backend: Some(started.backend),
                 native_session_id: started.native_session_id,
+                cwd: PathBuf::from(&params.cwd),
                 start_directory,
                 system_prompt,
                 system_prompt_delivered: false,
                 active_turn: None,
                 last_used: self.next_activity_id.fetch_add(1, Ordering::Relaxed),
+                title: None,
             },
         );
         drop(sessions);
 
         wire::send(sender, wire::ok(id, json!({ "sessionId": session_id }))).await;
+    }
+
+    async fn session_resume(&self, id: Value, params: Value, sender: &Sender) {
+        let params: SessionResumeParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => {
+                return reject(
+                    sender,
+                    id,
+                    format!("session/resume: invalid params: {error}"),
+                )
+                .await;
+            }
+        };
+        if let Err(error) =
+            validate_session_cwd_and_mcp("session/resume", &params.cwd, &params.mcp_servers)
+        {
+            return reject(sender, id, error).await;
+        }
+
+        let _creation = self.session_creation.lock().await;
+        {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get(&params.session_id) else {
+                return reject(sender, id, "session/resume: unknown session".into()).await;
+            };
+            if session.cwd != std::path::Path::new(&params.cwd) {
+                return reject(
+                    sender,
+                    id,
+                    format!(
+                        "session/resume: cwd does not match the session's original cwd {}",
+                        session.cwd.display()
+                    ),
+                )
+                .await;
+            }
+        }
+        if let Err(error) = self.ensure_session_resident(&params.session_id).await {
+            return server_error(sender, id, format!("session/resume: {error}")).await;
+        }
+        if let Some(session) = self.sessions.lock().await.get_mut(&params.session_id) {
+            session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+        }
+        wire::send(sender, wire::ok(id, json!({}))).await;
+    }
+
+    async fn session_list(&self, id: Value, params: Value, sender: &Sender) {
+        let params: SessionListParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => {
+                return reject(sender, id, format!("session/list: invalid params: {error}")).await;
+            }
+        };
+        if let Some(cwd) = params.cwd.as_deref()
+            && (cwd.is_empty() || !Path::new(cwd).is_absolute())
+        {
+            return reject(
+                sender,
+                id,
+                "session/list: cwd must be an absolute path".into(),
+            )
+            .await;
+        }
+        if params.cursor.is_some() {
+            return reject(
+                sender,
+                id,
+                "session/list: cursor is invalid because the previous response had no nextCursor"
+                    .into(),
+            )
+            .await;
+        }
+
+        let sessions = self.sessions.lock().await;
+        let mut entries = sessions.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(_, session)| std::cmp::Reverse(session.last_used));
+        let sessions = entries
+            .into_iter()
+            .filter(|(_, session)| {
+                params
+                    .cwd
+                    .as_deref()
+                    .is_none_or(|cwd| session.cwd == std::path::Path::new(cwd))
+            })
+            .map(|(session_id, session)| {
+                let mut entry = json!({
+                    "sessionId": session_id,
+                    "cwd": session.cwd,
+                });
+                if let Some(title) = session.title.as_ref() {
+                    entry["title"] = Value::String(title.clone());
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        wire::send(sender, wire::ok(id, json!({ "sessions": sessions }))).await;
+    }
+
+    async fn session_delete(&self, id: Value, params: Value, sender: &Sender) {
+        let params: SessionCancelParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => {
+                return reject(
+                    sender,
+                    id,
+                    format!("session/delete: invalid params: {error}"),
+                )
+                .await;
+            }
+        };
+        let _creation = self.session_creation.lock().await;
+        if !self.sessions.lock().await.contains_key(&params.session_id) {
+            // ACP specifies idempotent deletion for unknown/already-deleted IDs.
+            return wire::send(sender, wire::ok(id, json!({}))).await;
+        }
+        if let Some(cancel) = self
+            .sessions
+            .lock()
+            .await
+            .get(&params.session_id)
+            .and_then(|session| session.active_turn.as_ref())
+            .map(|active| active.cancel.clone())
+        {
+            cancel.cancel();
+        }
+        if let Err(error) = self.ensure_session_resident(&params.session_id).await {
+            return server_error(sender, id, format!("session/delete: {error}")).await;
+        }
+        let pane_id = self
+            .sessions
+            .lock()
+            .await
+            .get(&params.session_id)
+            .and_then(|session| session.pane_id.clone())
+            .expect("resident deleted session must have a pane");
+        let mut client = match self.config.transport.connect().await {
+            Ok(client) => client,
+            Err(error) => return server_error(sender, id, error).await,
+        };
+        if let Err(error) = client
+            .tag(pane_id.clone(), ACP_DELETED_TAG.to_string())
+            .await
+        {
+            return server_error(
+                sender,
+                id,
+                format!("session/delete: could not persist deletion tombstone: {error}"),
+            )
+            .await;
+        }
+        drop(client);
+        if let Err(error) = self.kill_pane(&pane_id).await {
+            return server_error(sender, id, format!("session/delete: {error}")).await;
+        }
+        self.sessions.lock().await.remove(&params.session_id);
+        wire::send(sender, wire::ok(id, json!({}))).await;
+    }
+
+    async fn session_close(&self, id: Value, params: Value, sender: &Sender) {
+        let params: SessionCancelParams = match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(error) => {
+                return reject(
+                    sender,
+                    id,
+                    format!("session/close: invalid params: {error}"),
+                )
+                .await;
+            }
+        };
+        let _creation = self.session_creation.lock().await;
+        let (pane_id, cancel) = {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get(&params.session_id) else {
+                return reject(sender, id, "session/close: unknown session".into()).await;
+            };
+            (
+                session.pane_id.clone(),
+                session
+                    .active_turn
+                    .as_ref()
+                    .map(|active| active.cancel.clone()),
+            )
+        };
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+        if let Some(pane_id) = pane_id {
+            if let Err(error) = self
+                .capture_native_session(&params.session_id, &pane_id)
+                .await
+            {
+                tracing::warn!(
+                    pane_id,
+                    "could not refresh session metadata before close: {error}"
+                );
+            }
+            if let Err(error) = self.kill_pane(&pane_id).await {
+                return server_error(sender, id, format!("session/close: {error}")).await;
+            }
+            self.mark_pane_gone(&params.session_id, &pane_id, None)
+                .await;
+            self.capture_latest_grave(&params.session_id).await;
+        }
+        wire::send(sender, wire::ok(id, json!({}))).await;
     }
 
     async fn session_prompt(&self, id: Value, params: Value, sender: &Sender) {
@@ -508,6 +949,8 @@ impl Adapter {
             }
         };
         accepted.store(true, Ordering::Release);
+        self.mark_session_resumable(session_id, &lease.pane_id)
+            .await;
         wire::send(
             sender,
             wire::session_update(session_id, active_run_update(Some(&lease.run_id))),
@@ -737,7 +1180,7 @@ impl Adapter {
                 return Err(format!("could not resolve backend for {pane_id}: {error}"));
             }
         };
-        if let Err(error) = client.tag(pane_id.clone(), "acp".into()).await {
+        if let Err(error) = client.tag(pane_id.clone(), ACP_TAG.into()).await {
             tracing::warn!("could not tag ACP pane {pane_id}: {error}");
         }
         Ok(StartedPane {
@@ -747,8 +1190,188 @@ impl Adapter {
         })
     }
 
+    async fn revive_pane(&self, grave_id: &str) -> Result<StartedPane, String> {
+        let mut client = self.config.transport.connect().await?;
+        let (pane_id, _) = client
+            .revive(Some(grave_id.to_string()), None)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(client);
+
+        let deadline = tokio::time::Instant::now() + self.config.ready_timeout;
+        loop {
+            let mut client = self.config.transport.connect().await?;
+            let panes = client.ps().await.map_err(|error| error.to_string())?;
+            if let Some(pane) = panes.into_iter().find(|pane| pane.pane_id == pane_id)
+                && pane.detailed_state != libslop::PaneDetailedState::BootingUp
+            {
+                return Ok(StartedPane {
+                    pane_id,
+                    backend: pane.backend,
+                    native_session_id: pane.session_id,
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {} seconds waiting for revived pane {pane_id}",
+                    self.config.ready_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn tag_session_pane(
+        &self,
+        pane_id: &str,
+        session_id: &str,
+        cwd: &str,
+        resumable: bool,
+    ) -> Result<(), String> {
+        let mut client = self.config.transport.connect().await?;
+        let existing = client
+            .tags(pane_id.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        for tag in existing
+            .iter()
+            .filter(|tag| tag.starts_with(ACP_OWNER_TAG_PREFIX) && **tag != self.owner_tag)
+        {
+            client
+                .untag(pane_id.to_string(), tag.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for tag in [
+            ACP_TAG.to_string(),
+            session_tag(session_id),
+            cwd_tag(cwd),
+            self.owner_tag.clone(),
+        ] {
+            client
+                .tag(pane_id.to_string(), tag)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if resumable {
+            client
+                .tag(pane_id.to_string(), ACP_RESUMABLE_TAG.to_string())
+                .await
+                .map_err(|error| error.to_string())?;
+        } else if existing.iter().any(|tag| tag == ACP_RESUMABLE_TAG) {
+            client
+                .untag(pane_id.to_string(), ACP_RESUMABLE_TAG.to_string())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn remove_session_tags(&self, pane_id: &str, tags: &[String]) {
+        let Ok(mut client) = self.config.transport.connect().await else {
+            return;
+        };
+        for tag in tags.iter().filter(|tag| {
+            *tag == ACP_TAG
+                || *tag == ACP_RESUMABLE_TAG
+                || tag.starts_with(ACP_SESSION_TAG_PREFIX)
+                || tag.starts_with(ACP_CWD_TAG_PREFIX)
+                || tag.starts_with(ACP_OWNER_TAG_PREFIX)
+        }) {
+            if let Err(error) = client.untag(pane_id.to_string(), tag.clone()).await {
+                tracing::warn!(pane_id, tag, "failed to remove abandoned ACP tag: {error}");
+            }
+        }
+    }
+
+    async fn mark_session_resumable(&self, session_id: &str, pane_id: &str) {
+        if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
+            session.system_prompt_delivered = true;
+        }
+        let mut client = match self.config.transport.connect().await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(pane_id, "could not persist resumable ACP state: {error}");
+                return;
+            }
+        };
+        if let Err(error) = client
+            .tag(pane_id.to_string(), ACP_RESUMABLE_TAG.to_string())
+            .await
+        {
+            tracing::warn!(pane_id, "could not persist resumable ACP state: {error}");
+        }
+        drop(client);
+        if let Err(error) = self.capture_native_session(session_id, pane_id).await {
+            tracing::debug!(
+                pane_id,
+                "native session metadata is not available yet: {error}"
+            );
+        }
+    }
+
+    async fn capture_native_session(&self, session_id: &str, pane_id: &str) -> Result<(), String> {
+        let mut client = self.config.transport.connect().await?;
+        let pane = client
+            .ps()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .ok_or_else(|| format!("pane {pane_id} is no longer live"))?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| "session disappeared".to_string())?;
+        if session.pane_id.as_deref() != Some(pane_id) {
+            return Err("session is attached to a different pane".into());
+        }
+        if pane.session_id.is_some() {
+            session.native_session_id = pane.session_id;
+        }
+        session.title = pane.pane_title;
+        Ok(())
+    }
+
+    async fn capture_latest_grave(&self, session_id: &str) {
+        let mut client = match self.config.transport.connect().await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    "could not find closed session in graveyard: {error}"
+                );
+                return;
+            }
+        };
+        let graves = match client.graveyard(None, GRAVEYARD_RECOVERY_LIMIT).await {
+            Ok(graves) => graves,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    "could not find closed session in graveyard: {error}"
+                );
+                return;
+            }
+        };
+        let Some(grave) = graves.into_iter().find(|grave| {
+            tagged_session_id(&grave.pane.tags).as_deref() == Some(session_id)
+                && grave.revived_at.is_none()
+        }) else {
+            return;
+        };
+        if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
+            session.grave_id = Some(grave.grave_id);
+            if grave.pane.session_id.is_some() {
+                session.native_session_id = grave.pane.session_id;
+            }
+            session.title = grave.pane.pane_title;
+            session.last_used = session.last_used.max(grave.destroyed_at);
+        }
+    }
+
     async fn ensure_session_resident(&self, session_id: &str) -> Result<(), String> {
-        let (start_directory, native_session_id) = {
+        let (start_directory, cwd, native_session_id, grave_id) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(session_id)
@@ -761,14 +1384,45 @@ impl Adapter {
             }
             (
                 session.start_directory.clone(),
+                session.cwd.to_string_lossy().into_owned(),
                 session.native_session_id.clone(),
+                session.grave_id.clone(),
             )
         };
 
         self.make_live_pane_room().await?;
-        let started = self
-            .start_pane(start_directory, native_session_id.as_deref())
-            .await?;
+        let (started, resumed) = if let Some(grave_id) = grave_id.as_deref() {
+            match self.revive_pane(grave_id).await {
+                Ok(started) => (started, true),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        grave_id,
+                        "grave revival failed, falling back to native resume: {error}"
+                    );
+                    (
+                        self.start_pane(start_directory, native_session_id.as_deref())
+                            .await?,
+                        native_session_id.is_some(),
+                    )
+                }
+            }
+        } else {
+            (
+                self.start_pane(start_directory, native_session_id.as_deref())
+                    .await?,
+                native_session_id.is_some(),
+            )
+        };
+        if let Err(error) = self
+            .tag_session_pane(&started.pane_id, session_id, &cwd, resumed)
+            .await
+        {
+            let _ = self.kill_pane(&started.pane_id).await;
+            return Err(format!(
+                "could not persist restored session metadata: {error}"
+            ));
+        }
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id) else {
             drop(sessions);
@@ -780,7 +1434,6 @@ impl Adapter {
             let _ = self.kill_pane(&started.pane_id).await;
             return Err("session acquired another pane while it was being restored".into());
         }
-        let resumed = native_session_id.is_some();
         tracing::info!(
             session_id,
             pane_id = started.pane_id,
@@ -789,6 +1442,7 @@ impl Adapter {
             "restored evicted ACP session"
         );
         session.pane_id = Some(started.pane_id);
+        session.grave_id = None;
         session.backend = Some(started.backend);
         session.native_session_id = started.native_session_id.or(native_session_id);
         if !resumed {
@@ -802,15 +1456,38 @@ impl Adapter {
         let panes = client.ps().await.map_err(|error| error.to_string())?;
         self.reconcile_live_sessions(&panes).await;
 
-        let victim = {
-            let mut sessions = self.sessions.lock().await;
-            let live_count = sessions
+        let live_count = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|session| session.pane_id.is_some())
+            .count();
+        if live_count < self.config.max_sessions {
+            return Ok(());
+        }
+        self.evict_lru_inactive().await
+    }
+
+    async fn trim_recovered_panes(&self) -> Result<(), String> {
+        loop {
+            let live_count = self
+                .sessions
+                .lock()
+                .await
                 .values()
                 .filter(|session| session.pane_id.is_some())
                 .count();
-            if live_count < self.config.max_sessions {
+            if live_count <= self.config.max_sessions {
                 return Ok(());
             }
+            self.evict_lru_inactive().await?;
+        }
+    }
+
+    async fn evict_lru_inactive(&self) -> Result<(), String> {
+        let victim = {
+            let mut sessions = self.sessions.lock().await;
             let Some(victim_id) = sessions
                 .iter()
                 .filter(|(_, session)| session.pane_id.is_some() && session.active_turn.is_none())
@@ -863,6 +1540,7 @@ impl Adapter {
                 return Err(format!("failed to evict oldest pane: {error}"));
             }
         }
+        self.capture_latest_grave(&victim.0).await;
         Ok(())
     }
 
@@ -1004,19 +1682,32 @@ impl Adapter {
             let sessions = std::mem::take(&mut *sessions);
             sessions
                 .into_values()
-                .filter_map(|session| {
-                    if let Some(active) = session.active_turn {
-                        active.cancel.cancel();
+                .filter_map(|session| match session.pane_id {
+                    Some(pane_id) => {
+                        let active = session.active_turn.map(|active| {
+                            active.cancel.cancel();
+                            true
+                        });
+                        Some((pane_id, active.unwrap_or(false)))
                     }
-                    session.pane_id
+                    None => None,
                 })
                 .collect::<Vec<_>>()
         };
-        for pane_id in panes {
-            if let Err(error) = self.kill_pane(&pane_id).await {
+        for (pane_id, was_active) in panes {
+            if was_active && let Err(error) = self.interrupt_pane(&pane_id).await {
                 tracing::warn!(
                     pane_id,
-                    "failed to remove ACP pane during shutdown: {error}"
+                    "failed to interrupt ACP pane during shutdown: {error}"
+                );
+            }
+            let Ok(mut client) = self.config.transport.connect().await else {
+                continue;
+            };
+            if let Err(error) = client.untag(pane_id.clone(), self.owner_tag.clone()).await {
+                tracing::warn!(
+                    pane_id,
+                    "failed to detach ACP pane owner during shutdown: {error}"
                 );
             }
         }
@@ -1287,6 +1978,73 @@ fn prompt_text(method: &str, blocks: &[Value]) -> Result<String, String> {
         }
     }
     Ok(parts.join("\n"))
+}
+
+fn validate_session_cwd_and_mcp(
+    method: &str,
+    cwd: &str,
+    mcp_servers: &[Value],
+) -> Result<(), String> {
+    if cwd.is_empty() || !Path::new(cwd).is_absolute() {
+        return Err(format!("{method}: cwd must be an absolute path"));
+    }
+    if !mcp_servers.is_empty() {
+        return Err(format!(
+            "{method}: MCP servers are not supported by the slopd control protocol"
+        ));
+    }
+    Ok(())
+}
+
+fn session_tag(session_id: &str) -> String {
+    format!(
+        "{ACP_SESSION_TAG_PREFIX}{}",
+        hex_encode(session_id.as_bytes())
+    )
+}
+
+fn cwd_tag(cwd: &str) -> String {
+    format!("{ACP_CWD_TAG_PREFIX}{}", hex_encode(cwd.as_bytes()))
+}
+
+fn tagged_session_id(tags: &[String]) -> Option<String> {
+    decoded_tag(tags, ACP_SESSION_TAG_PREFIX)
+}
+
+fn tagged_cwd(tags: &[String]) -> Option<PathBuf> {
+    decoded_tag(tags, ACP_CWD_TAG_PREFIX).map(PathBuf::from)
+}
+
+fn decoded_tag(tags: &[String], prefix: &str) -> Option<String> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix(prefix))
+        .and_then(hex_decode)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect()
 }
 
 fn launch_args(base: &[String], native_session_id: Option<&str>) -> Vec<String> {
@@ -1692,6 +2450,22 @@ mod tests {
             ["--resume", "native-42", "--foo", "--bar"]
         );
         assert_eq!(launch_args(&base, None), base);
+    }
+
+    #[test]
+    fn durable_tags_round_trip_acp_identity_and_cwd() {
+        let session_id = "slopd:%42";
+        let cwd = "/tmp/project with spaces";
+        assert_eq!(
+            tagged_session_id(&[session_tag(session_id)]).as_deref(),
+            Some(session_id)
+        );
+        assert_eq!(tagged_cwd(&[cwd_tag(cwd)]).as_deref(), Some(Path::new(cwd)));
+        assert!(
+            session_tag(session_id)
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        );
     }
 
     #[test]

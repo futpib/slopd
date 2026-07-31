@@ -129,6 +129,14 @@ fn initialize(harness: &mut Harness) {
         initialized["result"]["agentCapabilities"]["loadSession"],
         false
     );
+    assert!(
+        initialized["result"]["agentCapabilities"]["sessionCapabilities"]["resume"].is_object()
+    );
+    assert!(initialized["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
+    assert!(
+        initialized["result"]["agentCapabilities"]["sessionCapabilities"]["delete"].is_object()
+    );
+    assert!(initialized["result"]["agentCapabilities"]["sessionCapabilities"]["close"].is_object());
 }
 
 fn new_session(harness: &mut Harness, cwd: &std::path::Path, system_prompt: &str) -> String {
@@ -151,7 +159,8 @@ fn new_session(harness: &mut Harness, cwd: &std::path::Path, system_prompt: &str
         .as_str()
         .expect("session id")
         .to_string();
-    assert!(session_id.starts_with("slopd:%"));
+    let opaque_id = session_id.strip_prefix("slopd:").expect("slopd session id");
+    uuid::Uuid::parse_str(opaque_id).expect("new ACP sessions should use durable UUID IDs");
     session_id
 }
 
@@ -175,6 +184,64 @@ fn prompt(
     (response, notifications)
 }
 
+fn resume_session(
+    harness: &mut Harness,
+    request_id: u64,
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> Value {
+    let mut notifications = Vec::new();
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/resume",
+        "params": {
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+        },
+    }));
+    harness.response(request_id, &mut notifications)
+}
+
+fn list_sessions(harness: &mut Harness, request_id: u64) -> Vec<Value> {
+    let mut notifications = Vec::new();
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/list",
+        "params": {},
+    }));
+    harness
+        .response(request_id, &mut notifications)
+        .pointer("/result/sessions")
+        .and_then(Value::as_array)
+        .expect("session/list result")
+        .clone()
+}
+
+fn close_session(harness: &mut Harness, request_id: u64, session_id: &str) -> Value {
+    let mut notifications = Vec::new();
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/close",
+        "params": { "sessionId": session_id },
+    }));
+    harness.response(request_id, &mut notifications)
+}
+
+fn delete_session(harness: &mut Harness, request_id: u64, session_id: &str) -> Value {
+    let mut notifications = Vec::new();
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "session/delete",
+        "params": { "sessionId": session_id },
+    }));
+    harness.response(request_id, &mut notifications)
+}
+
 fn streamed_text(notifications: &[Value]) -> String {
     notifications
         .iter()
@@ -186,10 +253,18 @@ fn streamed_text(notifications: &[Value]) -> String {
         .collect()
 }
 
-fn session_pane_id(session_id: &str) -> &str {
-    session_id
-        .strip_prefix("slopd:")
-        .expect("slopd session id should contain its pane id")
+fn session_pane_id(env: &TestEnv, session_id: &str) -> String {
+    let encoded = session_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let tag = format!("acp-session-{encoded}");
+    panes(env)
+        .into_iter()
+        .find(|pane| pane.tags.iter().any(|candidate| candidate == &tag))
+        .map(|pane| pane.pane_id)
+        .unwrap_or_else(|| panic!("no live pane carries the durable session tag {tag}"))
 }
 
 fn panes(env: &TestEnv) -> Vec<libslop::PaneInfo> {
@@ -317,9 +392,7 @@ fn buzz_native_steer_reuses_the_existing_codex_pane() {
     let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
     initialize(&mut harness);
     let session_id = new_session(&mut harness, env.config_dir.path(), "");
-    let pane_id = session_id
-        .strip_prefix("slopd:")
-        .expect("slopd session id should contain its pane id");
+    let pane_id = session_pane_id(&env, &session_id);
 
     harness.send(json!({
         "jsonrpc": "2.0",
@@ -433,8 +506,8 @@ fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
         env.config_dir.path(),
         "RESUMED_SYSTEM_PROMPT_CANARY",
     );
-    let first_pane = session_pane_id(&first).to_string();
-    let second_pane = session_pane_id(&second).to_string();
+    let first_pane = session_pane_id(&env, &first);
+    let second_pane = session_pane_id(&env, &second);
 
     // Give the second pane conversation state worth resuming, including a
     // system prompt that must not be injected again after native resume.
@@ -452,7 +525,7 @@ fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
     assert_eq!(first_turn["result"]["stopReason"], "end_turn");
 
     let third = new_session(&mut harness, env.config_dir.path(), "");
-    let third_pane = session_pane_id(&third).to_string();
+    let third_pane = session_pane_id(&env, &third);
     let resident = panes(&env);
     assert_eq!(resident.len(), 2);
     assert!(resident.iter().any(|pane| pane.pane_id == first_pane));
@@ -525,7 +598,7 @@ fn evicted_session_without_native_context_restarts_fresh() {
         env.config_dir.path(),
         "FRESH_SYSTEM_PROMPT_CANARY",
     );
-    let empty_pane = session_pane_id(&empty).to_string();
+    let empty_pane = session_pane_id(&env, &empty);
     assert_eq!(
         panes(&env)
             .into_iter()
@@ -536,6 +609,7 @@ fn evicted_session_without_native_context_restarts_fresh() {
     );
 
     let replacement = new_session(&mut harness, env.config_dir.path(), "");
+    let replacement_pane = session_pane_id(&env, &replacement);
     assert_eq!(panes(&env).len(), 1);
     assert!(panes(&env).iter().all(|pane| pane.pane_id != empty_pane));
 
@@ -547,11 +621,7 @@ fn evicted_session_without_native_context_restarts_fresh() {
 
     let resident = panes(&env);
     assert_eq!(resident.len(), 1);
-    assert!(
-        resident
-            .iter()
-            .all(|pane| pane.pane_id != session_pane_id(&replacement))
-    );
+    assert!(resident.iter().all(|pane| pane.pane_id != replacement_pane));
     assert!(
         resident[0].session_id.is_some(),
         "freshly restored pane did not create native context on its first prompt"
@@ -585,7 +655,7 @@ fn session_limit_never_evicts_an_active_pane() {
     );
     initialize(&mut harness);
     let active = new_session(&mut harness, env.config_dir.path(), "");
-    let active_pane = session_pane_id(&active).to_string();
+    let active_pane = session_pane_id(&env, &active);
 
     harness.send(json!({
         "jsonrpc": "2.0",
@@ -657,8 +727,8 @@ fn dead_panes_are_pruned_before_limit_eviction() {
     );
     initialize(&mut harness);
     let dead = new_session(&mut harness, env.config_dir.path(), "");
-    let dead_pane = session_pane_id(&dead);
-    let killed = env.slopctl(&["kill", dead_pane]);
+    let dead_pane = session_pane_id(&env, &dead);
+    let killed = env.slopctl(&["kill", &dead_pane]);
     assert!(
         killed.status.success(),
         "failed to kill test pane: {killed:?}"
@@ -667,11 +737,11 @@ fn dead_panes_are_pruned_before_limit_eviction() {
     let replacement = new_session(&mut harness, env.config_dir.path(), "");
     let resident = panes(&env);
     assert_eq!(resident.len(), 1);
-    assert_eq!(resident[0].pane_id, session_pane_id(&replacement));
+    assert_eq!(resident[0].pane_id, session_pane_id(&env, &replacement));
 }
 
 #[test]
-fn graceful_adapter_eof_removes_owned_panes() {
+fn graceful_adapter_eof_detaches_panes_for_a_replacement_to_resume() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -693,14 +763,252 @@ fn graceful_adapter_eof_removes_owned_panes() {
     let _daemon = Daemon(Some(env.spawn_slopd()));
     let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
     initialize(&mut harness);
-    new_session(&mut harness, env.config_dir.path(), "");
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut harness, 3, &session_id, "PERSIST_EOF_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let pane_id = session_pane_id(&env, &session_id);
     assert_eq!(panes(&env).len(), 1);
 
     harness.close_stdin_and_wait();
+    assert_eq!(
+        panes(&env).len(),
+        1,
+        "graceful adapter shutdown should detach its resumable pane"
+    );
+
+    let mut replacement = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut replacement);
+    assert!(
+        list_sessions(&mut replacement, 4)
+            .iter()
+            .any(|session| { session["sessionId"].as_str() == Some(session_id.as_str()) })
+    );
+    let resumed = resume_session(&mut replacement, 5, &session_id, env.config_dir.path());
+    assert!(resumed.get("error").is_none(), "resume failed: {resumed}");
+    let resident = panes(&env);
+    assert_eq!(resident.len(), 1);
+    assert_eq!(
+        resident[0].pane_id, pane_id,
+        "resume should adopt the live pane"
+    );
+}
+
+#[test]
+fn replacement_recovers_a_session_after_abrupt_adapter_exit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut original = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut original);
+    let session_id = new_session(&mut original, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut original, 3, &session_id, "CRASH_RECOVERY_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let pane_id = session_pane_id(&env, &session_id);
+
+    // Harness::drop terminates the adapter without closing stdin, reproducing
+    // the service-level signal race that originally orphaned panes.
+    drop(original);
+    assert_eq!(panes(&env).len(), 1);
+
+    let mut replacement = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut replacement);
+    let listed = list_sessions(&mut replacement, 4);
+    assert!(
+        listed
+            .iter()
+            .any(|session| { session["sessionId"].as_str() == Some(session_id.as_str()) })
+    );
+    let resumed = resume_session(&mut replacement, 5, &session_id, env.config_dir.path());
+    assert!(resumed.get("error").is_none(), "resume failed: {resumed}");
+    assert_eq!(panes(&env)[0].pane_id, pane_id);
+
+    let (continued, notifications) = prompt(
+        &mut replacement,
+        6,
+        &session_id,
+        "AFTER_ADAPTER_RESTART_CANARY",
+    );
+    assert_eq!(continued["result"]["stopReason"], "end_turn");
+    assert!(streamed_text(&notifications).contains("AFTER_ADAPTER_RESTART_CANARY"));
+}
+
+#[test]
+fn closed_session_is_listed_and_revived_from_the_graveyard() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let original_pane = session_pane_id(&env, &session_id);
+    let (completed, _) = prompt(&mut harness, 3, &session_id, "GRAVEYARD_CONTEXT_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let native_session = panes(&env)[0]
+        .session_id
+        .clone()
+        .expect("native session id");
+
+    let closed = close_session(&mut harness, 4, &session_id);
+    assert!(closed.get("error").is_none(), "close failed: {closed}");
     assert!(
         panes(&env).is_empty(),
-        "graceful adapter shutdown left its managed pane behind"
+        "session/close must free its live pane"
     );
+    assert!(
+        list_sessions(&mut harness, 5)
+            .iter()
+            .any(|session| { session["sessionId"].as_str() == Some(session_id.as_str()) })
+    );
+    drop(harness);
+
+    let mut replacement = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut replacement);
+    assert!(
+        list_sessions(&mut replacement, 6)
+            .iter()
+            .any(|session| { session["sessionId"].as_str() == Some(session_id.as_str()) }),
+        "a replacement adapter did not reconstruct the closed logical session"
+    );
+
+    let resumed = resume_session(&mut replacement, 7, &session_id, env.config_dir.path());
+    assert!(resumed.get("error").is_none(), "resume failed: {resumed}");
+    let revived = panes(&env);
+    assert_eq!(revived.len(), 1);
+    assert_ne!(revived[0].pane_id, original_pane);
+    assert_eq!(
+        revived[0].session_id.as_deref(),
+        Some(native_session.as_str())
+    );
+
+    let (continued, notifications) = prompt(
+        &mut replacement,
+        8,
+        &session_id,
+        "AFTER_GRAVEYARD_REVIVE_CANARY",
+    );
+    assert_eq!(continued["result"]["stopReason"], "end_turn");
+    assert!(streamed_text(&notifications).contains("AFTER_GRAVEYARD_REVIVE_CANARY"));
+
+    let deleted = delete_session(&mut replacement, 9, &session_id);
+    assert!(deleted.get("error").is_none(), "delete failed: {deleted}");
+    assert!(panes(&env).is_empty());
+    assert!(
+        list_sessions(&mut replacement, 10)
+            .iter()
+            .all(|session| { session["sessionId"].as_str() != Some(session_id.as_str()) })
+    );
+    drop(replacement);
+
+    let mut restarted = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut restarted);
+    assert!(
+        list_sessions(&mut restarted, 11)
+            .iter()
+            .all(|session| { session["sessionId"].as_str() != Some(session_id.as_str()) })
+    );
+    let deleted_again = delete_session(&mut restarted, 12, &session_id);
+    assert!(
+        deleted_again.get("error").is_none(),
+        "idempotent delete failed: {deleted_again}"
+    );
+}
+
+#[test]
+fn replacement_trims_recovered_live_panes_but_keeps_their_sessions() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut original = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-codex", "--max-sessions", "3"],
+    );
+    initialize(&mut original);
+    let mut session_ids = Vec::new();
+    for request_id in 10..13 {
+        let session_id = new_session(&mut original, env.config_dir.path(), "");
+        let (completed, _) = prompt(
+            &mut original,
+            request_id,
+            &session_id,
+            &format!("RECOVERED_LIMIT_CANARY_{request_id}"),
+        );
+        assert_eq!(completed["result"]["stopReason"], "end_turn");
+        session_ids.push(session_id);
+    }
+    assert_eq!(panes(&env).len(), 3);
+    drop(original);
+
+    let mut replacement = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-codex", "--max-sessions", "2"],
+    );
+    initialize(&mut replacement);
+    assert_eq!(
+        panes(&env).len(),
+        2,
+        "startup recovery must enforce the live pane limit"
+    );
+    let listed = list_sessions(&mut replacement, 20);
+    assert_eq!(
+        listed.len(),
+        3,
+        "eviction must preserve logical ACP sessions"
+    );
+    for session_id in session_ids {
+        assert!(
+            listed
+                .iter()
+                .any(|session| { session["sessionId"].as_str() == Some(session_id.as_str()) })
+        );
+    }
 }
 
 #[test]

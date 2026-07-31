@@ -111,7 +111,7 @@ struct Cli {
 
     /// Maximum live managed panes. The least-recently-used inactive pane is
     /// evicted at the limit, then natively resumed when possible if reused.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 4)]
     max_sessions: usize,
 }
 
@@ -155,6 +155,10 @@ async fn main() {
         turn_timeout: Duration::from_secs(cli.turn_timeout),
         max_sessions: cli.max_sessions,
     });
+    if let Err(error) = adapter.recover_sessions().await {
+        eprintln!("slopd-acp: failed to recover durable ACP sessions: {error}");
+        std::process::exit(1);
+    }
 
     let (sender, receiver) = tokio::sync::mpsc::channel(256);
     let writer = tokio::spawn(wire::writer_task(receiver));

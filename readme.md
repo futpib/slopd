@@ -1245,6 +1245,10 @@ The adapter maps ACP onto slopd as follows:
 | ACP | slopd operation |
 |-----|-----------------|
 | `session/new` | `run` with ACP's cwd, selected account/backend, env, and agent args |
+| `session/resume` | reuse the resident pane, revive its graveyard entry, or resume its backend-native session |
+| `session/list` | list the durable sessions reconstructed from live panes and graveyard entries |
+| `session/close` | interrupt an active turn and move the pane to the graveyard while retaining the logical session |
+| `session/delete` | persist a deletion tombstone and remove the logical session |
 | `session/prompt` | subscribe to pane state and transcript, then `send` |
 | `session/update` message/tool chunks | normalized transcript records |
 | prompt completion | the pane's busy-to-ready state transition |
@@ -1255,19 +1259,29 @@ For [Buzz](https://github.com/block/buzz), the adapter also implements the
 routes steering text into the existing pane while the original ACP turn remains
 in flight, instead of opening a second session.
 
-Every adapter-created pane receives the `acp` slopd tag. ACP session IDs have
-the form `slopd:%42`, but the mapping is intentionally process-local and the
-adapter advertises `loadSession: false`. On orderly stdin shutdown it interrupts
-active turns and kills its live panes. After an abrupt adapter crash, panes can
-remain managed by slopd, but a replacement adapter does not automatically
-reattach to them.
+Every adapter-created pane receives durable `acp` session and cwd tags. ACP
+session IDs have the form `slopd:<uuid>` and do not depend on tmux pane IDs. At
+startup, the adapter reconstructs its session catalog from tagged live panes
+and the slopd graveyard, then reattaches to resumable panes. This works after
+both orderly stdin shutdown and abrupt adapter termination; orderly shutdown
+interrupts active turns but deliberately leaves their panes available to a
+replacement adapter. A pane that never reached its first accepted prompt is
+not considered resumable because its pending ACP system prompt existed only in
+the original adapter process.
 
-`--max-sessions N` limits **live panes**, not logical ACP sessions (default 64).
-At the limit, the adapter kills the least-recently-used inactive pane while
-retaining its process-local ACP session. If that session is used again, it
-creates another pane and resumes the captured backend-native session ID when
-available. Active turns are never selected for eviction; if every live pane is
-active, the new session/prompt fails instead of disrupting one.
+The adapter advertises ACP `resume`, `list`, `close`, and `delete` session
+capabilities. It continues to advertise `loadSession: false`: resuming preserves
+the underlying agent context but does not replay historical ACP updates to the
+client.
+
+`--max-sessions N` limits **live panes**, not logical ACP sessions (default 4).
+At the limit, the adapter moves the least-recently-used inactive pane to the
+graveyard while retaining its durable logical session. If that session is used
+again, the adapter first attempts an exact graveyard revival and otherwise
+resumes the captured backend-native session ID when available. Startup applies
+the same bound to panes left by an older adapter. Active turns are never
+selected for eviction; if every live pane is active, the new session or prompt
+fails instead of disrupting one.
 
 ### ACP limitations
 
