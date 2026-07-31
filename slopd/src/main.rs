@@ -5127,6 +5127,16 @@ async fn handle_request(
                         )
                         .await;
                     }
+                    // Publish the resolved backend before making the pane visible
+                    // to hook handlers. A fast SessionStart can already be waiting
+                    // for managed_panes registration; once notified, it uses this
+                    // runtime backend to choose transcript decoding. If registration
+                    // wins this ordering, a Codex pane can bind as Claude permanently
+                    // because the later backend attachment deliberately does not
+                    // replace an already-bound runtime.
+                    panes
+                        .get_or_insert(&pane_id)
+                        .mark_unbound_backend(resolved.backend);
                     managed_panes.insert(pane_id.clone());
                     // Wake any hook handlers that arrived before managed_panes.insert()
                     // (race between tmux creating the pane and this task resuming).
@@ -5156,7 +5166,6 @@ async fn handle_request(
                     // already has its session id (the pin); others fill it on bind.
                     {
                         let state = panes.get_or_insert(&pane_id);
-                        state.mark_unbound_backend(resolved.backend);
                         let mut id = state.identity.lock().unwrap();
                         id.backend = resolved.backend;
                         id.account = Some(resolved.name.clone());
