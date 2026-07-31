@@ -109,17 +109,16 @@ pub fn home_dir() -> PathBuf {
 
 /// The XDG state directory (`$XDG_STATE_HOME`, default `~/.local/state`), where
 /// slopd keeps state that should persist across reboots — unlike the runtime
-/// dir (the socket), which is wiped on reboot. Used for the pane backup manifest.
+/// dir (the socket), which is wiped on reboot. Used for the lifecycle journal.
 pub fn state_dir() -> PathBuf {
     dirs::state_dir().unwrap_or_else(|| home_dir().join(".local/state"))
 }
 
-/// Path to the pane backup manifest (`$XDG_STATE_HOME/slopd/panes.json`).
+/// Path to the legacy pane backup manifest (`$XDG_STATE_HOME/slopd/panes.json`).
 ///
-/// slopd writes the set of managed panes here so they can be re-spawned with
-/// `claude --resume` after a reboot, when the tmux server (which otherwise holds
-/// this state in pane options) is gone. The default location can be overridden
-/// via `[backup] path` in the config.
+/// Current slopd versions import this old single-file format into the lifecycle
+/// journal. The location can be overridden via `[backup] path`; its parent also
+/// becomes the journal's storage base.
 pub fn panes_manifest_path() -> PathBuf {
     state_dir().join("slopd/panes.json")
 }
@@ -2354,11 +2353,11 @@ impl Default for SlopdRunConfig {
 /// Backup and restore of the managed-pane set across reboots (the `[backup]`
 /// config section).
 ///
-/// slopd normally keeps each pane's identity (Claude session id, account, tags,
+/// slopd normally keeps each pane's identity (backend session id, account, tags,
 /// ancestry) in tmux pane options, which it re-reads on a daemon restart. A
-/// *reboot* destroys the tmux server along with those options and the Claude
-/// processes, so slopd can also write the set of panes to a manifest on disk
-/// ([`panes_manifest_path`]) and re-spawn them with `claude --resume` afterwards.
+/// *reboot* destroys the tmux server along with those options and processes, so
+/// slopd checkpoints the pane set in its durable lifecycle journal and resumes
+/// each backend session afterwards.
 ///
 /// The two automatic behaviours are independent toggles, and all four
 /// combinations are valid. Manual `slopctl backup` and `slopctl restore` are
@@ -2366,18 +2365,18 @@ impl Default for SlopdRunConfig {
 /// does on its own.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlopdBackupConfig {
-    /// Automatically write the manifest on a timer and on clean shutdown
+    /// Automatically checkpoint the pane set on a timer and clean shutdown
     /// (default: true). `slopctl backup` triggers a write on demand regardless.
     #[serde(default = "default_auto_backup")]
     pub auto_backup: bool,
-    /// Automatically re-spawn the recorded panes (via `claude --resume`) on the
+    /// Automatically re-spawn the recorded panes through their backend on the
     /// next startup into a freshly-created tmux session, i.e. after a reboot
     /// (default: false, so a reboot doesn't resurrect panes unless asked).
     /// `slopctl restore` triggers a restore on demand regardless.
     #[serde(default)]
     pub auto_restore: bool,
-    /// Manifest path. Defaults to [`panes_manifest_path`]
-    /// (`$XDG_STATE_HOME/slopd/panes.json`). Supports `~` and `$VAR` expansion.
+    /// Legacy manifest import path. Its parent is also the journal storage base.
+    /// Defaults to [`panes_manifest_path`]. Supports `~` and `$VAR` expansion.
     pub path: Option<PathBuf>,
     /// How often (seconds) to auto-back-up while running (default: 30). A backup
     /// is also taken on clean shutdown regardless of this interval.
@@ -2414,12 +2413,9 @@ impl SlopdBackupConfig {
             .unwrap_or_else(panes_manifest_path)
     }
 
-    /// Path to the pending-restore marker, a sibling of the manifest
-    /// (`<manifest>.pending`). Its presence means a restore was pending and not
-    /// yet resolved; slopd writes it when it enters the pending state and removes
-    /// it on resolve, so the pending state survives a daemon restart (not just a
-    /// reboot) — without it, a restart would resume auto-backup and clobber the
-    /// preserved manifest.
+    /// Path used by pre-journal versions for pending restores. Current slopd
+    /// removes this legacy marker after migration; journal resolution events now
+    /// preserve pending state across daemon restarts.
     pub fn pending_marker_path(&self) -> PathBuf {
         let mut s = self.manifest_path().into_os_string();
         s.push(".pending");
@@ -3056,13 +3052,33 @@ pub enum RequestBody {
     },
     /// List all panes in the slopd session.
     Ps,
-    /// Write the backup manifest to disk now (manual `slopctl backup`),
+    /// Write a lifecycle-journal checkpoint now (manual `slopctl backup`),
     /// independent of the `auto_backup` setting.
     Backup,
-    /// Re-spawn panes from the backup manifest now (manual `slopctl restore`),
+    /// Re-spawn panes from the pending/latest checkpoint (manual `slopctl restore`),
     /// independent of `auto_restore`. Sessions already running are skipped, so
     /// this is safe to run against a live daemon.
     Restore,
+    /// List panes recorded in the durable lifecycle graveyard. `boot` uses
+    /// journal-style relative generation numbers: 0 is the current tmux
+    /// session generation, -1 the previous one, and so on. Omit it to search
+    /// every retained generation, newest first.
+    Graveyard {
+        #[serde(default)]
+        boot: Option<i32>,
+        #[serde(default = "default_graveyard_limit")]
+        limit: usize,
+    },
+    /// Resume a pane from the lifecycle graveyard. `target` is a grave id
+    /// (full or unique prefix) or an old tmux pane id such as `%21`; omitted
+    /// means the newest not-yet-revived entry. `boot` disambiguates reused pane
+    /// ids across tmux session generations.
+    Revive {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        boot: Option<i32>,
+    },
     /// Cancel a subscription previously created by Subscribe or SubscribeTranscript.
     /// The `id` field in the outer Request identifies the Unsubscribe request itself;
     /// `subscription_id` is the `id` of the original Subscribe/SubscribeTranscript request.
@@ -3126,7 +3142,7 @@ pub enum ResponseBody {
     Ps {
         panes: Vec<PaneInfo>,
     },
-    /// Response to Backup: number of panes written to the manifest.
+    /// Response to Backup: number of panes written to the checkpoint.
     BackedUp {
         count: usize,
     },
@@ -3134,6 +3150,16 @@ pub enum ResponseBody {
     /// are skipped and not counted).
     Restored {
         restored: usize,
+    },
+    /// Durable pane-death records, newest first.
+    Graveyard {
+        entries: Vec<GraveEntry>,
+    },
+    /// The newly spawned pane (or an already-running pane bound to the same
+    /// backend session) produced by `revive`.
+    Revived {
+        pane_id: String,
+        grave_id: String,
     },
     /// Confirms that a subscription has been cancelled.
     Unsubscribed {
@@ -3235,7 +3261,7 @@ impl PaneDetailedState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     /// Unix timestamp when slopd spawned this pane (from @slopd_created_at).
@@ -3279,6 +3305,31 @@ pub struct PaneInfo {
     /// informative title. Purely descriptive: slopd never keys off it.
     #[serde(default)]
     pub pane_title: Option<String>,
+}
+
+/// A durable pane-death record from slopd's lifecycle journal.
+///
+/// `tmux_boot_id` identifies one tmux server lifetime and `tmux_session_id`
+/// identifies the managed session incarnation inside that server. Together
+/// with `pane.pane_id` they remain unambiguous even when tmux reuses `%N` after
+/// a server or session restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraveEntry {
+    pub grave_id: String,
+    pub tmux_boot_id: String,
+    pub tmux_session_id: String,
+    pub destroyed_at: u64,
+    pub cause: String,
+    pub detected_by: String,
+    pub pane: PaneInfo,
+    #[serde(default)]
+    pub revived_at: Option<u64>,
+    #[serde(default)]
+    pub revived_as: Option<String>,
+}
+
+fn default_graveyard_limit() -> usize {
+    50
 }
 
 /// Clean an agent's tmux pane title (`#{pane_title}`) into a stable label.
@@ -3331,10 +3382,9 @@ pub struct DaemonState {
     /// do not advance this counter.
     #[serde(default)]
     pub config_generation: u64,
-    /// Set after a reboot when `auto_restore` is off and the on-disk manifest
-    /// holds panes that have not been restored yet: the number of panes awaiting
-    /// a `slopctl restore`. While pending, auto-backup is suspended so the
-    /// manifest is preserved. `None` when there is nothing pending.
+    /// Set when an older generation has panes that have not been restored yet:
+    /// the number awaiting `slopctl restore`. While pending, auto-backup is
+    /// suspended so the recovery checkpoint remains an explicit user choice.
     #[serde(default)]
     pub pending_restore: Option<usize>,
 }

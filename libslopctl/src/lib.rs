@@ -306,11 +306,33 @@ pub enum CommonCommand {
         /// Tmux pane ID (e.g. %42). Defaults to $TMUX_PANE if omitted.
         pane_id: Option<String>,
     },
-    /// Write the backup manifest now (regardless of the `auto_backup` setting).
+    /// Write a lifecycle-journal checkpoint (regardless of `auto_backup`).
     Backup,
-    /// Re-spawn panes from the backup manifest now (regardless of `auto_restore`).
+    /// Re-spawn panes from the pending/latest checkpoint (`auto_restore` aside).
     /// Sessions already running are skipped, so this is safe on a live daemon.
     Restore,
+    /// List panes retained in the lifecycle graveyard, newest first.
+    Graveyard {
+        /// Restrict to a tmux session generation: 0 is current, -1 previous.
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        boot: Option<i32>,
+        /// Maximum number of records to print.
+        #[arg(long, default_value = "50", value_name = "N")]
+        limit: usize,
+        /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a pane retained in the lifecycle graveyard.
+    Revive {
+        /// Grave id (or unique prefix), old pane id (e.g. %21), or omit for
+        /// the newest not-yet-revived entry.
+        target: Option<String>,
+        /// Restrict pane-id lookup to a tmux session generation: 0 is current,
+        /// -1 previous.
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        boot: Option<i32>,
+    },
 }
 
 /// Context that differs between slopctl (local) and iroh-slopctl (remote).
@@ -536,6 +558,10 @@ fn truncate_title(title: &str) -> String {
     out
 }
 
+fn timestamp_ago(fmt: &timeago::Formatter, epoch: std::time::Duration, timestamp: u64) -> String {
+    fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(timestamp)))
+}
+
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let fmt = timeago::Formatter::new();
     let epoch = std::time::SystemTime::now()
@@ -549,15 +575,11 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
         ("PANE", Box::new(|p| p.pane_id.clone())),
         (
             "CREATED",
-            Box::new(|p| {
-                fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.created_at)))
-            }),
+            Box::new(|p| timestamp_ago(&fmt, epoch, p.created_at)),
         ),
         (
             "LAST_ACTIVE",
-            Box::new(|p| {
-                fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(p.last_active)))
-            }),
+            Box::new(|p| timestamp_ago(&fmt, epoch, p.last_active)),
         ),
         (
             "SESSION",
@@ -817,7 +839,7 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         }
     }
 
-    /// Write the backup manifest now; returns the number of panes recorded.
+    /// Write a lifecycle checkpoint now; returns the number of panes recorded.
     pub async fn backup(&mut self) -> Result<usize, Error> {
         match self.request(libslop::RequestBody::Backup).await? {
             libslop::ResponseBody::BackedUp { count } => Ok(count),
@@ -825,11 +847,41 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         }
     }
 
-    /// Restore panes from the manifest now; returns the number re-spawned
+    /// Restore panes from the pending/latest checkpoint; returns the number re-spawned
     /// (sessions already running are skipped and not counted).
     pub async fn restore(&mut self) -> Result<usize, Error> {
         match self.request(libslop::RequestBody::Restore).await? {
             libslop::ResponseBody::Restored { restored } => Ok(restored),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Read durable pane-death records, newest first.
+    pub async fn graveyard(
+        &mut self,
+        boot: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<libslop::GraveEntry>, Error> {
+        match self
+            .request(libslop::RequestBody::Graveyard { boot, limit })
+            .await?
+        {
+            libslop::ResponseBody::Graveyard { entries } => Ok(entries),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Resume one durable pane-death record.
+    pub async fn revive(
+        &mut self,
+        target: Option<String>,
+        boot: Option<i32>,
+    ) -> Result<(String, String), Error> {
+        match self
+            .request(libslop::RequestBody::Revive { target, boot })
+            .await?
+        {
+            libslop::ResponseBody::Revived { pane_id, grave_id } => Ok((pane_id, grave_id)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -2344,6 +2396,53 @@ where
         CommonCommand::Restore => {
             let restored = client.restore().await?;
             println!("restored {} pane(s)", restored);
+        }
+        CommonCommand::Graveyard { boot, limit, json } => {
+            let entries = client.graveyard(boot, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string(&entries).unwrap());
+            } else if !entries.is_empty() {
+                let fmt = timeago::Formatter::new();
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                println!(
+                    "GRAVE\tPANE\tCREATED\tDESTROYED\tREVIVED\tBACKEND\tACCOUNT\tSTATUS\tTITLE"
+                );
+                for entry in entries {
+                    let grave = entry.grave_id.get(..8).unwrap_or(&entry.grave_id);
+                    let revived = entry
+                        .revived_as
+                        .as_deref()
+                        .map(|p| format!("revived:{p}"))
+                        .unwrap_or_else(|| entry.cause.clone());
+                    let revived_at = entry
+                        .revived_at
+                        .map(|timestamp| timestamp_ago(&fmt, epoch, timestamp))
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        grave,
+                        entry.pane.pane_id,
+                        timestamp_ago(&fmt, epoch, entry.pane.created_at),
+                        timestamp_ago(&fmt, epoch, entry.destroyed_at),
+                        revived_at,
+                        entry.pane.backend.canonical_executable(),
+                        entry.pane.account,
+                        revived,
+                        entry
+                            .pane
+                            .pane_title
+                            .as_deref()
+                            .map(truncate_title)
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+        }
+        CommonCommand::Revive { target, boot } => {
+            let (pane_id, _grave_id) = client.revive(target, boot).await?;
+            println!("{}", pane_id);
         }
     }
     Ok(())

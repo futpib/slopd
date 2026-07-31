@@ -193,7 +193,7 @@ systemctl --user reload slopd
 The reload affects subsequent operations only — already-running panes keep the
 backend, executable, environment, and config directory they were spawned with.
 Logging, `[control] socket`, and the startup-resolved `[backup]` toggles,
-interval, and manifest path require a restart. A malformed config keeps the
+interval, and journal/legacy-manifest path require a restart. A malformed config keeps the
 previous generation; check the daemon log for the parse error. `slopctl status`
 exposes a `config_generation` counter that increments after every successful
 reload.
@@ -307,12 +307,13 @@ session named `slopd`.
 # Back up the managed-pane set to disk and restore it after a reboot (see
 # "Backup and restore"). The two automatic behaviours are independent; manual
 # `slopctl backup` / `slopctl restore` work regardless of them.
-# Automatically write the manifest on a timer and on clean shutdown (default: true).
+# Automatically checkpoint the live pane set on a timer and shutdown (default: true).
 # auto_backup = true
 # Automatically re-spawn the recorded panes after a reboot (default: false, so a
 # reboot does not resurrect panes unless you ask).
 # auto_restore = false
-# Manifest path (default: $XDG_STATE_HOME/slopd/panes.json). Supports ~ / $VAR.
+# Legacy manifest import path. Its parent is also the lifecycle-journal base
+# (default: $XDG_STATE_HOME/slopd). Supports ~ / $VAR.
 # path = "~/.local/state/slopd/panes.json"
 # How often (seconds) to auto-back-up while running (default: 30). A backup is
 # also taken on clean shutdown regardless of this interval.
@@ -420,23 +421,32 @@ re-adopts them.
 A **reboot** destroys the tmux server, taking those pane options and the agent
 processes with it. The backends keep their conversations on disk and can resume
 them by session ID, but slopd's record of *which* sessions were running is gone
-with tmux. Backup/restore closes that gap by keeping a durable manifest.
+with tmux. Backup/restore closes that gap through the durable lifecycle journal.
 
 Backup and restore each have an **automatic** toggle plus an always-available **manual** command, and the two automatic toggles are independent — all four combinations are valid:
 
 | | `auto_restore = false` (default) | `auto_restore = true` |
 |---|---|---|
 | **`auto_backup = true`** (default) | back up automatically; restore only on demand | full reboot survival |
-| **`auto_backup = false`** | drive both by hand | restore on reboot from manifests you write by hand |
+| **`auto_backup = false`** | drive both by hand | restore on reboot from checkpoints you write by hand |
 
 **Backup.** With `auto_backup` on (the default), slopd writes the managed-pane
-set to a JSON manifest (default `$XDG_STATE_HOME/slopd/panes.json`) every
-`[backup] interval_secs` seconds and once more on clean shutdown; `slopctl
-backup` writes it on demand at any time. Writes are atomic (temp file + rename),
-and only panes with a recorded backend session ID — the ones that can actually
-be resumed — are written. The manifest lives in the XDG **state** directory,
-which survives reboot, unlike the runtime directory that holds the control
-socket.
+set as a checkpoint every `[backup] interval_secs` seconds and once more on
+clean shutdown; `slopctl backup` checkpoints it on demand. Only panes with a
+recorded backend session ID are included. Pane bodies are appended only when
+their recovery metadata changes, and an unchanged checkpoint only syncs the
+existing file, so a quiet daemon does not grow storage every interval.
+
+The journal defaults below `$XDG_STATE_HOME/slopd/tmux-targets/`. It is first
+namespaced by the configured tmux socket and session name, so separate slopd
+instances under one Unix user cannot consume each other's restore points. Each
+target is then split into generations identified by a tmux-server UUID plus
+tmux's `#{session_id}`. The server UUID distinguishes pane IDs reused after a
+tmux restart; the session ID distinguishes a managed session killed and
+recreated inside the same server. Generation files are append-only JSONL and
+are retained without a time or count limit. The old single `panes.json` is
+imported once for the default target (or from an explicitly configured
+`[backup] path`).
 
 **Restore.** With `auto_restore` on, slopd restores when it has to create its
 tmux session from scratch — the signature of a fresh server after a reboot. It
@@ -447,7 +457,14 @@ restart the tmux session still exists, so slopd recovers live panes from tmux
 and does not duplicate them. `slopctl restore` performs the same operation on
 demand and skips sessions that are already running.
 
-**Pending restore (with `auto_restore` off).** When slopd starts into a fresh session and `auto_restore` is off, it does *not* resurrect the panes — but it does mark the manifest as a **pending restore**: the count shows in `slopctl status`, and **auto-backup is suspended** so the restore point is preserved. This matters because otherwise auto-backup would immediately overwrite the manifest with the empty (or, once you start working, diverged) post-reboot pane set, destroying it before you could use it. With the pending hold, you can reboot, start working, and run `slopctl restore` whenever you remember — the pre-reboot set is still there. The pending state is recorded by a `<manifest>.pending` marker file, so it survives a *daemon* restart too (a crash, `systemctl restart`, or package update in the pending window won't resume auto-backup and clobber the restore point). It is resolved by `slopctl restore` (bring the panes back) or `slopctl backup` (replace the restore point with the current state); either one removes the marker and resumes normal auto-backup.
+**Pending restore (with `auto_restore` off).** When slopd starts into a fresh
+generation and `auto_restore` is off, it does *not* resurrect the panes. The
+older unresolved checkpoint becomes a **pending restore**: its count appears in
+`slopctl status`, and auto-backup is suspended so post-reboot activity cannot
+replace the recovery choice. Resolution is itself a journal record, so pending
+state survives daemon crashes and restarts without a shared marker file.
+`slopctl restore` resolves it by bringing the panes back; `slopctl backup`
+resolves it by explicitly choosing the current live set.
 
 Restore never starts two agents on one backend session: it skips a session ID
 that is already running or that it has already restored in the same pass. It is
@@ -455,7 +472,7 @@ otherwise best-effort — a pane whose session can no longer be resumed simply
 fails without preventing the other panes from being restored.
 
 Because restore continues the same backend session, a restored pane keeps its
-conversation identity and the manifest stays useful across repeated reboots.
+conversation identity and its checkpoints stay useful across repeated reboots.
 The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup
 but does not resurrect panes until you run `slopctl restore` or opt into
 automatic restore.
@@ -681,7 +698,9 @@ slopctl interrupt %1
 
 ### `slopctl backup`
 
-Write the backup manifest now, regardless of the `[backup] auto_backup` setting. Prints how many panes were recorded. See [Backup and restore](#backup-and-restore).
+Write a lifecycle-journal checkpoint now, regardless of the `[backup]
+auto_backup` setting. Prints how many panes were recorded. See [Backup and
+restore](#backup-and-restore).
 
 ```bash
 slopctl backup
@@ -690,11 +709,43 @@ slopctl backup
 
 ### `slopctl restore`
 
-Re-spawn panes from the backup manifest now, regardless of `[backup] auto_restore`. Sessions that are already running are skipped, so this is safe to run against a live daemon (e.g. to pull back panes that died, or to restore after a reboot when `auto_restore` is off). Prints how many panes were re-spawned.
+Re-spawn panes from the pending or latest checkpoint, regardless of `[backup]
+auto_restore`. Sessions already running are skipped, so this is safe against a
+live daemon. Prints how many panes were re-spawned.
 
 ```bash
 slopctl restore
 # restored 2 pane(s)
+```
+
+### `slopctl graveyard [--boot N] [--limit N] [--json]`
+
+List durable pane-death records, newest first. With no `--boot`, every retained
+tmux generation is searched. `--boot 0` selects the current generation,
+`--boot -1` the previous generation, and so on. Each row has a stable grave ID;
+the complete JSON form also includes the tmux server boot UUID and tmux session
+ID, so an old `%N` remains unambiguous after tmux reuses pane IDs. Grave IDs
+are timestamp-ordered UUID v7 values generated by the stock `uuid` crate. The
+human table shows relative `CREATED`, `DESTROYED`, and `REVIVED` times like
+`slopctl ps`; `--json` retains exact Unix timestamps.
+
+```bash
+slopctl graveyard
+slopctl graveyard --boot -1 --json
+```
+
+### `slopctl revive [GRAVE_ID|PANE_ID] [--boot N]`
+
+Resume the backend session captured by a graveyard record and print its new tmux
+pane ID. A unique grave-ID prefix is accepted; with no target, the newest
+unrevived record is used. An old pane ID such as `%21` is also accepted when it
+matches one generation. If it was reused across generations, add `--boot` or use
+the stable grave ID. A grave can be revived once; killing the revived pane
+creates a new record.
+
+```bash
+slopctl revive 019c1234
+slopctl revive %21 --boot -2
 ```
 
 ### `slopctl hook <EVENT>`
@@ -1124,7 +1175,12 @@ Emitted once whenever a managed pane is torn down, from every death path, with a
 
 For a `vanished` pane, `preceding_hook` correlates the tmux lifecycle hook that fired just before it: `after-kill-pane` (a deliberate external kill) versus `window-unlinked` (a closed window).
 
-The broadcast is ephemeral — if no subscriber is listening at the moment of death it is lost — so slopd also writes the same record as **one structured line to its log** (stderr → the systemd journal). Abnormal deaths (`vanished`, `server_gone`, or a nonzero `self_exit`) log at `WARN` so they are visible at the default verbosity; a clean `slopctl kill` or a zero-exit process logs at `INFO`. After the fact:
+The broadcast is ephemeral, so slopd also appends the pane's full recovery
+snapshot and cause to the lifecycle graveyard and writes a structured log line
+to stderr. The graveyard is the durable recovery interface (`slopctl graveyard`
+and `slopctl revive`); the systemd journal remains useful for log correlation.
+Abnormal deaths (`vanished`, `server_gone`, or a nonzero `self_exit`) log at
+`WARN`; a clean `slopctl kill` or zero-exit process logs at `INFO`.
 
 ```bash
 journalctl --user -u slopd | grep 'pane %119 died'

@@ -12292,7 +12292,7 @@ fn grouped_interactive_view_is_isolated_and_self_cleaning() {
 
 // --- backup / restore across reboot ---------------------------------------
 //
-// slopd persists the managed-pane set to $XDG_STATE_HOME/slopd/panes.json and,
+// slopd persists the managed-pane set as a lifecycle-journal checkpoint and,
 // on a fresh start into a brand-new tmux session (the post-reboot signal),
 // re-spawns each recorded pane with `claude --resume <session_id>`. This drives
 // the full round trip: run a pane, snapshot it on clean shutdown, wipe the tmux
@@ -12345,14 +12345,9 @@ fn backup_restore_round_trip_across_reboot() {
     // SIGINT triggers a clean shutdown, which writes the final snapshot.
     sigint_child(slopd1);
 
-    // The manifest should now exist under $HOME/.local/state (HOME is the slopd
-    // config dir in the test harness) and record our pane.
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .unwrap_or_else(|e| panic!("manifest not written to {}: {}", manifest_path.display(), e));
-    let manifest: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&manifest_bytes).expect("manifest is not valid JSON");
-    let entry = manifest
+    // The latest generation checkpoint should record our pane.
+    let checkpoint = latest_lifecycle_checkpoint(&env);
+    let entry = checkpoint
         .iter()
         .find(|p| p.session_id.as_deref() == Some("mock-session-id-1234"))
         .expect("snapshot should contain the running pane");
@@ -12374,7 +12369,7 @@ fn backup_restore_round_trip_across_reboot() {
         .unwrap();
     assert!(kill.success(), "failed to kill slopd tmux session");
 
-    // --- second boot: slopd restores the pane from the manifest ---
+    // --- second boot: slopd restores the pane from the checkpoint ---
     let slopd2 = env.spawn_slopd();
 
     // Restore runs before the socket binds, so the pane should already be
@@ -12503,6 +12498,123 @@ fn backup_env(backup_toml: &str) -> Option<(TestEnv, tempfile::TempDir)> {
     Some((env, home_dir))
 }
 
+/// Journal files for this test's tmux target. The production layout includes
+/// hex-encoded socket/session directories; walking below `tmux-targets` keeps
+/// tests independent of that encoding detail.
+fn lifecycle_journal_files(env: &TestEnv) -> Vec<std::path::PathBuf> {
+    fn visit(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(
+        &env.config_dir
+            .path()
+            .join(".local/state/slopd/tmux-targets"),
+        &mut files,
+    );
+    files
+}
+
+fn journal_generation_order(path: &std::path::Path) -> (u64, i64) {
+    let file = std::fs::File::open(path).expect("open lifecycle journal");
+    let header = std::io::BufReader::new(file)
+        .lines()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(&line.ok()?).ok())
+        .expect("lifecycle generation header");
+    let started = header["started_at"].as_u64().unwrap_or_default();
+    let session = header["tmux_session_id"]
+        .as_str()
+        .and_then(|id| id.strip_prefix('$'))
+        .and_then(|id| id.parse().ok())
+        .unwrap_or(-1);
+    (started, session)
+}
+
+fn latest_lifecycle_journal(env: &TestEnv) -> std::path::PathBuf {
+    lifecycle_journal_files(env)
+        .into_iter()
+        .max_by_key(|path| journal_generation_order(path))
+        .expect("lifecycle journal was not written")
+}
+
+fn checkpoint_from_journal(path: &std::path::Path) -> Vec<libslop::PaneInfo> {
+    let file = std::fs::File::open(path).expect("open lifecycle journal");
+    let mut panes = std::collections::HashMap::<String, libslop::PaneInfo>::new();
+    let mut checkpoint = Vec::new();
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value["event"].as_str() {
+            Some("pane") => {
+                let pane: libslop::PaneInfo =
+                    serde_json::from_value(value["pane"].clone()).expect("valid pane event");
+                panes.insert(pane.pane_id.clone(), pane);
+            }
+            Some("checkpoint") => {
+                checkpoint = value["pane_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| id.as_str())
+                    .filter_map(|id| panes.get(id).cloned())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    checkpoint
+}
+
+fn latest_lifecycle_checkpoint(env: &TestEnv) -> Vec<libslop::PaneInfo> {
+    checkpoint_from_journal(&latest_lifecycle_journal(env))
+}
+
+/// Replace the latest checkpoint by appending pane versions plus a checkpoint,
+/// matching the journal's public on-disk format. Used only to plant malformed or
+/// historical recovery states that cannot be produced through the CLI.
+fn append_lifecycle_checkpoint(env: &TestEnv, panes: &[libslop::PaneInfo]) {
+    use std::io::Write;
+    let path = latest_lifecycle_journal(env);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("append lifecycle journal");
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for pane in panes {
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"event": "pane", "at": at, "pane": pane})
+        )
+        .unwrap();
+    }
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "event": "checkpoint",
+            "at": at,
+            "pane_ids": panes.iter().map(|pane| &pane.pane_id).collect::<Vec<_>>(),
+        })
+    )
+    .unwrap();
+}
+
 /// Count managed panes whose session id is `sid`.
 fn count_panes_with_session(env: &TestEnv, sid: &str) -> usize {
     let out = env.slopctl(&["ps", "--json"]);
@@ -12586,6 +12698,145 @@ fn manual_backup_and_restore_commands() {
     );
 
     kill_slopd(slopd2);
+}
+
+#[test]
+fn graveyard_records_and_revives_a_killed_pane() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_backup = false") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let pane_id = run_and_wait(&env);
+    assert!(
+        env.slopctl(&["tag", &pane_id, "recover-me"])
+            .status
+            .success()
+    );
+    assert!(env.slopctl(&["kill", &pane_id]).status.success());
+
+    let listed = env.slopctl(&["graveyard", "--json"]);
+    assert!(listed.status.success(), "graveyard failed: {listed:?}");
+    let entries: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&listed.stdout).expect("graveyard JSON");
+    let grave = entries
+        .iter()
+        .find(|entry| entry.pane.pane_id == pane_id)
+        .expect("killed pane should be in graveyard");
+    assert_eq!(
+        uuid::Uuid::parse_str(&grave.grave_id)
+            .unwrap()
+            .get_version(),
+        Some(uuid::Version::SortRand),
+        "grave IDs should be stock UUID v7 values"
+    );
+    assert_eq!(grave.cause, "deliberate_kill");
+    assert!(grave.pane.tags.contains(&"recover-me".to_string()));
+    assert!(grave.revived_at.is_none());
+    let human = String::from_utf8(env.slopctl(&["graveyard"]).stdout).unwrap();
+    assert!(human.contains("CREATED\tDESTROYED\tREVIVED"));
+    assert!(human.contains("ago") || human.contains("now"));
+
+    let prefix = &grave.grave_id[..grave.grave_id.len().min(8)];
+    let revived = env.slopctl(&["revive", prefix]);
+    assert!(revived.status.success(), "revive failed: {revived:?}");
+    let revived_id = String::from_utf8_lossy(&revived.stdout).trim().to_string();
+    assert_ne!(revived_id, pane_id);
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let pane = panes
+        .iter()
+        .find(|pane| pane.pane_id == revived_id)
+        .expect("revived pane should be managed");
+    assert_eq!(pane.session_id.as_deref(), Some(MOCK_SID));
+    assert!(pane.tags.contains(&"recover-me".to_string()));
+
+    let entries: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&env.slopctl(&["graveyard", "--json"]).stdout).unwrap();
+    let grave = entries
+        .iter()
+        .find(|entry| entry.grave_id.starts_with(prefix))
+        .unwrap();
+    assert_eq!(grave.revived_as.as_deref(), Some(revived_id.as_str()));
+    assert!(grave.revived_at.is_some());
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn graveyard_boot_disambiguates_reused_tmux_pane_ids() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_backup = false") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd = env.spawn_slopd();
+    let first_pane = run_and_wait(&env);
+    assert!(env.slopctl(&["kill", &first_pane]).status.success());
+
+    // Keep slopd itself alive while replacing the tmux server. The next `run`
+    // must both recreate its managed session and switch the open journal to the
+    // new server/session generation.
+    assert!(
+        env.tmux
+            .tmux()
+            .arg("kill-server")
+            .status()
+            .unwrap()
+            .success()
+    );
+    // `kill-server` replies just before the server has completely released its
+    // socket. Wait for that teardown before starting a new server at the same
+    // path, otherwise tmux can report "server exited unexpectedly".
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if env
+            .tmux
+            .tmux()
+            .args(["new-session", "-d", "-s", "test"])
+            .status()
+            .unwrap()
+            .success()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "failed to restart tmux server");
+    }
+
+    let second_pane = run_and_wait(&env);
+    assert_eq!(
+        first_pane, second_pane,
+        "precondition: a fresh tmux server should reuse its pane-id sequence"
+    );
+    assert!(env.slopctl(&["kill", &second_pane]).status.success());
+
+    let entries: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&env.slopctl(&["graveyard", "--json"]).stdout).unwrap();
+    let reused: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.pane.pane_id == first_pane)
+        .collect();
+    assert_eq!(reused.len(), 2, "both incarnations must be retained");
+    assert_ne!(reused[0].tmux_boot_id, reused[1].tmux_boot_id);
+
+    let ambiguous = env.slopctl(&["revive", &first_pane]);
+    assert!(
+        !ambiguous.status.success(),
+        "a reused pane id without --boot must be rejected"
+    );
+    let current: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&env.slopctl(&["graveyard", "--boot", "0", "--json"]).stdout)
+            .unwrap();
+    let previous: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&env.slopctl(&["graveyard", "--boot", "-1", "--json"]).stdout)
+            .unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(previous.len(), 1);
+    assert_ne!(current[0].tmux_boot_id, previous[0].tmux_boot_id);
+
+    kill_slopd(slopd);
 }
 
 // A manual restore against a live daemon must not double a session that is
@@ -12683,18 +12934,15 @@ fn restore_dedups_duplicate_sessions_in_manifest() {
     // Both panes report the same mock session id, so the shutdown backup writes a
     // manifest with two entries sharing it.
     sigint_child(slopd1);
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let manifest: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&std::fs::read(&manifest_path).expect("manifest written"))
-            .expect("valid manifest");
-    let dup = manifest
+    let checkpoint = latest_lifecycle_checkpoint(&env);
+    let dup = checkpoint
         .iter()
         .filter(|p| p.session_id.as_deref() == Some(MOCK_SID))
         .count();
     assert_eq!(
         dup, 2,
-        "precondition: manifest should hold two entries with the shared session id; got {:?}",
-        manifest
+        "precondition: checkpoint should hold two entries with the shared session id; got {:?}",
+        checkpoint
     );
 
     reboot_tmux(&env);
@@ -12742,7 +12990,7 @@ fn idle_shell_not_adopted_on_fresh_start() {
 }
 
 // With auto_restore off, a reboot must NOT silently lose the restore point.
-// The manifest becomes a "pending restore": auto-backup is suspended so it is
+// The older checkpoint becomes a "pending restore": auto-backup is suspended so it is
 // preserved through post-reboot activity (the "reboot, start working, THEN
 // remember to restore" case), instead of being clobbered by the new live set.
 #[test]
@@ -12752,15 +13000,15 @@ fn pending_restore_preserves_manifest_across_activity() {
         return;
     };
 
-    // First boot: a pane, captured into the manifest on clean shutdown.
+    // First boot: a pane, captured into the journal on clean shutdown.
     let slopd1 = env.spawn_slopd();
     run_and_wait(&env);
     sigint_child(slopd1);
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let before = std::fs::read(&manifest_path).expect("manifest written on shutdown");
+    let source_path = latest_lifecycle_journal(&env);
+    let before = std::fs::read(&source_path).expect("journal written on shutdown");
     assert!(
         !before.is_empty() && before != b"[]",
-        "precondition: manifest holds the pane"
+        "precondition: journal holds the pane"
     );
 
     // Reboot: fresh session, auto_restore off → pending, nothing restored.
@@ -12785,10 +13033,10 @@ fn pending_restore_preserves_manifest_across_activity() {
     assert!(out.status.success(), "run failed: {:?}", out);
     std::thread::sleep(Duration::from_millis(2500));
 
-    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    let after = std::fs::read(&source_path).expect("source journal still present");
     assert_eq!(
         before, after,
-        "while a restore is pending, auto-backup must not overwrite the manifest, \
+        "while a restore is pending, auto-backup must not overwrite the source checkpoint, \
          even after new panes are created post-reboot"
     );
 
@@ -12840,8 +13088,8 @@ fn pending_restore_resolved_by_slopctl_restore() {
 
 // The pending state must survive a *daemon* restart (not just a reboot), or a
 // crash/restart in the pending window would resume auto-backup and clobber the
-// preserved manifest. A `.pending` marker persists it: the restarted daemon
-// re-enters pending even though the tmux session survived.
+// preserved checkpoint. A journal resolution record persists it: the restarted
+// daemon re-enters pending even though the tmux session survived.
 #[test]
 fn pending_restore_survives_daemon_restart() {
     let Some((env, _home)) = backup_env("[backup]\nauto_restore = false\ninterval_secs = 1") else {
@@ -12849,15 +13097,15 @@ fn pending_restore_survives_daemon_restart() {
         return;
     };
 
-    // Boot 1: a pane captured into the manifest.
+    // Boot 1: a pane captured into the journal.
     let slopd1 = env.spawn_slopd();
     run_and_wait(&env);
     sigint_child(slopd1);
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let before = std::fs::read(&manifest_path).expect("manifest written");
+    let source_path = latest_lifecycle_journal(&env);
+    let before = std::fs::read(&source_path).expect("journal written");
     assert!(
         before != b"[]" && !before.is_empty(),
-        "precondition: manifest holds the pane"
+        "precondition: journal holds the pane"
     );
 
     // Reboot → pending.
@@ -12874,12 +13122,12 @@ fn pending_restore_survives_daemon_restart() {
     let slopd3 = env.spawn_slopd();
     std::thread::sleep(Duration::from_millis(2500)); // past several backup ticks
 
-    // The marker must have made the new daemon re-enter pending, so the manifest
-    // is preserved (not clobbered by resumed auto-backup) and status still shows it.
-    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    // The unresolved source generation makes the new daemon re-enter pending,
+    // so it is preserved and status still shows it.
+    let after = std::fs::read(&source_path).expect("source journal still present");
     assert_eq!(
         before, after,
-        "a daemon restart during a pending restore must not clobber the manifest"
+        "a daemon restart during a pending restore must not clobber its source checkpoint"
     );
     assert!(
         String::from_utf8_lossy(&env.slopctl(&["status"]).stdout).contains("pending_restore: 1"),
@@ -12922,15 +13170,15 @@ fn missing_executable_preserves_manifest_instead_of_clobbering() {
     };
     env.append_config("[backup]\nauto_restore = true\ninterval_secs = 1");
 
-    // Boot 1: a pane, captured into the manifest on clean shutdown.
+    // Boot 1: a pane, captured into the journal on clean shutdown.
     let slopd1 = env.spawn_slopd();
     run_and_wait(&env);
     sigint_child(slopd1);
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let before = std::fs::read(&manifest_path).expect("manifest written on shutdown");
+    let source_path = latest_lifecycle_journal(&env);
+    let before = std::fs::read(&source_path).expect("journal written on shutdown");
     assert!(
         before != b"[]" && !before.is_empty(),
-        "precondition: manifest holds the pane"
+        "precondition: journal holds the pane"
     );
 
     // The executable disappears.
@@ -12951,12 +13199,12 @@ fn missing_executable_preserves_manifest_instead_of_clobbering() {
         0,
         "nothing should have been spawned"
     );
-    // Past several periodic backup ticks (interval=1s): the manifest must survive.
+    // Past several periodic backup ticks: the source checkpoint must survive.
     std::thread::sleep(Duration::from_millis(2500));
-    let after = std::fs::read(&manifest_path).expect("manifest still present");
+    let after = std::fs::read(&source_path).expect("source journal still present");
     assert_eq!(
         before, after,
-        "a failed restore must not clobber the manifest"
+        "a failed restore must not clobber the source checkpoint"
     );
 
     // Recovery: with the executable back, `slopctl restore` brings the pane up,
@@ -13009,23 +13257,21 @@ fn restore_uses_transcript_launch_cwd_over_drifted_working_dir() {
     )
     .unwrap();
 
-    // Boot 1: a pane so a manifest is written, then clean shutdown.
+    // Boot 1: a pane so a checkpoint is written, then clean shutdown.
     let slopd1 = env.spawn_slopd();
     run_and_wait(&env);
     sigint_child(slopd1);
 
     // Plant the drift: working_dir → the unrelated dir, transcript_path → our
     // transcript recording the real launch cwd.
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let mut manifest: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    for p in &mut manifest {
+    let mut checkpoint = latest_lifecycle_checkpoint(&env);
+    for p in &mut checkpoint {
         if p.session_id.as_deref() == Some(MOCK_SID) {
             p.working_dir = Some(drifted_dir.to_str().unwrap().to_string());
             p.transcript_path = Some(transcript.to_str().unwrap().to_string());
         }
     }
-    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    append_lifecycle_checkpoint(&env, &checkpoint);
 
     // Reboot → restore. The restored pane must be launched in launch_dir.
     reboot_tmux(&env);
@@ -15045,19 +15291,17 @@ fn opencode_pane_restores_across_reboot() {
     assert!(!pane_id.is_empty(), "slopctl run --backend opencode failed");
     wait_until_ready(&env, &pane_id, Duration::from_secs(15));
 
-    sigint_child(slopd1); // clean shutdown → writes the manifest
+    sigint_child(slopd1); // clean shutdown → writes the checkpoint
 
-    let manifest_path = env.config_dir.path().join(".local/state/slopd/panes.json");
-    let manifest: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    let entry = manifest
+    let checkpoint = latest_lifecycle_checkpoint(&env);
+    let entry = checkpoint
         .iter()
         .find(|p| p.session_id.as_deref() == Some("ses_mock"))
-        .expect("opencode pane should be in the manifest");
+        .expect("opencode pane should be in the checkpoint");
     assert_eq!(
         entry.backend,
         libslop::Backend::Opencode,
-        "manifest must record the opencode backend so restore dispatches correctly"
+        "checkpoint must record the opencode backend so restore dispatches correctly"
     );
 
     // --- simulate reboot: destroy the slopd tmux session (and its panes) ---

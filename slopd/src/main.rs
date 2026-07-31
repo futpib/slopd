@@ -8,6 +8,7 @@ use tracing::{debug, error, info, trace, warn};
 
 mod backend;
 mod codex;
+mod journal;
 mod opencode;
 use backend::*;
 
@@ -52,6 +53,78 @@ fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
         cmd.args(["-S", socket.to_str().unwrap()]);
     }
     cmd
+}
+
+const TMUX_SERVER_BOOT_OPTION: &str = "@slopd_server_boot_id";
+
+/// Resolve the current tmux session incarnation. The server UUID is installed
+/// once as a global tmux option and therefore survives slopd restarts but not a
+/// tmux-server restart. `#{session_id}` distinguishes a session that was killed
+/// and recreated while the server itself stayed alive.
+async fn tmux_generation(config: &libslop::SlopdConfig) -> Result<journal::GenerationKey, String> {
+    let lock_name = "slopd-server-boot-id";
+    let locked = tmux(config)
+        .args(["wait-for", "-L", lock_name])
+        .output()
+        .await
+        .map_err(|e| format!("failed to lock tmux boot id: {e}"))?;
+    if !locked.status.success() {
+        return Err(format!(
+            "failed to lock tmux boot id: {}",
+            String::from_utf8_lossy(&locked.stderr).trim()
+        ));
+    }
+
+    let result = async {
+        let shown = tmux(config)
+            .args(["show-options", "-gqv", TMUX_SERVER_BOOT_OPTION])
+            .output()
+            .await
+            .map_err(|e| format!("failed to read tmux boot id: {e}"))?;
+        let mut boot_id = String::from_utf8_lossy(&shown.stdout).trim().to_string();
+        if boot_id.is_empty() {
+            boot_id = uuid::Uuid::new_v4().to_string();
+            let set = tmux(config)
+                .args(["set-option", "-gq", TMUX_SERVER_BOOT_OPTION, &boot_id])
+                .output()
+                .await
+                .map_err(|e| format!("failed to set tmux boot id: {e}"))?;
+            if !set.status.success() {
+                return Err(format!(
+                    "failed to set tmux boot id: {}",
+                    String::from_utf8_lossy(&set.stderr).trim()
+                ));
+            }
+        }
+
+        let session = config.tmux.session();
+        let shown = tmux(config)
+            .args(["display-message", "-p", "-t", &session, "#{session_id}"])
+            .output()
+            .await
+            .map_err(|e| format!("failed to read tmux session id: {e}"))?;
+        if !shown.status.success() {
+            return Err(format!(
+                "failed to read tmux session id: {}",
+                String::from_utf8_lossy(&shown.stderr).trim()
+            ));
+        }
+        let session_id = String::from_utf8_lossy(&shown.stdout).trim().to_string();
+        if session_id.is_empty() {
+            return Err("tmux returned an empty session id".to_string());
+        }
+        Ok(journal::GenerationKey {
+            tmux_boot_id: boot_id,
+            tmux_session_id: session_id,
+        })
+    }
+    .await;
+
+    let _ = tmux(config)
+        .args(["wait-for", "-U", lock_name])
+        .output()
+        .await;
+    result
 }
 
 async fn tmux_set_pane_option(
@@ -447,13 +520,15 @@ impl DeathDetectedBy {
 
 /// A durable snapshot of a pane's identity, kept in memory so a death can be
 /// fully described after the pane's tmux options are already gone. Populated at
-/// spawn (backend/parent/working_dir/created_at) and kept fresh as slopd learns
-/// the session id (SessionStart hook / opencode bind / fork pin) and title.
+/// spawn (backend/account/parent/working_dir/created_at) and kept fresh as slopd
+/// learns the session id, title, and tags.
 #[derive(Clone, Default)]
 struct PaneIdentity {
     backend: libslop::Backend,
+    account: Option<String>,
     session_id: Option<String>,
     parent_pane_id: Option<String>,
+    tags: Vec<String>,
     working_dir: Option<String>,
     title: Option<String>,
     created_at: Option<u64>,
@@ -489,9 +564,9 @@ struct PaneState {
     /// this pin the pane would be mis-bound to the source session. When set, the
     /// SessionStart handler uses this id instead of the hook payload's.
     pinned_session_id: std::sync::Mutex<Option<String>>,
-    /// Durable identity snapshot (backend, session id, parent, cwd, title,
-    /// spawn time), populated at spawn and kept fresh as slopd learns more. Read
-    /// at teardown to describe the death after the pane's tmux options are gone.
+    /// Durable identity snapshot (backend, account, session, tags, parent, cwd,
+    /// title, spawn time), populated at spawn and kept fresh as slopd learns
+    /// more. Read after the pane's tmux options are gone at teardown.
     identity: std::sync::Mutex<PaneIdentity>,
 }
 
@@ -1658,6 +1733,8 @@ async fn load_managed_panes(
             let state = panes.get_or_insert(pane_id);
             let mut id = state.identity.lock().unwrap();
             id.backend = opts.backend.unwrap_or(libslop::Backend::Claude);
+            id.account = Some(resolved.name.clone());
+            id.tags = opts.tags.clone();
             // Immediate parent is the first ancestor; read the field directly since
             // `opts` is already partially moved (transcript_path) above, which would
             // block the `parent_pane_id()` method's whole-`self` borrow.
@@ -1738,6 +1815,7 @@ async fn recover_state_from_transcript(
 }
 
 type EventTx = Arc<tokio::sync::broadcast::Sender<libslop::Record>>;
+type LifecycleJournal = Arc<journal::LifecycleJournal>;
 type PaneRegistered = Arc<tokio::sync::Notify>;
 /// The most recent time each relevant tmux lifecycle hook fired, shared between
 /// the TmuxHook handler and the reconcile loop. When a pane is found to have
@@ -1756,12 +1834,13 @@ struct RecentHooks {
 type HookLog = Arc<std::sync::Mutex<RecentHooks>>;
 /// How recently a tmux hook must have fired to be attributed to a vanished pane.
 const HOOK_CORRELATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
-/// After a reboot with `auto_restore` off, holds `Some(n)` while `n` panes from
-/// the on-disk manifest await a `slopctl restore`; `None` when nothing is
-/// pending. While `Some`, auto-backup is suspended so the manifest (the restore
-/// point) is preserved through any post-reboot activity until the user resolves
-/// it via `slopctl restore` (consume) or `slopctl backup` (replace).
-type PendingRestore = Arc<std::sync::Mutex<Option<usize>>>;
+/// A restore point inherited from an older tmux session generation.
+#[derive(Clone)]
+struct PendingRestoreState {
+    source: journal::GenerationKey,
+    panes: Vec<libslop::PaneInfo>,
+}
+type PendingRestore = Arc<std::sync::Mutex<Option<PendingRestoreState>>>;
 
 /// How long to wait for a pane to be registered before concluding that a hook
 /// came from a genuinely unmanaged (external) pane.  The race window is
@@ -2003,6 +2082,7 @@ async fn tmux_session_output(
 #[allow(clippy::too_many_arguments)]
 fn record_pane_death(
     event_tx: &EventTx,
+    lifecycle: &LifecycleJournal,
     pane_id: &str,
     cause: DeathCause,
     detected_by: DeathDetectedBy,
@@ -2025,6 +2105,56 @@ fn record_pane_death(
     let lived_secs = identity.created_at.map(|c| ts.saturating_sub(c));
     let output_tail = output_tail.filter(|s| !s.is_empty());
     let last_state_str = last_state.as_ref().map(|s| s.as_str());
+
+    // Persist the recovery identity before broadcasting the ephemeral event.
+    // Prefer the latest checkpoint because it carries tags/account/transcript;
+    // merge the in-memory identity over it because that is freshest at death.
+    let detailed_state = last_state
+        .clone()
+        .unwrap_or(libslop::PaneDetailedState::BootingUp);
+    let mut pane = lifecycle
+        .checkpoint_pane(pane_id)
+        .unwrap_or_else(|| libslop::PaneInfo {
+            pane_id: pane_id.to_string(),
+            created_at: identity.created_at.unwrap_or(ts),
+            last_active: ts,
+            session_id: identity.session_id.clone(),
+            parent_pane_id: identity.parent_pane_id.clone(),
+            tags: identity.tags.clone(),
+            state: detailed_state.to_simple(),
+            detailed_state: detailed_state.clone(),
+            working_dir: identity.working_dir.clone(),
+            transcript_path: state.and_then(|state| state.transcript_path.lock().unwrap().clone()),
+            account: identity
+                .account
+                .clone()
+                .unwrap_or_else(|| libslop::DEFAULT_ACCOUNT.to_string()),
+            backend: identity.backend,
+            pane_title: identity.title.clone(),
+        });
+    pane.created_at = identity.created_at.unwrap_or(pane.created_at);
+    pane.session_id = identity.session_id.clone().or(pane.session_id);
+    pane.parent_pane_id = identity.parent_pane_id.clone().or(pane.parent_pane_id);
+    pane.working_dir = identity.working_dir.clone().or(pane.working_dir);
+    pane.pane_title = identity.title.clone().or(pane.pane_title);
+    pane.backend = identity.backend;
+    pane.state = detailed_state.to_simple();
+    pane.detailed_state = detailed_state;
+    let generation = lifecycle.current_generation();
+    let grave = libslop::GraveEntry {
+        grave_id: uuid::Uuid::now_v7().to_string(),
+        tmux_boot_id: generation.tmux_boot_id,
+        tmux_session_id: generation.tmux_session_id,
+        destroyed_at: ts,
+        cause: cause.as_str().to_string(),
+        detected_by: detected_by.as_str().to_string(),
+        pane,
+        revived_at: None,
+        revived_as: None,
+    };
+    if let Err(e) = lifecycle.record_destroyed(grave) {
+        warn!("failed to persist pane {} death: {}", pane_id, e);
+    }
 
     // 1. Structured journal line — one line, all forensic fields, greppable.
     let line = format!(
@@ -2134,6 +2264,7 @@ async fn reconcile_panes(
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
     hook_log: &HookLog,
+    lifecycle: &LifecycleJournal,
 ) {
     let session = config.tmux.session();
     // Pull pane_dead/pane_dead_status alongside the id: a pane we set
@@ -2198,7 +2329,16 @@ async fn reconcile_panes(
     // kill-pane to clear the husk.
     for pane_id in &managed {
         if let Some(exit_status) = dead_panes.get(pane_id).copied() {
-            handle_dead_pane(config, panes, managed_panes, event_tx, pane_id, exit_status).await;
+            handle_dead_pane(
+                config,
+                panes,
+                managed_panes,
+                event_tx,
+                lifecycle,
+                pane_id,
+                exit_status,
+            )
+            .await;
         }
     }
 
@@ -2253,6 +2393,7 @@ async fn reconcile_panes(
             .flatten();
         record_pane_death(
             event_tx,
+            lifecycle,
             &pane_id,
             cause,
             DeathDetectedBy::ReconcileVanished,
@@ -2353,6 +2494,7 @@ async fn handle_dead_pane(
     panes: &PaneMap,
     managed_panes: &ManagedPanes,
     event_tx: &EventTx,
+    lifecycle: &LifecycleJournal,
     pane_id: &str,
     exit_status: Option<i64>,
 ) {
@@ -2395,6 +2537,7 @@ async fn handle_dead_pane(
     // PaneDestroyed that `slopctl run` reads.
     record_pane_death(
         event_tx,
+        lifecycle,
         pane_id,
         DeathCause::SelfExit,
         DeathDetectedBy::ReconcileDeadPane,
@@ -2592,7 +2735,7 @@ async fn main() {
         .expect("failed to run tmux has-session");
     // Whether slopd's tmux session already existed. False means we are starting
     // into a fresh tmux server (the common case after a reboot, which wipes the
-    // server) — the trigger for restoring panes from the on-disk manifest. True
+    // server) — the trigger for restoring panes from an older checkpoint. True
     // means a daemon restart against a surviving server, where load_managed_panes
     // already recovers panes from tmux and restoring from disk would duplicate them.
     let session_existed = has_session.success();
@@ -2673,12 +2816,29 @@ async fn main() {
     let session_lock: SessionLock = Arc::new(Mutex::new(()));
 
     // Backup/restore configuration, resolved once from the initial config. The
-    // two automatic behaviours are independent; manual backup/restore (via the
-    // RPC) ignore them.
+    // lifecycle journal is namespaced by the configured tmux socket + session,
+    // then split by tmux server boot id + session id.
     let auto_backup = config.backup.auto_backup;
     let auto_restore = config.backup.auto_restore;
     let manifest_path = config.backup.manifest_path();
     let pending_restore: PendingRestore = Arc::new(std::sync::Mutex::new(None));
+    let generation = tmux_generation(&config).await.unwrap_or_else(|e| {
+        error!("failed to identify tmux session generation: {e}");
+        std::process::exit(1);
+    });
+    let generation_started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let lifecycle: LifecycleJournal = Arc::new(
+        journal::LifecycleJournal::open(&config, generation, generation_started_at).unwrap_or_else(
+            |e| {
+                error!("failed to open lifecycle journal: {e}");
+                std::process::exit(1);
+            },
+        ),
+    );
+    info!("lifecycle journal: {}", lifecycle.root().display());
 
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized. This must happen before
@@ -2702,48 +2862,64 @@ async fn main() {
         }
     }
 
-    // Decide what to do with the on-disk manifest on this start.
-    //
-    // `!session_existed` (we had to create the tmux session) is the post-reboot
-    // case, where the manifest is the only surviving record: auto_restore
-    // re-spawns the panes, otherwise we hold a *pending restore*. A surviving
-    // session is a mere daemon restart — load_managed_panes already recovered
-    // the live panes, so we don't restore — EXCEPT when a pending restore was
-    // left unresolved before this restart: the `.pending` marker tells us to
-    // re-enter the pending state so the preserved manifest isn't clobbered by
-    // auto-backup resuming. (Without the marker, the in-memory pending flag would
-    // be lost on a daemon restart.)
-    let marker_path = config.backup.pending_marker_path();
-    let marker_exists = tokio::fs::metadata(&marker_path).await.is_ok();
-    let manifest = read_pane_manifest(&manifest_path).await;
-    let count = manifest.len();
-    let enter_pending = if count == 0 {
-        false
-    } else if !session_existed {
-        if !auto_restore {
-            true
-        } else if !restore_executable_available(&config) {
-            // Don't spawn panes that will die instantly and let the empty live
-            // set clobber the manifest. Preserve the restore point and tell the
-            // user how to fix it. (The post-reboot PATH failure mode.)
-            error!(
-                "backup: cannot auto-restore {} pane(s) — configured executable {:?} not found on slopd's PATH. \
-                 systemd user services start with a minimal PATH (no ~/.local/bin); add a PATH drop-in for slopd.service. \
-                 Manifest preserved and auto-backup paused — fix PATH, then run `slopctl restore`.",
-                count,
-                config
-                    .run
-                    .executable
-                    .as_ref()
-                    .map(|e| e.program())
-                    .unwrap_or("claude"),
-            );
-            true
-        } else {
+    // One-time migration from the old global manifest. Only the default tmux
+    // target may implicitly adopt the default manifest; a secondary instance
+    // must opt in with an explicit [backup].path, preventing the historical
+    // cross-instance restore bug during migration itself.
+    let default_target =
+        config.tmux.socket.is_none() && config.tmux.session() == libslop::SLOPD_TMUX_SESSION;
+    if !session_existed && (default_target || config.backup.path.is_some()) {
+        let legacy = read_pane_manifest(&manifest_path).await;
+        if !legacy.is_empty() {
+            let legacy_started = std::fs::metadata(&manifest_path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_else(|| start_time.saturating_sub(1).saturating_mul(1000));
+            match lifecycle.import_legacy(legacy, legacy_started) {
+                Ok(true) => info!(
+                    "backup: imported legacy manifest {} into the lifecycle journal",
+                    manifest_path.display()
+                ),
+                Ok(false) => {}
+                Err(e) => warn!("backup: failed to import legacy manifest: {e}"),
+            }
+        }
+    }
+
+    // A checkpoint in an older, unresolved generation is the restore point.
+    // The journal carries its resolution, so pending state survives daemon
+    // restarts without a shared `<manifest>.pending` marker.
+    let restore_source = lifecycle.pending_restore().unwrap_or_else(|e| {
+        error!("backup: failed to read lifecycle restore point: {e}");
+        None
+    });
+    if let Some((source, restore_panes_info)) = restore_source {
+        let count = restore_panes_info.len();
+        let missing_executables = missing_restore_executables(&config, &restore_panes_info);
+        if count > 0 && (!auto_restore || !missing_executables.is_empty()) {
+            if auto_restore && !missing_executables.is_empty() {
+                error!(
+                    "backup: cannot auto-restore {} pane(s) — required executable(s) {} not found on slopd's PATH. \
+                     Recovery checkpoint preserved — fix PATH, then run `slopctl restore`.",
+                    count,
+                    missing_executables.join(", "),
+                );
+            }
+            *pending_restore.lock().unwrap() = Some(PendingRestoreState {
+                source,
+                panes: restore_panes_info,
+            });
             info!(
-                "backup: fresh tmux session; restoring {} pane(s) from {}",
+                "backup: {} pane(s) from a previous tmux generation can be restored — run `slopctl restore`",
+                count
+            );
+        } else if count > 0 {
+            info!(
+                "backup: fresh tmux generation; restoring {} pane(s) from {}",
                 count,
-                manifest_path.display()
+                source.display()
             );
             restore_panes(
                 &config,
@@ -2752,33 +2928,18 @@ async fn main() {
                 &event_tx,
                 &pane_registered,
                 &session_lock,
-                manifest,
+                &lifecycle,
+                restore_panes_info,
             )
             .await;
-            false
+            if let Err(e) = lifecycle.resolve_restore(&source, "auto_restore") {
+                warn!("backup: failed to mark auto-restore resolved: {e}");
+            }
         }
-    } else {
-        // Daemon restart: only pending if a previous pending was unresolved.
-        marker_exists
-    };
-
-    if enter_pending {
-        *pending_restore.lock().unwrap() = Some(count);
-        if let Err(e) = tokio::fs::write(&marker_path, count.to_string()).await {
-            warn!(
-                "backup: failed to persist pending-restore marker {}: {}",
-                marker_path.display(),
-                e
-            );
-        }
-        info!(
-            "backup: {} pane(s) from a previous session can be restored — run `slopctl restore` (auto-backup paused until then; see `slopctl status`)",
-            count
-        );
-    } else {
-        // Not pending — clear any stale marker (restored, empty, or resolved).
-        let _ = tokio::fs::remove_file(&marker_path).await;
     }
+    // Remove a legacy pending marker after the journal has either imported or
+    // superseded it. New versions never create this shared file.
+    let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
 
     let _ = tokio::fs::remove_file(&socket_path).await;
 
@@ -2801,6 +2962,7 @@ async fn main() {
     let reconcile_managed = managed_panes.clone();
     let reconcile_tx = event_tx.clone();
     let reconcile_hook_log = hook_log.clone();
+    let reconcile_lifecycle = lifecycle.clone();
     // The background reconcile is a backstop for deaths the tmux hooks miss.
     // Tests that assert the hook-driven path (e.g. tmux-hook cause correlation)
     // lengthen this so only the hook path fires; production is always 2s.
@@ -2823,14 +2985,14 @@ async fn main() {
                 &reconcile_managed,
                 &reconcile_tx,
                 &reconcile_hook_log,
+                &reconcile_lifecycle,
             )
             .await;
         }
     });
 
     // Periodic auto-backup. Driven from the main select loop (not a spawned task)
-    // so it can never run concurrently with the shutdown backup, keeping the
-    // temp-file write in backup_panes race-free.
+    // so it cannot race the shutdown checkpoint.
     let mut backup_interval = tokio::time::interval(std::time::Duration::from_secs(
         config.backup.interval_secs.max(1),
     ));
@@ -2838,19 +3000,21 @@ async fn main() {
     loop {
         tokio::select! {
             _ = backup_interval.tick(), if auto_backup => {
-                // Skip while a restore is pending so the preserved manifest (the
-                // restore point) isn't clobbered by the empty/diverged live set.
+                // Skip while a restore is pending so automatic activity cannot
+                // resolve or supersede the user's older recovery choice.
                 let pending = pending_restore.lock().unwrap().is_some();
                 if !pending {
                     let config_snapshot = config_rx.borrow().clone();
-                    backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+                    if let Err(e) = backup_panes(&config_snapshot, &managed_panes, &lifecycle).await {
+                        warn!("backup: periodic checkpoint failed: {e}");
+                    }
                 }
             }
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
                 let config_snapshot = config_rx.borrow().clone();
-                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone(), hook_log.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone(), hook_log.clone(), lifecycle.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -2889,7 +3053,7 @@ async fn main() {
         }
     }
 
-    // Final auto-backup on clean shutdown, so the manifest reflects the very
+    // Final auto-backup on clean shutdown, so the checkpoint reflects the very
     // latest pane set rather than being up to interval_secs stale. Runs only
     // after the select loop has exited, so it never races the periodic backup.
     // Skipped while a restore is pending, so an unresolved restore point survives
@@ -2897,7 +3061,9 @@ async fn main() {
     let restore_pending = pending_restore.lock().unwrap().is_some();
     if auto_backup && !restore_pending {
         let config_snapshot = config_rx.borrow().clone();
-        backup_panes(&config_snapshot, &managed_panes, &manifest_path).await;
+        if let Err(e) = backup_panes(&config_snapshot, &managed_panes, &lifecycle).await {
+            warn!("backup: shutdown checkpoint failed: {e}");
+        }
     }
 
     // Use the latest config for the shutdown hook cleanup. If a config dir
@@ -3001,6 +3167,7 @@ async fn handle_connection(
     config_generation: Arc<std::sync::atomic::AtomicU64>,
     pending_restore: PendingRestore,
     hook_log: HookLog,
+    lifecycle: LifecycleJournal,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -3193,6 +3360,7 @@ async fn handle_connection(
                     &config_generation,
                     &pending_restore,
                     &hook_log,
+                    &lifecycle,
                 )
                 .await;
                 if write_response(&writer, req.id, body).await.is_err() {
@@ -3557,71 +3725,60 @@ fn pane_id_sort_key(pane_id: &str) -> (u8, u64, String) {
     }
 }
 
-/// Write the current managed-pane set to the backup manifest on disk, returning
-/// the number of panes recorded.
-///
-/// Writes to a temp file and atomically renames it into place, so a crash
-/// mid-write can never leave a torn manifest. A transient failure to enumerate
-/// panes is logged and skipped rather than clobbering a good manifest. Callers
-/// must serialize their calls (the daemon does, by auto-backing-up only from the
-/// main select loop and once on shutdown) so the shared temp path is safe.
+async fn refresh_lifecycle_generation(
+    config: &libslop::SlopdConfig,
+    lifecycle: &LifecycleJournal,
+) -> Result<(), String> {
+    let _refresh = lifecycle.lock_generation_refresh().await;
+    let generation = tmux_generation(config).await?;
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    lifecycle.switch_generation(generation, started_at)
+}
+
+async fn refresh_or_recreate_lifecycle_generation(
+    config: &libslop::SlopdConfig,
+    session_lock: &SessionLock,
+    lifecycle: &LifecycleJournal,
+) -> Result<(), String> {
+    if refresh_lifecycle_generation(config, lifecycle)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    recreate_slopd_session(config, session_lock).await;
+    refresh_lifecycle_generation(config, lifecycle).await
+}
+
+/// Checkpoint the current restorable pane set in the lifecycle journal.
+/// Pane bodies are appended only when they change, so an unchanged periodic
+/// backup syncs the journal without growing it.
 async fn backup_panes(
     config: &libslop::SlopdConfig,
     managed_panes: &ManagedPanes,
-    manifest_path: &std::path::Path,
-) -> usize {
-    let panes = match list_panes(config, managed_panes).await {
-        Ok(panes) => panes,
-        Err(e) => {
-            warn!("backup: failed to enumerate panes, skipping backup: {}", e);
-            return 0;
-        }
-    };
-    // Only panes with a recorded Claude session id are restorable; a pane still
+    lifecycle: &LifecycleJournal,
+) -> Result<usize, String> {
+    let panes = list_panes(config, managed_panes)
+        .await
+        .map_err(|e| format!("failed to enumerate panes: {e}"))?;
+    // Only panes with a recorded backend session id are restorable; a pane still
     // booting before its first SessionStart has none and would just be skipped on
-    // restore. Keep the manifest to resumable panes.
+    // restore. Keep the checkpoint to resumable panes.
     let panes: Vec<libslop::PaneInfo> = panes
         .into_iter()
         .filter(|p| p.session_id.is_some())
         .collect();
-    let json = match serde_json::to_string_pretty(&panes) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!("backup: failed to serialize pane manifest: {}", e);
-            return 0;
-        }
-    };
-    if let Some(parent) = manifest_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        warn!(
-            "backup: failed to create manifest dir {}: {}",
-            parent.display(),
-            e
-        );
-        return 0;
-    }
-    // Temp file beside the manifest so the rename stays on one filesystem (atomic).
-    let tmp_path = manifest_path.with_extension("json.tmp");
-    if let Err(e) = tokio::fs::write(&tmp_path, json.as_bytes()).await {
-        warn!("backup: failed to write {}: {}", tmp_path.display(), e);
-        return 0;
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, manifest_path).await {
-        warn!(
-            "backup: failed to rename into {}: {}",
-            manifest_path.display(),
-            e
-        );
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return 0;
-    }
+    refresh_lifecycle_generation(config, lifecycle).await?;
+    let count = lifecycle.checkpoint(panes)?;
     debug!(
-        "backup: wrote {} pane(s) to {}",
-        panes.len(),
-        manifest_path.display()
+        "backup: checkpointed {} pane(s) in {}",
+        count,
+        lifecycle.root().display()
     );
-    panes.len()
+    Ok(count)
 }
 
 /// Read the backup manifest from disk, returning the panes recorded there.
@@ -3691,7 +3848,7 @@ struct SpawnSpec {
 /// present on one spawn path and forgotten on the other.
 ///
 /// Returns the new pane id, or an error string if the executable can't be
-/// resolved (so the caller can surface it / preserve the manifest) or tmux
+/// resolved (so the caller can surface it / preserve the checkpoint) or tmux
 /// fails.
 async fn spawn_pane(
     config: &Arc<libslop::SlopdConfig>,
@@ -3830,24 +3987,53 @@ async fn spawn_pane(
     }
 }
 
-/// Whether the configured Claude executable resolves on slopd's PATH. Used as a
-/// pre-flight for the startup restore decision: if it can't be resolved we keep
-/// the manifest as a pending restore (rather than spawn panes that fail) until
-/// the user fixes their PATH. The actual spawn in [`spawn_pane`] resolves
-/// it again to an absolute path, so this only gates *whether* to attempt a
-/// restore, never how the executable is located.
-fn restore_executable_available(config: &libslop::SlopdConfig) -> bool {
+fn resolve_restore_account(
+    config: &libslop::SlopdConfig,
+    account: &str,
+    backend: libslop::Backend,
+) -> libslop::ResolvedAccount {
+    let mut resolved = config
+        .resolve_account(Some(account))
+        .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
+        .expect("the reserved default account always resolves");
+    if resolved.backend != backend {
+        resolved.backend = backend;
+        resolved.executable =
+            match libslop::Backend::infer_from_program(resolved.executable.program()) {
+                Some(inferred) if inferred == backend => resolved.executable.clone(),
+                Some(_) => libslop::Executable::String(backend.canonical_executable().to_string()),
+                None => resolved.executable.clone(),
+            };
+    }
+    resolved
+}
+
+/// Executables needed by a recovery checkpoint that cannot currently be
+/// resolved. This pre-flight keeps the whole checkpoint pending instead of
+/// spawning panes that are guaranteed to die. `spawn_pane` resolves again at
+/// launch time; this only decides whether startup auto-restore is safe.
+fn missing_restore_executables(
+    config: &libslop::SlopdConfig,
+    panes: &[libslop::PaneInfo],
+) -> Vec<String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    // Restore currently targets Claude panes only (the manifest gains a `backend`
-    // field in a later phase); use the global executable or the Claude default.
-    let program = config
-        .run
-        .executable
-        .as_ref()
-        .map(|e| e.program())
-        .unwrap_or("claude");
-    libslop::executable_exists(program, &path, &cwd)
+    let default_cwd = std::env::current_dir().unwrap_or_default();
+    let mut missing = std::collections::BTreeSet::new();
+    for pane in panes {
+        let resolved = resolve_restore_account(config, &pane.account, pane.backend);
+        let cwd = pane
+            .transcript_path
+            .as_deref()
+            .and_then(transcript_launch_cwd)
+            .or_else(|| pane.working_dir.clone())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| default_cwd.clone());
+        let program = resolved.executable.program();
+        if !libslop::executable_exists(program, &path, &cwd) {
+            missing.insert(program.to_string());
+        }
+    }
+    missing.into_iter().collect()
 }
 
 /// The launch cwd recorded in an agent transcript. Claude stores it at top
@@ -3894,7 +4080,7 @@ fn hook_transcript_path<'a>(
         .and_then(|value| value.as_str())
 }
 
-/// Re-spawn the panes recorded in `manifest` after a reboot, each via
+/// Re-spawn the panes recorded in a checkpoint after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
 /// Panes are restored parents-first so that ancestry can be remapped from the
@@ -3903,6 +4089,7 @@ fn hook_transcript_path<'a>(
 /// best-effort: a pane whose session can no longer be resumed (e.g. its
 /// transcript was deleted) just dies and is cleaned up by the reconciler; it
 /// does not abort the rest of the batch.
+#[allow(clippy::too_many_arguments)] // shared daemon state plus the checkpoint batch
 async fn restore_panes(
     config: &Arc<libslop::SlopdConfig>,
     managed_panes: &ManagedPanes,
@@ -3910,10 +4097,16 @@ async fn restore_panes(
     event_tx: &EventTx,
     pane_registered: &PaneRegistered,
     session_lock: &SessionLock,
+    lifecycle: &LifecycleJournal,
     manifest: Vec<libslop::PaneInfo>,
 ) -> usize {
+    if let Err(e) = refresh_or_recreate_lifecycle_generation(config, session_lock, lifecycle).await
+    {
+        warn!("backup: failed to identify restore generation: {e}");
+        return 0;
+    }
     let total = manifest.len();
-    // Only panes with a Claude session id can be resumed.
+    // Only panes with a backend session id can be resumed.
     let (resumable, skipped): (Vec<libslop::PaneInfo>, Vec<libslop::PaneInfo>) =
         manifest.into_iter().partition(|p| p.session_id.is_some());
     for p in &skipped {
@@ -4030,24 +4223,8 @@ async fn restore_panes(
         // manifest entry (authoritative — a pane created via `--backend opencode`
         // on the default account must restore as opencode even though the default
         // account now resolves to claude).
-        let mut resolved = config
-            .resolve_account(Some(account.as_str()))
-            .or_else(|_| config.resolve_account(Some(libslop::DEFAULT_ACCOUNT)))
-            .expect("the reserved default account always resolves");
         let manifest_backend = p.backend;
-        if resolved.backend != manifest_backend {
-            resolved.backend = manifest_backend;
-            // Recompute the executable to match: keep a custom/unrecognized path,
-            // else swap a recognized name to the backend's canonical binary.
-            resolved.executable =
-                match libslop::Backend::infer_from_program(resolved.executable.program()) {
-                    Some(inferred) if inferred == manifest_backend => resolved.executable.clone(),
-                    Some(_) => libslop::Executable::String(
-                        manifest_backend.canonical_executable().to_string(),
-                    ),
-                    None => resolved.executable.clone(),
-                };
-        }
+        let resolved = resolve_restore_account(config, &account, manifest_backend);
         // Resume the recorded session. Claude: `claude --resume` from the launch
         // cwd. OpenCode: `opencode -s <id>` over a freshly-allocated HTTP port,
         // then reattach the status-poll driver.
@@ -4232,6 +4409,7 @@ async fn handle_request(
     config_generation: &Arc<std::sync::atomic::AtomicU64>,
     pending_restore: &PendingRestore,
     hook_log: &HookLog,
+    lifecycle: &LifecycleJournal,
 ) -> libslop::ResponseBody {
     match body {
         libslop::RequestBody::Status => {
@@ -4244,7 +4422,11 @@ async fn handle_request(
                     uptime_secs: now.saturating_sub(start_time),
                     subscriber_count: event_tx.receiver_count() as u64,
                     config_generation: config_generation.load(std::sync::atomic::Ordering::Relaxed),
-                    pending_restore: *pending_restore.lock().unwrap(),
+                    pending_restore: pending_restore
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|pending| pending.panes.len()),
                 },
             }
         }
@@ -4297,6 +4479,7 @@ async fn handle_request(
             // guessing, as the %119 investigation had to.
             record_pane_death(
                 event_tx,
+                lifecycle,
                 &pane_id,
                 DeathCause::DeliberateKill,
                 DeathDetectedBy::KillRpc,
@@ -4322,7 +4505,7 @@ async fn handle_request(
                     _ => {}
                 }
             }
-            reconcile_panes(config, panes, managed_panes, event_tx, hook_log).await;
+            reconcile_panes(config, panes, managed_panes, event_tx, hook_log, lifecycle).await;
             libslop::ResponseBody::TmuxHooked
         }
 
@@ -4751,6 +4934,7 @@ async fn handle_request(
                 config_generation,
                 pending_restore,
                 hook_log,
+                lifecycle,
             ))
             .await
             {
@@ -4919,6 +5103,9 @@ async fn handle_request(
             .await;
             match output {
                 Ok(pane_id) => {
+                    if let Err(e) = refresh_lifecycle_generation(config, lifecycle).await {
+                        warn!("failed to refresh lifecycle generation after spawn: {e}");
+                    }
                     debug!(
                         "spawned {:?} ({}) in pane {}",
                         resolved.executable,
@@ -4977,6 +5164,7 @@ async fn handle_request(
                         state.mark_unbound_backend(resolved.backend);
                         let mut id = state.identity.lock().unwrap();
                         id.backend = resolved.backend;
+                        id.account = Some(resolved.name.clone());
                         id.parent_pane_id = parent_pane_id.clone();
                         id.working_dir = effective_start_dir
                             .as_ref()
@@ -5654,7 +5842,12 @@ async fn handle_request(
             };
             if remove {
                 match tmux_unset_pane_option(config, &pane_id, &option_name).await {
-                    Ok(s) if s.success() => libslop::ResponseBody::Untagged { pane_id, tag },
+                    Ok(s) if s.success() => {
+                        if let Some(state) = panes.get(&pane_id) {
+                            state.identity.lock().unwrap().tags.retain(|t| t != &tag);
+                        }
+                        libslop::ResponseBody::Untagged { pane_id, tag }
+                    }
                     Ok(s) => libslop::ResponseBody::Error {
                         message: format!("tmux exited with {}", s),
                     },
@@ -5664,7 +5857,15 @@ async fn handle_request(
                 }
             } else {
                 match tmux_set_pane_option(config, &pane_id, &option_name, "1").await {
-                    Ok(s) if s.success() => libslop::ResponseBody::Tagged { pane_id, tag },
+                    Ok(s) if s.success() => {
+                        if let Some(state) = panes.get(&pane_id) {
+                            let mut identity = state.identity.lock().unwrap();
+                            if !identity.tags.contains(&tag) {
+                                identity.tags.push(tag.clone());
+                            }
+                        }
+                        libslop::ResponseBody::Tagged { pane_id, tag }
+                    }
                     Ok(s) => libslop::ResponseBody::Error {
                         message: format!("tmux exited with {}", s),
                     },
@@ -5723,6 +5924,8 @@ async fn handle_request(
                             if id.working_dir.is_none() {
                                 id.working_dir = info.working_dir.clone();
                             }
+                            id.account = Some(info.account.clone());
+                            id.tags = info.tags.clone();
                         }
                     }
                     libslop::ResponseBody::Ps { panes: pane_infos }
@@ -5732,22 +5935,37 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Backup => {
-            // Manual backup: write the manifest now, regardless of auto_backup.
-            // This explicitly replaces the restore point with the current state,
-            // so it resolves any pending restore and lets auto-backup resume.
-            let manifest_path = config.backup.manifest_path();
-            let count = backup_panes(config, managed_panes, &manifest_path).await;
-            *pending_restore.lock().unwrap() = None;
-            let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
-            libslop::ResponseBody::BackedUp { count }
+            // A manual checkpoint explicitly chooses the current live set over
+            // an older pending restore point.
+            match backup_panes(config, managed_panes, lifecycle).await {
+                Ok(count) => {
+                    let pending = pending_restore.lock().unwrap().take();
+                    if let Some(pending) = pending
+                        && let Err(e) = lifecycle.resolve_restore(&pending.source, "backup")
+                    {
+                        warn!("backup: failed to resolve old restore point: {e}");
+                    }
+                    libslop::ResponseBody::BackedUp { count }
+                }
+                Err(message) => libslop::ResponseBody::Error { message },
+            }
         }
 
         libslop::RequestBody::Restore => {
-            // Manual restore: re-spawn from the manifest now, regardless of
-            // auto_restore. restore_panes seeds its dedup set with the sessions
-            // of currently-running panes, so this won't double a live session.
-            let manifest_path = config.backup.manifest_path();
-            let manifest = read_pane_manifest(&manifest_path).await;
+            // Prefer the unresolved pre-reboot checkpoint. With no pending
+            // generation, use the latest checkpoint so backup→kill→restore
+            // retains its historical behavior.
+            let pending = pending_restore.lock().unwrap().clone();
+            let source = match pending {
+                Some(pending) => Some((pending.source, pending.panes)),
+                None => match lifecycle.manual_restore_source() {
+                    Ok(source) => source,
+                    Err(message) => return libslop::ResponseBody::Error { message },
+                },
+            };
+            let Some((source, manifest)) = source else {
+                return libslop::ResponseBody::Restored { restored: 0 };
+            };
             let restored = restore_panes(
                 config,
                 managed_panes,
@@ -5755,13 +5973,83 @@ async fn handle_request(
                 event_tx,
                 pane_registered,
                 session_lock,
+                lifecycle,
                 manifest,
             )
             .await;
-            // The pending restore (if any) has now been consumed; resume auto-backup.
-            *pending_restore.lock().unwrap() = None;
-            let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
+            if let Err(e) = lifecycle.resolve_restore(&source, "manual_restore") {
+                warn!("backup: failed to mark manual restore resolved: {e}");
+            }
+            pending_restore.lock().unwrap().take();
             libslop::ResponseBody::Restored { restored }
+        }
+
+        libslop::RequestBody::Graveyard { boot, limit } => match lifecycle.graveyard(boot, limit) {
+            Ok(entries) => libslop::ResponseBody::Graveyard { entries },
+            Err(message) => libslop::ResponseBody::Error { message },
+        },
+
+        libslop::RequestBody::Revive { target, boot } => {
+            if let Err(message) =
+                refresh_or_recreate_lifecycle_generation(config, session_lock, lifecycle).await
+            {
+                return libslop::ResponseBody::Error { message };
+            }
+            let grave = match lifecycle.select_grave(target.as_deref(), boot) {
+                Ok(grave) => grave,
+                Err(message) => return libslop::ResponseBody::Error { message },
+            };
+            let Some(session_id) = grave.pane.session_id.as_deref() else {
+                return libslop::ResponseBody::Error {
+                    message: format!("grave {} has no resumable backend session", grave.grave_id),
+                };
+            };
+
+            // A session can already be live even though this particular pane
+            // died (for example after an earlier manual restore). Reuse it
+            // instead of spawning a second agent on the same conversation.
+            let mut revived_as = list_panes(config, managed_panes)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|pane| pane.session_id.as_deref() == Some(session_id))
+                .map(|pane| pane.pane_id);
+            if revived_as.is_none() {
+                let restored = restore_panes(
+                    config,
+                    managed_panes,
+                    panes,
+                    event_tx,
+                    pane_registered,
+                    session_lock,
+                    lifecycle,
+                    vec![grave.pane.clone()],
+                )
+                .await;
+                if restored > 0 {
+                    revived_as = list_panes(config, managed_panes)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|pane| pane.session_id.as_deref() == Some(session_id))
+                        .map(|pane| pane.pane_id);
+                }
+            }
+            let Some(pane_id) = revived_as else {
+                return libslop::ResponseBody::Error {
+                    message: format!(
+                        "failed to revive grave {} (session {})",
+                        grave.grave_id, session_id
+                    ),
+                };
+            };
+            if let Err(message) = lifecycle.record_revived(&grave.grave_id, &pane_id) {
+                return libslop::ResponseBody::Error { message };
+            }
+            libslop::ResponseBody::Revived {
+                pane_id,
+                grave_id: grave.grave_id,
+            }
         }
 
         libslop::RequestBody::ReadTranscript {
