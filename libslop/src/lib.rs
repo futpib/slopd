@@ -117,8 +117,7 @@ pub fn state_dir() -> PathBuf {
 /// Path to the legacy pane backup manifest (`$XDG_STATE_HOME/slopd/panes.json`).
 ///
 /// Current slopd versions import this old single-file format into the lifecycle
-/// journal. The location can be overridden via `[backup] path`; its parent also
-/// becomes the journal's storage base.
+/// journal for the default tmux target.
 pub fn panes_manifest_path() -> PathBuf {
     state_dir().join("slopd/panes.json")
 }
@@ -1260,6 +1259,14 @@ mod tests {
     }
 
     #[test]
+    fn backup_path_is_rejected() {
+        let error = toml::from_str::<SlopdConfig>("[backup]\npath = \"/tmp/panes.json\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `path`"), "{error}");
+    }
+
+    #[test]
     fn account_config_accepts_bare_string() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/claude-work\"\n");
         let acct = cfg.accounts.get("work").expect("work account missing");
@@ -2364,6 +2371,7 @@ impl Default for SlopdRunConfig {
 /// always available regardless of these — the toggles only control what slopd
 /// does on its own.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlopdBackupConfig {
     /// Automatically checkpoint the pane set on a timer and clean shutdown
     /// (default: true). `slopctl backup` triggers a write on demand regardless.
@@ -2375,9 +2383,6 @@ pub struct SlopdBackupConfig {
     /// `slopctl restore` triggers a restore on demand regardless.
     #[serde(default)]
     pub auto_restore: bool,
-    /// Legacy manifest import path. Its parent is also the journal storage base.
-    /// Defaults to [`panes_manifest_path`]. Supports `~` and `$VAR` expansion.
-    pub path: Option<PathBuf>,
     /// How often (seconds) to auto-back-up while running (default: 30). A backup
     /// is also taken on clean shutdown regardless of this interval.
     #[serde(default = "default_backup_interval_secs")]
@@ -2397,29 +2402,8 @@ impl Default for SlopdBackupConfig {
         Self {
             auto_backup: default_auto_backup(),
             auto_restore: false,
-            path: None,
             interval_secs: default_backup_interval_secs(),
         }
-    }
-}
-
-impl SlopdBackupConfig {
-    /// Resolve the manifest path: the configured `path` (with `~`/`$VAR`
-    /// expansion) if set, else the default [`panes_manifest_path`].
-    pub fn manifest_path(&self) -> PathBuf {
-        self.path
-            .as_deref()
-            .map(expand_path)
-            .unwrap_or_else(panes_manifest_path)
-    }
-
-    /// Path used by pre-journal versions for pending restores. Current slopd
-    /// removes this legacy marker after migration; journal resolution events now
-    /// preserve pending state across daemon restarts.
-    pub fn pending_marker_path(&self) -> PathBuf {
-        let mut s = self.manifest_path().into_os_string();
-        s.push(".pending");
-        s.into()
     }
 }
 

@@ -2820,7 +2820,6 @@ async fn main() {
     // then split by tmux server boot id + session id.
     let auto_backup = config.backup.auto_backup;
     let auto_restore = config.backup.auto_restore;
-    let manifest_path = config.backup.manifest_path();
     let pending_restore: PendingRestore = Arc::new(std::sync::Mutex::new(None));
     let generation = tmux_generation(&config).await.unwrap_or_else(|e| {
         error!("failed to identify tmux session generation: {e}");
@@ -2863,12 +2862,12 @@ async fn main() {
     }
 
     // One-time migration from the old global manifest. Only the default tmux
-    // target may implicitly adopt the default manifest; a secondary instance
-    // must opt in with an explicit [backup].path, preventing the historical
-    // cross-instance restore bug during migration itself.
+    // target may adopt it, preventing a secondary instance from consuming the
+    // main instance's old restore state.
     let default_target =
         config.tmux.socket.is_none() && config.tmux.session() == libslop::SLOPD_TMUX_SESSION;
-    if !session_existed && (default_target || config.backup.path.is_some()) {
+    if !session_existed && default_target {
+        let manifest_path = libslop::panes_manifest_path();
         let legacy = read_pane_manifest(&manifest_path).await;
         if !legacy.is_empty() {
             let legacy_started = std::fs::metadata(&manifest_path)
@@ -2937,10 +2936,6 @@ async fn main() {
             }
         }
     }
-    // Remove a legacy pending marker after the journal has either imported or
-    // superseded it. New versions never create this shared file.
-    let _ = tokio::fs::remove_file(config.backup.pending_marker_path()).await;
-
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     let listener = UnixListener::bind(&socket_path).unwrap();

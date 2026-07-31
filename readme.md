@@ -192,8 +192,8 @@ systemctl --user reload slopd
 
 The reload affects subsequent operations only — already-running panes keep the
 backend, executable, environment, and config directory they were spawned with.
-Logging, `[control] socket`, and the startup-resolved `[backup]` toggles,
-interval, and journal/legacy-manifest path require a restart. A malformed config keeps the
+Logging, `[control] socket`, and the startup-resolved `[backup]` toggles and
+interval require a restart. A malformed config keeps the
 previous generation; check the daemon log for the parse error. `slopctl status`
 exposes a `config_generation` counter that increments after every successful
 reload.
@@ -312,9 +312,6 @@ session named `slopd`.
 # Automatically re-spawn the recorded panes after a reboot (default: false, so a
 # reboot does not resurrect panes unless you ask).
 # auto_restore = false
-# Legacy manifest import path. Its parent is also the lifecycle-journal base
-# (default: $XDG_STATE_HOME/slopd). Supports ~ / $VAR.
-# path = "~/.local/state/slopd/panes.json"
 # How often (seconds) to auto-back-up while running (default: 30). A backup is
 # also taken on clean shutdown regardless of this interval.
 # interval_secs = 30
@@ -444,9 +441,8 @@ target is then split into generations identified by a tmux-server UUID plus
 tmux's `#{session_id}`. The server UUID distinguishes pane IDs reused after a
 tmux restart; the session ID distinguishes a managed session killed and
 recreated inside the same server. Generation files are append-only JSONL and
-are retained without a time or count limit. The old single `panes.json` is
-imported once for the default target (or from an explicitly configured
-`[backup] path`).
+are retained without a time or count limit. The old single
+`$XDG_STATE_HOME/slopd/panes.json` is imported once for the default target.
 
 **Restore.** With `auto_restore` on, slopd restores when it has to create its
 tmux session from scratch — the signature of a fresh server after a reboot. It

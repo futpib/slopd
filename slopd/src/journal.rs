@@ -101,6 +101,10 @@ impl LifecycleJournal {
         started_at: u64,
     ) -> Result<Self, String> {
         let root = target_root(config);
+        Self::open_at(root, generation, started_at)
+    }
+
+    fn open_at(root: PathBuf, generation: GenerationKey, started_at: u64) -> Result<Self, String> {
         let generations = root.join("generations");
         std::fs::create_dir_all(&generations).map_err(|e| {
             format!(
@@ -416,8 +420,8 @@ impl LifecycleJournal {
 
     /// Import the old single-manifest format as a synthetic previous
     /// generation. This is intentionally called only for the default tmux
-    /// target or an explicitly configured legacy path, so a secondary daemon
-    /// cannot accidentally adopt the main instance's old manifest.
+    /// target, so a secondary daemon cannot accidentally adopt the main
+    /// instance's old manifest.
     pub(crate) fn import_legacy(
         &self,
         panes: Vec<libslop::PaneInfo>,
@@ -512,11 +516,10 @@ impl LifecycleJournal {
 }
 
 fn target_root(config: &libslop::SlopdConfig) -> PathBuf {
-    let manifest = config.backup.manifest_path();
-    let base = manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| libslop::state_dir().join("slopd"));
+    target_root_at(config, &libslop::state_dir().join("slopd"))
+}
+
+fn target_root_at(config: &libslop::SlopdConfig, base: &Path) -> PathBuf {
     let socket = match config.tmux.socket.as_deref() {
         Some(socket) => {
             let expanded = libslop::expand_path(socket);
@@ -755,14 +758,27 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "[tmux]\nsocket = {:?}\nsession = {:?}\n\n[backup]\npath = {:?}\n",
+                "[tmux]\nsocket = {:?}\nsession = {:?}\n",
                 dir.join("tmux.sock"),
-                session,
-                dir.join("panes.json")
+                session
             ),
         )
         .unwrap();
         libslop::SlopdConfig::load_from(&path)
+    }
+
+    fn open(
+        dir: &Path,
+        config: &libslop::SlopdConfig,
+        generation: GenerationKey,
+        started_at: u64,
+    ) -> LifecycleJournal {
+        LifecycleJournal::open_at(
+            target_root_at(config, &dir.join("state")),
+            generation,
+            started_at,
+        )
+        .unwrap()
     }
 
     fn grave(journal: &LifecycleJournal, id: &str, pane_id: &str, session: &str, at: u64) {
@@ -790,7 +806,7 @@ mod tests {
             tmux_boot_id: "boot".into(),
             tmux_session_id: "$1".into(),
         };
-        let journal = LifecycleJournal::open(&config, key, 1).unwrap();
+        let journal = open(dir.path(), &config, key, 1);
         journal.checkpoint(vec![pane("%1", "s1")]).unwrap();
         let path = std::fs::read_dir(journal.root().join("generations"))
             .unwrap()
@@ -808,11 +824,15 @@ mod tests {
         let dir = libsloptest::tempfile::tempdir().unwrap();
         let a = config(dir.path(), "one");
         let b = config(dir.path(), "two");
-        assert_ne!(target_root(&a), target_root(&b));
+        let state = dir.path().join("state");
+        assert_ne!(target_root_at(&a, &state), target_root_at(&b, &state));
 
         let mut other_socket = config(dir.path(), "one");
         other_socket.tmux.socket = Some(dir.path().join("other.sock"));
-        assert_ne!(target_root(&a), target_root(&other_socket));
+        assert_ne!(
+            target_root_at(&a, &state),
+            target_root_at(&other_socket, &state)
+        );
     }
 
     #[test]
@@ -823,7 +843,7 @@ mod tests {
             tmux_boot_id: "boot-a".into(),
             tmux_session_id: "$1".into(),
         };
-        let journal = LifecycleJournal::open(&config, first, 1).unwrap();
+        let journal = open(dir.path(), &config, first, 1);
         grave(&journal, "grave-a", "%7", "session-a", 10);
 
         let second = GenerationKey {
@@ -855,7 +875,7 @@ mod tests {
             tmux_boot_id: "boot".into(),
             tmux_session_id: "$9".into(),
         };
-        let journal = LifecycleJournal::open(&config, first.clone(), 1).unwrap();
+        let journal = open(dir.path(), &config, first.clone(), 1);
         journal.checkpoint(vec![pane("%4", "session")]).unwrap();
         let second = GenerationKey {
             tmux_boot_id: "boot".into(),
@@ -866,7 +886,7 @@ mod tests {
         journal.resolve_restore(&first, "manual_restore").unwrap();
         drop(journal);
 
-        let reopened = LifecycleJournal::open(&config, second, 2).unwrap();
+        let reopened = open(dir.path(), &config, second, 2);
         assert!(reopened.pending_restore().unwrap().is_none());
     }
 
@@ -878,7 +898,7 @@ mod tests {
             tmux_boot_id: "boot".into(),
             tmux_session_id: "$1".into(),
         };
-        let journal = LifecycleJournal::open(&config, first.clone(), 1).unwrap();
+        let journal = open(dir.path(), &config, first.clone(), 1);
         journal.checkpoint(vec![pane("%4", "session")]).unwrap();
         journal
             .switch_generation(
@@ -911,7 +931,7 @@ mod tests {
             tmux_boot_id: "boot".into(),
             tmux_session_id: "$1".into(),
         };
-        let journal = LifecycleJournal::open(&config, current, 2).unwrap();
+        let journal = open(dir.path(), &config, current, 2);
         assert!(
             journal
                 .import_legacy(vec![pane("%4", "session")], 1)
@@ -937,7 +957,7 @@ mod tests {
             tmux_boot_id: "boot".into(),
             tmux_session_id: "$1".into(),
         };
-        let journal = LifecycleJournal::open(&config, key.clone(), 1).unwrap();
+        let journal = open(dir.path(), &config, key.clone(), 1);
         journal.checkpoint(vec![pane("%4", "session")]).unwrap();
         let path = std::fs::read_dir(journal.root().join("generations"))
             .unwrap()
@@ -952,7 +972,7 @@ mod tests {
         )
         .unwrap();
 
-        let reopened = LifecycleJournal::open(&config, key.clone(), 1).unwrap();
+        let reopened = open(dir.path(), &config, key.clone(), 1);
         assert_eq!(
             reopened.manual_restore_source().unwrap().unwrap().1,
             vec![pane("%4", "session")]
@@ -961,7 +981,7 @@ mod tests {
             .checkpoint(vec![pane("%4", "session"), pane("%5", "other")])
             .unwrap();
         drop(reopened);
-        let reopened = LifecycleJournal::open(&config, key, 1).unwrap();
+        let reopened = open(dir.path(), &config, key, 1);
         assert_eq!(reopened.current.lock().unwrap().checkpoint.len(), 2);
     }
 }
