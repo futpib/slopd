@@ -562,6 +562,33 @@ fn timestamp_ago(fmt: &timeago::Formatter, epoch: std::time::Duration, timestamp
     fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(timestamp)))
 }
 
+fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let widths: Vec<usize> = (0..header.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].len())
+                .fold(header[column].len(), usize::max)
+        })
+        .collect();
+    let render = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(column, value)| format!("{:<width$}", value, width = widths[column]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(render(
+        &header
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>(),
+    ));
+    lines.extend(rows.iter().map(|row| render(row)));
+    lines.join("\n")
+}
+
 pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
     let fmt = timeago::Formatter::new();
     let epoch = std::time::SystemTime::now()
@@ -632,28 +659,7 @@ pub fn print_ps(panes: Vec<libslop::PaneInfo>) {
         .map(|p| cols.iter().map(|(_, f)| f(p)).collect())
         .collect();
 
-    let widths: Vec<usize> = (0..header.len())
-        .map(|c| {
-            let mut w = header[c].len();
-            for r in &rows {
-                w = w.max(r[c].len());
-            }
-            w
-        })
-        .collect();
-    let render = |cells: &[String]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(c, v)| format!("{:<width$}", v, width = widths[c]))
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-    let header_row: Vec<String> = header.iter().map(|s| s.to_string()).collect();
-    println!("{}", render(&header_row));
-    for r in &rows {
-        println!("{}", render(r));
-    }
+    println!("{}", format_table(&header, &rows));
 }
 
 /// Shared state for the background demux task.
@@ -2406,38 +2412,53 @@ where
                 let epoch = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                println!(
-                    "GRAVE\tPANE\tCREATED\tDESTROYED\tREVIVED\tBACKEND\tACCOUNT\tSTATUS\tTITLE"
-                );
-                for entry in entries {
-                    let grave = entry.grave_id.get(..8).unwrap_or(&entry.grave_id);
-                    let revived = entry
-                        .revived_as
-                        .as_deref()
-                        .map(|p| format!("revived:{p}"))
-                        .unwrap_or_else(|| entry.cause.clone());
-                    let revived_at = entry
-                        .revived_at
-                        .map(|timestamp| timestamp_ago(&fmt, epoch, timestamp))
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        grave,
-                        entry.pane.pane_id,
-                        timestamp_ago(&fmt, epoch, entry.pane.created_at),
-                        timestamp_ago(&fmt, epoch, entry.destroyed_at),
-                        revived_at,
-                        entry.pane.backend.canonical_executable(),
-                        entry.pane.account,
-                        revived,
-                        entry
-                            .pane
-                            .pane_title
+                let header = [
+                    "GRAVE",
+                    "PANE",
+                    "CREATED",
+                    "DESTROYED",
+                    "REVIVED",
+                    "BACKEND",
+                    "ACCOUNT",
+                    "STATUS",
+                    "TITLE",
+                ];
+                let rows = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let grave = entry
+                            .grave_id
+                            .get(..8)
+                            .unwrap_or(&entry.grave_id)
+                            .to_string();
+                        let revived = entry
+                            .revived_as
                             .as_deref()
-                            .map(truncate_title)
-                            .unwrap_or_else(|| "-".to_string()),
-                    );
-                }
+                            .map(|p| format!("revived:{p}"))
+                            .unwrap_or_else(|| entry.cause.clone());
+                        let revived_at = entry
+                            .revived_at
+                            .map(|timestamp| timestamp_ago(&fmt, epoch, timestamp))
+                            .unwrap_or_else(|| "-".to_string());
+                        vec![
+                            grave,
+                            entry.pane.pane_id,
+                            timestamp_ago(&fmt, epoch, entry.pane.created_at),
+                            timestamp_ago(&fmt, epoch, entry.destroyed_at),
+                            revived_at,
+                            entry.pane.backend.canonical_executable().to_string(),
+                            entry.pane.account,
+                            revived,
+                            entry
+                                .pane
+                                .pane_title
+                                .as_deref()
+                                .map(truncate_title)
+                                .unwrap_or_else(|| "-".to_string()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", format_table(&header, &rows));
             }
         }
         CommonCommand::Revive { target, boot } => {
@@ -2451,6 +2472,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_columns_align_when_values_are_wider_than_headers() {
+        let table = format_table(
+            &["GRAVE", "PANE", "CREATED"],
+            &[vec![
+                "019fba29".to_string(),
+                "%27".to_string(),
+                "6 seconds ago".to_string(),
+            ]],
+        );
+        let mut lines = table.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        assert_eq!(header.find("GRAVE"), row.find("019fba29"));
+        assert_eq!(header.find("PANE"), row.find("%27"));
+        assert_eq!(header.find("CREATED"), row.find("6 seconds ago"));
+        assert!(!table.contains('\t'));
+    }
 
     fn died_msg(diag: PaneDeathDiagnostics) -> String {
         match run_died_error("%28", diag) {

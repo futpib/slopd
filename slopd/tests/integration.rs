@@ -12735,7 +12735,13 @@ fn graveyard_records_and_revives_a_killed_pane() {
     assert!(grave.pane.tags.contains(&"recover-me".to_string()));
     assert!(grave.revived_at.is_none());
     let human = String::from_utf8(env.slopctl(&["graveyard"]).stdout).unwrap();
-    assert!(human.contains("CREATED\tDESTROYED\tREVIVED"));
+    let mut lines = human.lines();
+    let header = lines.next().expect("graveyard header");
+    let row = lines.next().expect("graveyard row");
+    assert_eq!(header.find("GRAVE"), row.find(&grave.grave_id[..8]));
+    assert_eq!(header.find("PANE"), row.find(&pane_id));
+    assert_eq!(header.find("STATUS"), row.find("deliberate_kill"));
+    assert!(!human.contains('\t'));
     assert!(human.contains("ago") || human.contains("now"));
 
     let prefix = &grave.grave_id[..grave.grave_id.len().min(8)];
