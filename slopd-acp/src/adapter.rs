@@ -968,12 +968,18 @@ impl Adapter {
             wire::session_update(session_id, active_run_update(Some(&lease.run_id))),
         )
         .await;
+        wire::send(
+            sender,
+            wire::session_update(session_id, progress_chunk("Working…")),
+        )
+        .await;
 
         let mut projection = Projection::default();
         let mut transcript_gate =
             TurnTranscriptGate::new(lease.backend, &lease.prompt, lease.discard_replayed_history);
         let mut saw_busy = false;
         let mut saw_answer = false;
+        let mut sent_progress = HashSet::from(["Working…"]);
         loop {
             tokio::select! {
                 item = transcript.next() => {
@@ -1068,11 +1074,20 @@ impl Adapter {
                             }
                         }
                         "DetailedStateChange" => {
-                            match record
+                            let detailed_state = record
                                 .payload
                                 .get("detailed_state")
-                                .and_then(Value::as_str)
+                                .and_then(Value::as_str);
+                            if let Some(text) = detailed_state.and_then(progress_text)
+                                && sent_progress.insert(text)
                             {
+                                wire::send(
+                                    sender,
+                                    wire::session_update(session_id, progress_chunk(text)),
+                                )
+                                .await;
+                            }
+                            match detailed_state {
                                 Some("busy_processing" | "busy_tool_use" | "busy_subagent" | "busy_compacting") => {
                                     saw_busy = true;
                                 }
@@ -2202,11 +2217,27 @@ fn thought_chunk(text: &str) -> Value {
     })
 }
 
+fn progress_chunk(text: &str) -> Value {
+    let mut update = thought_chunk(text);
+    update["messageId"] = Value::String(uuid::Uuid::new_v4().to_string());
+    update
+}
+
+fn progress_text(state: &str) -> Option<&'static str> {
+    match state {
+        "busy_processing" => Some("Working…"),
+        "busy_subagent" => Some("Subagent working…"),
+        "busy_compacting" => Some("Compacting context…"),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct Projection {
     open_tools: HashSet<String>,
     opencode_text: HashMap<String, String>,
     opencode_role: Option<String>,
+    message_id: Option<String>,
 }
 
 impl Projection {
@@ -2221,14 +2252,25 @@ impl Projection {
             // server or test double omits the normally-unique part id.
             self.opencode_text.clear();
         }
-        if let Some(text) = assistant_text(
+        let text = assistant_text(
             backend,
             record,
             &mut self.opencode_text,
             self.opencode_role.as_deref(),
-        ) && !text.is_empty()
+        );
+        if text.is_none() {
+            self.message_id = None;
+        }
+        if let Some(text) = text
+            && !text.is_empty()
         {
-            updates.push(message_chunk(&text));
+            let id = self
+                .message_id
+                .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+                .clone();
+            let mut update = message_chunk(&text);
+            update["messageId"] = Value::String(id);
+            updates.push(update);
         }
         if record.event_type == "reasoning"
             && let Some(text) = record.payload.get("text").and_then(Value::as_str)
@@ -2236,7 +2278,11 @@ impl Projection {
         {
             updates.push(thought_chunk(text));
         }
+        let before_tools = updates.len();
         self.tool_updates(record, &mut updates);
+        if updates.len() != before_tools {
+            self.message_id = None;
+        }
         updates
     }
 
@@ -2593,6 +2639,18 @@ mod tests {
     }
 
     #[test]
+    fn normalized_states_have_sparse_progress_text() {
+        assert_eq!(progress_text("busy_processing"), Some("Working…"));
+        assert_eq!(progress_text("busy_subagent"), Some("Subagent working…"));
+        assert_eq!(
+            progress_text("busy_compacting"),
+            Some("Compacting context…")
+        );
+        assert_eq!(progress_text("busy_tool_use"), None);
+        assert_eq!(progress_text("ready"), None);
+    }
+
+    #[test]
     fn codex_turn_gate_discards_resumed_history_before_current_prompt() {
         let mut gate = TurnTranscriptGate::new(libslop::Backend::Codex, "current prompt", true);
         assert!(!gate.accepts(&record("agentMessage", json!({"text":"historical answer"}),)));
@@ -2624,6 +2682,32 @@ mod tests {
             assistant_text(libslop::Backend::Codex, &codex, &mut previous, None).as_deref(),
             Some("world")
         );
+    }
+
+    #[test]
+    fn projected_message_ids_split_on_non_message_activity() {
+        let mut projection = Projection::default();
+        let first = projection.updates(
+            libslop::Backend::Codex,
+            &record("agentMessage", json!({"text":"one"})),
+        );
+        let second = projection.updates(
+            libslop::Backend::Codex,
+            &record("agentMessage", json!({"text":"two"})),
+        );
+        let first_id = first[0]["messageId"].as_str().unwrap();
+        assert_eq!(second[0]["messageId"].as_str(), Some(first_id));
+
+        assert!(
+            projection
+                .updates(libslop::Backend::Codex, &record("boundary", json!({})))
+                .is_empty()
+        );
+        let third = projection.updates(
+            libslop::Backend::Codex,
+            &record("agentMessage", json!({"text":"three"})),
+        );
+        assert_ne!(third[0]["messageId"].as_str(), Some(first_id));
     }
 
     #[test]

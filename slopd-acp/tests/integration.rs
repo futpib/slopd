@@ -245,6 +245,12 @@ fn delete_session(harness: &mut Harness, request_id: u64, session_id: &str) -> V
 fn streamed_text(notifications: &[Value]) -> String {
     notifications
         .iter()
+        .filter(|message| {
+            message
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("agent_message_chunk")
+        })
         .filter_map(|message| {
             message
                 .pointer("/params/update/content/text")
@@ -300,6 +306,16 @@ fn local_acp_session_streams_a_turn_and_cancels_the_next_one() {
     let streamed = streamed_text(&notifications);
     assert!(streamed.contains("SYSTEM_CANARY"), "streamed: {streamed}");
     assert!(streamed.contains("USER_CANARY"), "streamed: {streamed}");
+    assert!(notifications.iter().any(|message| {
+        message
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("agent_thought_chunk")
+            && message
+                .pointer("/params/update/messageId")
+                .and_then(Value::as_str)
+                .is_some()
+    }));
 
     notifications.clear();
     harness.send(json!({
