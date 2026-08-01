@@ -4123,6 +4123,30 @@ fn hook_transcript_path<'a>(
         .and_then(|value| value.as_str())
 }
 
+/// Codex may start maintenance helpers (currently memory consolidation) from
+/// inside its TUI process. They inherit `TMUX_PANE`, so their hooks name the
+/// main pane even though they have a different session id. Accept the first
+/// binding and matching hooks; only a new SessionStart with a real transcript
+/// may intentionally rebind an already-bound pane.
+fn hook_belongs_to_bound_session(
+    backend: libslop::Backend,
+    bound_session_id: Option<&str>,
+    event: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    if backend != libslop::Backend::Codex {
+        return true;
+    }
+    let Some(bound_session_id) = bound_session_id else {
+        return true;
+    };
+    let Some(hook_session_id) = payload.get("session_id").and_then(|value| value.as_str()) else {
+        return true;
+    };
+    hook_session_id == bound_session_id
+        || (event == "SessionStart" && hook_transcript_path(backend, event, payload).is_some())
+}
+
 /// Re-spawn the panes recorded in a checkpoint after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
@@ -4601,14 +4625,32 @@ async fn handle_request(
                 }
             }
 
+            let pane_state = panes.get_or_insert(pane);
+            let hook_backend = pane_state.runtime().backend();
+            let bound_session_id = pane_state.identity.lock().unwrap().session_id.clone();
+            if !hook_belongs_to_bound_session(
+                hook_backend,
+                bound_session_id.as_deref(),
+                &event,
+                &payload,
+            ) {
+                debug!(
+                    "ignoring foreign {} hook for pane {}: bound session {:?}, hook session {:?}",
+                    event,
+                    pane,
+                    bound_session_id,
+                    payload.get("session_id").and_then(|value| value.as_str()),
+                );
+                return libslop::ResponseBody::Hooked;
+            }
+
             // Start (or re-start) tailing the transcript file whenever a hook
             // includes a transcript_path we haven't seen yet for this pane.
             // This covers both SessionStart and any hook fired after a slopd
             // restart where the tailer is no longer running.
-            let hook_backend = panes.get_or_insert(pane).runtime().backend();
             if let Some(raw_transcript_path) = hook_transcript_path(hook_backend, &event, &payload)
             {
-                let state = panes.get_or_insert(pane);
+                let state = pane_state.clone();
                 // A forked Claude pane: real Claude's hooks report the SOURCE
                 // transcript file until the fork's first turn writes its own file.
                 // slopd minted (and pinned) the fork id, so rewrite the path to the
@@ -6417,6 +6459,57 @@ mod tests {
             hook_transcript_path(libslop::Backend::Claude, "SubagentStart", &payload),
             Some("/sessions/subagent.jsonl"),
         );
+    }
+
+    #[test]
+    fn codex_ignores_lifecycle_hooks_from_a_nested_maintenance_session() {
+        let main = "main-session";
+        let helper_start = serde_json::json!({
+            "session_id": "memory-helper",
+            "transcript_path": null,
+            "cwd": "/codex/memories",
+        });
+        let helper_stop = serde_json::json!({
+            "session_id": "memory-helper",
+            "transcript_path": null,
+        });
+        for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+            let payload = if event == "SessionStart" {
+                &helper_start
+            } else {
+                &helper_stop
+            };
+            assert!(!hook_belongs_to_bound_session(
+                libslop::Backend::Codex,
+                Some(main),
+                event,
+                payload,
+            ));
+        }
+
+        let main_stop = serde_json::json!({"session_id": main});
+        assert!(hook_belongs_to_bound_session(
+            libslop::Backend::Codex,
+            Some(main),
+            "Stop",
+            &main_stop,
+        ));
+        let legitimate_rebind = serde_json::json!({
+            "session_id": "next-main-session",
+            "transcript_path": "/sessions/next-main-session.jsonl",
+        });
+        assert!(hook_belongs_to_bound_session(
+            libslop::Backend::Codex,
+            Some(main),
+            "SessionStart",
+            &legitimate_rebind,
+        ));
+        assert!(hook_belongs_to_bound_session(
+            libslop::Backend::Claude,
+            Some(main),
+            "Stop",
+            &helper_stop,
+        ));
     }
 
     #[test]

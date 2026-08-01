@@ -67,6 +67,11 @@ fn write_record(path: &Path, record: Value) {
 }
 
 fn response_message(path: &Path, role: &str, text: &str) {
+    let phase = (role == "assistant").then_some("final_answer");
+    response_message_with_phase(path, role, text, phase);
+}
+
+fn response_message_with_phase(path: &Path, role: &str, text: &str, phase: Option<&str>) {
     let text_kind = if role == "user" {
         "input_text"
     } else {
@@ -79,6 +84,8 @@ fn response_message(path: &Path, role: &str, text: &str) {
             "payload":{
                 "type":"message",
                 "role":role,
+                "id":format!("mock-message-{}", counter()),
+                "phase":phase,
                 "content":[{"type":text_kind,"text":text}]
             }
         }),
@@ -337,6 +344,30 @@ fn main() {
                     json!({"type":"event_msg","payload":{"type":"task_started"}}),
                 );
                 response_message(&transcript, "user", &prompt);
+
+                if prompt == "FOREIGN_HELPER_CANARY" {
+                    response_message_with_phase(
+                        &transcript,
+                        "assistant",
+                        "I am still working after the helper runs.",
+                        Some("commentary"),
+                    );
+                    let helper_id = "mock-memory-helper";
+                    let helper_cwd = cwd.join("codex/memories");
+                    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+                        let mut payload = hook_payload(event, helper_id, &helper_cwd, &transcript);
+                        payload["transcript_path"] = Value::Null;
+                        fire_hooks(&settings, event, &payload);
+                    }
+                    finish_turn(
+                        &settings,
+                        &session_id,
+                        &cwd,
+                        &transcript,
+                        "main session finished",
+                    );
+                    continue;
+                }
 
                 if matches!(mock_command, Some(MockCommand::Active)) {
                     active = true;

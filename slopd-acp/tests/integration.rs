@@ -382,6 +382,34 @@ fn codex_acp_session_streams_a_complete_turn() {
         streamed.contains("CODEX_USER_CANARY"),
         "Codex user prompt was not delivered: {streamed}"
     );
+
+    let pane_id = session_pane_id(&env, &session_id);
+    let native_session_id = panes(&env)
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .and_then(|pane| pane.session_id)
+        .expect("Codex pane should be bound before the helper test");
+    let (completed, notifications) = prompt(&mut harness, 4, &session_id, "FOREIGN_HELPER_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    assert!(notifications.iter().any(|message| {
+        message
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("agent_thought_chunk")
+            && message
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+                == Some("I am still working after the helper runs.")
+    }));
+    assert!(
+        streamed_text(&notifications).contains("main session finished"),
+        "the foreign helper ended the ACP turn before the main answer: {notifications:?}"
+    );
+    let pane = panes(&env)
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .expect("main Codex pane should survive the helper lifecycle");
+    assert_eq!(pane.session_id.as_deref(), Some(native_session_id.as_str()));
 }
 
 #[test]

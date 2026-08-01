@@ -91,6 +91,7 @@ struct TurnLease {
     run_id: String,
     pane_id: String,
     backend: libslop::Backend,
+    native_session_id: Option<String>,
     prompt: String,
     system_prompt_included: bool,
     discard_replayed_history: bool,
@@ -844,6 +845,7 @@ impl Adapter {
                 run_id,
                 pane_id,
                 backend,
+                native_session_id: session.native_session_id.clone(),
                 prompt,
                 system_prompt_included: system_prompt.is_some(),
                 discard_replayed_history,
@@ -1016,7 +1018,7 @@ impl Adapter {
                         "received state record"
                     );
                     match record.event_type.as_str() {
-                        "PaneDestroyed" | "SessionEnd" => {
+                        "PaneDestroyed" => {
                             self.mark_pane_gone(
                                 session_id,
                                 &lease.pane_id,
@@ -1028,7 +1030,27 @@ impl Adapter {
                                 lease.pane_id
                             ));
                         }
-                        "Stop" => {
+                        "SessionEnd" if hook_matches_session(
+                            lease.backend,
+                            lease.native_session_id.as_deref(),
+                            &record.payload,
+                        ) => {
+                            self.mark_pane_gone(
+                                session_id,
+                                &lease.pane_id,
+                                record.payload.get("session_id").and_then(Value::as_str),
+                            )
+                            .await;
+                            return Err(format!(
+                                "underlying pane {} ended during the turn",
+                                lease.pane_id
+                            ));
+                        }
+                        "Stop" if hook_matches_session(
+                            lease.backend,
+                            lease.native_session_id.as_deref(),
+                            &record.payload,
+                        ) => {
                             return complete_turn(
                                 &mut transcript,
                                 &mut projection,
@@ -1037,6 +1059,15 @@ impl Adapter {
                                 session_id,
                                 sender,
                             ).await;
+                        }
+                        "Stop" | "SessionEnd" => {
+                            tracing::debug!(
+                                pane_id = lease.pane_id,
+                                expected_session_id = ?lease.native_session_id,
+                                hook_session_id = ?record.payload.get("session_id").and_then(|value| value.as_str()),
+                                event_type = record.event_type,
+                                "ignoring lifecycle hook from a foreign Codex session",
+                            );
                         }
                         "StateChange" => {
                             match record.payload.get("state").and_then(Value::as_str) {
@@ -1793,6 +1824,23 @@ fn state_ready_completes(backend: libslop::Backend, saw_busy: bool, saw_answer: 
         saw_answer
     } else {
         saw_busy || saw_answer
+    }
+}
+
+fn hook_matches_session(
+    backend: libslop::Backend,
+    expected_session_id: Option<&str>,
+    payload: &Value,
+) -> bool {
+    if backend != libslop::Backend::Codex {
+        return true;
+    }
+    match (
+        expected_session_id,
+        payload.get("session_id").and_then(Value::as_str),
+    ) {
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => true,
     }
 }
 
@@ -2702,6 +2750,27 @@ mod tests {
         assert!(!state_ready_completes(libslop::Backend::Codex, true, false));
         assert!(state_ready_completes(libslop::Backend::Codex, true, true));
         assert!(state_ready_completes(libslop::Backend::Claude, true, false));
+    }
+
+    #[test]
+    fn codex_turn_ignores_foreign_helper_lifecycle_hooks() {
+        let helper = json!({"session_id":"memory-helper"});
+        assert!(!hook_matches_session(
+            libslop::Backend::Codex,
+            Some("main-session"),
+            &helper,
+        ));
+        let main = json!({"session_id":"main-session"});
+        assert!(hook_matches_session(
+            libslop::Backend::Codex,
+            Some("main-session"),
+            &main,
+        ));
+        assert!(hook_matches_session(
+            libslop::Backend::Claude,
+            Some("main-session"),
+            &helper,
+        ));
     }
 
     #[test]
