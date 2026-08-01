@@ -66,6 +66,9 @@ struct Session {
     start_directory: PathBuf,
     system_prompt: Option<String>,
     system_prompt_delivered: bool,
+    /// The next Codex turn must discard transcript history replayed while a
+    /// backend-native session binds its transcript path.
+    pending_resume_history: bool,
     active_turn: Option<ActiveTurn>,
     last_used: u64,
     title: Option<String>,
@@ -90,6 +93,7 @@ struct TurnLease {
     backend: libslop::Backend,
     prompt: String,
     system_prompt_included: bool,
+    discard_replayed_history: bool,
     cancel: CancellationToken,
 }
 
@@ -217,6 +221,7 @@ impl Adapter {
                 start_directory,
                 system_prompt: None,
                 system_prompt_delivered: true,
+                pending_resume_history: false,
                 active_turn: None,
                 last_used: grave.destroyed_at.max(grave.pane.last_active),
                 title: grave.pane.pane_title,
@@ -265,6 +270,7 @@ impl Adapter {
                     start_directory,
                     system_prompt: None,
                     system_prompt_delivered: true,
+                    pending_resume_history: false,
                     active_turn: None,
                     last_used: pane.last_active.max(pane.created_at),
                     title: pane.pane_title,
@@ -554,6 +560,7 @@ impl Adapter {
                 start_directory,
                 system_prompt,
                 system_prompt_delivered: false,
+                pending_resume_history: false,
                 active_turn: None,
                 last_used: self.next_activity_id.fetch_add(1, Ordering::Relaxed),
                 title: None,
@@ -824,6 +831,7 @@ impl Adapter {
                 .then_some(session.system_prompt.as_deref())
                 .flatten();
             let prompt = frame_first_prompt(system_prompt, &user_prompt);
+            let discard_replayed_history = std::mem::take(&mut session.pending_resume_history);
             let cancel = CancellationToken::new();
             session.active_turn = Some(ActiveTurn {
                 id: turn_id,
@@ -838,6 +846,7 @@ impl Adapter {
                 backend,
                 prompt,
                 system_prompt_included: system_prompt.is_some(),
+                discard_replayed_history,
                 cancel,
             }
         };
@@ -873,6 +882,9 @@ impl Adapter {
                     .unwrap_or_else(|_| accepted.load(Ordering::Acquire));
                 if lease.system_prompt_included && was_accepted {
                     session.system_prompt_delivered = true;
+                }
+                if lease.discard_replayed_history && !was_accepted {
+                    session.pending_resume_history = true;
                 }
                 true
             } else {
@@ -958,6 +970,8 @@ impl Adapter {
         .await;
 
         let mut projection = Projection::default();
+        let mut transcript_gate =
+            TurnTranscriptGate::new(lease.backend, &lease.prompt, lease.discard_replayed_history);
         let mut saw_busy = false;
         let mut saw_answer = false;
         loop {
@@ -971,13 +985,15 @@ impl Adapter {
                                 cursor = record.cursor,
                                 "received transcript record"
                             );
-                            saw_answer |= emit_record_updates(
-                                &mut projection,
-                                lease.backend,
-                                &record,
-                                session_id,
-                                sender,
-                            ).await;
+                            if transcript_gate.accepts(&record) {
+                                saw_answer |= emit_record_updates(
+                                    &mut projection,
+                                    lease.backend,
+                                    &record,
+                                    session_id,
+                                    sender,
+                                ).await;
+                            }
                         }
                         SubscriptionEvent::Subscribed => continue,
                         SubscriptionEvent::Closed => {
@@ -1016,6 +1032,7 @@ impl Adapter {
                             return complete_turn(
                                 &mut transcript,
                                 &mut projection,
+                                &mut transcript_gate,
                                 lease.backend,
                                 session_id,
                                 sender,
@@ -1041,6 +1058,7 @@ impl Adapter {
                                     return complete_turn(
                                         &mut transcript,
                                         &mut projection,
+                                        &mut transcript_gate,
                                         lease.backend,
                                         session_id,
                                         sender,
@@ -1445,6 +1463,8 @@ impl Adapter {
         session.grave_id = None;
         session.backend = Some(started.backend);
         session.native_session_id = started.native_session_id.or(native_session_id);
+        session.pending_resume_history =
+            resumed && session.backend == Some(libslop::Backend::Codex);
         if !resumed {
             session.system_prompt_delivered = false;
         }
@@ -1776,14 +1796,70 @@ fn state_ready_completes(backend: libslop::Backend, saw_busy: bool, saw_answer: 
     }
 }
 
+/// Discard Codex history that a newly resumed pane can replay before its
+/// current prompt appears. Fresh and resumed Codex panes learn their transcript
+/// path from SessionStart, which fires only after submission; a subscription
+/// established before `send` therefore cannot snapshot the old file boundary.
+/// The echoed user message is the unambiguous boundary for this turn.
+struct TurnTranscriptGate<'a> {
+    prompt: Option<&'a str>,
+    saw_boundary: bool,
+    buffered: Vec<libslop::Record>,
+}
+
+impl<'a> TurnTranscriptGate<'a> {
+    fn new(backend: libslop::Backend, prompt: &'a str, discard_replayed_history: bool) -> Self {
+        let gated = backend == libslop::Backend::Codex && discard_replayed_history;
+        Self {
+            prompt: gated.then_some(prompt),
+            saw_boundary: false,
+            buffered: Vec::new(),
+        }
+    }
+
+    fn accepts(&mut self, record: &libslop::Record) -> bool {
+        let Some(prompt) = self.prompt else {
+            return true;
+        };
+        if record.event_type == "userMessage"
+            && record.payload.get("text").and_then(Value::as_str) == Some(prompt)
+        {
+            // A repeated prompt can also occur in the replayed history. Keep
+            // only records after the last matching user echo; Stop provides
+            // the authoritative point at which that boundary is final.
+            self.saw_boundary = true;
+            self.buffered.clear();
+        } else if self.saw_boundary {
+            self.buffered.push(record.clone());
+        }
+        false
+    }
+
+    fn take_buffered(&mut self) -> Vec<libslop::Record> {
+        std::mem::take(&mut self.buffered)
+    }
+}
+
 async fn complete_turn(
     transcript: &mut libslopctl::Subscription,
     projection: &mut Projection,
+    transcript_gate: &mut TurnTranscriptGate<'_>,
     backend: libslop::Backend,
     session_id: &str,
     sender: &Sender,
 ) -> Result<TurnResult, String> {
-    drain_transcript(transcript, projection, backend, session_id, sender).await?;
+    drain_transcript(
+        transcript,
+        projection,
+        transcript_gate,
+        backend,
+        session_id,
+        sender,
+    )
+    .await?;
+    for record in transcript_gate.take_buffered() {
+        emit_record_updates(projection, backend, &record, session_id, sender).await;
+    }
     for update in projection.finish_open_tools() {
         wire::send(sender, wire::session_update(session_id, update)).await;
     }
@@ -1813,6 +1889,7 @@ async fn emit_record_updates(
 async fn drain_transcript(
     transcript: &mut libslopctl::Subscription,
     projection: &mut Projection,
+    transcript_gate: &mut TurnTranscriptGate<'_>,
     backend: libslop::Backend,
     session_id: &str,
     sender: &Sender,
@@ -1832,7 +1909,10 @@ async fn drain_transcript(
                             cursor = record.cursor,
                             "drained transcript record"
                         );
-                        emit_record_updates(projection, backend, &record, session_id, sender).await;
+                        if transcript_gate.accepts(&record) {
+                            emit_record_updates(projection, backend, &record, session_id, sender)
+                                .await;
+                        }
                     }
                     // A subscription acknowledgement is not an EOF marker. Keep
                     // the quiet-window drain open for the transcript record that
@@ -2510,6 +2590,22 @@ mod tests {
         assert!(!state_ready_completes(libslop::Backend::Codex, true, false));
         assert!(state_ready_completes(libslop::Backend::Codex, true, true));
         assert!(state_ready_completes(libslop::Backend::Claude, true, false));
+    }
+
+    #[test]
+    fn codex_turn_gate_discards_resumed_history_before_current_prompt() {
+        let mut gate = TurnTranscriptGate::new(libslop::Backend::Codex, "current prompt", true);
+        assert!(!gate.accepts(&record("agentMessage", json!({"text":"historical answer"}),)));
+        assert!(!gate.accepts(&record("userMessage", json!({"text":"current prompt"}),)));
+        assert!(!gate.accepts(&record(
+            "agentMessage",
+            json!({"text":"older matching answer"}),
+        )));
+        assert!(!gate.accepts(&record("userMessage", json!({"text":"current prompt"}),)));
+        assert!(!gate.accepts(&record("agentMessage", json!({"text":"current answer"}),)));
+        let buffered = gate.take_buffered();
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(buffered[0].payload["text"], "current answer");
     }
 
     #[test]

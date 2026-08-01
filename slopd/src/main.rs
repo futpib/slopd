@@ -249,13 +249,12 @@ fn reduce_pane_state(
                 current,
                 libslop::PaneDetailedState::AwaitingInputPermission
                     | libslop::PaneDetailedState::AwaitingInputElicitation
-            ) && matches!(
-                next,
-                Some(
-                    libslop::PaneDetailedState::BusyProcessing
-                        | libslop::PaneDetailedState::BusyToolUse
-                )
-            ) {
+            ) && next.is_some()
+            {
+                // Hooks are authoritative while Codex is waiting on the user.
+                // A lagging task_complete from the preceding turn must not
+                // clear the dialog; doing so lets the current task_started
+                // record strand the pane back in BusyProcessing.
                 None
             } else {
                 next
@@ -346,7 +345,47 @@ async fn set_pane_detailed_state(
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
-    *panes.get_or_insert(pane_id).detailed_state.lock().unwrap() = detailed.clone();
+    set_pane_detailed_state_inner(config, pane_id, detailed, previous, true, event_tx, panes).await;
+}
+
+async fn set_hook_detailed_state(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    detailed: &libslop::PaneDetailedState,
+    previous: Option<&libslop::PaneDetailedState>,
+    event_tx: &EventTx,
+    panes: &PaneMap,
+) {
+    set_pane_detailed_state_inner(config, pane_id, detailed, previous, false, event_tx, panes)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_pane_detailed_state_inner(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    detailed: &libslop::PaneDetailedState,
+    previous: Option<&libslop::PaneDetailedState>,
+    reject_stale: bool,
+    event_tx: &EventTx,
+    panes: &PaneMap,
+) {
+    let pane_state = panes.get_or_insert(pane_id);
+    let _guard = pane_state.state_update_mutex.lock().await;
+
+    // State sources run concurrently (hooks, transcript tailers, and backend
+    // drivers). A transition can become stale while it is waiting to enter
+    // this function; applying it would overwrite both the in-memory state and
+    // tmux options established by a newer event. Treat `previous` as an
+    // optimistic compare-and-set guard, while initialization (`None`) remains
+    // unconditional.
+    {
+        let mut current = pane_state.detailed_state.lock().unwrap();
+        if reject_stale && previous.is_some_and(|expected| &*current != expected) {
+            return;
+        }
+        *current = detailed.clone();
+    }
     let simple = detailed.to_simple();
     for (opt, val) in [
         (libslop::TmuxOption::SlopdState, simple.as_str()),
@@ -538,6 +577,8 @@ struct PaneIdentity {
 struct PaneState {
     /// Serialises the type-then-enter sequence so two concurrent sends don't interleave.
     type_mutex: Mutex<()>,
+    /// Serialises state changes and their mirrored tmux option writes.
+    state_update_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
     /// Notified whenever SessionStart binds or re-binds a session id.
@@ -574,6 +615,7 @@ impl PaneState {
     fn new() -> Self {
         Self {
             type_mutex: Mutex::new(()),
+            state_update_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
             session_bound: Notify::new(),
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
@@ -3570,36 +3612,42 @@ async fn list_panes(
         title: Option<String>,
         opts: ParsedPaneOptions,
     }
+    // Query every pane in one list command, then intersect it with the
+    // authoritative managed set below. tmux 3.4 rewrites literal control
+    // characters in command-line format arguments to underscores, so an
+    // actual tab cannot be used as the separator. Use a printable sentinel
+    // that keeps space-bearing paths and titles separable instead.
+    const FIELD_SEPARATOR: &str = "__SLOPD_PANE_FIELD_6E0A5C__";
+    let metadata_format = format!(
+        "#{{pane_id}}{FIELD_SEPARATOR}#{{window_activity}}{FIELD_SEPARATOR}#{{pane_current_path}}{FIELD_SEPARATOR}#{{pane_title}}"
+    );
+    let metadata_out = tmux(config)
+        .args(["list-panes", "-a", "-F", &metadata_format])
+        .output()
+        .await;
+    let mut metadata = std::collections::HashMap::new();
+    if let Ok(out) = metadata_out
+        && out.status.success()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.splitn(4, FIELD_SEPARATOR);
+            let Some(pane_id) = parts.next().filter(|pane_id| !pane_id.is_empty()) else {
+                continue;
+            };
+            let activity = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let working_dir = parts
+                .next()
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty());
+            let title = parts.next().and_then(libslop::normalize_pane_title);
+            metadata.insert(pane_id.to_string(), (activity, working_dir, title));
+        }
+    }
+
     let mut raw_panes = Vec::new();
     for pane_id in managed_panes.snapshot() {
-        // Tab-delimited so the path and the (space-bearing) pane title stay
-        // separable; window_activity is numeric so it never contains a tab.
-        let dm_out = tmux(config)
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &pane_id,
-                "-F",
-                "#{window_activity}\t#{pane_current_path}\t#{pane_title}",
-            ])
-            .output()
-            .await;
-        let (last_active, working_dir, title) = match dm_out {
-            Ok(out) if out.status.success() => {
-                let line = String::from_utf8_lossy(&out.stdout)
-                    .trim_end_matches('\n')
-                    .to_string();
-                let mut parts = line.splitn(3, '\t');
-                let activity: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                let cwd = parts
-                    .next()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                let title = parts.next().and_then(libslop::normalize_pane_title);
-                (activity, cwd, title)
-            }
-            _ => continue,
+        let Some((last_active, working_dir, title)) = metadata.remove(&pane_id) else {
+            continue;
         };
 
         let opts_out = tmux(config)
@@ -4709,7 +4757,7 @@ async fn handle_request(
                             .and_then(|v| v.as_str()),
                     },
                 ) {
-                    set_pane_detailed_state(
+                    set_hook_detailed_state(
                         config,
                         pane,
                         &new_state,
@@ -6369,6 +6417,24 @@ mod tests {
             hook_transcript_path(libslop::Backend::Claude, "SubagentStart", &payload),
             Some("/sessions/subagent.jsonl"),
         );
+    }
+
+    #[test]
+    fn codex_transcript_cannot_override_an_awaiting_input_hook() {
+        for record in [
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+        ] {
+            let event = PaneStateEvent::TranscriptRecord {
+                backend: libslop::Backend::Codex,
+                record_type: "event_msg",
+                record: &record,
+            };
+            assert_eq!(
+                reduce_pane_state(&libslop::PaneDetailedState::AwaitingInputPermission, &event,),
+                None,
+            );
+        }
     }
 
     #[test]
