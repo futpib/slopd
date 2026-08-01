@@ -310,7 +310,7 @@ fn local_acp_session_streams_a_turn_and_cancels_the_next_one() {
         message
             .pointer("/params/update/sessionUpdate")
             .and_then(Value::as_str)
-            == Some("agent_thought_chunk")
+            == Some("agent_message_chunk")
             && message
                 .pointer("/params/update/messageId")
                 .and_then(Value::as_str)

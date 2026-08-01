@@ -37,6 +37,10 @@ pub fn transcript_record(record: &Value) -> Option<TranscriptRecord> {
                     "role": role,
                     "text": text,
                     "content": payload.get("content").cloned().unwrap_or(Value::Null),
+                    // Keep the small, stable subset slopd-acp needs to group
+                    // chunks and distinguish commentary from the final answer.
+                    "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                    "phase": payload.get("phase").cloned().unwrap_or(Value::Null),
                 }),
             ))
         }
@@ -148,11 +152,19 @@ mod tests {
     fn normalizes_messages_without_exposing_instructions() {
         let user = json!({
             "type": "response_item",
-            "payload": {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            "payload": {
+                "type":"message",
+                "role":"user",
+                "id":"msg-1",
+                "phase":"commentary",
+                "content":[{"type":"input_text","text":"hello"}]
+            }
         });
         let (kind, payload) = transcript_record(&user).unwrap();
         assert_eq!(kind, "userMessage");
         assert_eq!(payload["text"], "hello");
+        assert_eq!(payload["id"], "msg-1");
+        assert_eq!(payload["phase"], "commentary");
 
         let developer = json!({
             "type": "response_item",

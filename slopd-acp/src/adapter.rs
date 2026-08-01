@@ -968,18 +968,12 @@ impl Adapter {
             wire::session_update(session_id, active_run_update(Some(&lease.run_id))),
         )
         .await;
-        wire::send(
-            sender,
-            wire::session_update(session_id, progress_chunk("Working…")),
-        )
-        .await;
 
         let mut projection = Projection::default();
         let mut transcript_gate =
             TurnTranscriptGate::new(lease.backend, &lease.prompt, lease.discard_replayed_history);
         let mut saw_busy = false;
         let mut saw_answer = false;
-        let mut sent_progress = HashSet::from(["Working…"]);
         loop {
             tokio::select! {
                 item = transcript.next() => {
@@ -1078,15 +1072,6 @@ impl Adapter {
                                 .payload
                                 .get("detailed_state")
                                 .and_then(Value::as_str);
-                            if let Some(text) = detailed_state.and_then(progress_text)
-                                && sent_progress.insert(text)
-                            {
-                                wire::send(
-                                    sender,
-                                    wire::session_update(session_id, progress_chunk(text)),
-                                )
-                                .await;
-                            }
                             match detailed_state {
                                 Some("busy_processing" | "busy_tool_use" | "busy_subagent" | "busy_compacting") => {
                                     saw_busy = true;
@@ -2217,26 +2202,13 @@ fn thought_chunk(text: &str) -> Value {
     })
 }
 
-fn progress_chunk(text: &str) -> Value {
-    let mut update = thought_chunk(text);
-    update["messageId"] = Value::String(uuid::Uuid::new_v4().to_string());
-    update
-}
-
-fn progress_text(state: &str) -> Option<&'static str> {
-    match state {
-        "busy_processing" => Some("Working…"),
-        "busy_subagent" => Some("Subagent working…"),
-        "busy_compacting" => Some("Compacting context…"),
-        _ => None,
-    }
-}
-
 #[derive(Default)]
 struct Projection {
     open_tools: HashSet<String>,
     opencode_text: HashMap<String, String>,
     opencode_role: Option<String>,
+    opencode_message_id: Option<String>,
+    opencode_progress: bool,
     message_id: Option<String>,
 }
 
@@ -2247,36 +2219,86 @@ impl Projection {
             && matches!(record.event_type.as_str(), "user" | "assistant")
         {
             self.opencode_role = Some(record.event_type.clone());
-            // OpenCode text parts are cumulative within one message. A new
-            // message starts a new delta baseline, including when an older
-            // server or test double omits the normally-unique part id.
-            self.opencode_text.clear();
+            if record.event_type == "assistant" {
+                let message_id = record
+                    .payload
+                    .pointer("/info/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // OpenCode text parts are cumulative within one message.
+                if message_id.is_none() || message_id != self.opencode_message_id {
+                    self.opencode_text.clear();
+                }
+                self.opencode_message_id = message_id;
+                self.opencode_progress = record
+                    .payload
+                    .pointer("/info/finish")
+                    .and_then(Value::as_str)
+                    == Some("tool-calls");
+            } else {
+                self.opencode_text.clear();
+                self.opencode_message_id = None;
+                self.opencode_progress = false;
+            }
         }
         let text = assistant_text(
             backend,
             record,
             &mut self.opencode_text,
             self.opencode_role.as_deref(),
+            self.opencode_message_id.as_deref(),
+            self.opencode_progress,
         );
         if text.is_none() {
             self.message_id = None;
         }
         if let Some(text) = text
-            && !text.is_empty()
+            && !text.text.is_empty()
         {
-            let id = self
-                .message_id
-                .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
-                .clone();
-            let mut update = message_chunk(&text);
+            let id = match text.message_id {
+                Some(id) => {
+                    self.message_id = None;
+                    id
+                }
+                None => self
+                    .message_id
+                    .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+                    .clone(),
+            };
+            let mut update = if text.progress {
+                thought_chunk(&text.text)
+            } else {
+                message_chunk(&text.text)
+            };
             update["messageId"] = Value::String(id);
             updates.push(update);
         }
-        if record.event_type == "reasoning"
-            && let Some(text) = record.payload.get("text").and_then(Value::as_str)
-            && !text.is_empty()
-        {
-            updates.push(thought_chunk(text));
+        if record.event_type == "reasoning" {
+            let text = if backend == libslop::Backend::Opencode {
+                opencode_part_delta(&record.payload, &mut self.opencode_text)
+            } else {
+                record
+                    .payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            if let Some(text) = text
+                && !text.is_empty()
+            {
+                let id = record
+                    .payload
+                    .pointer("/part/id")
+                    .or_else(|| record.payload.pointer("/part/messageID"))
+                    .or_else(|| record.payload.pointer("/part/messageId"))
+                    .or_else(|| record.payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let mut update = thought_chunk(&text);
+                update["messageId"] = Value::String(id);
+                updates.push(update);
+            }
         }
         let before_tools = updates.len();
         self.tool_updates(record, &mut updates);
@@ -2441,43 +2463,87 @@ impl Projection {
     }
 }
 
+struct AssistantText {
+    text: String,
+    message_id: Option<String>,
+    progress: bool,
+}
+
 fn assistant_text(
     backend: libslop::Backend,
     record: &libslop::Record,
     opencode_previous: &mut HashMap<String, String>,
     opencode_role: Option<&str>,
-) -> Option<String> {
+    opencode_message_id: Option<&str>,
+    opencode_progress: bool,
+) -> Option<AssistantText> {
     match backend {
-        libslop::Backend::Codex if record.event_type == "agentMessage" => record
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        libslop::Backend::Claude if record.event_type == "assistant" => {
-            content_text(record.payload.pointer("/message/content"))
-        }
+        libslop::Backend::Codex if record.event_type == "agentMessage" => Some(AssistantText {
+            text: record
+                .payload
+                .get("text")
+                .and_then(Value::as_str)?
+                .to_string(),
+            message_id: record
+                .payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            progress: record.payload.get("phase").and_then(Value::as_str) == Some("commentary"),
+        }),
+        libslop::Backend::Claude if record.event_type == "assistant" => Some(AssistantText {
+            text: content_text(record.payload.pointer("/message/content"))?,
+            message_id: record
+                .payload
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            progress: record
+                .payload
+                .pointer("/message/stop_reason")
+                .and_then(Value::as_str)
+                == Some("tool_use"),
+        }),
         libslop::Backend::Opencode
             if record.event_type == "text" && opencode_role == Some("assistant") =>
         {
             let part = record.payload.get("part")?;
-            let text = part.get("text").and_then(Value::as_str)?;
-            let part_id = part
-                .get("id")
-                .or_else(|| part.get("partID"))
-                .or_else(|| part.get("partId"))
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_string();
-            let previous = opencode_previous.entry(part_id).or_default();
-            let delta = text
-                .strip_prefix(previous.as_str())
-                .unwrap_or(text)
-                .to_string();
-            *previous = text.to_string();
-            Some(delta)
+            Some(AssistantText {
+                text: opencode_part_delta(&record.payload, opencode_previous)?,
+                message_id: part
+                    .get("messageID")
+                    .or_else(|| part.get("messageId"))
+                    .and_then(Value::as_str)
+                    .or(opencode_message_id)
+                    .or_else(|| part.get("id").and_then(Value::as_str))
+                    .map(str::to_string),
+                progress: opencode_progress,
+            })
         }
         _ => None,
     }
+}
+
+fn opencode_part_delta(
+    payload: &Value,
+    opencode_previous: &mut HashMap<String, String>,
+) -> Option<String> {
+    let part = payload.get("part")?;
+    let text = part.get("text").and_then(Value::as_str)?;
+    let part_id = part
+        .get("id")
+        .or_else(|| part.get("partID"))
+        .or_else(|| part.get("partId"))
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    let previous = opencode_previous.entry(part_id).or_default();
+    let delta = text
+        .strip_prefix(previous.as_str())
+        .unwrap_or(text)
+        .to_string();
+    *previous = text.to_string();
+    Some(delta)
 }
 
 fn content_text(value: Option<&Value>) -> Option<String> {
@@ -2639,18 +2705,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_states_have_sparse_progress_text() {
-        assert_eq!(progress_text("busy_processing"), Some("Working…"));
-        assert_eq!(progress_text("busy_subagent"), Some("Subagent working…"));
-        assert_eq!(
-            progress_text("busy_compacting"),
-            Some("Compacting context…")
-        );
-        assert_eq!(progress_text("busy_tool_use"), None);
-        assert_eq!(progress_text("ready"), None);
-    }
-
-    #[test]
     fn codex_turn_gate_discards_resumed_history_before_current_prompt() {
         let mut gate = TurnTranscriptGate::new(libslop::Backend::Codex, "current prompt", true);
         assert!(!gate.accepts(&record("agentMessage", json!({"text":"historical answer"}),)));
@@ -2674,14 +2728,125 @@ mod tests {
             json!({"message":{"content":[{"type":"text","text":"hello"}]}}),
         );
         assert_eq!(
-            assistant_text(libslop::Backend::Claude, &claude, &mut previous, None).as_deref(),
-            Some("hello")
+            assistant_text(
+                libslop::Backend::Claude,
+                &claude,
+                &mut previous,
+                None,
+                None,
+                false
+            )
+            .unwrap()
+            .text,
+            "hello"
         );
         let codex = record("agentMessage", json!({"text":"world"}));
         assert_eq!(
-            assistant_text(libslop::Backend::Codex, &codex, &mut previous, None).as_deref(),
-            Some("world")
+            assistant_text(
+                libslop::Backend::Codex,
+                &codex,
+                &mut previous,
+                None,
+                None,
+                false
+            )
+            .unwrap()
+            .text,
+            "world"
         );
+    }
+
+    #[test]
+    fn provider_metadata_projects_real_progress_and_final_text() {
+        let mut projection = Projection::default();
+        let codex_progress = projection.updates(
+            libslop::Backend::Codex,
+            &record(
+                "agentMessage",
+                json!({"text":"Inspecting the repository.","id":"codex-1","phase":"commentary"}),
+            ),
+        );
+        assert_eq!(codex_progress[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(codex_progress[0]["messageId"], "codex-1");
+
+        let codex_final = projection.updates(
+            libslop::Backend::Codex,
+            &record(
+                "agentMessage",
+                json!({"text":"Done.","id":"codex-2","phase":"final_answer"}),
+            ),
+        );
+        assert_eq!(codex_final[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(codex_final[0]["messageId"], "codex-2");
+
+        let claude_progress = projection.updates(
+            libslop::Backend::Claude,
+            &record(
+                "assistant",
+                json!({"message":{"id":"claude-1","stop_reason":"tool_use","content":[{"type":"text","text":"Checking that now."}]}}),
+            ),
+        );
+        assert_eq!(claude_progress[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(claude_progress[0]["messageId"], "claude-1");
+
+        let claude_final = projection.updates(
+            libslop::Backend::Claude,
+            &record(
+                "assistant",
+                json!({"message":{"id":"claude-2","stop_reason":"end_turn","content":[{"type":"text","text":"Finished."}]}}),
+            ),
+        );
+        assert_eq!(claude_final[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(claude_final[0]["messageId"], "claude-2");
+
+        projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "assistant",
+                json!({"info":{"id":"opencode-1","finish":"tool-calls"}}),
+            ),
+        );
+        let opencode_progress = projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "text",
+                json!({"part":{"id":"part-1","messageID":"opencode-1","text":"Checking."}}),
+            ),
+        );
+        assert_eq!(opencode_progress[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(opencode_progress[0]["messageId"], "opencode-1");
+
+        projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "assistant",
+                json!({"info":{"id":"opencode-2","finish":"stop"}}),
+            ),
+        );
+        let opencode_final = projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "text",
+                json!({"part":{"id":"part-2","messageID":"opencode-2","text":"Finished."}}),
+            ),
+        );
+        assert_eq!(opencode_final[0]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(opencode_final[0]["messageId"], "opencode-2");
+    }
+
+    #[test]
+    fn opencode_reasoning_part_projects_real_progress() {
+        let mut projection = Projection::default();
+        let updates = projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "reasoning",
+                json!({"part":{"id":"reason-1","messageID":"message-1","text":"Inspecting files."}}),
+            ),
+        );
+        assert_eq!(updates[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(updates[0]["messageId"], "reason-1");
+        assert_eq!(updates[0]["content"]["text"], "Inspecting files.");
     }
 
     #[test]
@@ -2721,30 +2886,39 @@ mod tests {
                 libslop::Backend::Opencode,
                 &first,
                 &mut previous,
-                Some("assistant")
+                Some("assistant"),
+                None,
+                false
             )
-            .as_deref(),
-            Some("hel")
+            .unwrap()
+            .text,
+            "hel"
         );
         assert_eq!(
             assistant_text(
                 libslop::Backend::Opencode,
                 &second,
                 &mut previous,
-                Some("assistant")
+                Some("assistant"),
+                None,
+                false
             )
-            .as_deref(),
-            Some("lo")
+            .unwrap()
+            .text,
+            "lo"
         );
         assert_eq!(
             assistant_text(
                 libslop::Backend::Opencode,
                 &other,
                 &mut previous,
-                Some("assistant")
+                Some("assistant"),
+                None,
+                false
             )
-            .as_deref(),
-            Some("world")
+            .unwrap()
+            .text,
+            "world"
         );
     }
 
