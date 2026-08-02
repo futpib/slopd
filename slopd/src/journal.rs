@@ -88,6 +88,27 @@ struct CurrentState {
     checkpoint: Vec<libslop::PaneInfo>,
 }
 
+/// Whether two pane snapshots describe the same durable recovery state.
+///
+/// Activity, runtime state, and title are useful live/forensic metadata, but
+/// `restore_panes` does not consume them. Comparing the full `PaneInfo` would
+/// therefore append a pane body and checkpoint whenever tmux activity changed.
+fn same_recovery_metadata(a: &libslop::PaneInfo, b: &libslop::PaneInfo) -> bool {
+    a.pane_id == b.pane_id
+        && a.created_at == b.created_at
+        && a.session_id == b.session_id
+        && a.parent_pane_id == b.parent_pane_id
+        && a.tags == b.tags
+        && a.working_dir == b.working_dir
+        && a.transcript_path == b.transcript_path
+        && a.account == b.account
+        && a.backend == b.backend
+}
+
+fn same_recovery_checkpoint(a: &[libslop::PaneInfo], b: &[libslop::PaneInfo]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_recovery_metadata(a, b))
+}
+
 pub(crate) struct LifecycleJournal {
     root: PathBuf,
     current: Mutex<CurrentState>,
@@ -167,17 +188,25 @@ impl LifecycleJournal {
         panes.retain(|pane| pane.session_id.is_some());
         panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
         let mut current = self.current.lock().unwrap();
-        if current.checkpoint == panes {
+        if same_recovery_checkpoint(&current.checkpoint, &panes) {
             current
                 .file
                 .sync_data()
                 .map_err(|e| format!("failed to sync lifecycle journal: {e}"))?;
-            return Ok(panes.len());
+            let count = panes.len();
+            // Keep the freshest live/forensic fields available to a death record
+            // without persisting them as recovery-state changes.
+            current.checkpoint = panes;
+            return Ok(count);
         }
 
         let at = now();
         for pane in &panes {
-            if current.pane_versions.get(&pane.pane_id) != Some(pane) {
+            let recovery_metadata_unchanged = current
+                .pane_versions
+                .get(&pane.pane_id)
+                .is_some_and(|previous| same_recovery_metadata(previous, pane));
+            if !recovery_metadata_unchanged {
                 append_event(
                     &mut current.file,
                     &JournalEvent::Pane {
@@ -799,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_appends_only_when_state_changes() {
+    fn checkpoint_does_not_append_when_snapshot_is_unchanged() {
         let dir = libsloptest::tempfile::tempdir().unwrap();
         let config = config(dir.path(), "slopd");
         let key = GenerationKey {
@@ -817,6 +846,62 @@ mod tests {
         let before = std::fs::metadata(&path).unwrap().len();
         journal.checkpoint(vec![pane("%1", "s1")]).unwrap();
         assert_eq!(before, std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn checkpoint_ignores_non_recovery_pane_changes() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let key = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = open(dir.path(), &config, key, 1);
+        let original = pane("%1", "s1");
+        journal.checkpoint(vec![original.clone()]).unwrap();
+        let path = std::fs::read_dir(journal.root().join("generations"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let mut changed = original;
+        changed.last_active += 1;
+        changed.state = libslop::PaneState::Busy;
+        changed.detailed_state = libslop::PaneDetailedState::BusyToolUse;
+        changed.pane_title = Some("new live title".to_string());
+        journal.checkpoint(vec![changed.clone()]).unwrap();
+
+        assert_eq!(before, std::fs::metadata(path).unwrap().len());
+        assert_eq!(journal.checkpoint_pane("%1"), Some(changed));
+    }
+
+    #[test]
+    fn checkpoint_appends_when_recovery_metadata_changes() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let key = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = open(dir.path(), &config, key, 1);
+        let original = pane("%1", "s1");
+        journal.checkpoint(vec![original.clone()]).unwrap();
+        let path = std::fs::read_dir(journal.root().join("generations"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let mut changed = original;
+        changed.session_id = Some("s2".to_string());
+        journal.checkpoint(vec![changed]).unwrap();
+
+        assert!(std::fs::metadata(path).unwrap().len() > before);
     }
 
     #[test]
