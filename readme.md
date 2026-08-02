@@ -1254,8 +1254,8 @@ The adapter maps ACP onto slopd as follows:
 | prompt completion | the pane's busy-to-ready state transition |
 | `session/cancel` | `interrupt` |
 
-For [Buzz](https://github.com/block/buzz), the adapter also implements the
-`_goose/unstable/session/steer` extension. It publishes the active run ID and
+For ACP hosts such as [Buzz](https://github.com/block/buzz), the adapter
+advertises and implements the vendor-neutral `_session/steering` extension. It
 routes steering text into the existing pane while the original ACP turn remains
 in flight, instead of opening a second session.
 

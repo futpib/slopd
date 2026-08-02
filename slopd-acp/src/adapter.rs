@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::transport::Transport;
 use crate::wire::{self, Sender};
 
 const PROTOCOL_VERSION: u32 = 2;
-const NATIVE_STEER_METHOD: &str = "_goose/unstable/session/steer";
+const STEER_METHOD: &str = "_session/steering";
 const ACP_TAG: &str = "acp";
 const ACP_RESUMABLE_TAG: &str = "acp-resumable";
 const ACP_DELETED_TAG: &str = "acp-deleted";
@@ -82,13 +82,13 @@ struct StartedPane {
 
 struct ActiveTurn {
     id: u64,
-    run_id: String,
     cancel: CancellationToken,
+    steering: Arc<Semaphore>,
+    done: CancellationToken,
 }
 
 struct TurnLease {
     turn_id: u64,
-    run_id: String,
     pane_id: String,
     backend: libslop::Backend,
     native_session_id: Option<String>,
@@ -96,6 +96,8 @@ struct TurnLease {
     system_prompt_included: bool,
     discard_replayed_history: bool,
     cancel: CancellationToken,
+    steering: Arc<Semaphore>,
+    done: CancellationToken,
 }
 
 struct TurnResult {
@@ -152,9 +154,8 @@ struct SessionListParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeSteerParams {
+struct SteerParams {
     session_id: String,
-    expected_run_id: String,
     prompt: Vec<Value>,
 }
 
@@ -396,11 +397,11 @@ impl Adapter {
                     adapter.session_prompt(id, params, &sender).await;
                 });
             }
-            NATIVE_STEER_METHOD => {
+            STEER_METHOD => {
                 let adapter = Arc::clone(self);
                 let sender = sender.clone();
                 tokio::spawn(async move {
-                    adapter.native_steer(id, params, &sender).await;
+                    adapter.steer(id, params, &sender).await;
                 });
             }
             "session/cancel" => {
@@ -464,6 +465,11 @@ impl Adapter {
                     "agentInfo": {
                         "name": "slopd-acp",
                         "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "_meta": {
+                        "steering": {
+                            "supported": true,
+                        },
                     },
                 }),
             ),
@@ -799,7 +805,6 @@ impl Adapter {
         };
 
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-        let run_id = format!("slopd-turn-{turn_id}");
         let creation = self.session_creation.lock().await;
         if !self.sessions.lock().await.contains_key(&params.session_id) {
             return reject(sender, id, "session/prompt: unknown session".into()).await;
@@ -834,15 +839,17 @@ impl Adapter {
             let prompt = frame_first_prompt(system_prompt, &user_prompt);
             let discard_replayed_history = std::mem::take(&mut session.pending_resume_history);
             let cancel = CancellationToken::new();
+            let steering = Arc::new(Semaphore::new(1));
+            let done = CancellationToken::new();
             session.active_turn = Some(ActiveTurn {
                 id: turn_id,
-                run_id: run_id.clone(),
                 cancel: cancel.clone(),
+                steering: Arc::clone(&steering),
+                done: done.clone(),
             });
             session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
             TurnLease {
                 turn_id,
-                run_id,
                 pane_id,
                 backend,
                 native_session_id: session.native_session_id.clone(),
@@ -850,6 +857,8 @@ impl Adapter {
                 system_prompt_included: system_prompt.is_some(),
                 discard_replayed_history,
                 cancel,
+                steering,
+                done,
             }
         };
         drop(creation);
@@ -869,7 +878,14 @@ impl Adapter {
             }
         };
 
-        let cleared_active_turn = {
+        lease.done.cancel();
+        let _steering = lease
+            .steering
+            .acquire()
+            .await
+            .expect("turn semaphore is never closed");
+
+        {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&params.session_id)
                 && session
@@ -888,17 +904,7 @@ impl Adapter {
                 if lease.discard_replayed_history && !was_accepted {
                     session.pending_resume_history = true;
                 }
-                true
-            } else {
-                false
             }
-        };
-        if cleared_active_turn {
-            wire::send(
-                sender,
-                wire::session_update(&params.session_id, active_run_update(None)),
-            )
-            .await;
         }
 
         match result {
@@ -965,11 +971,6 @@ impl Adapter {
         accepted.store(true, Ordering::Release);
         self.mark_session_resumable(session_id, &lease.pane_id)
             .await;
-        wire::send(
-            sender,
-            wire::session_update(session_id, active_run_update(Some(&lease.run_id))),
-        )
-        .await;
 
         let mut projection = Projection::default();
         let mut transcript_gate =
@@ -1650,79 +1651,109 @@ impl Adapter {
         }
     }
 
-    async fn native_steer(&self, id: Value, params: Value, sender: &Sender) {
-        let params: NativeSteerParams = match serde_json::from_value(params) {
+    async fn steer(&self, id: Value, params: Value, sender: &Sender) {
+        let params: SteerParams = match serde_json::from_value(params) {
             Ok(params) => params,
             Err(error) => {
                 return reject(
                     sender,
                     id,
-                    format!("{NATIVE_STEER_METHOD}: invalid params: {error}"),
+                    format!("{STEER_METHOD}: invalid params: {error}"),
                 )
                 .await;
             }
         };
-        let prompt = match prompt_text(NATIVE_STEER_METHOD, &params.prompt) {
+        let prompt = match prompt_text(STEER_METHOD, &params.prompt) {
             Ok(prompt) if !prompt.is_empty() => prompt,
             Ok(_) => {
-                return reject(
-                    sender,
-                    id,
-                    format!("{NATIVE_STEER_METHOD}: prompt is empty"),
-                )
-                .await;
+                return reject(sender, id, format!("{STEER_METHOD}: prompt is empty")).await;
             }
             Err(error) => return reject(sender, id, error).await,
         };
 
-        let pane_id = {
+        let target = {
             let mut sessions = self.sessions.lock().await;
-            let Some(session) = sessions.get_mut(&params.session_id) else {
-                return reject(
-                    sender,
-                    id,
-                    format!("{NATIVE_STEER_METHOD}: unknown session"),
-                )
-                .await;
-            };
-            let Some(active_turn) = session.active_turn.as_ref() else {
-                return reject(
-                    sender,
-                    id,
-                    format!("{NATIVE_STEER_METHOD}: no prompt is in flight"),
-                )
-                .await;
-            };
-            if active_turn.run_id != params.expected_run_id {
-                return reject(
-                    sender,
-                    id,
-                    format!("{NATIVE_STEER_METHOD}: expectedRunId does not match the active turn"),
-                )
-                .await;
-            }
-            let Some(pane_id) = session.pane_id.clone() else {
-                return reject(
-                    sender,
-                    id,
-                    format!("{NATIVE_STEER_METHOD}: active pane is no longer live"),
-                )
-                .await;
-            };
-            session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
-            pane_id
+            sessions.get_mut(&params.session_id).and_then(|session| {
+                let active_turn = session.active_turn.as_ref()?;
+                let steering = Arc::clone(&active_turn.steering).try_acquire_owned().ok()?;
+                let done = active_turn.done.clone();
+                let pane_id = session.pane_id.clone()?;
+                session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+                Some((pane_id, done, steering))
+            })
+        };
+        let Some((pane_id, done, _steering_permit)) = target else {
+            return send_steer_outcome(sender, id, "failed").await;
         };
 
         let mut client = match self.config.transport.connect().await {
             Ok(client) => client,
-            Err(error) => return server_error(sender, id, error).await,
+            Err(error) => {
+                tracing::warn!("{STEER_METHOD}: {error}");
+                return send_steer_outcome(sender, id, "failed").await;
+            }
         };
-        match client
-            .send_prompt(pane_id, prompt, self.config.send_timeout_secs, false)
-            .await
-        {
-            Ok(_) => wire::send(sender, wire::ok(id, Value::Null)).await,
-            Err(error) => server_error(sender, id, error.to_string()).await,
+        let mut transcript = match client.subscribe_transcript(pane_id.clone(), 0).await {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                tracing::warn!("{STEER_METHOD}: could not observe the session transcript: {error}");
+                return send_steer_outcome(sender, id, "failed").await;
+            }
+        };
+        let send = client.send_prompt(
+            pane_id,
+            prompt.clone(),
+            self.config.send_timeout_secs,
+            false,
+        );
+        tokio::pin!(send);
+        let mut send_pending = true;
+        let mut transcript_open = true;
+
+        let delivered = loop {
+            tokio::select! {
+                biased;
+                result = &mut send, if send_pending => {
+                    send_pending = false;
+                    match result {
+                        Ok(_) => break true,
+                        Err(error) if steer_send_is_ambiguous(&error) => {
+                            tracing::debug!("{STEER_METHOD}: waiting for transcript confirmation after {error}");
+                        }
+                        Err(error) => {
+                            tracing::warn!("{STEER_METHOD}: {error}");
+                            break false;
+                        }
+                    }
+                }
+                item = transcript.next(), if transcript_open => {
+                    match item {
+                        Ok(Some(libslopctl::SubscriptionItem::Record(record)))
+                            if value_contains_string(&record.payload, &prompt) => break true,
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            transcript_open = false;
+                            if !send_pending {
+                                break false;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("{STEER_METHOD}: transcript observation failed: {error}");
+                            transcript_open = false;
+                            if !send_pending {
+                                break false;
+                            }
+                        }
+                    }
+                }
+                _ = done.cancelled() => break false,
+            }
+        };
+
+        if delivered {
+            send_steer_outcome(sender, id, "injected").await;
+        } else {
+            send_steer_outcome(sender, id, "failed").await;
         }
     }
 
@@ -2205,15 +2236,26 @@ fn launch_args(base: &[String], native_session_id: Option<&str>) -> Vec<String> 
     filtered
 }
 
-fn active_run_update(run_id: Option<&str>) -> Value {
-    json!({
-        "sessionUpdate": "session_info_update",
-        "_meta": {
-            "goose": {
-                "activeRunId": run_id,
-            },
-        },
-    })
+async fn send_steer_outcome(sender: &Sender, id: Value, outcome: &str) {
+    wire::send(sender, wire::ok(id, json!({ "outcome": outcome }))).await;
+}
+
+fn steer_send_is_ambiguous(error: &libslopctl::Error) -> bool {
+    matches!(error, libslopctl::Error::Timeout)
+        || matches!(error, libslopctl::Error::Server(message) if message.contains("timed out"))
+}
+
+fn value_contains_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_string(value, expected)),
+        _ => false,
+    }
 }
 
 fn frame_first_prompt(system_prompt: Option<&str>, user_prompt: &str) -> String {
@@ -2719,18 +2761,15 @@ mod tests {
     }
 
     #[test]
-    fn active_run_update_matches_buzz_native_steer_contract() {
-        assert_eq!(
-            active_run_update(Some("slopd-turn-7"))
-                .pointer("/_meta/goose/activeRunId")
-                .and_then(Value::as_str),
-            Some("slopd-turn-7")
-        );
-        assert!(
-            active_run_update(None)
-                .pointer("/_meta/goose/activeRunId")
-                .is_some_and(Value::is_null)
-        );
+    fn transcript_confirmation_is_shape_agnostic() {
+        assert!(value_contains_string(
+            &json!({"nested": [{"content": "STEER_CANARY"}]}),
+            "STEER_CANARY"
+        ));
+        assert!(!value_contains_string(
+            &json!({"nested": [{"content": "other"}]}),
+            "STEER_CANARY"
+        ));
     }
 
     #[test]
