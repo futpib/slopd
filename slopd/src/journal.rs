@@ -422,18 +422,23 @@ impl LifecycleJournal {
                 .take(8)
                 .map(|entry| {
                     format!(
-                        "{} ({} {}, boot {} session {})",
-                        &entry.grave_id[..entry.grave_id.len().min(8)],
+                        "\n  {} ({} {}, boot {} session {})",
+                        entry.grave_id,
                         entry.pane.pane_id,
                         entry.pane.pane_title.as_deref().unwrap_or("untitled"),
-                        &entry.tmux_boot_id[..entry.tmux_boot_id.len().min(8)],
+                        entry.tmux_boot_id,
                         entry.tmux_session_id,
                     )
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .collect::<String>();
+            let omitted = matches.len().saturating_sub(8);
+            let omitted = if omitted == 0 {
+                String::new()
+            } else {
+                format!("\n  ... and {omitted} more")
+            };
             return Err(format!(
-                "graveyard target is ambiguous; use a grave id or --boot: {candidates}"
+                "graveyard target is ambiguous; use a full grave ID, a longer unique grave-ID prefix, or a pane ID with --boot:{candidates}{omitted}"
             ));
         }
         let entry = matches.remove(0);
@@ -949,6 +954,42 @@ mod tests {
         assert_eq!(
             journal.select_grave(Some("%7"), Some(-1)).unwrap().grave_id,
             "grave-a"
+        );
+    }
+
+    #[test]
+    fn ambiguous_uuid_v7_prefix_lists_actionable_full_ids() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let key = GenerationKey {
+            tmux_boot_id: "dd427521-a4db-49b3-844a-4ed3d6f75f3d".into(),
+            tmux_session_id: "$0".into(),
+        };
+        let journal = open(dir.path(), &config, key, 1);
+        let ids = [
+            "019fe160-fd0e-7603-9dd9-d4719fadcf98",
+            "019fe160-f53f-7e21-a814-457d32feac67",
+            "019fe160-c68b-7d03-92a1-a3726458a5eb",
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            grave(
+                &journal,
+                id,
+                &format!("%{}", index + 1),
+                &format!("session-{index}"),
+                index as u64,
+            );
+        }
+
+        let error = journal.select_grave(Some("019fe160"), None).unwrap_err();
+        assert!(error.contains("longer unique grave-ID prefix"));
+        assert!(error.contains("pane ID with --boot"));
+        for id in ids {
+            assert!(error.contains(id), "candidate must show full ID: {error}");
+        }
+        assert_eq!(
+            journal.select_grave(Some(ids[0]), None).unwrap().grave_id,
+            ids[0]
         );
     }
 

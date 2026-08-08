@@ -562,6 +562,56 @@ fn timestamp_ago(fmt: &timeago::Formatter, epoch: std::time::Duration, timestamp
     fmt.convert(epoch.saturating_sub(std::time::Duration::from_secs(timestamp)))
 }
 
+fn format_graveyard_table(entries: &[libslop::GraveEntry], epoch: std::time::Duration) -> String {
+    let fmt = timeago::Formatter::new();
+    let header = [
+        "GRAVE_ID",
+        "PANE",
+        "BOOT_ID",
+        "TMUX_SESSION",
+        "CREATED",
+        "DESTROYED",
+        "REVIVED",
+        "BACKEND",
+        "ACCOUNT",
+        "STATUS",
+        "TITLE",
+    ];
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            let status = entry
+                .revived_as
+                .as_deref()
+                .map(|pane_id| format!("revived:{pane_id}"))
+                .unwrap_or_else(|| entry.cause.clone());
+            let revived_at = entry
+                .revived_at
+                .map(|timestamp| timestamp_ago(&fmt, epoch, timestamp))
+                .unwrap_or_else(|| "-".to_string());
+            vec![
+                entry.grave_id.clone(),
+                entry.pane.pane_id.clone(),
+                entry.tmux_boot_id.clone(),
+                entry.tmux_session_id.clone(),
+                timestamp_ago(&fmt, epoch, entry.pane.created_at),
+                timestamp_ago(&fmt, epoch, entry.destroyed_at),
+                revived_at,
+                entry.pane.backend.canonical_executable().to_string(),
+                entry.pane.account.clone(),
+                status,
+                entry
+                    .pane
+                    .pane_title
+                    .as_deref()
+                    .map(truncate_title)
+                    .unwrap_or_else(|| "-".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    format_table(&header, &rows)
+}
+
 fn format_table(header: &[&str], rows: &[Vec<String>]) -> String {
     let widths: Vec<usize> = (0..header.len())
         .map(|column| {
@@ -2408,57 +2458,10 @@ where
             if json {
                 println!("{}", serde_json::to_string(&entries).unwrap());
             } else if !entries.is_empty() {
-                let fmt = timeago::Formatter::new();
                 let epoch = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                let header = [
-                    "GRAVE",
-                    "PANE",
-                    "CREATED",
-                    "DESTROYED",
-                    "REVIVED",
-                    "BACKEND",
-                    "ACCOUNT",
-                    "STATUS",
-                    "TITLE",
-                ];
-                let rows = entries
-                    .into_iter()
-                    .map(|entry| {
-                        let grave = entry
-                            .grave_id
-                            .get(..8)
-                            .unwrap_or(&entry.grave_id)
-                            .to_string();
-                        let revived = entry
-                            .revived_as
-                            .as_deref()
-                            .map(|p| format!("revived:{p}"))
-                            .unwrap_or_else(|| entry.cause.clone());
-                        let revived_at = entry
-                            .revived_at
-                            .map(|timestamp| timestamp_ago(&fmt, epoch, timestamp))
-                            .unwrap_or_else(|| "-".to_string());
-                        vec![
-                            grave,
-                            entry.pane.pane_id,
-                            timestamp_ago(&fmt, epoch, entry.pane.created_at),
-                            timestamp_ago(&fmt, epoch, entry.destroyed_at),
-                            revived_at,
-                            entry.pane.backend.canonical_executable().to_string(),
-                            entry.pane.account,
-                            revived,
-                            entry
-                                .pane
-                                .pane_title
-                                .as_deref()
-                                .map(truncate_title)
-                                .unwrap_or_else(|| "-".to_string()),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                println!("{}", format_table(&header, &rows));
+                println!("{}", format_graveyard_table(&entries, epoch));
             }
         }
         CommonCommand::Revive { target, boot } => {
@@ -2490,6 +2493,46 @@ mod tests {
         assert_eq!(header.find("PANE"), row.find("%27"));
         assert_eq!(header.find("CREATED"), row.find("6 seconds ago"));
         assert!(!table.contains('\t'));
+    }
+
+    #[test]
+    fn graveyard_table_shows_copyable_ids_for_clustered_uuid_v7_entries() {
+        let ids = [
+            "019fe160-fd0e-7603-9dd9-d4719fadcf98",
+            "019fe160-f53f-7e21-a814-457d32feac67",
+        ];
+        let entries = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut pane = pane_with(libslop::Backend::Claude, "claude", &[]);
+                pane.pane_id = format!("%{}", index + 1);
+                libslop::GraveEntry {
+                    grave_id: (*id).to_string(),
+                    tmux_boot_id: "dd427521-a4db-49b3-844a-4ed3d6f75f3d".to_string(),
+                    tmux_session_id: "$0".to_string(),
+                    destroyed_at: index as u64,
+                    cause: "self_exit".to_string(),
+                    detected_by: "reconcile_dead_pane".to_string(),
+                    pane,
+                    revived_at: None,
+                    revived_as: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let table = format_graveyard_table(&entries, std::time::Duration::from_secs(2));
+        let mut lines = table.lines();
+        let header = lines.next().unwrap();
+        let first = lines.next().unwrap();
+        let second = lines.next().unwrap();
+        assert_eq!(header.find("GRAVE_ID"), first.find(ids[0]));
+        assert_eq!(header.find("GRAVE_ID"), second.find(ids[1]));
+        assert_eq!(
+            header.find("BOOT_ID"),
+            first.find("dd427521-a4db-49b3-844a-4ed3d6f75f3d")
+        );
+        assert_eq!(header.find("TMUX_SESSION"), first.find("$0"));
     }
 
     fn died_msg(diag: PaneDeathDiagnostics) -> String {

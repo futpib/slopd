@@ -12738,14 +12738,19 @@ fn graveyard_records_and_revives_a_killed_pane() {
     let mut lines = human.lines();
     let header = lines.next().expect("graveyard header");
     let row = lines.next().expect("graveyard row");
-    assert_eq!(header.find("GRAVE"), row.find(&grave.grave_id[..8]));
+    assert_eq!(header.find("GRAVE_ID"), row.find(&grave.grave_id));
     assert_eq!(header.find("PANE"), row.find(&pane_id));
+    assert_eq!(header.find("BOOT_ID"), row.find(&grave.tmux_boot_id));
+    assert_eq!(
+        header.find("TMUX_SESSION"),
+        row.find(&grave.tmux_session_id)
+    );
     assert_eq!(header.find("STATUS"), row.find("deliberate_kill"));
     assert!(!human.contains('\t'));
     assert!(human.contains("ago") || human.contains("now"));
 
-    let prefix = &grave.grave_id[..grave.grave_id.len().min(8)];
-    let revived = env.slopctl(&["revive", prefix]);
+    let selector = grave.grave_id.as_str();
+    let revived = env.slopctl(&["revive", selector]);
     assert!(revived.status.success(), "revive failed: {revived:?}");
     let revived_id = String::from_utf8_lossy(&revived.stdout).trim().to_string();
     assert_ne!(revived_id, pane_id);
@@ -12762,7 +12767,7 @@ fn graveyard_records_and_revives_a_killed_pane() {
         serde_json::from_slice(&env.slopctl(&["graveyard", "--json"]).stdout).unwrap();
     let grave = entries
         .iter()
-        .find(|entry| entry.grave_id.starts_with(prefix))
+        .find(|entry| entry.grave_id == selector)
         .unwrap();
     assert_eq!(grave.revived_as.as_deref(), Some(revived_id.as_str()));
     assert!(grave.revived_at.is_some());
