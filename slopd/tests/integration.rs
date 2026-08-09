@@ -4232,6 +4232,20 @@ where
     event
 }
 
+fn wait_for_detailed_state_event(
+    listener: std::process::Child,
+    pane_id: &str,
+    detailed_state: &str,
+) -> serde_json::Value {
+    let pane_id = pane_id.to_string();
+    let detailed_state = detailed_state.to_string();
+    wait_for_event(listener, move |event| {
+        event["event_type"] == "DetailedStateChange"
+            && event["pane_id"] == pane_id
+            && event["payload"]["detailed_state"] == detailed_state
+    })
+}
+
 #[test]
 fn listen_event_state_change_fires_on_hook() {
     build_bin("slopd");
@@ -15522,25 +15536,13 @@ fn opencode_tool_use_tracks_busy_tool_use_state() {
     assert!(!pane_id.is_empty());
     wait_until_ready(&env, &pane_id, Duration::from_secs(15));
 
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
     assert!(
         env.slopctl(&["send", &pane_id, "::mock tool"])
             .status
             .success()
     );
-    // The mock holds the tool in pending/running (~300ms) → busy_tool_use.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen_tool_use = false;
-    while Instant::now() < deadline {
-        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusyToolUse {
-            seen_tool_use = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        seen_tool_use,
-        "opencode tool turn should pass through busy_tool_use"
-    );
+    wait_for_detailed_state_event(listener, &pane_id, "busy_tool_use");
     wait_until_ready(&env, &pane_id, Duration::from_secs(10));
     kill_slopd(slopd);
 }
@@ -15661,24 +15663,13 @@ fn opencode_subagent_turn_tracks_busy_subagent() {
     assert!(!pane_id.is_empty());
     wait_until_ready(&env, &pane_id, Duration::from_secs(15));
 
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
     assert!(
         env.slopctl(&["send", &pane_id, "::mock subagent normal"])
             .status
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen_subagent = false;
-    while Instant::now() < deadline {
-        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusySubagent {
-            seen_subagent = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        seen_subagent,
-        "opencode subagent turn should pass through busy_subagent"
-    );
+    wait_for_detailed_state_event(listener, &pane_id, "busy_subagent");
     wait_until_ready(&env, &pane_id, Duration::from_secs(10));
     kill_slopd(slopd);
 }
@@ -15707,6 +15698,7 @@ fn opencode_retrying_subagent_does_not_stick_busy_subagent() {
 
     // "subagent" + "retry" → the mock spawns a child, then wedges BOTH the child and
     // the main session in retry with NO terminal event on the SSE stream.
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
     assert!(
         env.slopctl(&["send", &pane_id, "::mock subagent retry"])
             .status
@@ -15714,19 +15706,7 @@ fn opencode_retrying_subagent_does_not_stick_busy_subagent() {
     );
 
     // The SSE reader sees the child spawn → busy_subagent.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen_subagent = false;
-    while Instant::now() < deadline {
-        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::BusySubagent {
-            seen_subagent = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        seen_subagent,
-        "expected busy_subagent once the child session spawns"
-    );
+    wait_for_detailed_state_event(listener, &pane_id, "busy_subagent");
 
     // It must NOT stay stuck: the backstop prunes the retry-wedged child and the
     // main session's retry surfaces as busy_processing. (Before the fix it stayed
@@ -15854,24 +15834,13 @@ fn opencode_question_tool_tracks_awaiting_elicitation() {
     assert!(!pane_id.is_empty());
     wait_until_ready(&env, &pane_id, Duration::from_secs(15));
 
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
     assert!(
         env.slopctl(&["send", &pane_id, "::mock question"])
             .status
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen_elicitation = false;
-    while Instant::now() < deadline {
-        if env.pane_state(&pane_id).1 == libslop::PaneDetailedState::AwaitingInputElicitation {
-            seen_elicitation = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        seen_elicitation,
-        "opencode question tool should set awaiting_input_elicitation"
-    );
+    wait_for_detailed_state_event(listener, &pane_id, "awaiting_input_elicitation");
     kill_slopd(slopd);
 }
 
