@@ -315,6 +315,7 @@ fn main() {
                         command,
                         MockCommand::Help
                             | MockCommand::Active
+                            | MockCommand::Env(_)
                             | MockCommand::Permission(None)
                             | MockCommand::PolicyShow
                             | MockCommand::PolicyRestrict
@@ -387,7 +388,12 @@ fn main() {
                     finish_turn(&settings, &session_id, &cwd, &transcript, "restricted");
                     continue;
                 }
-                let response = if matches!(mock_command, Some(MockCommand::PolicyShow)) {
+                let response = if let Some(MockCommand::Env(key)) = mock_command {
+                    format!(
+                        "::mock env {key}={}",
+                        std::env::var(key).unwrap_or_else(|_| "UNSET".to_string())
+                    )
+                } else if matches!(mock_command, Some(MockCommand::PolicyShow)) {
                     policy.to_string()
                 } else if matches!(mock_command, Some(MockCommand::Help)) {
                     MOCK_HELP.to_string()

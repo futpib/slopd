@@ -962,6 +962,69 @@ fn closed_session_is_listed_and_revived_from_the_graveyard() {
 }
 
 #[test]
+fn closed_session_with_environment_is_resumed_in_a_fresh_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut harness, 3, &session_id, "ENVIRONMENT_CONTEXT_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let native_session = panes(&env)[0]
+        .session_id
+        .clone()
+        .expect("native session id");
+    let closed = close_session(&mut harness, 4, &session_id);
+    assert!(closed.get("error").is_none(), "close failed: {closed}");
+    drop(harness);
+
+    let mut replacement = Harness::spawn(
+        &env.socket_path(),
+        &[
+            "--account",
+            "acp-codex",
+            "--env",
+            "BUZZ_PRIVATE_KEY=restored-credential",
+        ],
+    );
+    initialize(&mut replacement);
+    let resumed = resume_session(&mut replacement, 5, &session_id, env.config_dir.path());
+    assert!(resumed.get("error").is_none(), "resume failed: {resumed}");
+    assert_eq!(
+        panes(&env)[0].session_id.as_deref(),
+        Some(native_session.as_str())
+    );
+
+    let (continued, notifications) = prompt(
+        &mut replacement,
+        6,
+        &session_id,
+        "::mock env BUZZ_PRIVATE_KEY",
+    );
+    assert_eq!(continued["result"]["stopReason"], "end_turn");
+    assert!(
+        streamed_text(&notifications).contains("::mock env BUZZ_PRIVATE_KEY=restored-credential")
+    );
+}
+
+#[test]
 fn replacement_trims_recovered_live_panes_but_keeps_their_sessions() {
     build_bin("slopd");
     build_bin("slopctl");

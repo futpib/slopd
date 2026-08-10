@@ -1441,7 +1441,9 @@ impl Adapter {
         };
 
         self.make_live_pane_room().await?;
-        let (started, resumed) = if let Some(grave_id) = grave_id.as_deref() {
+        let (started, resumed) = if self.config.env.is_empty()
+            && let Some(grave_id) = grave_id.as_deref()
+        {
             match self.revive_pane(grave_id).await {
                 Ok(started) => (started, true),
                 Err(error) => {
