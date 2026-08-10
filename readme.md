@@ -731,7 +731,7 @@ slopctl graveyard
 slopctl graveyard --boot -1 --json
 ```
 
-### `slopctl revive [GRAVE_ID|PANE_ID] [--boot N]`
+### `slopctl revive [GRAVE_ID|PANE_ID] [--boot N] [-e KEY=VALUE]... [--env-file PATH]...`
 
 Resume the backend session captured by a graveyard record and print its new tmux
 pane ID. A unique grave-ID prefix is accepted; with no target, the newest
@@ -744,7 +744,12 @@ a new record.
 ```bash
 slopctl revive 019c1234
 slopctl revive %21 --boot -2
+slopctl revive 019c1234 -e API_TOKEN="$API_TOKEN"
 ```
+
+Environment flags use the same merge order as `run`: configured files, configured
+values, caller files, then caller values. They apply only to the new process and
+are not retained in graveyard records.
 
 ### `slopctl hook <EVENT>`
 

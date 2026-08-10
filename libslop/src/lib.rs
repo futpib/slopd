@@ -3056,12 +3056,15 @@ pub enum RequestBody {
     /// Resume a pane from the lifecycle graveyard. `target` is a grave id
     /// (full or unique prefix) or an old tmux pane id such as `%21`; omitted
     /// means the newest not-yet-revived entry. `boot` disambiguates reused pane
-    /// ids across tmux session generations.
+    /// ids across tmux session generations. `env` is applied only if a new pane
+    /// must be spawned.
     Revive {
         #[serde(default)]
         target: Option<String>,
         #[serde(default)]
         boot: Option<i32>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
     },
     /// Cancel a subscription previously created by Subscribe or SubscribeTranscript.
     /// The `id` field in the outer Request identifies the Unsubscribe request itself;

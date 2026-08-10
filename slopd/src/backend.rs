@@ -316,6 +316,7 @@ pub(super) struct RestoreContext<'a> {
     pub(super) session_lock: &'a SessionLock,
     pub(super) panes: &'a PaneMap,
     pub(super) event_tx: &'a EventTx,
+    pub(super) extra_env: &'a [(String, String)],
 }
 
 #[async_trait::async_trait]
@@ -399,7 +400,7 @@ impl BackendLifecycle for ClaudeBackend {
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
                 executable: context.resolved.executable.clone(),
-                extra_env: Vec::new(),
+                extra_env: context.extra_env.to_vec(),
                 trailing_args: vec!["--resume".to_string(), context.session_id.to_string()],
             },
         )
@@ -501,7 +502,7 @@ impl BackendLifecycle for OpencodeBackend {
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
                 executable: context.resolved.executable.clone(),
-                extra_env: Vec::new(),
+                extra_env: context.extra_env.to_vec(),
                 trailing_args: vec![
                     "-s".to_string(),
                     context.session_id.to_string(),
@@ -609,7 +610,7 @@ impl BackendLifecycle for CodexBackend {
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
                 executable: context.resolved.executable.clone(),
-                extra_env: Vec::new(),
+                extra_env: context.extra_env.to_vec(),
                 trailing_args: vec![
                     "--dangerously-bypass-hook-trust".to_string(),
                     "--no-alt-screen".to_string(),

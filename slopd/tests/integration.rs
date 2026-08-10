@@ -12764,7 +12764,7 @@ fn graveyard_records_and_revives_a_killed_pane() {
     assert!(human.contains("ago") || human.contains("now"));
 
     let selector = grave.grave_id.as_str();
-    let revived = env.slopctl(&["revive", selector]);
+    let revived = env.slopctl(&["revive", selector, "--env", "REVIVE_ENV=restored-value"]);
     assert!(revived.status.success(), "revive failed: {revived:?}");
     let revived_id = String::from_utf8_lossy(&revived.stdout).trim().to_string();
     assert_ne!(revived_id, pane_id);
@@ -12776,6 +12776,10 @@ fn graveyard_records_and_revives_a_killed_pane() {
         .expect("revived pane should be managed");
     assert_eq!(pane.session_id.as_deref(), Some(MOCK_SID));
     assert!(pane.tags.contains(&"recover-me".to_string()));
+    assert_eq!(
+        read_pane_env(&env, &revived_id, "REVIVE_ENV"),
+        "restored-value"
+    );
 
     let entries: Vec<libslop::GraveEntry> =
         serde_json::from_slice(&env.slopctl(&["graveyard", "--json"]).stdout).unwrap();

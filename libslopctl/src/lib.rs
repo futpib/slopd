@@ -332,6 +332,13 @@ pub enum CommonCommand {
         /// -1 previous.
         #[arg(long, value_name = "N", allow_hyphen_values = true)]
         boot: Option<i32>,
+        /// Extra environment variables for the revived pane (repeatable).
+        /// Format: KEY=VALUE, with $VAR / ${VAR} expansion against slopctl's env.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+        /// Path to a dotenv-style file of KEY=VALUE lines (repeatable).
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_files: Vec<PathBuf>,
     },
 }
 
@@ -372,7 +379,7 @@ pub fn die_err(e: Error) -> ! {
     die(&e.to_string());
 }
 
-/// Build the merged env list for `slopctl run`: entries from env-files (in flag
+/// Build a merged CLI env list: entries from env-files (in flag
 /// order) followed by entries from --env flags (in flag order). Values in
 /// --env are expanded against slopctl's environment; entries from env-files
 /// are returned as dotenvy parses them. Env-file paths are `~` / `$VAR`-expanded
@@ -932,9 +939,10 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         &mut self,
         target: Option<String>,
         boot: Option<i32>,
+        env: Vec<(String, String)>,
     ) -> Result<(String, String), Error> {
         match self
-            .request(libslop::RequestBody::Revive { target, boot })
+            .request(libslop::RequestBody::Revive { target, boot, env })
             .await?
         {
             libslop::ResponseBody::Revived { pane_id, grave_id } => Ok((pane_id, grave_id)),
@@ -2464,8 +2472,14 @@ where
                 println!("{}", format_graveyard_table(&entries, epoch));
             }
         }
-        CommonCommand::Revive { target, boot } => {
-            let (pane_id, _grave_id) = client.revive(target, boot).await?;
+        CommonCommand::Revive {
+            target,
+            boot,
+            envs,
+            env_files,
+        } => {
+            let env = build_cli_env(&env_files, &envs)?;
+            let (pane_id, _grave_id) = client.revive(target, boot, env).await?;
             println!("{}", pane_id);
         }
     }

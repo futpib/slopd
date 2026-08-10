@@ -2971,6 +2971,7 @@ async fn main() {
                 &session_lock,
                 &lifecycle,
                 restore_panes_info,
+                &[],
             )
             .await;
             if let Err(e) = lifecycle.resolve_restore(&source, "auto_restore") {
@@ -4166,6 +4167,7 @@ async fn restore_panes(
     session_lock: &SessionLock,
     lifecycle: &LifecycleJournal,
     manifest: Vec<libslop::PaneInfo>,
+    extra_env: &[(String, String)],
 ) -> usize {
     if let Err(e) = refresh_or_recreate_lifecycle_generation(config, session_lock, lifecycle).await
     {
@@ -4306,6 +4308,7 @@ async fn restore_panes(
                 session_lock,
                 panes,
                 event_tx,
+                extra_env,
             })
             .await
         {
@@ -4439,6 +4442,24 @@ async fn restore_panes(
 
     info!("backup: restored {}/{} recorded pane(s)", restored, total);
     restored
+}
+
+fn merge_spawn_env(
+    config: &libslop::SlopdConfig,
+    request_env: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut merged = Vec::new();
+    for raw_path in &config.run.env_files {
+        let path = libslop::expand_path(raw_path);
+        merged.extend(libslop::load_env_file(&path)?);
+    }
+    for (key, value) in &config.run.env {
+        let expanded = libslop::expand_env_value(value)
+            .map_err(|error| format!("invalid [run.env] {key}: {error}"))?;
+        merged.push((key.clone(), expanded));
+    }
+    merged.extend(request_env);
+    Ok(merged)
 }
 
 /// After sending the interrupt Escape on a `send --interrupt`, wait this long
@@ -5105,29 +5126,11 @@ async fn handle_request(
                         .as_ref()
                         .map(|p| libslop::expand_path(p))
                 });
-            // Merge env: config env_files (in order) → config env → request env.
-            // Later entries override earlier ones (tmux applies -e left-to-right).
-            let mut merged_env: Vec<(String, String)> = Vec::new();
-            for raw_path in &config.run.env_files {
-                let path = libslop::expand_path(raw_path);
-                match libslop::load_env_file(&path) {
-                    Ok(pairs) => merged_env.extend(pairs),
-                    Err(e) => {
-                        return libslop::ResponseBody::Error { message: e };
-                    }
-                }
-            }
-            for (k, v) in &config.run.env {
-                match libslop::expand_env_value(v) {
-                    Ok(expanded) => merged_env.push((k.clone(), expanded)),
-                    Err(e) => {
-                        return libslop::ResponseBody::Error {
-                            message: format!("invalid [run.env] {}: {}", k, e),
-                        };
-                    }
-                }
-            }
-            merged_env.extend(env.iter().cloned());
+            // Merge config files, config values, then caller values (last wins).
+            let merged_env = match merge_spawn_env(config, env) {
+                Ok(env) => env,
+                Err(message) => return libslop::ResponseBody::Error { message },
+            };
 
             // Prepare backend-specific standalone launch arguments/resources.
             let prepared = match backend_lifecycle(resolved.backend)
@@ -6069,6 +6072,7 @@ async fn handle_request(
                 session_lock,
                 lifecycle,
                 manifest,
+                &[],
             )
             .await;
             if let Err(e) = lifecycle.resolve_restore(&source, "manual_restore") {
@@ -6083,7 +6087,7 @@ async fn handle_request(
             Err(message) => libslop::ResponseBody::Error { message },
         },
 
-        libslop::RequestBody::Revive { target, boot } => {
+        libslop::RequestBody::Revive { target, boot, env } => {
             if let Err(message) =
                 refresh_or_recreate_lifecycle_generation(config, session_lock, lifecycle).await
             {
@@ -6109,6 +6113,10 @@ async fn handle_request(
                 .find(|pane| pane.session_id.as_deref() == Some(session_id))
                 .map(|pane| pane.pane_id);
             if revived_as.is_none() {
+                let env = match merge_spawn_env(config, env) {
+                    Ok(env) => env,
+                    Err(message) => return libslop::ResponseBody::Error { message },
+                };
                 let restored = restore_panes(
                     config,
                     managed_panes,
@@ -6118,6 +6126,7 @@ async fn handle_request(
                     session_lock,
                     lifecycle,
                     vec![grave.pane.clone()],
+                    &env,
                 )
                 .await;
                 if restored > 0 {

@@ -962,7 +962,7 @@ fn closed_session_is_listed_and_revived_from_the_graveyard() {
 }
 
 #[test]
-fn closed_session_with_environment_is_resumed_in_a_fresh_pane() {
+fn closed_session_with_environment_is_revived() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -1010,6 +1010,19 @@ fn closed_session_with_environment_is_resumed_in_a_fresh_pane() {
     assert_eq!(
         panes(&env)[0].session_id.as_deref(),
         Some(native_session.as_str())
+    );
+    let listed = env.slopctl(&["graveyard", "--json"]);
+    assert!(listed.status.success(), "graveyard failed: {listed:?}");
+    let graves: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&listed.stdout).expect("graveyard JSON");
+    let grave = graves
+        .iter()
+        .find(|grave| grave.pane.session_id.as_deref() == Some(native_session.as_str()))
+        .expect("closed session grave");
+    assert!(grave.revived_at.is_some());
+    assert_eq!(
+        grave.revived_as.as_deref(),
+        Some(panes(&env)[0].pane_id.as_str())
     );
 
     let (continued, notifications) = prompt(
