@@ -602,11 +602,17 @@ interactive_type = "forking"
 
 `--interactive` is a local-slopctl feature (it attaches to slopd's tmux); `iroh-slopctl run --interactive` errors.
 
-### `slopctl fork <PANE_ID> [--no-wait] [-i] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
+### `slopctl fork [PANE_ID] [--no-wait] [-i] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new pane whose agent session **starts as a copy** of `PANE_ID`'s conversation and then diverges independently. The source pane keeps running, untouched — the two share history up to the fork point and nothing after it. The fork inherits the source's account, backend, and (by default) working directory. Prints the new pane id, and — like `run` — waits for it to become ready unless `--no-wait` is given.
 
+For local `slopctl`, `PANE_ID` defaults to `$TMUX_PANE`, so it can be omitted
+when forking the pane you are currently using. Outside a tmux pane, the argument
+is required. `iroh-slopctl` always requires it because the client's local tmux
+pane has no meaning on the remote host.
+
 ```bash
+FORK=$(slopctl fork)             # branch the current pane's conversation
 FORK=$(slopctl fork %1)          # branch %1's conversation into a fresh pane
 ```
 

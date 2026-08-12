@@ -84,7 +84,13 @@ async fn main() {
     if let Command::Common(ref cmd) = cli.command {
         libslopctl::validate_command_filters(cmd).unwrap_or_else(|e| libslopctl::die_err(e));
     }
-    if let Command::Common(libslopctl::CommonCommand::Tags { pane_id: None }) = cli.command {
+    if matches!(
+        &cli.command,
+        Command::Common(
+            libslopctl::CommonCommand::Fork { pane_id: None, .. }
+                | libslopctl::CommonCommand::Tags { pane_id: None }
+        )
+    ) {
         eprintln!("error: <PANE_ID> is required for iroh-slopctl (no $TMUX_PANE available)");
         std::process::exit(2);
     }

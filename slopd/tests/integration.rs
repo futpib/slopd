@@ -14132,8 +14132,12 @@ fn fork_opencode_pane_binds_new_pane_to_forked_session() {
         String::from_utf8_lossy(&run_out.stderr)
     );
 
-    // Fork it: the new pane must become ready and have its id printed.
-    let fork_out = env.slopctl_raw(&["fork", &src_pane, "--ready-timeout", "30"]);
+    // Fork it without an explicit source: local slopctl must default to the
+    // current managed pane from $TMUX_PANE.
+    let fork_out = env.slopctl_raw_envs(
+        &["fork", "--ready-timeout", "30"],
+        &[("TMUX_PANE", &src_pane)],
+    );
     let fork_pane = String::from_utf8_lossy(&fork_out.stdout).trim().to_string();
     assert!(
         fork_out.status.success() && !fork_pane.is_empty(),

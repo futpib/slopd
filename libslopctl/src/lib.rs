@@ -139,8 +139,9 @@ pub enum CommonCommand {
     /// pane keeps running, untouched. The fork inherits the source's account,
     /// backend, and (by default) working directory.
     Fork {
-        /// Tmux pane ID to fork from (e.g. %42).
-        pane_id: String,
+        /// Tmux pane ID to fork from (e.g. %42). Defaults to $TMUX_PANE for
+        /// local slopctl if omitted.
+        pane_id: Option<String>,
         /// Working directory for the forked pane. Defaults to the source pane's
         /// cwd (Claude resolves its transcript by cwd, so overriding this to a
         /// different directory will usually make the fork fail to find history).
@@ -165,7 +166,7 @@ pub enum CommonCommand {
         #[arg(long, default_value = "30", value_name = "SECS")]
         ready_timeout: u64,
         /// Extra arguments passed to the forked backend invocation (after --).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
     /// Terminate a Claude pane.
@@ -348,7 +349,8 @@ pub struct CommandContext {
     /// The daemon also uses it to inherit the parent pane's account when `--account`
     /// is not given.
     pub parent_pane_id: Option<String>,
-    /// For `Tags` when pane_id is None: fallback pane ID.
+    /// For commands with an optional pane ID: fallback pane ID. Local slopctl
+    /// sets this to $TMUX_PANE; iroh-slopctl sets None.
     pub fallback_pane_id: Option<String>,
     /// For `run --interactive`: how to launch the viewer command. `None` means
     /// interactive run is unsupported here (remote iroh — can't attach to a
@@ -2330,6 +2332,9 @@ where
             ready_timeout,
             extra_args,
         } => {
+            let pane_id = pane_id.or(ctx.fallback_pane_id.clone()).ok_or_else(|| {
+                Error::RunFailed("<PANE_ID> is required when $TMUX_PANE is not set".to_string())
+            })?;
             let env = build_cli_env(&env_files, &envs)?;
             // Resolve / validate --start-directory exactly like `run` (local cwd
             // vs. rejected-over-remote). When omitted, slopd defaults it to the

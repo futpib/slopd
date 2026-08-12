@@ -53,6 +53,23 @@ fn slopd_version_contains_commit_hash() {
 }
 
 #[test]
+fn fork_without_pane_id_and_without_tmux_pane_errors_before_connecting() {
+    build_bin("slopctl");
+
+    let output = Command::new(cargo_bin("slopctl"))
+        .args(["--socket", "/tmp/slopd-fork-missing-pane.sock", "fork"])
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("failed to run slopctl fork");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: <PANE_ID> is required when $TMUX_PANE is not set\n"
+    );
+}
+
+#[test]
 fn ps_json_returns_valid_json_array() {
     build_bin("slopd");
     build_bin("slopctl");

@@ -557,8 +557,8 @@ impl TestEnv {
         cmd.args(args)
             // Don't leak the ambient tmux context (e.g. when the test runner is
             // itself inside a tmux pane). slopctl reads $TMUX_PANE for the `run`
-            // parent and the `tags` fallback, so an inherited value would point
-            // at a pane that doesn't exist in the test's isolated tmux server.
+            // parent and the `fork`/`tags` fallback, so an inherited value would
+            // point at a pane that doesn't exist in the test's isolated tmux server.
             // Tests that need a specific parent pane set TMUX_PANE via `envs`.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
