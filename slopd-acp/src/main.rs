@@ -17,6 +17,7 @@ enum Backend {
     Claude,
     Opencode,
     Codex,
+    Grok,
 }
 
 impl From<Backend> for libslop::Backend {
@@ -25,6 +26,7 @@ impl From<Backend> for libslop::Backend {
             Backend::Claude => libslop::Backend::Claude,
             Backend::Opencode => libslop::Backend::Opencode,
             Backend::Codex => libslop::Backend::Codex,
+            Backend::Grok => libslop::Backend::Grok,
         }
     }
 }

@@ -1955,6 +1955,12 @@ async fn emit_record_updates(
     session_id: &str,
     sender: &Sender,
 ) -> bool {
+    if backend == libslop::Backend::Grok
+        && let Some((message, saw_answer)) = grok_native_message(record, session_id)
+    {
+        wire::send(sender, message).await;
+        return saw_answer;
+    }
     let mut saw_answer = false;
     for update in projection.updates(backend, record) {
         if update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk") {
@@ -1963,6 +1969,19 @@ async fn emit_record_updates(
         wire::send(sender, wire::session_update(session_id, update)).await;
     }
     saw_answer
+}
+
+fn grok_native_message(record: &libslop::Record, session_id: &str) -> Option<(Value, bool)> {
+    let method = record.payload.get("method")?.as_str()?;
+    let mut params = record.payload.get("params")?.clone();
+    let update = params.get("update")?;
+    let saw_answer =
+        update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk");
+    params["sessionId"] = Value::String(session_id.to_string());
+    Some((
+        json!({"jsonrpc": "2.0", "method": method, "params": params}),
+        saw_answer,
+    ))
 }
 
 async fn drain_transcript(
@@ -2770,6 +2789,36 @@ mod tests {
             &json!({"nested": [{"content": "other"}]}),
             "STEER_CANARY"
         ));
+    }
+
+    #[test]
+    fn grok_transcript_updates_pass_through_without_projection_loss() {
+        let native = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "grok-tool-1",
+            "title": "run_terminal_command",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": "cargo test"},
+            "_meta": {"eventId": "event-7", "xaiExtension": true},
+        });
+        let record = record(
+            "tool_call",
+            json!({
+                "method": "_x.ai/session/update",
+                "params": {"sessionId": "native-s", "update": native},
+            }),
+        );
+        let (message, saw_answer) = grok_native_message(&record, "slopd:logical").unwrap();
+        assert_eq!(
+            message,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "_x.ai/session/update",
+                "params": {"sessionId": "slopd:logical", "update": native},
+            })
+        );
+        assert!(!saw_answer);
     }
 
     #[test]

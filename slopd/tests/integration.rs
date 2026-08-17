@@ -2,6 +2,7 @@ use libsloptest::{
     TestEnv, build_bin, cargo_bin, kill_child, kill_slopd, sighup_pid, sigint_child, tempfile,
 };
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14379,6 +14380,290 @@ fn codex_mock_run_send_approval_transcript_fork_and_restart() {
         assert!(
             Instant::now() < deadline,
             "restored Codex panes did not become ready: {ps:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        env.slopctl(&["send", &restored, "after backup restore"])
+            .status
+            .success()
+    );
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let grok_working_dir = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "grok",
+        "--backend",
+        "grok",
+        "--start-directory",
+        grok_working_dir.path().to_str().unwrap(),
+        "--ready-timeout",
+        "20",
+    ]);
+    assert!(
+        run.status.success(),
+        "Grok run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let hooks: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(grok_home.path().join("hooks").join("slopd.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(hooks.pointer("/hooks/SessionStart").is_some());
+    assert!(hooks.pointer("/hooks/StopCancelled").is_some());
+    assert!(hooks.pointer("/hooks/PermissionDenied").is_some());
+    assert!(hooks.pointer("/hooks/PermissionRequest").is_none());
+
+    let socket = env
+        .tmux
+        .tmux()
+        .args([
+            "show-options",
+            "-t",
+            &source,
+            "-p",
+            "-v",
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+        ])
+        .output()
+        .unwrap();
+    assert!(socket.status.success());
+    let socket = String::from_utf8_lossy(&socket.stdout).trim().to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !PathBuf::from(format!("{socket}.mock-sidecar")).exists() {
+        assert!(Instant::now() < deadline, "Grok ACP sidecar never attached");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let ps: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let source_info = ps.iter().find(|pane| pane.pane_id == source).unwrap();
+    assert_eq!(source_info.backend, libslop::Backend::Grok);
+    let source_session = source_info.session_id.clone().expect("Grok session id");
+    uuid::Uuid::parse_str(&source_session).expect("slopd preallocates a Grok UUID");
+
+    let send = env.slopctl(&["send", &source, "hello mock grok"]);
+    assert!(
+        send.status.success(),
+        "Grok ACP send failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline, "Grok turn did not finish");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let transcript = env.slopctl(&["transcript", &source, "--limit", "20"]);
+    assert!(transcript.status.success());
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let records = transcript["records"].as_array().unwrap();
+    assert!(records.iter().any(|record| {
+        record["event_type"] == "agent_message_chunk"
+            && record
+                .pointer("/payload/params/update/content/text")
+                .and_then(serde_json::Value::as_str)
+                == Some("mock response: hello mock grok")
+    }));
+
+    for (prompt, expected) in [
+        ("::mock tool", libslop::PaneDetailedState::BusyToolUse),
+        (
+            "::mock subagent normal",
+            libslop::PaneDetailedState::BusySubagent,
+        ),
+        ("::mock compact", libslop::PaneDetailedState::BusyCompacting),
+        (
+            "::mock elicitation",
+            libslop::PaneDetailedState::AwaitingInputElicitation,
+        ),
+    ] {
+        assert!(env.slopctl(&["send", &source, prompt]).status.success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while env.pane_state(&source).1 != expected {
+            assert!(
+                Instant::now() < deadline,
+                "Grok {prompt} did not reach {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+            assert!(
+                Instant::now() < deadline,
+                "Grok {prompt} did not return to ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    assert!(
+        env.slopctl(&["send", &source, "::mock active"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(Instant::now() < deadline, "Grok active turn did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        env.slopctl(&["send", &source, "steered input"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline, "Grok steering did not finish");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(
+        env.slopctl(&["send", &source, "::mock permission"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::AwaitingInputPermission {
+        assert!(
+            Instant::now() < deadline,
+            "Grok permission state not surfaced"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(env.slopctl(&["interrupt", &source]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok StopCancelled did not restore ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // A non-off Grok sandbox disables leader mode by design. slopd must keep
+    // native hook/transcript support and fall back to bracketed TUI input,
+    // rather than starting an independent ACP agent for the same session.
+    let sandbox_run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "grok",
+        "--ready-timeout",
+        "20",
+        "--",
+        "--sandbox",
+        "strict",
+    ]);
+    assert!(
+        sandbox_run.status.success(),
+        "sandboxed Grok run failed: {}",
+        String::from_utf8_lossy(&sandbox_run.stderr)
+    );
+    let sandbox_pane = String::from_utf8_lossy(&sandbox_run.stdout)
+        .trim()
+        .to_string();
+    let sandbox_socket = env
+        .tmux
+        .tmux()
+        .args([
+            "show-options",
+            "-t",
+            &sandbox_pane,
+            "-p",
+            "-v",
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+        ])
+        .output()
+        .unwrap();
+    let sandbox_socket = String::from_utf8_lossy(&sandbox_socket.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        env.slopctl(&["send", &sandbox_pane, "sandbox fallback"])
+            .status
+            .success(),
+        "sandboxed Grok TUI transport failed"
+    );
+    std::thread::sleep(Duration::from_millis(5_250));
+    assert!(
+        !PathBuf::from(format!("{sandbox_socket}.mock-sidecar")).exists(),
+        "sandboxed Grok unexpectedly started an ACP sidecar"
+    );
+    assert!(env.slopctl(&["kill", &sandbox_pane]).status.success());
+
+    let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "20"]);
+    assert!(
+        fork.status.success(),
+        "Grok fork failed: {}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
+    let ps: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let fork_info = ps.iter().find(|pane| pane.pane_id == fork_pane).unwrap();
+    assert_eq!(fork_info.backend, libslop::Backend::Grok);
+    assert_ne!(
+        fork_info.session_id.as_deref(),
+        Some(source_session.as_str())
+    );
+    assert_eq!(fork_info.parent_pane_id.as_deref(), Some(source.as_str()));
+
+    kill_slopd(slopd);
+    let slopd = env.spawn_slopd();
+    let recovered = env.slopctl(&["send", &source, "after daemon restart"]);
+    assert!(
+        recovered.status.success(),
+        "recovered Grok send failed: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let commands = std::fs::read_to_string(format!("{socket}.mock-commands")).unwrap();
+    let recovered_load = commands
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|command| command["type"] == "load")
+        .expect("recovered Grok sidecar did not reload the session");
+    assert_eq!(
+        recovered_load["cwd"].as_str(),
+        grok_working_dir.path().to_str(),
+        "recovered Grok ACP sidecar must retain the pane cwd"
+    );
+
+    assert!(env.slopctl(&["backup"]).status.success());
+    assert!(env.slopctl(&["kill", &source]).status.success());
+    assert!(env.slopctl(&["kill", &fork_pane]).status.success());
+    assert!(env.slopctl(&["restore"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let restored = loop {
+        let ps: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        if let Some(pane) = ps.iter().find(|pane| {
+            pane.session_id.as_deref() == Some(source_session.as_str())
+                && pane.detailed_state == libslop::PaneDetailedState::Ready
+        }) {
+            break pane.pane_id.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restored Grok pane did not become ready: {ps:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     };

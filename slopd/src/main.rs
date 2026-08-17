@@ -8,6 +8,7 @@ use tracing::{debug, error, info, trace, warn};
 
 mod backend;
 mod codex;
+mod grok;
 mod journal;
 mod opencode;
 use backend::*;
@@ -208,6 +209,58 @@ async fn tmux_paste_text(
     child.wait().await
 }
 
+/// Submit slopd's synthetic `continue` prompt through the backend's strongest
+/// available transport. Grok uses its attached ACP peer when possible and the
+/// same bracketed-paste path as normal sends otherwise; Claude keeps its
+/// literal-key behavior.
+async fn submit_auto_continue(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    pane_id: &str,
+) -> bool {
+    let Some(state) = panes.get(pane_id) else {
+        return false;
+    };
+    let notified = state.prompt_submitted.notified();
+    if let Some(client) = state.grok().and_then(|runtime| runtime.client())
+        && client.prompt("continue").await.is_ok()
+    {
+        return tokio::time::timeout(std::time::Duration::from_secs(10), notified)
+            .await
+            .is_ok();
+    }
+
+    let settle_before_enter = matches!(
+        state.runtime().backend(),
+        libslop::Backend::Codex | libslop::Backend::Grok
+    );
+    let typed = if settle_before_enter {
+        matches!(tmux_send_keys(config, pane_id, "C-u").await, Ok(status) if status.success())
+            && matches!(
+                tmux_paste_text(config, pane_id, "continue").await,
+                Ok(status) if status.success()
+            )
+    } else {
+        matches!(
+            tmux_send_keys(config, pane_id, "continue").await,
+            Ok(status) if status.success()
+        )
+    };
+    if !typed {
+        return false;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    if !matches!(
+        tmux_send_keys(config, pane_id, "Enter").await,
+        Ok(status) if status.success()
+    ) {
+        return false;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), notified)
+        .await
+        .is_ok()
+}
+
 /// Events that can cause a pane state transition.
 enum PaneStateEvent<'a> {
     /// slopd startup recovery or new pane creation.
@@ -315,10 +368,11 @@ fn reduce_hook_event(
     match event {
         "SessionStart" => Some(libslop::PaneDetailedState::Ready),
         "UserPromptSubmit" => Some(libslop::PaneDetailedState::BusyProcessing),
-        "Stop" | "StopFailure" => Some(libslop::PaneDetailedState::Ready),
+        "Stop" | "StopFailure" | "StopCancelled" => Some(libslop::PaneDetailedState::Ready),
         "PreToolUse" => Some(libslop::PaneDetailedState::BusyToolUse),
         "PostToolUse" | "PostToolUseFailure" => Some(libslop::PaneDetailedState::BusyProcessing),
         "PermissionRequest" => Some(libslop::PaneDetailedState::AwaitingInputPermission),
+        "PermissionDenied" => Some(libslop::PaneDetailedState::BusyProcessing),
         "SubagentStart" => Some(libslop::PaneDetailedState::BusySubagent),
         "SubagentStop" | "ElicitationResult" => Some(libslop::PaneDetailedState::BusyProcessing),
         "PreCompact" => Some(libslop::PaneDetailedState::BusyCompacting),
@@ -332,6 +386,9 @@ fn reduce_hook_event(
         // Other Notification types (permission, etc.) must not clear state.
         "Notification" if notification_type == Some("idle_prompt") => {
             Some(libslop::PaneDetailedState::Ready)
+        }
+        "Notification" if notification_type == Some("permission_prompt") => {
+            Some(libslop::PaneDetailedState::AwaitingInputPermission)
         }
         _ => None,
     }
@@ -583,6 +640,10 @@ struct PaneState {
     prompt_submitted: Notify,
     /// Notified whenever SessionStart binds or re-binds a session id.
     session_bound: Notify,
+    /// Set by the first SessionStart hook. Grok's ACP subscriber waits for this
+    /// so the visible TUI becomes the leader's session driver first.
+    session_started: std::sync::atomic::AtomicBool,
+    session_started_notify: Notify,
     /// Cached detailed state, kept in sync by set_pane_detailed_state.
     detailed_state: std::sync::Mutex<libslop::PaneDetailedState>,
     /// Cancels the transcript tail task when the pane is killed or the tailer is restarted.
@@ -618,6 +679,8 @@ impl PaneState {
             state_update_mutex: Mutex::new(()),
             prompt_submitted: Notify::new(),
             session_bound: Notify::new(),
+            session_started: std::sync::atomic::AtomicBool::new(false),
+            session_started_notify: Notify::new(),
             detailed_state: std::sync::Mutex::new(libslop::PaneDetailedState::BootingUp),
             transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             transcript_path: std::sync::Mutex::new(None),
@@ -658,6 +721,13 @@ impl PaneState {
     fn opencode(&self) -> Option<OpencodeState> {
         match self.runtime() {
             PaneRuntime::Opencode(runtime) => Some(runtime),
+            _ => None,
+        }
+    }
+
+    fn grok(&self) -> Option<GrokState> {
+        match self.runtime() {
+            PaneRuntime::Grok(runtime) => Some(runtime),
             _ => None,
         }
     }
@@ -1264,12 +1334,25 @@ async fn tail_transcript(
     let mut reader = tokio::io::BufReader::new(file);
     let mut line = String::new();
     let mut byte_pos: u64 = 0;
+    let mut grok_event_ids = std::collections::HashSet::new();
+    let mut grok_event_order = std::collections::VecDeque::new();
 
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => {
-                // EOF — wait for more data or cancellation.
+                // EOF — detect truncation/replacement before waiting. Grok's
+                // updates.jsonl is normally append-only, but recovery tools and
+                // interrupted rewrites can replace it; retaining the old file
+                // descriptor would strand the live transcript forever.
+                if pane_state.runtime().backend() == libslop::Backend::Grok
+                    && transcript_needs_reopen(reader.get_ref(), &path, byte_pos).await
+                    && let Ok(file) = tokio::fs::File::open(&path).await
+                {
+                    reader = tokio::io::BufReader::new(file);
+                    byte_pos = 0;
+                    continue;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
@@ -1286,6 +1369,19 @@ async fn tail_transcript(
                 match serde_json::from_str::<serde_json::Value>(trimmed) {
                     Ok(record) => {
                         let backend = pane_state.runtime().backend();
+                        if backend == libslop::Backend::Grok
+                            && let Some(event_id) = grok::event_id(&record)
+                        {
+                            if !grok_event_ids.insert(event_id.clone()) {
+                                continue;
+                            }
+                            grok_event_order.push_back(event_id);
+                            if grok_event_order.len() > 8192
+                                && let Some(expired) = grok_event_order.pop_front()
+                            {
+                                grok_event_ids.remove(&expired);
+                            }
+                        }
                         let record_type = record
                             .get("type")
                             .and_then(|v| v.as_str())
@@ -1337,6 +1433,9 @@ async fn tail_transcript(
                         if backend == libslop::Backend::Codex && codex::prompt_submitted(&record) {
                             pane_state.prompt_submitted.notify_waiters();
                         }
+                        if backend == libslop::Backend::Grok && grok::prompt_submitted(&record) {
+                            pane_state.prompt_submitted.notify_waiters();
+                        }
                         if is_slash_command_record {
                             debug!(
                                 "transcript slash-command: notifying pending senders for pane {}",
@@ -1370,8 +1469,13 @@ async fn tail_transcript(
                             }
                         }
 
-                        if let Some((event_type, payload)) =
-                            decode_transcript_record(backend, &record)
+                        let grok_acp_is_live = backend == libslop::Backend::Grok
+                            && pane_state
+                                .grok()
+                                .is_some_and(|runtime| runtime.acp_connected());
+                        if !grok_acp_is_live
+                            && let Some((event_type, payload)) =
+                                decode_transcript_record(backend, &record)
                         {
                             let _ = event_tx.send(libslop::Record {
                                 source: "transcript".to_string(),
@@ -1392,6 +1496,31 @@ async fn tail_transcript(
                 return;
             }
         }
+    }
+}
+
+async fn transcript_needs_reopen(
+    open_file: &tokio::fs::File,
+    path: &std::path::Path,
+    byte_pos: u64,
+) -> bool {
+    let Ok(open_metadata) = open_file.metadata().await else {
+        return true;
+    };
+    let Ok(path_metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    if path_metadata.len() < byte_pos {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        open_metadata.dev() != path_metadata.dev() || open_metadata.ino() != path_metadata.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -1457,6 +1586,7 @@ fn decode_transcript_record(
             record.clone(),
         )),
         libslop::Backend::Opencode => None,
+        libslop::Backend::Grok => grok::decode_record(record),
     }
 }
 
@@ -1465,6 +1595,34 @@ async fn read_transcript_tail(
     n: u64,
     backend: libslop::Backend,
 ) -> std::io::Result<(Vec<(u64, String, serde_json::Value)>, u64)> {
+    if backend == libslop::Backend::Grok {
+        use tokio::io::AsyncBufReadExt;
+        let file = tokio::fs::File::open(path).await?;
+        let file_len = file.metadata().await?.len();
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut line = String::new();
+        let mut byte_pos = 0_u64;
+        let mut records = Vec::new();
+        while reader.read_line(&mut line).await? != 0 {
+            let offset = byte_pos;
+            byte_pos += line.len() as u64;
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                records.push((offset, raw));
+            }
+            line.clear();
+        }
+        let live = grok::filter_rewind_records(records);
+        let start = live.len().saturating_sub(n as usize);
+        let decoded = live
+            .into_iter()
+            .skip(start)
+            .filter_map(|(offset, raw)| {
+                decode_transcript_record(backend, &raw)
+                    .map(|(event_type, payload)| (offset, event_type, payload))
+            })
+            .collect();
+        return Ok((decoded, file_len));
+    }
     use tokio::io::AsyncBufReadExt;
 
     let file = tokio::fs::File::open(path).await?;
@@ -1501,6 +1659,37 @@ async fn read_transcript_before(
     limit: u64,
     backend: libslop::Backend,
 ) -> std::io::Result<(Vec<(u64, String, serde_json::Value)>, bool)> {
+    if backend == libslop::Backend::Grok {
+        use tokio::io::AsyncBufReadExt;
+        let file = tokio::fs::File::open(path).await?;
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut line = String::new();
+        let mut byte_pos = 0_u64;
+        let mut records = Vec::new();
+        while reader.read_line(&mut line).await? != 0 {
+            let offset = byte_pos;
+            byte_pos += line.len() as u64;
+            if offset >= before_offset {
+                break;
+            }
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                records.push((offset, raw));
+            }
+            line.clear();
+        }
+        let live = grok::filter_rewind_records(records);
+        let at_beginning = live.len() <= limit as usize;
+        let start = live.len().saturating_sub(limit as usize);
+        let decoded = live
+            .into_iter()
+            .skip(start)
+            .filter_map(|(offset, raw)| {
+                decode_transcript_record(backend, &raw)
+                    .map(|(event_type, payload)| (offset, event_type, payload))
+            })
+            .collect();
+        return Ok((decoded, at_beginning));
+    }
     use tokio::io::AsyncBufReadExt;
 
     let file = tokio::fs::File::open(path).await?;
@@ -1736,6 +1925,23 @@ async fn load_managed_panes(
         if !opts.slopd_managed {
             continue;
         }
+        let pane_working_dir = tmux(config)
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{pane_current_path}",
+            ])
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         managed.insert(pane_id.to_string());
 
         // Record where this pane's hooks live so we can re-inject them.
@@ -1769,8 +1975,8 @@ async fn load_managed_panes(
         // Rebuild the identity snapshot from the pane's tmux options so a pane
         // recovered across a daemon restart is just as describable at death as a
         // freshly-spawned one (the death record's only other source, the pane's
-        // options, is gone by the time it dies). working_dir isn't a slopd option
-        // so it stays unset here; a later `ps` fills the title.
+        // options, is gone by the time it dies). The live pane path also gives
+        // reconnecting companion transports such as Grok ACP the same cwd.
         {
             let state = panes.get_or_insert(pane_id);
             let mut id = state.identity.lock().unwrap();
@@ -1782,6 +1988,7 @@ async fn load_managed_panes(
             // block the `parent_pane_id()` method's whole-`self` borrow.
             id.parent_pane_id = opts.ancestor_panes.first().cloned();
             id.created_at = opts.created_at;
+            id.working_dir = Some(pane_working_dir.to_string_lossy().into_owned());
             if let Some(sid) = opts.session_id.as_ref().filter(|s| !s.is_empty()) {
                 id.session_id = Some(sid.clone());
             }
@@ -1808,6 +2015,7 @@ async fn load_managed_panes(
             .recover(RecoverContext {
                 pane_id,
                 options: &opts,
+                working_dir: &pane_working_dir,
                 config,
                 panes,
                 event_tx,
@@ -1831,6 +2039,12 @@ async fn recover_state_from_transcript(
     transcript_path: &str,
     backend: libslop::Backend,
 ) -> Option<libslop::PaneDetailedState> {
+    // Grok's ACP transcript does not contain a terminal idle record. Its hook
+    // state mirrored into tmux is the durable authority across daemon restarts;
+    // replaying only updates would turn every idle session back into busy.
+    if backend == libslop::Backend::Grok {
+        return None;
+    }
     let path = std::path::Path::new(transcript_path);
     let (records, _) = read_raw_transcript_tail(path, 100).await.ok()?;
     if records.is_empty() {
@@ -3428,6 +3642,8 @@ struct ParsedPaneOptions {
     opencode_port: Option<u16>,
     /// For opencode panes: the per-pane auth token (@slopd_opencode_token).
     opencode_token: Option<String>,
+    /// For Grok panes: private leader socket used by the TUI and ACP sidecar.
+    grok_leader_socket: Option<std::path::PathBuf>,
 }
 
 impl ParsedPaneOptions {
@@ -3449,6 +3665,7 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
     let mut backend = None;
     let mut opencode_port = None;
     let mut opencode_token = None;
+    let mut grok_leader_socket = None;
     for opt_line in stdout.lines() {
         let mut words = opt_line.splitn(2, ' ');
         let key = words.next().unwrap_or("").trim();
@@ -3489,6 +3706,7 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
                 "opencode" => Some(libslop::Backend::Opencode),
                 "claude" => Some(libslop::Backend::Claude),
                 "codex" => Some(libslop::Backend::Codex),
+                "grok" => Some(libslop::Backend::Grok),
                 _ => None,
             };
         } else if key == libslop::TmuxOption::SlopdOpencodePort.as_str() {
@@ -3498,6 +3716,12 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
                 None
             } else {
                 Some(val.to_string())
+            };
+        } else if key == libslop::TmuxOption::SlopdGrokLeaderSocket.as_str() {
+            grok_leader_socket = if val.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(val))
             };
         } else if let Some(tag) = key.strip_prefix(libslop::TAG_OPTION_PREFIX) {
             tags.push(tag.to_string());
@@ -3515,6 +3739,7 @@ fn parse_pane_options(stdout: &str) -> ParsedPaneOptions {
         backend,
         opencode_port,
         opencode_token,
+        grok_leader_socket,
     }
 }
 
@@ -3899,29 +4124,12 @@ async fn spawn_pane(
     session_lock: &SessionLock,
     spec: &SpawnSpec,
 ) -> Result<String, String> {
-    // Resolve against the pane's effective PATH (a spec PATH override wins, else
-    // slopd's) and working dir, matching what the spawned pane would see.
-    let lookup_path = spec
-        .extra_env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| std::ffi::OsString::from(v))
-        .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_default();
     let lookup_cwd = spec
         .working_dir
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let program = spec.executable.program();
-    let resolved = libslop::resolve_executable(program, &lookup_path, &lookup_cwd).ok_or_else(|| {
-        format!(
-            "configured executable {:?} not found — check `[run] executable` / account `executable` (or --executable) and slopd's PATH \
-             (systemd user services start with a minimal PATH that omits ~/.local/bin, where `claude` usually lives)",
-            program
-        )
-    })?;
+    let resolved = resolve_spawn_program(&spec.executable, &spec.extra_env, &lookup_cwd)?;
 
     let xdg_runtime_dir = libslop::runtime_dir();
     let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
@@ -4031,6 +4239,30 @@ async fn spawn_pane(
     }
 }
 
+/// Resolve a backend executable against the exact PATH and cwd its pane (or a
+/// companion process such as Grok's ACP sidecar) receives.
+fn resolve_spawn_program(
+    executable: &libslop::Executable,
+    extra_env: &[(String, String)],
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let lookup_path = extra_env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let program = executable.program();
+    libslop::resolve_executable(program, &lookup_path, cwd).ok_or_else(|| {
+        format!(
+            "configured executable {:?} not found — check `[run] executable` / account `executable` (or --executable) and slopd's PATH \
+             (systemd user services start with a minimal PATH that omits ~/.local/bin)",
+            program
+        )
+    })
+}
+
 fn resolve_restore_account(
     config: &libslop::SlopdConfig,
     account: &str,
@@ -4081,7 +4313,8 @@ fn missing_restore_executables(
 }
 
 /// The launch cwd recorded in an agent transcript. Claude stores it at top
-/// level; Codex stores it in the `session_meta` payload.
+/// level, Codex in the `session_meta` payload, and Grok in its native session
+/// update envelope.
 fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(transcript_path).ok()?;
@@ -4095,6 +4328,7 @@ fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
         if let Some(cwd) = value
             .get("cwd")
             .or_else(|| value.pointer("/payload/cwd"))
+            .or_else(|| value.pointer("/params/update/cwd"))
             .and_then(|c| c.as_str())
             && !cwd.is_empty()
         {
@@ -4648,6 +4882,11 @@ async fn handle_request(
 
             let pane_state = panes.get_or_insert(pane);
             let hook_backend = pane_state.runtime().backend();
+            let payload = if hook_backend == libslop::Backend::Grok {
+                grok::normalize_hook_payload(payload)
+            } else {
+                payload
+            };
             let bound_session_id = pane_state.identity.lock().unwrap().session_id.clone();
             if !hook_belongs_to_bound_session(
                 hook_backend,
@@ -4744,6 +4983,11 @@ async fn handle_request(
                     libslop::Backend::Codex => {
                         pane_state.set_runtime(PaneRuntime::Codex(CodexState))
                     }
+                    libslop::Backend::Grok => {
+                        // The runtime may already own a reconnecting ACP driver;
+                        // SessionStart only marks the visible TUI as the leader's
+                        // driver and must not replace/cancel that runtime.
+                    }
                     libslop::Backend::Opencode => {}
                 }
                 // A forked Claude pane pins the (minted) fork session id: real
@@ -4751,9 +4995,12 @@ async fn handle_request(
                 // fork's, so trusting the payload would mis-bind the pane to the
                 // source session. The pin wins when present; otherwise use the
                 // payload id (the normal fresh/resume path).
-                let pinned = (pane_state.runtime().backend() == libslop::Backend::Claude)
-                    .then(|| pane_state.pinned_session_id.lock().unwrap().clone())
-                    .flatten();
+                let pinned = matches!(
+                    pane_state.runtime().backend(),
+                    libslop::Backend::Claude | libslop::Backend::Grok
+                )
+                .then(|| pane_state.pinned_session_id.lock().unwrap().clone())
+                .flatten();
                 let session_id = pinned.or_else(|| {
                     payload
                         .get("session_id")
@@ -4777,6 +5024,10 @@ async fn handle_request(
                         );
                     }
                 }
+                pane_state
+                    .session_started
+                    .store(true, std::sync::atomic::Ordering::Release);
+                pane_state.session_started_notify.notify_waiters();
             }
             if event == "UserPromptSubmit" {
                 debug!(
@@ -4897,28 +5148,15 @@ async fn handle_request(
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 
-                        // Type "continue" into the pane.
-                        let _ = tmux(&config_clone)
-                            .args(["send-keys", "-t", &pane_id, "continue"])
-                            .status()
-                            .await;
-
-                        // Small delay before Enter to ensure the text lands.
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-                        // Send Enter and wait for UserPromptSubmit.
-                        if let Some(pane_obj) = panes_clone.get(&pane_id) {
-                            let _ = tmux(&config_clone)
-                                .args(["send-keys", "-t", &pane_id, "Enter"])
-                                .status()
-                                .await;
-                            let notified = pane_obj.prompt_submitted.notified();
-                            let _ = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(10),
-                                notified,
-                            )
-                            .await;
-                            debug!("StopFailure: auto-continue submitted to pane {}", pane_id);
+                        if panes_clone.get(&pane_id).is_some() {
+                            if submit_auto_continue(&config_clone, &panes_clone, &pane_id).await {
+                                debug!("StopFailure: auto-continue submitted to pane {}", pane_id);
+                            } else {
+                                warn!(
+                                    "StopFailure: auto-continue was not accepted by pane {}",
+                                    pane_id
+                                );
+                            }
                         } else {
                             warn!(
                                 "StopFailure: failed to send auto-continue to pane {} (pane disappeared)",
@@ -5014,7 +5252,10 @@ async fn handle_request(
             // hook (which reports the resumed source id, not the fork's, and would
             // otherwise mis-bind both the session id and the transcript path).
             // opencode tracks its id via the resume path, so it needs no pin.
-            let pin_session_id = if src.backend == libslop::Backend::Claude {
+            let pin_session_id = if matches!(
+                src.backend,
+                libslop::Backend::Claude | libslop::Backend::Grok
+            ) {
                 Some(new_session_id.clone())
             } else {
                 None
@@ -5101,8 +5342,7 @@ async fn handle_request(
                 }
                 Err(message) => return libslop::ResponseBody::Error { message },
             };
-            // Inject hooks into the backend-specific config file the pane reads:
-            // Claude settings.json or Codex hooks.json.
+            // Inject hooks into the backend-specific config file the pane reads.
             if resolved.backend.uses_injected_hooks() {
                 let hook_path = config.resolved_hook_path(&resolved);
                 if let Err(e) = libslop::inject_backend_hooks_into_file(
@@ -5152,6 +5392,12 @@ async fn handle_request(
                 .clone()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let mut trailing = prepared.trailing_args(extra_args, &spawn_cwd);
+            let grok_session_id = match &prepared {
+                PreparedBackendRun::Grok(runtime) if !runtime.session_id.is_empty() => {
+                    Some(runtime.session_id.clone())
+                }
+                _ => None,
+            };
             let spawn_env = merged_env;
             if let Some(port) = prepared.opencode_port() {
                 let mut v = trailing.clone();
@@ -5183,8 +5429,12 @@ async fn handle_request(
                         .and_then(|d| d.to_str().map(str::to_string)),
                     config_dir: resolved.config_dir.clone(),
                     backend: resolved.backend,
-                    executable: resolved.executable.clone(),
-                    extra_env: spawn_env,
+                    executable: if resolved.backend == libslop::Backend::Grok {
+                        normalized_grok_executable(&resolved.executable)
+                    } else {
+                        resolved.executable.clone()
+                    },
+                    extra_env: spawn_env.clone(),
                     trailing_args: trailing,
                 },
             )
@@ -5206,7 +5456,8 @@ async fn handle_request(
                     // resumed source id it reports. Also set @slopd_session_id up front
                     // so `ps` is correct before the first hook arrives. (opencode forks
                     // pass None here.)
-                    if let Some(ref pin) = pin_session_id {
+                    let known_session_id = pin_session_id.as_ref().or(grok_session_id.as_ref());
+                    if let Some(pin) = known_session_id {
                         *panes
                             .get_or_insert(&pane_id)
                             .pinned_session_id
@@ -5267,7 +5518,7 @@ async fn handle_request(
                             .as_ref()
                             .and_then(|d| d.to_str().map(str::to_string));
                         id.created_at = Some(now);
-                        if let Some(ref pin) = pin_session_id {
+                        if let Some(pin) = known_session_id {
                             id.session_id = Some(pin.clone());
                         }
                     }
@@ -5460,6 +5711,69 @@ async fn handle_request(
                                 .await;
                             }
                         }
+                        PreparedBackendRun::Grok(runtime) => {
+                            let _ = tmux_set_pane_option(
+                                config,
+                                &pane_id,
+                                libslop::TmuxOption::SlopdBackend.as_str(),
+                                "grok",
+                            )
+                            .await;
+                            let _ = tmux_set_pane_option(
+                                config,
+                                &pane_id,
+                                libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+                                runtime.leader_socket.to_string_lossy().as_ref(),
+                            )
+                            .await;
+                            if !runtime.session_id.is_empty() {
+                                panes
+                                    .get_or_insert(&pane_id)
+                                    .note_session_id(&runtime.session_id);
+                                let _ = tmux_set_pane_option(
+                                    config,
+                                    &pane_id,
+                                    libslop::TmuxOption::SlopdSessionId.as_str(),
+                                    &runtime.session_id,
+                                )
+                                .await;
+                            }
+                            let executable_spec = normalized_grok_executable(&resolved.executable);
+                            let executable = match resolve_spawn_program(
+                                &executable_spec,
+                                &spawn_env,
+                                &spawn_cwd,
+                            ) {
+                                Ok(executable) => executable,
+                                Err(message) => {
+                                    warn!("cannot attach Grok ACP sidecar: {}", message);
+                                    std::path::PathBuf::from(resolved.executable.program())
+                                }
+                            };
+                            let attach = grok::AttachSpec {
+                                executable,
+                                executable_args: executable_spec.args().to_vec(),
+                                leader_socket: runtime.leader_socket,
+                                session_id: runtime.session_id,
+                                cwd: spawn_cwd,
+                                config_dir: resolved.config_dir.clone(),
+                                env: spawn_env,
+                            };
+                            let cancel = tokio_util::sync::CancellationToken::new();
+                            let grok_runtime = GrokState::new(cancel);
+                            let pane_state = panes.get_or_insert(&pane_id);
+                            pane_state.set_runtime(PaneRuntime::Grok(grok_runtime.clone()));
+                            tokio::spawn(grok::run_driver(
+                                attach,
+                                pane_id.clone(),
+                                grok_runtime,
+                                pane_state,
+                                panes.clone(),
+                                config.clone(),
+                                event_tx.clone(),
+                                true,
+                            ));
+                        }
                         PreparedBackendRun::Claude => {
                             panes
                                 .get_or_insert(&pane_id)
@@ -5580,18 +5894,19 @@ async fn handle_request(
                 };
             }
             let settle_before_enter = matches!(
-                send_transport,
+                &send_transport,
                 SendTransport::Tui {
                     settle_before_enter: true
-                }
+                } | SendTransport::Grok(_)
             );
+            let backend_name = state.runtime().backend().canonical_executable();
 
             // OpenCode lifecycle and composer insertion use its embedded HTTP
             // server, but submission is a real Enter in the pane. This is one
             // generic path for every input: OpenCode's own TUI decides whether
             // it is a normal prompt, built-in slash command, configured command,
             // or anything added in a future release.
-            if let SendTransport::Opencode(oc) = send_transport {
+            if let SendTransport::Opencode(oc) = &send_transport {
                 if interrupt && let Err(e) = oc.client.abort(&oc.session_id).await {
                     warn!("opencode abort failed for pane {}: {}", pane_id, e);
                 }
@@ -5667,6 +5982,89 @@ async fn handle_request(
                         }
                     }
                 };
+            }
+
+            if let SendTransport::Grok(grok_runtime) = &send_transport
+                && let Some(client) = grok_runtime
+                    .client()
+                    .filter(|client| !client.is_disconnected())
+            {
+                if interrupt && let Err(message) = client.interrupt().await {
+                    warn!("Grok ACP cancel failed for pane {}: {}", pane_id, message);
+                }
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                loop {
+                    let current_state = state.detailed_state.lock().unwrap().clone();
+                    match current_state {
+                        libslop::PaneDetailedState::BootingUp => {
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            if remaining.is_zero() {
+                                return libslop::ResponseBody::Error {
+                                    message: format!(
+                                        "timed out after {}s waiting for Grok pane {} to become ready",
+                                        timeout_secs, pane_id
+                                    ),
+                                };
+                            }
+                            tokio::time::sleep(
+                                remaining.min(std::time::Duration::from_millis(200)),
+                            )
+                            .await;
+                        }
+                        libslop::PaneDetailedState::AwaitingInputPermission
+                        | libslop::PaneDetailedState::AwaitingInputElicitation => {
+                            return libslop::ResponseBody::Error {
+                                message: format!(
+                                    "pane {} cannot accept a prompt (state: {}); use --interrupt to preempt",
+                                    pane_id,
+                                    current_state.as_str()
+                                ),
+                            };
+                        }
+                        _ => break,
+                    }
+                }
+
+                let _guard = state.type_mutex.lock().await;
+                *state.retry_state.lock().unwrap() = None;
+                let submitted = state.prompt_submitted.notified();
+                let response = match client.prompt(&prompt).await {
+                    Ok(response) => Some(response),
+                    Err(message) => {
+                        debug!(
+                            "Grok ACP prompt transport failed for pane {}; using tmux fallback: {}",
+                            pane_id, message
+                        );
+                        None
+                    }
+                };
+                if let Some(response) = response {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    return match tokio::time::timeout(remaining, async {
+                        tokio::select! {
+                            _ = submitted => Ok(()),
+                            response = response => {
+                                response
+                                    .map_err(|_| "Grok ACP response waiter closed".to_string())?
+                                    .map(|_| ())
+                            }
+                        }
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => libslop::ResponseBody::Sent { pane_id },
+                        Ok(Err(message)) => libslop::ResponseBody::Error { message },
+                        Err(_) => libslop::ResponseBody::Error {
+                            message: format!(
+                                "timed out after {}s waiting for Grok to accept prompt on pane {}",
+                                timeout_secs, pane_id
+                            ),
+                        },
+                    };
+                }
+                drop(_guard);
             }
 
             let deadline =
@@ -5772,13 +6170,10 @@ async fn handle_request(
                 };
             }
 
-            // Codex detects a rapid tmux send-keys stream as a non-bracketed
-            // paste burst. Its composer intentionally consumes Enter as a
-            // newline while that burst is active, which can leave a Buzz
-            // prompt sitting unsubmitted forever. Use tmux's bracketed-paste
-            // path so Codex receives one explicit Paste event and clears that
-            // suppression state before the following Enter. Claude retains
-            // the historical literal-key path.
+            // Codex and Grok are both sensitive to rapid literal key streams.
+            // Use tmux's bracketed-paste path so each TUI receives one explicit
+            // paste event before the following Enter. Claude retains the
+            // historical literal-key path.
             let result = if settle_before_enter {
                 tmux_paste_text(config, &pane_id, &prompt).await
             } else {
@@ -5798,7 +6193,7 @@ async fn handle_request(
                 }
                 Ok(_) => {
                     // A successful paste is not a successful submission. Wait
-                    // for Codex's UserPromptSubmit/task_started signal and
+                    // for the backend's UserPromptSubmit/task_started signal and
                     // report an error if it never arrives; returning Sent for
                     // an unconfirmed draft strands the ACP turn indefinitely.
                     // Repeated empty Enters are harmless after acceptance and
@@ -5831,8 +6226,8 @@ async fn handle_request(
                             if remaining.is_zero() {
                                 return libslop::ResponseBody::Error {
                                     message: format!(
-                                        "timed out after {}s waiting for Codex to submit prompt on pane {}",
-                                        timeout_secs, pane_id
+                                        "timed out after {}s waiting for {} to submit prompt on pane {}",
+                                        timeout_secs, backend_name, pane_id
                                     ),
                                 };
                             }
@@ -5906,7 +6301,10 @@ async fn handle_request(
             // Acquire the type-mutex so we don't interleave with concurrent sends.
             let _guard = state.type_mutex.lock().await;
 
-            if state.runtime().backend() == libslop::Backend::Codex {
+            if matches!(
+                state.runtime().backend(),
+                libslop::Backend::Codex | libslop::Backend::Grok
+            ) {
                 // Ctrl-D exits the standalone Codex CLI, so the generic
                 // Claude sequence (Ctrl-C, Ctrl-D, Escape) destroys the pane.
                 // Escape is Codex's native in-turn cancel key and is harmless
@@ -6585,6 +6983,87 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--remote"));
+    }
+
+    #[test]
+    fn prepared_grok_run_forces_private_leader_without_clobbering_session_flags() {
+        let prepared = PreparedBackendRun::Grok(PreparedGrokRun {
+            session_id: "new-session".to_string(),
+            leader_socket: std::path::PathBuf::from("/run/user/1000/grok.sock"),
+        });
+        let args = prepared.trailing_args(
+            vec![
+                "--no-leader".to_string(),
+                "--leader-socket=/tmp/stale.sock".to_string(),
+                "--resume".to_string(),
+                "source-session".to_string(),
+                "--fork-session".to_string(),
+                "--session-id".to_string(),
+                "new-session".to_string(),
+            ],
+            std::path::Path::new("/work"),
+        );
+        assert_eq!(
+            &args[..4],
+            [
+                "--leader",
+                "--leader-socket",
+                "/run/user/1000/grok.sock",
+                "--no-alt-screen",
+            ]
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--resume", "source-session"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--session-id", "new-session"])
+        );
+        assert!(!args.iter().any(|argument| argument == "--no-leader"));
+        assert!(!args.iter().any(|argument| argument.contains("stale.sock")));
+
+        let executable = normalized_grok_executable(&libslop::Executable::Array(vec![
+            "/opt/grok-wrapper".to_string(),
+            "--model".to_string(),
+            "grok-code-fast-1".to_string(),
+            "--leader-socket=/tmp/configured.sock".to_string(),
+            "--no-leader".to_string(),
+        ]));
+        assert_eq!(executable.program(), "/opt/grok-wrapper");
+        assert_eq!(
+            executable.args(),
+            &["--model".to_string(), "grok-code-fast-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn grok_hook_states_cover_native_cancellation_and_permission_notification() {
+        assert_eq!(
+            reduce_hook_event("StopCancelled", None),
+            Some(libslop::PaneDetailedState::Ready)
+        );
+        assert_eq!(
+            reduce_hook_event("PermissionDenied", None),
+            Some(libslop::PaneDetailedState::BusyProcessing)
+        );
+        assert_eq!(
+            reduce_hook_event("Notification", Some("permission_prompt")),
+            Some(libslop::PaneDetailedState::AwaitingInputPermission)
+        );
+    }
+
+    #[test]
+    fn parsed_pane_options_recover_grok_transport_metadata() {
+        let parsed = parse_pane_options(
+            "@slopd_managed true\n@slopd_backend grok\n@slopd_session_id s1\n@slopd_grok_leader_socket /tmp/grok.sock\n",
+        );
+        assert_eq!(parsed.backend, Some(libslop::Backend::Grok));
+        assert_eq!(parsed.session_id.as_deref(), Some("s1"));
+        assert_eq!(
+            parsed.grok_leader_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/grok.sock"))
+        );
     }
 
     #[test]

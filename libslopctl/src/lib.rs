@@ -75,7 +75,7 @@ pub enum CommonCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Open a new Claude pane in the slopd tmux session.
+    /// Open a new agent pane in the slopd tmux session.
     Run {
         /// Working directory for the new pane. A relative path (e.g. `.`) is
         /// resolved against slopctl's current directory (local slopctl only; over
@@ -104,7 +104,7 @@ pub enum CommonCommand {
         /// back to slopd's default_account.
         #[arg(short = 'a', long, value_name = "NAME")]
         account: Option<String>,
-        /// Override the pane's agent backend — `claude`, `opencode`, or `codex`. By default
+        /// Override the pane's agent backend — `claude`, `opencode`, `codex`, or `grok`. By default
         /// the account's resolved backend is used. An explicit override wins: the
         /// executable is kept if it already matches or is a custom path, else
         /// swapped to the backend's canonical binary. Handy for `slopctl run
@@ -130,7 +130,7 @@ pub enum CommonCommand {
         /// and the exit code is non-zero. Ignored with --no-wait.
         #[arg(long, default_value = "30", value_name = "SECS")]
         ready_timeout: u64,
-        /// Extra arguments passed to the Claude executable (after --).
+        /// Extra arguments passed to the agent executable (after --).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -169,7 +169,7 @@ pub enum CommonCommand {
         #[arg(last = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
-    /// Terminate a Claude pane.
+    /// Terminate a managed agent pane.
     Kill {
         /// Tmux pane ID (e.g. %42).
         pane_id: String,
@@ -211,10 +211,10 @@ pub enum CommonCommand {
         transcripts: Vec<String>,
         /// Only receive events from this tmux pane. Must be a tmux pane id
         /// (e.g. %42); a UUID-shaped value is rejected with a hint pointing
-        /// at --session-id (use that flag for Claude session UUIDs).
+        /// at --session-id (use that flag for backend session UUIDs).
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
-        /// Only receive events from this Claude session.
+        /// Only receive events from this backend session.
         #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
         /// Server-side payload predicate(s) of the form KEY=VALUE (repeatable, AND).
@@ -245,10 +245,10 @@ pub enum CommonCommand {
         transcripts: Vec<String>,
         /// Only receive events from this tmux pane. Must be a tmux pane id
         /// (e.g. %42); a UUID-shaped value is rejected with a hint pointing
-        /// at --session-id (use that flag for Claude session UUIDs).
+        /// at --session-id (use that flag for backend session UUIDs).
         #[arg(long, value_name = "PANE_ID")]
         pane_id: Option<String>,
-        /// Only receive events from this Claude session.
+        /// Only receive events from this backend session.
         #[arg(long, value_name = "SESSION_ID")]
         session_id: Option<String>,
         /// Server-side payload predicate(s) (same syntax as --until; leading
@@ -439,7 +439,7 @@ pub fn apply_filters(
             filters.iter().all(|(key, value)| {
                 match key.as_str() {
                     "tag" => pane.tags.iter().any(|t| t == value),
-                    // Match the backend by its canonical binary name (claude/opencode).
+                    // Match the backend by its canonical binary name.
                     "backend" => pane.backend.canonical_executable() == value,
                     "account" => pane.account == *value,
                     _ => false,
@@ -492,7 +492,7 @@ pub fn validate_command_filters(command: &CommonCommand) -> Result<(), Error> {
 }
 
 /// Return true for strings shaped like a UUID (8-4-4-4-12 hex digits). Used to
-/// detect when a caller has passed a Claude session UUID to `--pane-id` so we
+/// detect when a caller has passed a backend session UUID to `--pane-id` so we
 /// can point them at `--session-id` instead of silently subscribing to nothing.
 fn looks_like_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
@@ -519,14 +519,14 @@ fn validate_pane_id_arg(arg: &str) -> Result<(), Error> {
     }
     if looks_like_uuid(arg) {
         return Err(Error::FilterError(format!(
-            "--pane-id {:?} looks like a Claude session UUID; use --session-id for UUIDs \
+            "--pane-id {:?} looks like a backend session UUID; use --session-id for UUIDs \
              (`--pane-id` is for tmux pane ids like %42)",
             arg
         )));
     }
     Err(Error::FilterError(format!(
         "--pane-id {:?} is not a tmux pane id (expected `%<digits>`, e.g. %42); \
-         use --session-id for a Claude session UUID",
+         use --session-id for a backend session UUID",
         arg
     )))
 }
@@ -2269,9 +2269,11 @@ where
             let backend = match backend.as_deref() {
                 Some("claude") => Some(libslop::Backend::Claude),
                 Some("opencode") => Some(libslop::Backend::Opencode),
+                Some("codex") => Some(libslop::Backend::Codex),
+                Some("grok") => Some(libslop::Backend::Grok),
                 Some(other) => {
                     return Err(Error::RunFailed(format!(
-                        "invalid --backend {other:?}: expected \"claude\" or \"opencode\""
+                        "invalid --backend {other:?}: expected \"claude\", \"opencode\", \"codex\", or \"grok\""
                     )));
                 }
                 None => None,

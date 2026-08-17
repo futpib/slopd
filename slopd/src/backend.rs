@@ -35,6 +35,44 @@ pub(super) struct CodexState;
 pub(super) struct ClaudeState;
 
 #[derive(Clone)]
+pub(super) struct GrokState {
+    pub(super) client: Arc<std::sync::Mutex<Option<grok::GrokClient>>>,
+    pub(super) cancel: tokio_util::sync::CancellationToken,
+}
+
+impl GrokState {
+    pub(super) fn new(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            client: Arc::new(std::sync::Mutex::new(None)),
+            cancel,
+        }
+    }
+
+    pub(super) fn client(&self) -> Option<grok::GrokClient> {
+        self.client.lock().unwrap().clone()
+    }
+
+    pub(super) fn set_client(&self, client: Option<grok::GrokClient>) {
+        *self.client.lock().unwrap() = client;
+    }
+
+    pub(super) fn clear_client(&self, disconnected: &grok::GrokClient) {
+        let mut client = self.client.lock().unwrap();
+        if client
+            .as_ref()
+            .is_some_and(|current| current.same_connection(disconnected))
+        {
+            *client = None;
+        }
+    }
+
+    pub(super) fn acp_connected(&self) -> bool {
+        self.client()
+            .is_some_and(|client| !client.is_disconnected())
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct UnboundState {
     pub(super) backend: libslop::Backend,
 }
@@ -45,6 +83,7 @@ pub(super) enum PaneRuntime {
     Claude(ClaudeState),
     Opencode(OpencodeState),
     Codex(CodexState),
+    Grok(GrokState),
 }
 
 impl Default for PaneRuntime {
@@ -70,6 +109,7 @@ pub(super) enum SendTransport {
     Unavailable(libslop::Backend),
     Tui { settle_before_enter: bool },
     Opencode(OpencodeState),
+    Grok(GrokState),
 }
 
 impl BackendRuntime for UnboundState {
@@ -177,6 +217,37 @@ impl BackendRuntime for CodexState {
     }
 }
 
+impl BackendRuntime for GrokState {
+    fn backend(&self) -> libslop::Backend {
+        libslop::Backend::Grok
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+        if let Some(client) = self.client() {
+            client.stop();
+        }
+    }
+
+    fn send_transport(&self) -> SendTransport {
+        SendTransport::Grok(self.clone())
+    }
+
+    async fn interrupt(&self) -> Option<Result<(), String>> {
+        let client = self.client().filter(|client| !client.is_disconnected())?;
+        let result = client.interrupt().await;
+        if result.is_err() && client.is_disconnected() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    async fn transcript(&self, _pane_id: &str) -> Option<Result<Vec<libslop::Record>, String>> {
+        None
+    }
+}
+
 impl BackendRuntime for PaneRuntime {
     fn backend(&self) -> libslop::Backend {
         match self {
@@ -184,6 +255,7 @@ impl BackendRuntime for PaneRuntime {
             Self::Claude(runtime) => runtime.backend(),
             Self::Opencode(runtime) => runtime.backend(),
             Self::Codex(runtime) => runtime.backend(),
+            Self::Grok(runtime) => runtime.backend(),
         }
     }
 
@@ -193,6 +265,7 @@ impl BackendRuntime for PaneRuntime {
             Self::Claude(runtime) => runtime.cancel(),
             Self::Opencode(runtime) => runtime.cancel(),
             Self::Codex(runtime) => runtime.cancel(),
+            Self::Grok(runtime) => runtime.cancel(),
         }
     }
 
@@ -202,6 +275,7 @@ impl BackendRuntime for PaneRuntime {
             Self::Claude(runtime) => runtime.send_transport(),
             Self::Opencode(runtime) => runtime.send_transport(),
             Self::Codex(runtime) => runtime.send_transport(),
+            Self::Grok(runtime) => runtime.send_transport(),
         }
     }
 
@@ -211,6 +285,7 @@ impl BackendRuntime for PaneRuntime {
             Self::Claude(runtime) => runtime.interrupt().await,
             Self::Opencode(runtime) => runtime.interrupt().await,
             Self::Codex(runtime) => runtime.interrupt().await,
+            Self::Grok(runtime) => runtime.interrupt().await,
         }
     }
 
@@ -220,6 +295,7 @@ impl BackendRuntime for PaneRuntime {
             Self::Claude(runtime) => runtime.transcript(pane_id).await,
             Self::Opencode(runtime) => runtime.transcript(pane_id).await,
             Self::Codex(runtime) => runtime.transcript(pane_id).await,
+            Self::Grok(runtime) => runtime.transcript(pane_id).await,
         }
     }
 }
@@ -238,6 +314,11 @@ pub(super) struct PreparedCodexRun {
     pub(super) resume_session: Option<String>,
 }
 
+pub(super) struct PreparedGrokRun {
+    pub(super) session_id: String,
+    pub(super) leader_socket: std::path::PathBuf,
+}
+
 pub(super) enum PreparedBackendRun {
     Claude,
     Opencode {
@@ -245,6 +326,7 @@ pub(super) enum PreparedBackendRun {
         resume_session: Option<String>,
     },
     Codex(PreparedCodexRun),
+    Grok(PreparedGrokRun),
 }
 
 impl PreparedBackendRun {
@@ -276,6 +358,25 @@ impl PreparedBackendRun {
                 trailing.splice(0..0, prefix);
                 trailing
             }
+            Self::Grok(runtime) => {
+                let mut trailing = strip_grok_transport_flags(extra_args);
+                let has_session_id = extract_grok_session_id(&trailing).is_some();
+                let has_resume = extract_grok_resume_target(&trailing).is_some()
+                    || trailing
+                        .iter()
+                        .any(|arg| arg == "--continue" || arg == "-c");
+                let mut prefix = vec![
+                    "--leader".to_string(),
+                    "--leader-socket".to_string(),
+                    runtime.leader_socket.to_string_lossy().into_owned(),
+                    "--no-alt-screen".to_string(),
+                ];
+                if !has_session_id && !has_resume {
+                    prefix.extend(["--session-id".to_string(), runtime.session_id.clone()]);
+                }
+                trailing.splice(0..0, prefix);
+                trailing
+            }
         }
     }
 
@@ -301,6 +402,7 @@ pub(super) struct ForkContext<'a> {
 pub(super) struct RecoverContext<'a> {
     pub(super) pane_id: &'a str,
     pub(super) options: &'a ParsedPaneOptions,
+    pub(super) working_dir: &'a std::path::Path,
     pub(super) config: &'a Arc<libslop::SlopdConfig>,
     pub(super) panes: &'a PaneMap,
     pub(super) event_tx: &'a EventTx,
@@ -333,17 +435,109 @@ pub(super) trait BackendLifecycle: Sync {
 struct ClaudeBackend;
 struct OpencodeBackend;
 struct CodexBackend;
+struct GrokBackend;
 
 static CLAUDE_BACKEND: ClaudeBackend = ClaudeBackend;
 static OPENCODE_BACKEND: OpencodeBackend = OpencodeBackend;
 static CODEX_BACKEND: CodexBackend = CodexBackend;
+static GROK_BACKEND: GrokBackend = GrokBackend;
 
 pub(super) fn backend_lifecycle(backend: libslop::Backend) -> &'static dyn BackendLifecycle {
     match backend {
         libslop::Backend::Claude => &CLAUDE_BACKEND,
         libslop::Backend::Opencode => &OPENCODE_BACKEND,
         libslop::Backend::Codex => &CODEX_BACKEND,
+        libslop::Backend::Grok => &GROK_BACKEND,
     }
+}
+
+fn extract_grok_resume_target(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--resume" | "-r" => {
+                if let Some(value) = args.next()
+                    && !value.starts_with('-')
+                {
+                    return Some(value.clone());
+                }
+            }
+            other => {
+                for prefix in ["--resume=", "-r="] {
+                    if let Some(value) = other.strip_prefix(prefix) {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_grok_session_id(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--session-id" | "-s" => {
+                if let Some(value) = args.next()
+                    && !value.starts_with('-')
+                {
+                    return Some(value.clone());
+                }
+            }
+            other => {
+                for prefix in ["--session-id=", "-s="] {
+                    if let Some(value) = other.strip_prefix(prefix) {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn strip_grok_transport_flags(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--leader" | "--no-leader" => {}
+            "--leader-socket" => {
+                let _ = args.next();
+            }
+            other if other.starts_with("--leader-socket=") => {}
+            _ => out.push(argument),
+        }
+    }
+    out
+}
+
+/// Grok's leader transport belongs to slopd, even when an account's executable
+/// array contains its own transport flags. Preserve every ordinary global flag
+/// while replacing leader selection/socket arguments with the pane-private
+/// values prepared for this launch.
+pub(super) fn normalized_grok_executable(executable: &libslop::Executable) -> libslop::Executable {
+    let arguments = strip_grok_transport_flags(executable.args().to_vec());
+    if arguments.is_empty() {
+        libslop::Executable::String(executable.program().to_string())
+    } else {
+        let mut command = Vec::with_capacity(arguments.len() + 1);
+        command.push(executable.program().to_string());
+        command.extend(arguments);
+        libslop::Executable::Array(command)
+    }
+}
+
+fn new_grok_leader_socket() -> Result<std::path::PathBuf, String> {
+    let directory = libslop::runtime_dir().join("slopd").join("grok-leaders");
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "failed to create Grok leader directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory.join(format!("{}.sock", uuid::Uuid::new_v4())))
 }
 
 #[async_trait::async_trait]
@@ -639,6 +833,213 @@ impl BackendLifecycle for CodexBackend {
             .panes
             .get_or_insert(&id)
             .set_runtime(PaneRuntime::Codex(CodexState));
+        Ok(id)
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendLifecycle for GrokBackend {
+    async fn prepare_run(
+        &self,
+        context: PrepareRunContext<'_>,
+    ) -> Result<PreparedBackendRun, String> {
+        let resume_session = extract_grok_resume_target(context.extra_args);
+        let continues_latest = context
+            .extra_args
+            .iter()
+            .any(|argument| argument == "--continue" || argument == "-c");
+        let session_id = extract_grok_session_id(context.extra_args)
+            .or_else(|| {
+                (!context.extra_args.iter().any(|arg| arg == "--fork-session"))
+                    .then(|| resume_session.clone())
+                    .flatten()
+            })
+            .unwrap_or_else(|| {
+                if continues_latest {
+                    String::new()
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                }
+            });
+        Ok(PreparedBackendRun::Grok(PreparedGrokRun {
+            session_id,
+            leader_socket: new_grok_leader_socket()?,
+        }))
+    }
+
+    async fn fork(&self, context: ForkContext<'_>) -> Result<(Vec<String>, String), String> {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let mut args = vec![
+            "--resume".to_string(),
+            context.session_id.to_string(),
+            "--fork-session".to_string(),
+            "--session-id".to_string(),
+            new_id.clone(),
+        ];
+        args.extend(context.extra_args);
+        Ok((args, new_id))
+    }
+
+    async fn recover(&self, context: RecoverContext<'_>) -> Result<(), String> {
+        let session_id = context
+            .options
+            .session_id
+            .as_ref()
+            .filter(|session| !session.is_empty())
+            .ok_or_else(|| format!("Grok pane {} has no recorded session id", context.pane_id))?
+            .clone();
+        let leader_socket = context
+            .options
+            .grok_leader_socket
+            .as_ref()
+            .ok_or_else(|| {
+                format!(
+                    "Grok pane {} has no recorded leader socket",
+                    context.pane_id
+                )
+            })?
+            .clone();
+        let mut resolved = context
+            .config
+            .resolve_account(context.options.account.as_deref())
+            .or_else(|_| {
+                context
+                    .config
+                    .resolve_account(Some(libslop::DEFAULT_ACCOUNT))
+            })?;
+        if resolved.backend != libslop::Backend::Grok {
+            resolved.backend = libslop::Backend::Grok;
+            if libslop::Backend::infer_from_program(resolved.executable.program()).is_some() {
+                resolved.executable = libslop::Executable::String("grok".to_string());
+            }
+        }
+        let cwd = context
+            .options
+            .transcript_path
+            .as_deref()
+            .and_then(transcript_launch_cwd)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| context.working_dir.to_path_buf());
+        let env = merge_spawn_env(context.config, Vec::new())?;
+        let executable_spec = normalized_grok_executable(&resolved.executable);
+        let executable = resolve_spawn_program(&executable_spec, &env, &cwd)?;
+        let attach = grok::AttachSpec {
+            executable,
+            executable_args: executable_spec.args().to_vec(),
+            leader_socket,
+            session_id,
+            cwd,
+            config_dir: resolved.config_dir,
+            env,
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let runtime = GrokState::new(cancel);
+        let pane_state = context.panes.get_or_insert(context.pane_id);
+        pane_state.set_runtime(PaneRuntime::Grok(runtime.clone()));
+        tokio::spawn(grok::run_driver(
+            attach,
+            context.pane_id.to_string(),
+            runtime,
+            pane_state,
+            context.panes.clone(),
+            context.config.clone(),
+            context.event_tx.clone(),
+            false,
+        ));
+        Ok(())
+    }
+
+    async fn restore(&self, context: RestoreContext<'_>) -> Result<String, String> {
+        let hook_path = context.config.resolved_hook_path(context.resolved);
+        if let Err(error) = libslop::inject_backend_hooks_into_file(
+            &hook_path,
+            &context.config.hook_slopctl(),
+            libslop::Backend::Grok,
+        ) {
+            warn!(
+                "failed to inject Grok hooks into {}: {}",
+                hook_path.display(),
+                error
+            );
+        }
+        let launch_dir = context
+            .transcript_path
+            .as_deref()
+            .and_then(transcript_launch_cwd)
+            .or_else(|| context.working_dir.clone());
+        let cwd = launch_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let leader_socket = new_grok_leader_socket()?;
+        let trailing_args = vec![
+            "--leader".to_string(),
+            "--leader-socket".to_string(),
+            leader_socket.to_string_lossy().into_owned(),
+            "--no-alt-screen".to_string(),
+            "--resume".to_string(),
+            context.session_id.to_string(),
+        ];
+        let id = spawn_pane(
+            context.config,
+            context.session_lock,
+            &SpawnSpec {
+                working_dir: launch_dir,
+                config_dir: context.resolved.config_dir.clone(),
+                backend: libslop::Backend::Grok,
+                executable: normalized_grok_executable(&context.resolved.executable),
+                extra_env: context.extra_env.to_vec(),
+                trailing_args,
+            },
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to restore Grok pane {} (session {}): {}",
+                context.old_pane_id, context.session_id, error
+            )
+        })?;
+        let _ = tmux_set_pane_option(
+            context.config,
+            &id,
+            libslop::TmuxOption::SlopdBackend.as_str(),
+            "grok",
+        )
+        .await;
+        let _ = tmux_set_pane_option(
+            context.config,
+            &id,
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+            leader_socket.to_string_lossy().as_ref(),
+        )
+        .await;
+        let env = merge_spawn_env(context.config, context.extra_env.to_vec())?;
+        let executable_spec = normalized_grok_executable(&context.resolved.executable);
+        let executable = resolve_spawn_program(&executable_spec, &env, &cwd)?;
+        let attach = grok::AttachSpec {
+            executable,
+            executable_args: executable_spec.args().to_vec(),
+            leader_socket,
+            session_id: context.session_id.to_string(),
+            cwd,
+            config_dir: context.resolved.config_dir.clone(),
+            env,
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let runtime = GrokState::new(cancel);
+        let pane_state = context.panes.get_or_insert(&id);
+        pane_state.note_session_id(context.session_id);
+        pane_state.set_runtime(PaneRuntime::Grok(runtime.clone()));
+        tokio::spawn(grok::run_driver(
+            attach,
+            id.clone(),
+            runtime,
+            pane_state,
+            context.panes.clone(),
+            context.config.clone(),
+            context.event_tx.clone(),
+            true,
+        ));
         Ok(id)
     }
 }

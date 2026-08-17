@@ -147,7 +147,7 @@ pub fn expand_path(path: &std::path::Path) -> PathBuf {
 /// PATH-style value) and resolving relative names against `cwd` — mirroring how
 /// a spawned pane looks it up. `None` if it can't be found.
 ///
-/// slopd spawns Claude panes with this *absolute* path rather than the bare
+/// slopd spawns agent panes with this *absolute* path rather than the bare
 /// program name, so a pane never depends on its own inherited PATH to locate
 /// the executable. That is what made restore silently fail after a reboot:
 /// systemd user services start with a minimal PATH that omits `~/.local/bin`
@@ -215,7 +215,7 @@ pub fn load_env_file(path: &std::path::Path) -> Result<Vec<(String, String)>, St
 pub enum TmuxOption {
     /// Marks the slopd-managed tmux session; value is "true"
     SlopdManaged,
-    /// Stores the Claude session ID on a pane
+    /// Stores the backend session ID on a pane.
     SlopdSessionId,
     /// Comma-separated ancestor pane IDs (immediate parent first, then grandparent, etc.)
     SlopdAncestorPanes,
@@ -230,12 +230,15 @@ pub enum TmuxOption {
     /// Stores the account name the pane was launched under (empty/unset for the
     /// unnamed default account). Used to re-inject the right hooks on recovery.
     SlopdAccount,
-    /// Stores the pane's agent backend (`claude` / `opencode`); unset = claude.
+    /// Stores the pane's agent backend; unset = claude.
     SlopdBackend,
     /// For opencode panes: the embedded HTTP server port slopd drives the pane over.
     SlopdOpencodePort,
     /// For opencode panes: the per-pane basic-auth token for that server.
     SlopdOpencodeToken,
+    /// For Grok panes: the private leader socket shared by the visible TUI and
+    /// slopd's ACP sidecar.
+    SlopdGrokLeaderSocket,
 }
 
 impl TmuxOption {
@@ -252,6 +255,7 @@ impl TmuxOption {
             TmuxOption::SlopdBackend => "@slopd_backend",
             TmuxOption::SlopdOpencodePort => "@slopd_opencode_port",
             TmuxOption::SlopdOpencodeToken => "@slopd_opencode_token",
+            TmuxOption::SlopdGrokLeaderSocket => "@slopd_grok_leader_socket",
         }
     }
 }
@@ -318,7 +322,28 @@ pub const CODEX_HOOK_EVENTS: &[&str] = &[
     "Stop",
 ];
 
-/// Idempotently inject slopctl hook entries into a Claude settings.json value.
+/// Hook events emitted by Grok Build. Grok accepts Claude-compatible hook JSON,
+/// but its event vocabulary differs in several important places: cancellation
+/// is distinct from a successful stop, and denied permissions are observable.
+pub const GROK_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PermissionDenied",
+    "Stop",
+    "StopFailure",
+    "StopCancelled",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "SessionEnd",
+];
+
+/// Idempotently inject slopctl hook entries into a hook configuration value.
 /// Adds our hook command for each event only if not already present.
 pub fn inject_hooks(settings: &mut serde_json::Value, slopctl: &str) {
     inject_hook_events(settings, slopctl, HOOK_EVENTS);
@@ -404,7 +429,7 @@ fn inject_hook_events(settings: &mut serde_json::Value, slopctl: &str, hook_even
     }
 }
 
-/// Remove all slopctl hook entries from a Claude settings.json value.
+/// Remove all slopctl hook entries from a hook configuration value.
 /// Entries from other tools are preserved.
 pub fn remove_hooks(settings: &mut serde_json::Value) {
     remove_hook_events(settings, HOOK_EVENTS);
@@ -1353,6 +1378,9 @@ mod tests {
 
             [accounts.opencode]
             backend = "opencode"
+
+            [accounts.grok]
+            backend = "grok"
         "#;
         let mut cfg = config_from_toml(config);
 
@@ -1360,6 +1388,7 @@ mod tests {
             ("codex", Backend::Codex),
             ("claude", Backend::Claude),
             ("opencode", Backend::Opencode),
+            ("grok", Backend::Grok),
         ] {
             cfg.default_account = Some(name.to_string());
             let resolved = cfg.resolve_account(None).unwrap();
@@ -1623,6 +1652,10 @@ mod tests {
             Some(Backend::Codex)
         );
         assert_eq!(
+            Backend::infer_from_program("/usr/bin/grok"),
+            Some(Backend::Grok)
+        );
+        assert_eq!(
             Backend::infer_from_program("opencode.exe"),
             Some(Backend::Opencode)
         );
@@ -1653,6 +1686,42 @@ mod tests {
             cfg.resolved_hook_path(&resolved),
             PathBuf::from("/tmp/codex-work/hooks.json")
         );
+    }
+
+    #[test]
+    fn backend_explicit_grok_defaults_and_uses_grok_home() {
+        let cfg: SlopdConfig = toml::from_str(
+            r#"
+            [accounts.work]
+            backend = "grok"
+            config_dir = "/tmp/grok-work"
+        "#,
+        )
+        .unwrap();
+        let resolved = cfg.resolve_account(Some("work")).unwrap();
+        assert_eq!(resolved.backend, Backend::Grok);
+        assert_eq!(resolved.executable.program(), "grok");
+        assert_eq!(resolved.backend.config_dir_env_var(), "GROK_HOME");
+        assert!(resolved.backend.uses_injected_hooks());
+        assert_eq!(
+            cfg.resolved_hook_path(&resolved),
+            PathBuf::from("/tmp/grok-work/hooks/slopd.json")
+        );
+    }
+
+    #[test]
+    fn grok_hook_injection_uses_native_event_vocabulary() {
+        let mut hooks = serde_json::json!({});
+        inject_backend_hooks(&mut hooks, "slopctl", Backend::Grok);
+        for event in GROK_HOOK_EVENTS {
+            assert_eq!(
+                hooks["hooks"][event].as_array().map(Vec::len),
+                Some(1),
+                "missing Grok hook {event}"
+            );
+        }
+        assert!(hooks["hooks"].get("PermissionRequest").is_none());
+        assert!(hooks["hooks"].get("Elicitation").is_none());
     }
 
     #[test]
@@ -1952,7 +2021,8 @@ pub struct SlopdConfig {
     pub backup: SlopdBackupConfig,
     /// Agent config dir for the reserved [`DEFAULT_ACCOUNT`] (the account used
     /// when no account is selected). Exported as `CLAUDE_CONFIG_DIR` (Claude) or
-    /// `OPENCODE_CONFIG_DIR` (OpenCode), or `CODEX_HOME` (Codex). Supports `~`
+    /// `OPENCODE_CONFIG_DIR` (OpenCode), `CODEX_HOME` (Codex), or `GROK_HOME`
+    /// (Grok). Supports `~`
     /// and `$VAR` / `${VAR}` expansion.
     #[serde(alias = "claude_config_dir")]
     pub config_dir: Option<PathBuf>,
@@ -2019,8 +2089,9 @@ pub enum AccountConfig {
 pub struct AccountSettings {
     /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
     /// for [`Backend::Claude`], `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`],
-    /// or `CODEX_HOME` for [`Backend::Codex`]). When omitted, that environment
-    /// variable is left unset and the backend uses its standard location.
+    /// `CODEX_HOME` for [`Backend::Codex`], or `GROK_HOME` for
+    /// [`Backend::Grok`]). When omitted, that environment variable is left
+    /// unset and the backend uses its standard location.
     #[serde(alias = "claude_config_dir")]
     #[serde(default)]
     pub config_dir: Option<PathBuf>,
@@ -2120,7 +2191,7 @@ impl SlopdTmuxConfig {
 ///
 /// Resolution against `executable` is bidirectional ("each implies the other"):
 /// see [`Backend::resolve`]. Inference recognizes only the canonical binary
-/// names (`claude`, `opencode`); a custom path/wrapper needs an explicit
+/// names (`claude`, `opencode`, `codex`, `grok`); a custom path/wrapper needs an explicit
 /// `backend` and is treated as an executable override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2136,15 +2207,20 @@ pub enum Backend {
     /// OpenAI Codex CLI. Runs as an independent local process; slopd observes it
     /// through Codex hooks and the session rollout transcript.
     Codex,
+    /// xAI Grok Build. Runs a visible TUI against a pane-private leader while
+    /// slopd attaches as an ACP subscriber; hooks and updates.jsonl remain the
+    /// durable lifecycle and recovery authority.
+    Grok,
 }
 
 impl Backend {
-    /// The canonical bare binary name for this backend (`claude` / `opencode`).
+    /// The canonical bare binary name for this backend.
     pub fn canonical_executable(self) -> &'static str {
         match self {
             Backend::Claude => "claude",
             Backend::Opencode => "opencode",
             Backend::Codex => "codex",
+            Backend::Grok => "grok",
         }
     }
 
@@ -2162,6 +2238,7 @@ impl Backend {
             "claude" => Some(Backend::Claude),
             "opencode" => Some(Backend::Opencode),
             "codex" => Some(Backend::Codex),
+            "grok" => Some(Backend::Grok),
             _ => None,
         }
     }
@@ -2172,12 +2249,13 @@ impl Backend {
             Backend::Claude => "CLAUDE_CONFIG_DIR",
             Backend::Opencode => "OPENCODE_CONFIG_DIR",
             Backend::Codex => "CODEX_HOME",
+            Backend::Grok => "GROK_HOME",
         }
     }
 
     /// Whether slopd injects `slopctl hook` entries for this backend.
     pub fn uses_injected_hooks(self) -> bool {
-        matches!(self, Backend::Claude | Backend::Codex)
+        matches!(self, Backend::Claude | Backend::Codex | Backend::Grok)
     }
 
     /// Hook event names accepted by this backend's configuration file.
@@ -2185,6 +2263,7 @@ impl Backend {
         match self {
             Backend::Claude => HOOK_EVENTS,
             Backend::Codex => CODEX_HOOK_EVENTS,
+            Backend::Grok => GROK_HOOK_EVENTS,
             Backend::Opencode => &[],
         }
     }
@@ -2258,23 +2337,23 @@ pub struct SlopdRunConfig {
     /// Agent executable for panes that don't override it per-account. When
     /// unset, the effective executable is derived via [`Backend::resolve`] (the
     /// resolved backend's canonical binary). A recognized name here
-    /// (`claude`/`opencode`) also implies the backend for accounts that don't
+    /// (`claude`/`opencode`/`codex`/`grok`) also implies the backend for accounts that don't
     /// set one.
     #[serde(default)]
     pub executable: Option<Executable>,
     /// Path to slopctl binary used for hook injection (default: "slopctl")
     #[serde(default = "default_slopctl")]
     pub slopctl: String,
-    /// Default working directory for new Claude panes. Supports `~` and
+    /// Default working directory for new agent panes. Supports `~` and
     /// `$VAR` / `${VAR}` expansion. Overridden per-session by
     /// `slopctl run --start-directory`.
     pub start_directory: Option<PathBuf>,
-    /// Extra environment variables for every new Claude pane. Values support
+    /// Extra environment variables for every new agent pane. Values support
     /// `$VAR` / `${VAR}` expansion against slopd's environment at spawn time.
     /// Merged with (and overridden by) `slopctl run --env` / `--env-file`.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// Paths to env-files loaded for every new Claude pane. Paths support
+    /// Paths to env-files loaded for every new agent pane. Paths support
     /// `~` / `$VAR` expansion. Files are loaded in order; later files and
     /// [run.env] entries override earlier ones. CLI `--env-file` / `--env`
     /// override all of these.
@@ -2566,6 +2645,12 @@ impl SlopdConfig {
                 .clone()
                 .unwrap_or_else(|| home_dir().join(".codex"))
                 .join("hooks.json"),
+            Backend::Grok => resolved
+                .config_dir
+                .clone()
+                .unwrap_or_else(|| home_dir().join(".grok"))
+                .join("hooks")
+                .join("slopd.json"),
             Backend::Opencode => unreachable!("opencode does not use injected hooks"),
         }
     }
@@ -2957,11 +3042,11 @@ pub enum RequestBody {
         /// handler for the executable recomputation.
         #[serde(default)]
         backend: Option<Backend>,
-        /// Internal (daemon-set) only: pin this Claude session id on the new pane
-        /// before it is registered, so its `SessionStart` hook — which real Claude
-        /// fires with the *resumed source* id, not this one — cannot mis-bind it.
-        /// Set only by the `Fork` handler's synthetic Run; always `None` from the
-        /// CLI. Ignored for opencode (which tracks its id via the resume path).
+        /// Internal (daemon-set) only: pin a preallocated backend session id on
+        /// the new pane before it is registered, so a fork's `SessionStart`
+        /// hook cannot overwrite it with the source session. Set only by the
+        /// `Fork` handler's synthetic Run; always `None` from the CLI. Ignored
+        /// for opencode, which tracks its id via the resume path.
         #[serde(default)]
         pin_session_id: Option<String>,
     },
@@ -3090,7 +3175,7 @@ pub enum ResponseBody {
         pane_id: String,
     },
     /// Response to Fork: the new pane and the backend session id it was bound to
-    /// (minted by the daemon for Claude, returned by the fork API for opencode).
+    /// (preallocated by the daemon or returned by the backend fork API).
     Forked {
         pane_id: String,
         session_id: String,
@@ -3255,7 +3340,7 @@ pub struct PaneInfo {
     pub created_at: u64,
     /// Unix timestamp of last tmux window activity (#{window_activity}).
     pub last_active: u64,
-    /// Claude session ID stored by the SessionStart hook, if set.
+    /// Backend session ID learned from lifecycle discovery, if set.
     pub session_id: Option<String>,
     /// Parent pane ID if this pane was spawned by another pane via slopctl run.
     pub parent_pane_id: Option<String>,
@@ -3270,7 +3355,7 @@ pub struct PaneInfo {
     /// uses [`Self::transcript_path`] to recover the launch cwd instead.
     #[serde(default)]
     pub working_dir: Option<String>,
-    /// Path to the pane's Claude transcript (@slopd_transcript_path), if known.
+    /// Path to the pane's transcript (@slopd_transcript_path), if known.
     /// Restore reads the session's launch cwd from it: `claude --resume`
     /// resolves the session from the project dir of its launch cwd, which is the
     /// dir Claude was *started* in — not the drift-prone `working_dir`.

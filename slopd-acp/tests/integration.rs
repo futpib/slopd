@@ -417,6 +417,88 @@ fn codex_acp_session_streams_a_complete_turn() {
 }
 
 #[test]
+fn grok_acp_session_preserves_native_updates_for_a_complete_turn() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_grok");
+    let slopctl = cargo_bin("slopctl");
+    let grok_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "acp-grok", "--backend", "grok"],
+    );
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "GROK_SYSTEM_CANARY");
+    let (completed, notifications) = prompt(&mut harness, 3, &session_id, "GROK_USER_CANARY");
+
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let streamed = streamed_text(&notifications);
+    assert!(
+        streamed.contains("mock response:"),
+        "notifications: {notifications:?}"
+    );
+    assert!(
+        streamed.contains("GROK_SYSTEM_CANARY"),
+        "streamed: {streamed}"
+    );
+    assert!(
+        streamed.contains("GROK_USER_CANARY"),
+        "streamed: {streamed}"
+    );
+    assert!(notifications.iter().any(|message| {
+        message
+            .pointer("/params/update/_meta/eventId")
+            .and_then(Value::as_str)
+            .is_some()
+    }));
+
+    let (completed, notifications) = prompt(&mut harness, 4, &session_id, "::mock tool");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    assert!(
+        notifications.iter().any(|message| {
+            message
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+                == Some("tool_call")
+                && message
+                    .pointer("/params/update/rawInput/command")
+                    .and_then(Value::as_str)
+                    == Some("cargo test --workspace")
+        }),
+        "native Grok tool update was projected or lost: {notifications:?}"
+    );
+
+    let (completed, notifications) = prompt(&mut harness, 5, &session_id, "::mock subagent normal");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    assert!(
+        notifications.iter().any(|message| {
+            message.get("method").and_then(Value::as_str) == Some("_x.ai/session/update")
+                && message
+                    .pointer("/params/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("subagent_spawned")
+                && message.pointer("/params/sessionId").and_then(Value::as_str)
+                    == Some(session_id.as_str())
+        }),
+        "native xAI method or logical session identity was lost: {notifications:?}"
+    );
+}
+
+#[test]
 fn generic_steering_reuses_the_existing_codex_pane() {
     build_bin("slopd");
     build_bin("slopctl");
