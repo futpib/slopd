@@ -275,6 +275,7 @@ enum PaneStateEvent<'a> {
         backend: libslop::Backend,
         record_type: &'a str,
         record: &'a serde_json::Value,
+        active_prompt_id: Option<&'a str>,
     },
 }
 
@@ -313,6 +314,13 @@ fn reduce_pane_state(
                 next
             }
         }
+
+        PaneStateEvent::TranscriptRecord {
+            backend: libslop::Backend::Grok,
+            record,
+            active_prompt_id,
+            ..
+        } => grok::transcript_state(record, *active_prompt_id),
 
         PaneStateEvent::TranscriptRecord {
             record_type,
@@ -402,7 +410,32 @@ async fn set_pane_detailed_state(
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
-    set_pane_detailed_state_inner(config, pane_id, detailed, previous, true, event_tx, panes).await;
+    set_pane_detailed_state_inner(
+        config, pane_id, detailed, previous, true, None, event_tx, panes,
+    )
+    .await;
+}
+
+async fn set_grok_terminal_detailed_state(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    detailed: &libslop::PaneDetailedState,
+    previous: Option<&libslop::PaneDetailedState>,
+    prompt_id: &str,
+    event_tx: &EventTx,
+    panes: &PaneMap,
+) {
+    set_pane_detailed_state_inner(
+        config,
+        pane_id,
+        detailed,
+        previous,
+        true,
+        Some(prompt_id),
+        event_tx,
+        panes,
+    )
+    .await;
 }
 
 async fn set_hook_detailed_state(
@@ -413,8 +446,10 @@ async fn set_hook_detailed_state(
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
-    set_pane_detailed_state_inner(config, pane_id, detailed, previous, false, event_tx, panes)
-        .await;
+    set_pane_detailed_state_inner(
+        config, pane_id, detailed, previous, false, None, event_tx, panes,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -424,11 +459,18 @@ async fn set_pane_detailed_state_inner(
     detailed: &libslop::PaneDetailedState,
     previous: Option<&libslop::PaneDetailedState>,
     reject_stale: bool,
+    grok_prompt_guard: Option<&str>,
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
     let pane_state = panes.get_or_insert(pane_id);
     let _guard = pane_state.state_update_mutex.lock().await;
+
+    if grok_prompt_guard.is_some_and(|expected| {
+        pane_state.grok_active_prompt_id.lock().unwrap().as_deref() != Some(expected)
+    }) {
+        return;
+    }
 
     // State sources run concurrently (hooks, transcript tailers, and backend
     // drivers). A transition can become stale while it is waiting to enter
@@ -652,6 +694,10 @@ struct PaneState {
     transcript_path: std::sync::Mutex<Option<String>>,
     /// Auto-continue retry state (when a turn fails with StopFailure).
     retry_state: std::sync::Mutex<Option<RetryState>>,
+    /// Grok prompt currently owning the pane's state. Native transcript updates
+    /// can lag hooks, so terminal records must be correlated before they are
+    /// allowed to mark a newer turn ready.
+    grok_active_prompt_id: std::sync::Mutex<Option<String>>,
     /// Set just before slopd injects its own "continue" prompt, so the
     /// UserPromptSubmit that prompt triggers is not mistaken for the user
     /// manually taking over (which would reset the retry counter and let a
@@ -685,6 +731,7 @@ impl PaneState {
             transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             transcript_path: std::sync::Mutex::new(None),
             retry_state: std::sync::Mutex::new(None),
+            grok_active_prompt_id: std::sync::Mutex::new(None),
             expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
             runtime: std::sync::Mutex::new(PaneRuntime::default()),
             pinned_session_id: std::sync::Mutex::new(None),
@@ -1447,25 +1494,46 @@ async fn tail_transcript(
                         // Check if this transcript record triggers a state transition.
                         {
                             let current = pane_state.detailed_state.lock().unwrap().clone();
+                            let active_prompt_id = if backend == libslop::Backend::Grok {
+                                pane_state.grok_active_prompt_id.lock().unwrap().clone()
+                            } else {
+                                None
+                            };
                             let event = PaneStateEvent::TranscriptRecord {
                                 backend,
                                 record_type: &record_type,
                                 record: &record,
+                                active_prompt_id: active_prompt_id.as_deref(),
                             };
                             if let Some(new_state) = reduce_pane_state(&current, &event) {
                                 debug!(
                                     "transcript {} event while pane {} in {:?} — transitioning to {:?}",
                                     record_type, pane_id, current, new_state
                                 );
-                                set_pane_detailed_state(
-                                    &config,
-                                    &pane_id,
-                                    &new_state,
-                                    Some(&current),
-                                    &event_tx,
-                                    &panes,
-                                )
-                                .await;
+                                if backend == libslop::Backend::Grok
+                                    && let Some(prompt_id) = grok::terminal_prompt_id(&record)
+                                {
+                                    set_grok_terminal_detailed_state(
+                                        &config,
+                                        &pane_id,
+                                        &new_state,
+                                        Some(&current),
+                                        prompt_id,
+                                        &event_tx,
+                                        &panes,
+                                    )
+                                    .await;
+                                } else {
+                                    set_pane_detailed_state(
+                                        &config,
+                                        &pane_id,
+                                        &new_state,
+                                        Some(&current),
+                                        &event_tx,
+                                        &panes,
+                                    )
+                                    .await;
+                                }
                             }
                         }
 
@@ -2062,6 +2130,7 @@ async fn recover_state_from_transcript(
             backend,
             record_type,
             record,
+            active_prompt_id: None,
         };
         if let Some(new_state) = reduce_pane_state(&state, &event) {
             state = new_state;
@@ -5035,6 +5104,12 @@ async fn handle_request(
                     pane
                 );
                 let pane_state = panes.get_or_insert(pane);
+                if hook_backend == libslop::Backend::Grok
+                    && let Some(prompt_id) =
+                        payload.get("prompt_id").and_then(|value| value.as_str())
+                {
+                    *pane_state.grok_active_prompt_id.lock().unwrap() = Some(prompt_id.to_string());
+                }
                 pane_state.prompt_submitted.notify_waiters();
                 // A manual prompt means the user has taken over — reset the retry
                 // counter so the next failure starts a fresh backoff sequence. But
@@ -5056,30 +5131,57 @@ async fn handle_request(
 
             // Unified state transition via reducer.
             {
-                let current = panes
-                    .get_or_insert(pane)
-                    .detailed_state
-                    .lock()
-                    .unwrap()
-                    .clone();
-                if let Some(new_state) = reduce_pane_state(
-                    &current,
-                    &PaneStateEvent::Hook {
-                        event: &event,
-                        notification_type: payload
-                            .get("notification_type")
-                            .and_then(|v| v.as_str()),
-                    },
-                ) {
-                    set_hook_detailed_state(
-                        config,
-                        pane,
-                        &new_state,
-                        Some(&current),
-                        event_tx,
-                        panes,
-                    )
-                    .await;
+                let stale_grok_terminal = hook_backend == libslop::Backend::Grok
+                    && matches!(event.as_str(), "Stop" | "StopFailure" | "StopCancelled")
+                    && payload
+                        .get("prompt_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|terminal| {
+                            panes
+                                .get_or_insert(pane)
+                                .grok_active_prompt_id
+                                .lock()
+                                .unwrap()
+                                .as_deref()
+                                .is_some_and(|active| active != terminal)
+                        });
+                if !stale_grok_terminal {
+                    let current = panes
+                        .get_or_insert(pane)
+                        .detailed_state
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    if let Some(new_state) = reduce_pane_state(
+                        &current,
+                        &PaneStateEvent::Hook {
+                            event: &event,
+                            notification_type: payload
+                                .get("notification_type")
+                                .and_then(|v| v.as_str()),
+                        },
+                    ) {
+                        set_hook_detailed_state(
+                            config,
+                            pane,
+                            &new_state,
+                            Some(&current),
+                            event_tx,
+                            panes,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            if hook_backend == libslop::Backend::Grok
+                && matches!(event.as_str(), "Stop" | "StopFailure" | "StopCancelled")
+            {
+                let terminal_prompt = payload.get("prompt_id").and_then(|value| value.as_str());
+                let pane_state = panes.get_or_insert(pane);
+                let mut active = pane_state.grok_active_prompt_id.lock().unwrap();
+                if terminal_prompt.is_none() || terminal_prompt == active.as_deref() {
+                    *active = None;
                 }
             }
 
@@ -6929,6 +7031,7 @@ mod tests {
                 backend: libslop::Backend::Codex,
                 record_type: "event_msg",
                 record: &record,
+                active_prompt_id: None,
             };
             assert_eq!(
                 reduce_pane_state(&libslop::PaneDetailedState::AwaitingInputPermission, &event,),

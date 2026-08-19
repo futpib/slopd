@@ -5,7 +5,7 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod mock_support;
 use mock_support::{
@@ -79,6 +79,32 @@ fn transcript_path(home: &Path, session_id: &str) -> PathBuf {
         .join("updates.jsonl")
 }
 
+fn seed_fork_transcript(home: &Path, args: &[String], fork_session_id: &str) {
+    if !args.iter().any(|argument| argument == "--fork-session") {
+        return;
+    }
+    let Some(source_session_id) = argument_value(args, &["--resume", "-r"]) else {
+        return;
+    };
+    let source = transcript_path(home, &source_session_id);
+    let destination = transcript_path(home, fork_session_id);
+    if destination.exists() {
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(source) else {
+        return;
+    };
+    for line in contents.lines() {
+        let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.pointer("/params/sessionId").is_some() {
+            record["params"]["sessionId"] = json!(fork_session_id);
+        }
+        append_json(&destination, &record);
+    }
+}
+
 fn load_hooks(home: &Path) -> Value {
     std::fs::read_to_string(home.join("hooks").join("slopd.json"))
         .ok()
@@ -132,6 +158,18 @@ fn hook_payload(event: &str, session_id: &str, cwd: &Path, transcript: &Path) ->
     })
 }
 
+fn hook_payload_for_prompt(
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    transcript: &Path,
+    prompt_id: &str,
+) -> Value {
+    let mut payload = hook_payload(event, session_id, cwd, transcript);
+    payload["promptId"] = json!(prompt_id);
+    payload
+}
+
 fn append_json(path: &Path, value: &Value) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create mock Grok state directory");
@@ -165,7 +203,13 @@ fn xai_update(session_id: &str, kind: &str, fields: Value) -> Value {
     envelope
 }
 
-fn write_prompt(transcript: &Path, session_id: &str, prompt: &str, prompt_index: u64) {
+fn write_prompt(
+    transcript: &Path,
+    session_id: &str,
+    prompt: &str,
+    prompt_id: &str,
+    prompt_index: u64,
+) {
     append_json(
         transcript,
         &update(
@@ -175,6 +219,7 @@ fn write_prompt(transcript: &Path, session_id: &str, prompt: &str, prompt_index:
                 "content": {"type": "text", "text": prompt},
                 "_meta": {
                     "eventId": format!("mock-event-{}", counter()),
+                    "promptId": prompt_id,
                     "promptIndex": prompt_index,
                 },
             }),
@@ -365,6 +410,11 @@ fn agent_main(args: &[String]) {
 struct TuiState {
     active: bool,
     awaiting_permission: bool,
+    cancel_hook: bool,
+    cancel_delay: Option<Duration>,
+    fail_always: bool,
+    continued_busy: Option<Duration>,
+    active_prompt_id: Option<String>,
     prompt_index: u64,
 }
 
@@ -376,22 +426,78 @@ fn handle_prompt(
     cwd: &Path,
     transcript: &Path,
 ) {
-    let mut submitted = hook_payload("UserPromptSubmit", session_id, cwd, transcript);
+    let prompt_id = format!("prompt-{}", counter());
+    state.active_prompt_id = Some(prompt_id.clone());
+    let mut submitted =
+        hook_payload_for_prompt("UserPromptSubmit", session_id, cwd, transcript, &prompt_id);
     submitted["prompt"] = json!(prompt);
     fire_hooks(settings, "UserPromptSubmit", &submitted);
-    write_prompt(transcript, session_id, prompt, state.prompt_index);
+    write_prompt(
+        transcript,
+        session_id,
+        prompt,
+        &prompt_id,
+        state.prompt_index,
+    );
     state.prompt_index += 1;
 
     let command = parse_mock_command(prompt).ok().flatten();
+    if state.fail_always && command != Some(MockCommand::FailAlways) {
+        fail_turn(settings, session_id, cwd, transcript, &prompt_id);
+        return;
+    }
+    if prompt == "continue"
+        && let Some(duration) = state.continued_busy.take()
+    {
+        let mut pre = hook_payload("PreToolUse", session_id, cwd, transcript);
+        pre["toolName"] = json!("mock_long_turn");
+        fire_hooks(settings, "PreToolUse", &pre);
+        std::thread::sleep(duration);
+        let mut post = hook_payload("PostToolUse", session_id, cwd, transcript);
+        post["toolName"] = json!("mock_long_turn");
+        fire_hooks(settings, "PostToolUse", &post);
+        finish_turn(
+            settings,
+            session_id,
+            cwd,
+            transcript,
+            &prompt_id,
+            "continued after failure",
+        );
+        return;
+    }
     match command {
         Some(MockCommand::Active) => {
             state.active = true;
+            state.cancel_hook = true;
+            state.cancel_delay = None;
+        }
+        None if prompt == "::mock active-no-cancel-hook" => {
+            state.active = true;
+            state.cancel_hook = false;
+            state.cancel_delay = None;
+        }
+        None if prompt == "::mock active-delayed-cancel" => {
+            state.active = true;
+            state.cancel_hook = false;
+            state.cancel_delay = Some(Duration::from_millis(250));
         }
         Some(MockCommand::Permission(_)) => {
             state.awaiting_permission = true;
             let mut notification = hook_payload("Notification", session_id, cwd, transcript);
             notification["notificationType"] = json!("permission_prompt");
             fire_hooks(settings, "Notification", &notification);
+        }
+        Some(MockCommand::FailOnce) => {
+            fail_turn(settings, session_id, cwd, transcript, &prompt_id);
+        }
+        Some(MockCommand::FailAlways) => {
+            state.fail_always = true;
+            fail_turn(settings, session_id, cwd, transcript, &prompt_id);
+        }
+        Some(MockCommand::FailThenBusy(duration)) => {
+            state.continued_busy = Some(duration);
+            fail_turn(settings, session_id, cwd, transcript, &prompt_id);
         }
         Some(MockCommand::Tool) => {
             let tool_id = format!("tool-{}", counter());
@@ -426,7 +532,14 @@ fn handle_prompt(
                     json!({"toolCallId":tool_id,"status":"completed"}),
                 ),
             );
-            finish_turn(settings, session_id, cwd, transcript, "tool complete");
+            finish_turn(
+                settings,
+                session_id,
+                cwd,
+                transcript,
+                &prompt_id,
+                "tool complete",
+            );
         }
         Some(MockCommand::Subagent(SubagentMode::Normal)) => {
             let child = format!("child-{}", counter());
@@ -449,7 +562,14 @@ fn handle_prompt(
                 transcript,
                 &xai_update(session_id, "subagent_finished", json!({"sessionId":child})),
             );
-            finish_turn(settings, session_id, cwd, transcript, "subagent complete");
+            finish_turn(
+                settings,
+                session_id,
+                cwd,
+                transcript,
+                &prompt_id,
+                "subagent complete",
+            );
         }
         None if prompt == "::mock compact" => {
             fire_hooks(
@@ -463,7 +583,14 @@ fn handle_prompt(
                 "PostCompact",
                 &hook_payload("PostCompact", session_id, cwd, transcript),
             );
-            finish_turn(settings, session_id, cwd, transcript, "compact complete");
+            finish_turn(
+                settings,
+                session_id,
+                cwd,
+                transcript,
+                &prompt_id,
+                "compact complete",
+            );
         }
         None if prompt == "::mock elicitation" => {
             append_json(
@@ -476,6 +603,7 @@ fn handle_prompt(
                 session_id,
                 cwd,
                 transcript,
+                &prompt_id,
                 "elicitation complete",
             );
         }
@@ -492,17 +620,48 @@ fn handle_prompt(
                 }
                 _ => format!("mock response: {prompt}"),
             };
-            finish_turn(settings, session_id, cwd, transcript, &response);
+            finish_turn(settings, session_id, cwd, transcript, &prompt_id, &response);
         }
     }
 }
 
-fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path, response: &str) {
+fn finish_turn(
+    settings: &Value,
+    session_id: &str,
+    cwd: &Path,
+    transcript: &Path,
+    prompt_id: &str,
+    response: &str,
+) {
     write_response(transcript, session_id, response);
     fire_hooks(
         settings,
         "Stop",
-        &hook_payload("Stop", session_id, cwd, transcript),
+        &hook_payload_for_prompt("Stop", session_id, cwd, transcript, prompt_id),
+    );
+    append_json(
+        transcript,
+        &xai_update(
+            session_id,
+            "turn_completed",
+            json!({"prompt_id":prompt_id,"stop_reason":"end_turn"}),
+        ),
+    );
+}
+
+fn fail_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path, prompt_id: &str) {
+    append_json(
+        transcript,
+        &xai_update(
+            session_id,
+            "turn_completed",
+            json!({"prompt_id":prompt_id,"stop_reason":"error"}),
+        ),
+    );
+    fire_hooks(
+        settings,
+        "StopFailure",
+        &hook_payload_for_prompt("StopFailure", session_id, cwd, transcript, prompt_id),
     );
 }
 
@@ -518,10 +677,33 @@ fn cancel_turn(
     }
     state.active = false;
     state.awaiting_permission = false;
-    let mut payload = hook_payload("StopCancelled", session_id, cwd, transcript);
-    payload["reason"] = json!("user_interrupt");
-    payload["cancelledBy"] = json!("client");
-    fire_hooks(settings, "StopCancelled", &payload);
+    let prompt_id = state
+        .active_prompt_id
+        .clone()
+        .unwrap_or_else(|| format!("prompt-{}", counter()));
+    let terminal = xai_update(
+        session_id,
+        "turn_completed",
+        json!({"prompt_id":prompt_id,"stop_reason":"cancelled"}),
+    );
+    if let Some(delay) = state.cancel_delay.take() {
+        let transcript = transcript.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            append_json(&transcript, &terminal);
+        });
+    } else {
+        append_json(transcript, &terminal);
+    }
+    if state.cancel_hook {
+        let mut payload =
+            hook_payload_for_prompt("StopCancelled", session_id, cwd, transcript, &prompt_id);
+        payload["reason"] = json!("user_interrupt");
+        payload["cancelledBy"] = json!("client");
+        fire_hooks(settings, "StopCancelled", &payload);
+    }
+    state.cancel_hook = true;
+    state.active_prompt_id = None;
 }
 
 fn read_commands(path: &Path, offset: &mut u64) -> Vec<Value> {
@@ -545,6 +727,7 @@ fn read_commands(path: &Path, offset: &mut u64) -> Vec<Value> {
 fn tui_main(args: &[String]) {
     let home = grok_home();
     let session_id = session_id(args);
+    seed_fork_transcript(&home, args, &session_id);
     let socket = leader_socket(args);
     let commands = command_path(&socket);
     if let Some(parent) = commands.parent() {
@@ -591,12 +774,18 @@ fn tui_main(args: &[String]) {
     let mut state = TuiState {
         active: false,
         awaiting_permission: false,
+        cancel_hook: true,
+        cancel_delay: None,
+        fail_always: false,
+        continued_busy: None,
+        active_prompt_id: None,
         prompt_index: 0,
     };
     let mut input = Vec::new();
     let mut command_offset = 0_u64;
     let mut bracketed = false;
     let mut escape = Vec::new();
+    let mut escape_started = None;
     let mut running = true;
     while running {
         for command in read_commands(&commands, &mut command_offset) {
@@ -627,15 +816,21 @@ fn tui_main(args: &[String]) {
                     if !escape.is_empty() || *byte == 0x1b {
                         const START: &[u8] = b"\x1b[200~";
                         const END: &[u8] = b"\x1b[201~";
+                        if escape.is_empty() {
+                            escape_started = Some(Instant::now());
+                        }
                         escape.push(*byte);
                         if escape == START {
                             escape.clear();
+                            escape_started = None;
                             bracketed = true;
                         } else if escape == END {
                             escape.clear();
+                            escape_started = None;
                             bracketed = false;
                         } else if !START.starts_with(&escape) && !END.starts_with(&escape) {
                             escape.clear();
+                            escape_started = None;
                             cancel_turn(&mut state, &settings, &session_id, &cwd, &transcript);
                         }
                         continue;
@@ -664,6 +859,13 @@ fn tui_main(args: &[String]) {
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => running = false,
+        }
+        if escape == [0x1b]
+            && escape_started.is_some_and(|started| started.elapsed() >= Duration::from_millis(25))
+        {
+            escape.clear();
+            escape_started = None;
+            cancel_turn(&mut state, &settings, &session_id, &cwd, &transcript);
         }
         std::thread::sleep(Duration::from_millis(10));
     }

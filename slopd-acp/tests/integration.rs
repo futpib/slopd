@@ -496,6 +496,26 @@ fn grok_acp_session_preserves_native_updates_for_a_complete_turn() {
         }),
         "native xAI method or logical session identity was lost: {notifications:?}"
     );
+
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "::mock active-no-cancel-hook" }],
+        },
+    }));
+    let first_update = harness.receive();
+    assert_eq!(first_update["method"], "session/update");
+    harness.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": session_id },
+    }));
+    let mut cancellation_updates = Vec::new();
+    let cancelled = harness.response(6, &mut cancellation_updates);
+    assert_eq!(cancelled["result"]["stopReason"], "cancelled");
 }
 
 #[test]

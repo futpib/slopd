@@ -604,6 +604,30 @@ pub(super) fn prompt_submitted(record: &Value) -> bool {
         == Some("user_message_chunk")
 }
 
+pub(super) fn transcript_state(
+    record: &Value,
+    active_prompt_id: Option<&str>,
+) -> Option<libslop::PaneDetailedState> {
+    let update = record
+        .pointer("/params/update")
+        .or_else(|| record.get("update"))?;
+    let event = update.get("sessionUpdate").and_then(Value::as_str)?;
+    let prompt_id = terminal_prompt_id(record);
+    if event == "turn_completed" && prompt_id.is_some() && prompt_id == active_prompt_id {
+        return Some(libslop::PaneDetailedState::Ready);
+    }
+    None
+}
+
+pub(super) fn terminal_prompt_id(record: &Value) -> Option<&str> {
+    record
+        .pointer("/params/update/prompt_id")
+        .or_else(|| record.pointer("/params/update/promptId"))
+        .or_else(|| record.pointer("/update/prompt_id"))
+        .or_else(|| record.pointer("/update/promptId"))
+        .and_then(Value::as_str)
+}
+
 pub(super) fn event_id(record: &Value) -> Option<String> {
     let value = record
         .pointer("/params/update/_meta/eventId")
@@ -814,5 +838,32 @@ mod tests {
         let (kind, payload) = decode_record(&raw).unwrap();
         assert_eq!(kind, "agent_thought_chunk");
         assert_eq!(payload, raw);
+    }
+
+    #[test]
+    fn completed_turn_is_a_terminal_state_backstop() {
+        let completed = envelope(
+            "_x.ai/session/update",
+            json!({
+                "sessionUpdate":"turn_completed",
+                "stop_reason":"cancelled",
+                "prompt_id":"prompt-1",
+            }),
+        );
+        assert_eq!(
+            transcript_state(&completed, Some("prompt-1")),
+            Some(libslop::PaneDetailedState::Ready)
+        );
+        assert_eq!(
+            transcript_state(
+                &envelope(
+                    "session/update",
+                    json!({"sessionUpdate":"agent_message_chunk"}),
+                ),
+                Some("prompt-1")
+            ),
+            None
+        );
+        assert_eq!(transcript_state(&completed, Some("prompt-2")), None);
     }
 }

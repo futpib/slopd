@@ -258,7 +258,6 @@ session named `slopd`.
 #
 # [accounts.grok]
 # backend = "grok"
-# config_dir = "~/.grok"                    # exported as GROK_HOME
 
 # [tmux]
 # Path to a custom tmux socket. When omitted slopd uses its default server.
@@ -1056,7 +1055,6 @@ owner.
 ```toml
 [accounts.grok]
 backend = "grok"
-config_dir = "~/.grok"      # exported as GROK_HOME
 executable = "grok"         # needed only if global [run] executable is another backend
 ```
 
@@ -1064,13 +1062,19 @@ executable = "grok"         # needed only if global [run] executable is another 
 slopctl run --account grok
 ```
 
+`config_dir` is optional. Omit it to use Grok's normal authenticated `~/.grok`
+home. Set it only when the account intentionally uses an isolated Grok home;
+slopd then exports that path as `GROK_HOME`.
+
 slopd preallocates a UUID for a fresh Grok session and launches the TUI with
 `--leader --leader-socket <private> --no-alt-screen --session-id <uuid>`. It
 injects only Grok's native hook vocabulary into `$GROK_HOME/hooks/slopd.json`.
 Those hooks are the lifecycle and detailed-state authority, including tool use,
 subagents, compaction, permissions, cancellation, turn failure, and session
 end. Hook payload keys are normalized to snake case and the unmodified Grok
-envelope remains available under `_grok_raw`.
+envelope remains available under `_grok_raw`. A native `turn_completed` update
+is also a terminal-state backstop because Grok can omit `StopCancelled` when an
+in-flight provider retry is cancelled.
 
 Grok's `updates.jsonl` is the durable transcript. slopd follows file replacement
 and truncation, avoids duplicate ACP/on-disk broadcasts, deduplicates repeated

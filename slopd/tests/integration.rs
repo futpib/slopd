@@ -14538,6 +14538,52 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
     }
 
     assert!(
+        env.slopctl(&["send", &source, "::mock active"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(
+            Instant::now() < deadline,
+            "Grok replacement turn did not start"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        env.slopctl(&[
+            "send",
+            &source,
+            "replacement after interrupt",
+            "--interrupt",
+        ])
+        .status
+        .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let transcript = env.slopctl(&["transcript", &source, "--limit", "40"]);
+        if String::from_utf8_lossy(&transcript.stdout)
+            .contains("mock response: replacement after interrupt")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Grok --interrupt replacement did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok replacement response did not leave the pane ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(
         env.slopctl(&["send", &source, "::mock permission"])
             .status
             .success()
@@ -14603,6 +14649,42 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
             .success(),
         "sandboxed Grok TUI transport failed"
     );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&sandbox_pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "sandboxed Grok turn did not return to ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let sandbox_transcript = env.slopctl(&["transcript", &sandbox_pane, "--limit", "20"]);
+    assert!(sandbox_transcript.status.success());
+    assert!(
+        String::from_utf8_lossy(&sandbox_transcript.stdout)
+            .contains("mock response: sandbox fallback")
+    );
+    assert!(
+        env.slopctl(&["send", &sandbox_pane, "::mock active"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&sandbox_pane).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(
+            Instant::now() < deadline,
+            "sandboxed Grok turn did not become active"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(env.slopctl(&["interrupt", &sandbox_pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&sandbox_pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "sandboxed Grok TUI interrupt did not return to ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     std::thread::sleep(Duration::from_millis(5_250));
     assert!(
         !PathBuf::from(format!("{sandbox_socket}.mock-sidecar")).exists(),
@@ -14626,6 +14708,29 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
         Some(source_session.as_str())
     );
     assert_eq!(fork_info.parent_pane_id.as_deref(), Some(source.as_str()));
+    let fork_socket = env
+        .tmux
+        .tmux()
+        .args([
+            "show-options",
+            "-t",
+            &fork_pane,
+            "-p",
+            "-v",
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+        ])
+        .output()
+        .unwrap();
+    let fork_socket = String::from_utf8_lossy(&fork_socket.stdout)
+        .trim()
+        .to_string();
+    assert_ne!(fork_socket, socket, "each Grok pane needs a private leader");
+    let fork_transcript = env.slopctl(&["transcript", &fork_pane, "--limit", "50"]);
+    assert!(fork_transcript.status.success());
+    assert!(
+        String::from_utf8_lossy(&fork_transcript.stdout).contains("hello mock grok"),
+        "Grok fork did not inherit the source conversation"
+    );
 
     kill_slopd(slopd);
     let slopd = env.spawn_slopd();
@@ -14647,6 +14752,11 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
         "recovered Grok ACP sidecar must retain the pane cwd"
     );
 
+    assert!(
+        env.slopctl(&["tag", &source, "grok-restore"])
+            .status
+            .success()
+    );
     assert!(env.slopctl(&["backup"]).status.success());
     assert!(env.slopctl(&["kill", &source]).status.success());
     assert!(env.slopctl(&["kill", &fork_pane]).status.success());
@@ -14659,6 +14769,11 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
             pane.session_id.as_deref() == Some(source_session.as_str())
                 && pane.detailed_state == libslop::PaneDetailedState::Ready
         }) {
+            assert!(pane.tags.iter().any(|tag| tag == "grok-restore"));
+            assert_eq!(
+                pane.working_dir.as_deref(),
+                grok_working_dir.path().to_str()
+            );
             break pane.pane_id.clone();
         }
         assert!(
@@ -14672,6 +14787,567 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
             .status
             .success()
     );
+    let restored_transcript = env.slopctl(&["transcript", &restored, "--limit", "100"]);
+    assert!(restored_transcript.status.success());
+    assert!(
+        String::from_utf8_lossy(&restored_transcript.stdout).contains("hello mock grok"),
+        "Grok restore did not preserve the prior transcript"
+    );
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_cancelled_turn_without_stop_hook_returns_to_ready() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(
+        run.status.success(),
+        "Grok run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    assert!(
+        env.slopctl(&["send", &pane, "::mock active-no-cancel-hook"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(Instant::now() < deadline, "Grok turn did not become busy");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(env.slopctl(&["interrupt", &pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok transcript-only cancellation left pane busy"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "10"]);
+    assert!(transcript.status.success());
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    assert!(
+        transcript["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| {
+                record["event_type"] == "turn_completed"
+                    && record
+                        .pointer("/payload/params/update/stop_reason")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("cancelled")
+            })
+    );
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_delayed_cancel_terminal_cannot_override_the_replacement_prompt() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(
+        env.slopctl(&["send", &pane, "::mock active-delayed-cancel"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(env.slopctl(&["interrupt", &pane]).status.success());
+    assert!(
+        env.slopctl(&["send", &pane, "::mock permission"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::AwaitingInputPermission {
+        assert!(
+            Instant::now() < deadline,
+            "replacement Grok prompt did not reach permission state"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        env.pane_state(&pane).1,
+        libslop::PaneDetailedState::AwaitingInputPermission,
+        "the cancelled prompt's delayed terminal update overrode its replacement"
+    );
+    assert!(env.slopctl(&["interrupt", &pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let working_dir = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "grok",
+        "--start-directory",
+        working_dir.path().to_str().unwrap(),
+        "--ready-timeout",
+        "20",
+    ]);
+    assert!(
+        run.status.success(),
+        "Grok run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let original_pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(
+        env.slopctl(&["send", &original_pane, "revive-history-marker"])
+            .status
+            .success()
+    );
+    assert!(
+        env.slopctl(&["tag", &original_pane, "revived-grok"])
+            .status
+            .success()
+    );
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let original = panes
+        .iter()
+        .find(|pane| pane.pane_id == original_pane)
+        .unwrap();
+    let session_id = original.session_id.clone().unwrap();
+    let transcript_path = original.transcript_path.clone().unwrap();
+    let original_socket = env
+        .tmux
+        .tmux()
+        .args([
+            "show-options",
+            "-t",
+            &original_pane,
+            "-p",
+            "-v",
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+        ])
+        .output()
+        .unwrap();
+    let original_socket = String::from_utf8_lossy(&original_socket.stdout)
+        .trim()
+        .to_string();
+
+    assert!(env.slopctl(&["kill", &original_pane]).status.success());
+    let graveyard = env.slopctl(&["graveyard", "--json"]);
+    assert!(graveyard.status.success());
+    let graveyard: serde_json::Value = serde_json::from_slice(&graveyard.stdout).unwrap();
+    let grave = graveyard
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|grave| {
+            grave
+                .pointer("/pane/session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(session_id.as_str())
+        })
+        .unwrap();
+    assert_eq!(grave["cause"], "deliberate_kill");
+    assert_eq!(grave["detected_by"], "kill_rpc");
+    let grave_id = grave["grave_id"].as_str().unwrap();
+
+    let revive_env = "PARITY_REVIVE_ENV=from-revive";
+    let revive = env.slopctl_raw(&["revive", grave_id, "--env", revive_env]);
+    assert!(
+        revive.status.success(),
+        "Grok revive failed: {}",
+        String::from_utf8_lossy(&revive.stderr)
+    );
+    let revived_pane = String::from_utf8_lossy(&revive.stdout).trim().to_string();
+    assert_ne!(revived_pane, original_pane);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let revived = loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let revived = panes
+            .into_iter()
+            .find(|pane| pane.pane_id == revived_pane)
+            .unwrap();
+        if revived.detailed_state == libslop::PaneDetailedState::Ready
+            && revived.transcript_path.is_some()
+        {
+            break revived;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revived Grok pane did not finish SessionStart: {revived:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(revived.session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(revived.account, "grok");
+    assert_eq!(revived.backend, libslop::Backend::Grok);
+    assert_eq!(revived.working_dir.as_deref(), working_dir.path().to_str());
+    assert_eq!(
+        revived.transcript_path.as_deref(),
+        Some(transcript_path.as_str())
+    );
+    assert!(revived.tags.iter().any(|tag| tag == "revived-grok"));
+    let revived_socket = env
+        .tmux
+        .tmux()
+        .args([
+            "show-options",
+            "-t",
+            &revived_pane,
+            "-p",
+            "-v",
+            libslop::TmuxOption::SlopdGrokLeaderSocket.as_str(),
+        ])
+        .output()
+        .unwrap();
+    let revived_socket = String::from_utf8_lossy(&revived_socket.stdout)
+        .trim()
+        .to_string();
+    assert_ne!(revived_socket, original_socket);
+
+    let transcript = env.slopctl(&["transcript", &revived_pane, "--limit", "50"]);
+    assert!(transcript.status.success());
+    assert!(
+        String::from_utf8_lossy(&transcript.stdout).contains("revive-history-marker"),
+        "revived Grok pane lost its prior transcript"
+    );
+    assert!(
+        env.slopctl(&["send", &revived_pane, "::mock env PARITY_REVIVE_ENV",])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let transcript = env.slopctl(&["transcript", &revived_pane, "--limit", "20"]);
+        let transcript = String::from_utf8_lossy(&transcript.stdout);
+        if transcript.contains("::mock env PARITY_REVIVE_ENV=from-revive") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revived Grok pane did not receive the caller environment: {transcript}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let graveyard = env.slopctl(&["graveyard", "--json"]);
+    let graveyard: serde_json::Value = serde_json::from_slice(&graveyard.stdout).unwrap();
+    let grave = graveyard
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|grave| grave["grave_id"] == grave_id)
+        .unwrap();
+    assert!(grave["revived_at"].is_number());
+    assert_eq!(grave["revived_as"], revived_pane);
+
+    assert!(env.slopctl(&["kill", &revived_pane]).status.success());
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_arbitrary_input_streams_native_transcript_and_normalized_hooks() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let mut listener = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--pane-id", &pane])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn Grok event listener");
+    let stdout = listener.stdout.take().unwrap();
+    let (subscribed, reader) = read_line_timeout(stdout, Duration::from_secs(10))
+        .expect("timed out waiting for Grok subscription");
+    assert!(subscribed.contains("subscribed"));
+
+    let prompt = "Grok line one\nGrok Unicode line two: 🦀";
+    assert!(
+        env.slopctl(&["send", &pane, prompt, "--timeout", "5"])
+            .status
+            .success()
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(reader);
+        for line in reader.lines().map_while(Result::ok) {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if tx.send(record).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut records = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(record) = rx.recv_timeout(Duration::from_millis(100)) {
+            records.push(record);
+            let saw_stop = records
+                .iter()
+                .any(|record| record["source"] == "hook" && record["event_type"] == "Stop");
+            let saw_user = records.iter().any(|record| {
+                record["source"] == "transcript" && record["event_type"] == "user_message_chunk"
+            });
+            let saw_agent = records.iter().any(|record| {
+                record["source"] == "transcript" && record["event_type"] == "agent_message_chunk"
+            });
+            if saw_stop && saw_user && saw_agent {
+                break;
+            }
+        }
+    }
+    kill_child(listener);
+
+    let submitted = records
+        .iter()
+        .find(|record| record["source"] == "hook" && record["event_type"] == "UserPromptSubmit")
+        .expect("missing normalized Grok UserPromptSubmit hook");
+    assert_eq!(submitted["payload"]["prompt"], prompt);
+    assert!(submitted["payload"]["session_id"].is_string());
+    assert_eq!(
+        submitted["payload"]["_grok_raw"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+    assert!(records.iter().any(|record| {
+        record["source"] == "transcript"
+            && record["event_type"] == "user_message_chunk"
+            && record
+                .pointer("/payload/params/update/content/text")
+                .and_then(serde_json::Value::as_str)
+                == Some(prompt)
+    }));
+    assert!(records.iter().any(|record| {
+        record["source"] == "transcript"
+            && record["event_type"] == "agent_message_chunk"
+            && record
+                .pointer("/payload/params/update/content/text")
+                .and_then(serde_json::Value::as_str)
+                == Some(format!("mock response: {prompt}").as_str())
+    }));
+
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "2"]);
+    assert!(transcript.status.success());
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let records = transcript["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let before = records[0]["cursor"].as_u64().unwrap().to_string();
+    let previous = env.slopctl(&["transcript", &pane, "--limit", "2", "--before", &before]);
+    assert!(previous.status.success());
+    assert!(
+        !serde_json::from_slice::<serde_json::Value>(&previous.stdout).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "Grok transcript pagination did not return the preceding page"
+    );
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_auto_continues_once_during_a_long_retry() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let env =
+        TestEnv::new_with_auto_continue(Some(&[mock_grok.to_str().unwrap()]), None, 3, 50, 200)
+            .expect("tmux required");
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--backend", "grok", "--ready-timeout", "20"]);
+    assert!(
+        run.status.success(),
+        "Grok run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    assert!(
+        env.slopctl(&["send", &pane, "::mock fail-then-busy 750ms"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let transcript = env.slopctl(&["transcript", &pane, "--limit", "20"]);
+        assert!(transcript.status.success());
+        let transcript = String::from_utf8_lossy(&transcript.stdout);
+        if transcript.contains("continued after failure") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Grok did not auto-continue after StopFailure: {transcript}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok auto-continued turn did not return to ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "100"]);
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let continue_count = transcript["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["event_type"] == "user_message_chunk"
+                && record
+                    .pointer("/payload/params/update/content/text")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("continue")
+        })
+        .count();
+    assert_eq!(
+        continue_count, 1,
+        "Grok auto-continue repeated during a still-active retry"
+    );
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_auto_continue_stops_at_the_retry_limit() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let env =
+        TestEnv::new_with_auto_continue(Some(&[mock_grok.to_str().unwrap()]), None, 2, 50, 100)
+            .expect("tmux required");
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--backend", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(
+        env.slopctl(&["send", &pane, "::mock fail always"])
+            .status
+            .success()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let transcript = env.slopctl(&["transcript", &pane, "--limit", "100"]);
+        let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+        let retries = transcript["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| {
+                record["event_type"] == "user_message_chunk"
+                    && record
+                        .pointer("/payload/params/update/content/text")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("continue")
+            })
+            .count();
+        if retries == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Grok did not reach the configured retry limit: {transcript}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "100"]);
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let retries = transcript["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["event_type"] == "user_message_chunk"
+                && record
+                    .pointer("/payload/params/update/content/text")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("continue")
+        })
+        .count();
+    assert_eq!(retries, 2, "Grok retried past max_retry_attempts");
+    assert_eq!(env.pane_state(&pane).1, libslop::PaneDetailedState::Ready);
+
     kill_slopd(slopd);
 }
 
