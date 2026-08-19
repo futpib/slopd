@@ -149,12 +149,31 @@ impl GrokClient {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 if matches!(method, "session/update" | "_x.ai/session/update") {
                     publish_update(method, params, &reader_pane, &pane_state, &event_tx).await;
-                } else if message.get("id").is_some() {
+                } else {
+                    let (interaction_method, interaction_params) =
+                        interaction_parts(method, &params);
+                    if interaction_method == "x.ai/queue/changed" {
+                        let pending_prompt = pane_state.grok_pending_prompt.lock().unwrap().clone();
+                        if pending_prompt.as_deref().is_some_and(|prompt| {
+                            value_contains_exact_string(interaction_params, prompt)
+                        }) {
+                            pane_state.prompt_submitted.notify_waiters();
+                        }
+                        let _ = event_tx.send(libslop::Record {
+                            cursor: None,
+                            source: "transcript".to_string(),
+                            event_type: "queue_changed".to_string(),
+                            pane_id: Some(reader_pane.clone()),
+                            payload: json!({"method":method,"params":params}),
+                        });
+                        continue;
+                    }
+                    if message.get("id").is_none() {
+                        continue;
+                    }
                     // Permission and elicitation reverse requests are deliberately
                     // left to the visible TUI. Grok's leader broadcasts those
                     // interactions and accepts the first client response.
-                    let (interaction_method, interaction_params) =
-                        interaction_parts(method, &params);
                     if let Some((event_type, detailed_state)) =
                         reverse_interaction(interaction_method)
                     {
@@ -316,6 +335,19 @@ impl GrokClient {
     pub(super) fn stop(&self) {
         self.cancel.cancel();
         self.disconnected.cancel();
+    }
+}
+
+fn value_contains_exact_string(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(value) => value == needle,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_exact_string(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_exact_string(value, needle)),
+        _ => false,
     }
 }
 

@@ -4196,6 +4196,35 @@ fn spawn_event_listener(env: &TestEnv, event_type: &str) -> std::process::Child 
     child
 }
 
+fn spawn_transcript_listener(env: &TestEnv, event_type: &str) -> std::process::Child {
+    let mut child = Command::new(cargo_bin("slopctl"))
+        .args(["listen", "--transcript", event_type])
+        .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn slopctl listen --transcript");
+    let stdout = child.stdout.as_mut().expect("listener has no stdout");
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        use std::io::Read;
+        stdout
+            .read_exact(&mut buf)
+            .expect("failed to read subscription confirmation");
+        if buf[0] == b'\n' {
+            break;
+        }
+        line.push(buf[0]);
+    }
+    let line = String::from_utf8_lossy(&line);
+    assert!(
+        line.contains("subscribed"),
+        "unexpected first line from slopctl listen: {line:?}"
+    );
+    child
+}
+
 /// Read lines from a listener child until a line whose parsed JSON satisfies `pred`, or panic after 10s.
 fn wait_for_event<F>(mut listener: std::process::Child, pred: F) -> serde_json::Value
 where
@@ -14520,10 +14549,15 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
         assert!(Instant::now() < deadline, "Grok active turn did not start");
         std::thread::sleep(Duration::from_millis(25));
     }
+    let started = Instant::now();
     assert!(
         env.slopctl(&["send", &source, "steered input"])
             .status
             .success()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "Grok native queue acknowledgement did not unblock busy send"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
@@ -14667,6 +14701,37 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
         assert!(
             Instant::now() < deadline,
             "sandboxed Grok turn did not become active"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let started = Instant::now();
+    assert!(
+        env.slopctl(&["send", &sandbox_pane, "sandbox queued input"])
+            .status
+            .success()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "sandboxed Grok TUI queue acceptance blocked until turn completion"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&sandbox_pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "sandboxed Grok queued prompt did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        env.slopctl(&["send", &sandbox_pane, "::mock active"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&sandbox_pane).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(
+            Instant::now() < deadline,
+            "sandboxed Grok interrupt turn did not become active"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -14915,6 +14980,74 @@ fn grok_slash_command_without_user_prompt_hook_returns_to_ready() {
                 .and_then(serde_json::Value::as_str)
                 == Some("/compact")
     }));
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_busy_send_returns_on_native_queue_ack_before_turn_finishes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(
+        env.slopctl(&["send", &pane, "::mock active"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::BusyProcessing {
+        assert!(Instant::now() < deadline, "Grok turn did not become busy");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let listener = spawn_transcript_listener(&env, "queue_changed");
+    let started = Instant::now();
+    let send = env.slopctl(&["send", &pane, "queued while busy", "--timeout", "5"]);
+    assert!(
+        send.status.success(),
+        "busy Grok send failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "busy Grok send waited for the prior turn instead of its queue acknowledgement"
+    );
+    assert_eq!(
+        env.pane_state(&pane).1,
+        libslop::PaneDetailedState::BusyProcessing,
+        "queue acknowledgement incorrectly completed the active turn"
+    );
+    let event = wait_for_event(listener, |event| {
+        event["event_type"] == "queue_changed" && event.to_string().contains("queued while busy")
+    });
+    assert_eq!(event["payload"]["method"], "x.ai/queue/changed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "queued Grok prompt did not eventually complete"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "20"]);
+    assert!(transcript.status.success());
+    assert!(
+        String::from_utf8_lossy(&transcript.stdout).contains("mock response: queued while busy")
+    );
 
     kill_slopd(slopd);
 }

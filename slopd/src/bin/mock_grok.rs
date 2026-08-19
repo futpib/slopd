@@ -469,6 +469,27 @@ fn handle_prompt(
         );
         return;
     }
+    if state.active {
+        append_json(
+            transcript,
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"x.ai/queue/changed",
+                "params":{
+                    "sessionId":session_id,
+                    "entries":[{
+                        "id":prompt_id,
+                        "text":prompt,
+                        "kind":"prompt",
+                        "position":0,
+                    }],
+                    "runningPromptId":state.active_prompt_id,
+                },
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(1_500));
+        state.active = false;
+    }
     state.active_prompt_id = Some(prompt_id.clone());
     let mut submitted =
         hook_payload_for_prompt("UserPromptSubmit", session_id, cwd, transcript, &prompt_id);
@@ -656,10 +677,6 @@ fn handle_prompt(
                     std::env::var(key).unwrap_or_else(|_| "UNSET".to_string())
                 ),
                 Some(MockCommand::Help) => "mock Grok help".to_string(),
-                _ if state.active => {
-                    state.active = false;
-                    format!("steered: {prompt}")
-                }
                 _ => format!("mock response: {prompt}"),
             };
             finish_turn(settings, session_id, cwd, transcript, &prompt_id, &response);

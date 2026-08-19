@@ -723,6 +723,8 @@ struct PaneState {
     /// Grok client-local commands such as `/compact` have a turn but omit the
     /// normal UserPromptSubmit hook and its prompt id.
     grok_unbound_prompt_active: std::sync::atomic::AtomicBool,
+    /// One ACP prompt waiting for Grok's native queue or submit acknowledgement.
+    grok_pending_prompt: std::sync::Mutex<Option<String>>,
     /// Set just before slopd injects its own "continue" prompt, so the
     /// UserPromptSubmit that prompt triggers is not mistaken for the user
     /// manually taking over (which would reset the retry counter and let a
@@ -758,6 +760,7 @@ impl PaneState {
             retry_state: std::sync::Mutex::new(None),
             grok_active_prompt_id: std::sync::Mutex::new(None),
             grok_unbound_prompt_active: std::sync::atomic::AtomicBool::new(false),
+            grok_pending_prompt: std::sync::Mutex::new(None),
             expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
             runtime: std::sync::Mutex::new(PaneRuntime::default()),
             pinned_session_id: std::sync::Mutex::new(None),
@@ -6186,10 +6189,12 @@ async fn handle_request(
 
                 let _guard = state.type_mutex.lock().await;
                 *state.retry_state.lock().unwrap() = None;
+                *state.grok_pending_prompt.lock().unwrap() = Some(prompt.clone());
                 let submitted = state.prompt_submitted.notified();
                 let response = match client.prompt(&prompt).await {
                     Ok(response) => Some(response),
                     Err(message) => {
+                        *state.grok_pending_prompt.lock().unwrap() = None;
                         debug!(
                             "Grok ACP prompt transport failed for pane {}; using tmux fallback: {}",
                             pane_id, message
@@ -6199,7 +6204,7 @@ async fn handle_request(
                 };
                 if let Some(response) = response {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    return match tokio::time::timeout(remaining, async {
+                    let result = tokio::time::timeout(remaining, async {
                         tokio::select! {
                             _ = submitted => Ok(()),
                             response = response => {
@@ -6209,8 +6214,9 @@ async fn handle_request(
                             }
                         }
                     })
-                    .await
-                    {
+                    .await;
+                    *state.grok_pending_prompt.lock().unwrap() = None;
+                    return match result {
                         Ok(Ok(())) => libslop::ResponseBody::Sent { pane_id },
                         Ok(Err(message)) => libslop::ResponseBody::Error { message },
                         Err(_) => libslop::ResponseBody::Error {
@@ -6254,7 +6260,7 @@ async fn handle_request(
             // BootingUp: Claude hasn't drawn its UI yet — wait for Ready.
             // AwaitingInput*: pane is at a dialog — reject immediately (interrupt
             //   should be used first if the caller wants to preempt).
-            loop {
+            let grok_tui_queue_acceptance = loop {
                 let current_state = state.detailed_state.lock().unwrap().clone();
                 match current_state {
                     libslop::PaneDetailedState::BootingUp => {
@@ -6310,9 +6316,12 @@ async fn handle_request(
                             ),
                         };
                     }
-                    _ => break,
+                    _ => {
+                        break state.runtime().backend() == libslop::Backend::Grok
+                            && current_state.to_simple() == libslop::PaneState::Busy;
+                    }
                 }
-            }
+            };
 
             // Acquire the type-mutex so concurrent sends don't interleave keystrokes.
             let _guard = state.type_mutex.lock().await;
@@ -6377,6 +6386,9 @@ async fn handle_request(
                                         message: e.to_string(),
                                     };
                                 }
+                            }
+                            if grok_tui_queue_acceptance {
+                                return libslop::ResponseBody::Sent { pane_id };
                             }
                             let remaining =
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
