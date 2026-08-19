@@ -112,6 +112,27 @@ fn session_id(args: &[String]) -> String {
     format!("mock-codex-{}", uuid::Uuid::new_v4())
 }
 
+fn config_override<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    let mut value = None;
+    let mut index = 0;
+    while index < args.len() {
+        let expression = match args[index].as_str() {
+            "-c" | "--config" => {
+                index += 1;
+                args.get(index).map(String::as_str)
+            }
+            argument => argument.strip_prefix("--config="),
+        };
+        if let Some((candidate, candidate_value)) = expression.and_then(|item| item.split_once('='))
+            && candidate == key
+        {
+            value = Some(candidate_value);
+        }
+        index += 1;
+    }
+    value
+}
+
 fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path, response: &str) {
     response_message(transcript, "assistant", response);
     write_record(
@@ -130,7 +151,9 @@ fn main() {
     for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
         if matches!(
             arg.as_str(),
-            "--mock-session-start=lazy" | "--mock-require-bracketed-paste"
+            "--mock-session-start=lazy"
+                | "--mock-require-bracketed-paste"
+                | "--mock-update-available"
         ) || arg
             .strip_prefix("--mock-submit-after=")
             .is_some_and(|value| value.parse::<u8>().is_ok_and(|count| count > 0))
@@ -138,6 +161,16 @@ fn main() {
             continue;
         }
         reject_unknown_mock_option("mock_codex", arg);
+    }
+    if args.iter().any(|arg| arg == "--mock-update-available")
+        && config_override(&args, "check_for_update_on_startup") != Some("false")
+    {
+        println!("Update available!\n1. Update now\n2. Skip\n3. Skip until next version");
+        std::io::stdout().flush().expect("flush update prompt");
+        let mut input = std::io::stdin();
+        let mut byte = [0_u8; 1];
+        while input.read(&mut byte).is_ok_and(|read| read != 0) {}
+        return;
     }
     let submit_after = args
         .iter()

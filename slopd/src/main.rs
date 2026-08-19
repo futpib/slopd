@@ -6973,6 +6973,8 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-c",
+                "check_for_update_on_startup=false",
                 "--dangerously-bypass-hook-trust",
                 "--no-alt-screen",
                 "-C",

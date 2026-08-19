@@ -14850,6 +14850,58 @@ fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() 
 }
 
 #[test]
+fn codex_managed_launch_disables_the_interactive_update_prompt() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-update]\nbackend = \"codex\"\nexecutable = [{:?}, \"--mock-session-start=lazy\", \"--mock-update-available\"]\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "codex-update", "--ready-timeout", "10"]);
+    assert!(
+        run.status.success(),
+        "Codex run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let send = env.slopctl(&[
+        "send",
+        &pane_id,
+        "UPDATE_PROMPT_BYPASS_CANARY",
+        "--timeout",
+        "2",
+    ]);
+    assert!(
+        send.status.success(),
+        "managed Codex remained blocked on its update prompt: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let pane = panes.iter().find(|pane| pane.pane_id == pane_id).unwrap();
+        if pane.session_id.is_some() && pane.detailed_state == libslop::PaneDetailedState::Ready {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Codex did not create a session after bypassing the update prompt: {pane:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    kill_slopd(slopd);
+}
+
+#[test]
 fn codex_send_uses_bracketed_paste_and_waits_until_prompt_is_submitted() {
     build_bin("slopd");
     build_bin("slopctl");

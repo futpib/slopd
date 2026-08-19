@@ -314,6 +314,15 @@ pub(super) struct PreparedCodexRun {
     pub(super) resume_session: Option<String>,
 }
 
+// Managed panes must not stop at Codex's startup update chooser before hooks
+// and prompt submission become available.
+fn codex_unattended_update_args() -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "check_for_update_on_startup=false".to_string(),
+    ]
+}
+
 pub(super) struct PreparedGrokRun {
     pub(super) session_id: String,
     pub(super) leader_socket: std::path::PathBuf,
@@ -346,12 +355,13 @@ impl PreparedBackendRun {
             }
             Self::Codex(runtime) => {
                 let mut trailing = strip_resume_flags(extra_args);
-                let mut prefix = vec![
+                let mut prefix = codex_unattended_update_args();
+                prefix.extend([
                     "--dangerously-bypass-hook-trust".to_string(),
                     "--no-alt-screen".to_string(),
                     "-C".to_string(),
                     cwd.to_string_lossy().into_owned(),
-                ];
+                ]);
                 if let Some(session_id) = &runtime.resume_session {
                     prefix.extend(["resume".to_string(), session_id.clone()]);
                 }
@@ -763,7 +773,8 @@ impl BackendLifecycle for CodexBackend {
     }
 
     async fn fork(&self, context: ForkContext<'_>) -> Result<(Vec<String>, String), String> {
-        let mut args = vec!["fork".to_string(), context.session_id.to_string()];
+        let mut args = codex_unattended_update_args();
+        args.extend(["fork".to_string(), context.session_id.to_string()]);
         args.extend(context.extra_args);
         // Standalone `codex fork` creates the new session in the child process.
         // Its SessionStart hook binds the real id after spawn.
@@ -805,14 +816,18 @@ impl BackendLifecycle for CodexBackend {
                 backend: context.resolved.backend,
                 executable: context.resolved.executable.clone(),
                 extra_env: context.extra_env.to_vec(),
-                trailing_args: vec![
-                    "--dangerously-bypass-hook-trust".to_string(),
-                    "--no-alt-screen".to_string(),
-                    "-C".to_string(),
-                    launch_dir.unwrap_or_else(|| ".".to_string()),
-                    "resume".to_string(),
-                    context.session_id.to_string(),
-                ],
+                trailing_args: {
+                    let mut args = codex_unattended_update_args();
+                    args.extend([
+                        "--dangerously-bypass-hook-trust".to_string(),
+                        "--no-alt-screen".to_string(),
+                        "-C".to_string(),
+                        launch_dir.unwrap_or_else(|| ".".to_string()),
+                        "resume".to_string(),
+                        context.session_id.to_string(),
+                    ]);
+                    args
+                },
             },
         )
         .await
