@@ -5920,7 +5920,8 @@ async fn handle_request(
                                 env: spawn_env,
                             };
                             let cancel = tokio_util::sync::CancellationToken::new();
-                            let grok_runtime = GrokState::new(cancel);
+                            let grok_runtime =
+                                GrokState::new(cancel, Some(attach.leader_socket.clone()));
                             let pane_state = panes.get_or_insert(&pane_id);
                             pane_state.set_runtime(PaneRuntime::Grok(grok_runtime.clone()));
                             tokio::spawn(grok::run_driver(

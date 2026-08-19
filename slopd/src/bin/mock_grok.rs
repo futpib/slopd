@@ -72,6 +72,55 @@ fn command_path(socket: &Path) -> PathBuf {
     PathBuf::from(format!("{}.mock-commands", socket.display()))
 }
 
+fn reverse_emitted_path(transcript: &Path) -> PathBuf {
+    transcript.with_extension("mock-reverse-emitted")
+}
+
+// This child intentionally survives the mock TUI so the E2E can prove slopd
+// reaps the same detached leader shape as the real Grok harness.
+#[allow(clippy::zombie_processes)]
+fn spawn_detached_leader(socket: &Path) {
+    let executable = std::env::current_exe().expect("resolve mock_grok executable");
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "agent",
+            "leader",
+            "--mock-leader-child",
+            socket.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().expect("spawn detached mock Grok leader");
+}
+
+fn detached_leader_main(socket: &Path) {
+    let _ = std::fs::remove_file(socket);
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent).expect("create mock leader parent");
+    }
+    let listener = std::os::unix::net::UnixListener::bind(socket)
+        .expect("bind detached mock Grok leader socket");
+    std::fs::write(
+        socket.with_extension("lock"),
+        std::process::id().to_string(),
+    )
+    .expect("write detached mock Grok leader lock");
+    loop {
+        let _ = listener.accept();
+    }
+}
+
 fn transcript_path(home: &Path, session_id: &str) -> PathBuf {
     home.join("sessions")
         .join("mock")
@@ -277,6 +326,7 @@ fn stream_turn(
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut offset = starting_offset;
         let mut finished = false;
+        let mut saw_user_turn = false;
         while std::time::Instant::now() < deadline && !finished {
             if let Ok(mut file) = std::fs::File::open(&transcript) {
                 let _ = file.seek(SeekFrom::Start(offset));
@@ -285,11 +335,13 @@ fn stream_turn(
                 while reader.read_line(&mut line).unwrap_or(0) != 0 {
                     offset += line.len() as u64;
                     if let Ok(mut envelope) = serde_json::from_str::<Value>(line.trim()) {
-                        if envelope
+                        let update_type = envelope
                             .pointer("/params/update/sessionUpdate")
-                            .and_then(Value::as_str)
-                            == Some("mock_reverse_ready")
-                        {
+                            .and_then(Value::as_str);
+                        if update_type == Some("user_message_chunk") {
+                            saw_user_turn = true;
+                        }
+                        if update_type == Some("mock_reverse_ready") {
                             emit_line(
                                 &stdout,
                                 &json!({
@@ -306,11 +358,10 @@ fn stream_turn(
                                     },
                                 }),
                             );
+                            std::fs::write(reverse_emitted_path(&transcript), b"emitted\n")
+                                .expect("record mock Grok reverse-request emission");
                         }
-                        finished = envelope
-                            .pointer("/params/update/sessionUpdate")
-                            .and_then(Value::as_str)
-                            == Some("agent_message_chunk");
+                        finished = saw_user_turn && update_type == Some("agent_message_chunk");
                         envelope["jsonrpc"] = json!("2.0");
                         emit_line(&stdout, &envelope);
                     }
@@ -409,7 +460,7 @@ fn agent_main(args: &[String]) {
 
 struct TuiState {
     active: bool,
-    awaiting_permission: bool,
+    awaiting_interaction: bool,
     cancel_hook: bool,
     cancel_delay: Option<Duration>,
     fail_always: bool,
@@ -546,7 +597,7 @@ fn handle_prompt(
             state.cancel_delay = Some(Duration::from_millis(250));
         }
         Some(MockCommand::Permission(_)) => {
-            state.awaiting_permission = true;
+            state.awaiting_interaction = true;
             let mut notification = hook_payload("Notification", session_id, cwd, transcript);
             notification["notificationType"] = json!("permission_prompt");
             fire_hooks(settings, "Notification", &notification);
@@ -656,19 +707,22 @@ fn handle_prompt(
             );
         }
         None if prompt == "::mock elicitation" => {
+            state.awaiting_interaction = true;
+            let reverse_emitted = reverse_emitted_path(transcript);
+            let _ = std::fs::remove_file(&reverse_emitted);
             append_json(
                 transcript,
                 &xai_update(session_id, "mock_reverse_ready", json!({})),
             );
-            std::thread::sleep(Duration::from_millis(250));
-            finish_turn(
-                settings,
-                session_id,
-                cwd,
-                transcript,
-                &prompt_id,
-                "elicitation complete",
-            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !reverse_emitted.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "mock Grok ACP sidecar did not emit the elicitation request"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = std::fs::remove_file(reverse_emitted);
         }
         _ => {
             let response = match command {
@@ -731,11 +785,11 @@ fn cancel_turn(
     cwd: &Path,
     transcript: &Path,
 ) {
-    if !state.active && !state.awaiting_permission {
+    if !state.active && !state.awaiting_interaction {
         return;
     }
     state.active = false;
-    state.awaiting_permission = false;
+    state.awaiting_interaction = false;
     let prompt_id = state
         .active_prompt_id
         .clone()
@@ -792,7 +846,13 @@ fn tui_main(args: &[String]) {
     if let Some(parent) = commands.parent() {
         std::fs::create_dir_all(parent).expect("create mock leader directory");
     }
-    if leader_enabled(args) {
+    if leader_enabled(args)
+        && args
+            .iter()
+            .any(|argument| argument == "--mock-detached-leader")
+    {
+        spawn_detached_leader(&socket);
+    } else if leader_enabled(args) {
         std::fs::write(&socket, b"mock Grok leader\n").expect("create mock leader socket");
     }
     let _ = std::fs::OpenOptions::new()
@@ -832,7 +892,7 @@ fn tui_main(args: &[String]) {
 
     let mut state = TuiState {
         active: false,
-        awaiting_permission: false,
+        awaiting_interaction: false,
         cancel_hook: true,
         cancel_delay: None,
         fail_always: false,
@@ -938,12 +998,24 @@ fn tui_main(args: &[String]) {
         libc::fcntl(stdin_fd, libc::F_SETFL, original_flags);
         libc::tcsetattr(stdin_fd, libc::TCSANOW, &original);
     }
-    let _ = std::fs::remove_file(socket);
+    if !args
+        .iter()
+        .any(|argument| argument == "--mock-detached-leader")
+    {
+        let _ = std::fs::remove_file(socket);
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(argument) = args.iter().find(|argument| argument.starts_with("--mock-")) {
+    if let Some(socket) = argument_value(&args, &["--mock-leader-child"]) {
+        detached_leader_main(Path::new(&socket));
+        return;
+    }
+    if let Some(argument) = args
+        .iter()
+        .find(|argument| argument.starts_with("--mock-") && *argument != "--mock-detached-leader")
+    {
         reject_unknown_mock_option("mock_grok", argument);
     }
     if args.iter().any(|argument| argument == "agent") {

@@ -38,13 +38,18 @@ pub(super) struct ClaudeState;
 pub(super) struct GrokState {
     pub(super) client: Arc<std::sync::Mutex<Option<grok::GrokClient>>>,
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    pub(super) leader_socket: Option<std::path::PathBuf>,
 }
 
 impl GrokState {
-    pub(super) fn new(cancel: tokio_util::sync::CancellationToken) -> Self {
+    pub(super) fn new(
+        cancel: tokio_util::sync::CancellationToken,
+        leader_socket: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             client: Arc::new(std::sync::Mutex::new(None)),
             cancel,
+            leader_socket,
         }
     }
 
@@ -226,6 +231,9 @@ impl BackendRuntime for GrokState {
         self.cancel.cancel();
         if let Some(client) = self.client() {
             client.stop();
+        }
+        if let Some(socket) = self.leader_socket.clone() {
+            grok::schedule_private_leader_cleanup(socket);
         }
     }
 
@@ -948,7 +956,7 @@ impl BackendLifecycle for GrokBackend {
             env,
         };
         let cancel = tokio_util::sync::CancellationToken::new();
-        let runtime = GrokState::new(cancel);
+        let runtime = GrokState::new(cancel, Some(attach.leader_socket.clone()));
         let pane_state = context.panes.get_or_insert(context.pane_id);
         pane_state.set_runtime(PaneRuntime::Grok(runtime.clone()));
         tokio::spawn(grok::run_driver(
@@ -1041,7 +1049,7 @@ impl BackendLifecycle for GrokBackend {
             env,
         };
         let cancel = tokio_util::sync::CancellationToken::new();
-        let runtime = GrokState::new(cancel);
+        let runtime = GrokState::new(cancel, Some(attach.leader_socket.clone()));
         let pane_state = context.panes.get_or_insert(&id);
         pane_state.note_session_id(context.session_id);
         pane_state.set_runtime(PaneRuntime::Grok(runtime.clone()));

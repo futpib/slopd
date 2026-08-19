@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,8 +13,115 @@ const ACP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 const LEADER_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const LEADER_CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 type RpcResult = Result<Value, String>;
 type PendingRequests = std::sync::Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<RpcResult>>>>;
+
+pub(super) fn schedule_private_leader_cleanup(socket: PathBuf) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + LEADER_CLEANUP_WAIT;
+        loop {
+            if terminate_private_leader(&socket) || std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+}
+
+fn terminate_private_leader(socket: &std::path::Path) -> bool {
+    let expected_parent = libslop::runtime_dir().join("slopd").join("grok-leaders");
+    if socket.parent() != Some(expected_parent.as_path())
+        || socket.extension().and_then(|extension| extension.to_str()) != Some("sock")
+    {
+        warn!(
+            "refusing to terminate Grok leader outside {}: {}",
+            expected_parent.display(),
+            socket.display()
+        );
+        return true;
+    }
+
+    let Ok(metadata) = std::fs::symlink_metadata(socket) else {
+        return false;
+    };
+    if !metadata.file_type().is_socket() {
+        warn!(
+            "refusing to terminate Grok leader for non-socket path {}",
+            socket.display()
+        );
+        return true;
+    }
+
+    let lock = socket.with_extension("lock");
+    let Some(pid) = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    if pid <= 1 || !leader_process_matches(pid, socket) {
+        warn!(
+            "refusing to terminate unverified Grok leader pid {} for {}",
+            pid,
+            socket.display()
+        );
+        return true;
+    }
+
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            warn!(
+                "failed to terminate Grok leader pid {} for {}: {}",
+                pid,
+                socket.display(),
+                error
+            );
+            return true;
+        }
+    }
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(lock);
+    true
+}
+
+fn leader_process_matches(pid: i32, socket: &std::path::Path) -> bool {
+    let Ok(command_line) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let arguments: Vec<&[u8]> = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    if !arguments
+        .windows(2)
+        .any(|arguments| arguments[0] == b"agent" && arguments[1] == b"leader")
+    {
+        return false;
+    }
+
+    let Ok(unix_sockets) = std::fs::read_to_string("/proc/net/unix") else {
+        return false;
+    };
+    let socket_text = socket.to_string_lossy();
+    let Some(inode) = unix_sockets.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        (fields.len() >= 8 && fields[7] == socket_text).then_some(fields[6])
+    }) else {
+        return false;
+    };
+    let expected = format!("socket:[{inode}]");
+    let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    descriptors.flatten().any(|descriptor| {
+        std::fs::read_link(descriptor.path())
+            .ok()
+            .is_some_and(|target| target.to_string_lossy() == expected)
+    })
+}
 
 #[derive(Clone)]
 pub(super) struct AttachSpec {

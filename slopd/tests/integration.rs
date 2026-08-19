@@ -4248,18 +4248,32 @@ where
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if pred(&v) {
-                let _ = tx.send(Some(v));
+            let matches = pred(&v);
+            if tx.send(Some((matches, v))).is_err() || matches {
                 return;
             }
         }
     });
-    let event = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("timed out waiting for event")
-        .expect("listener closed before matching event");
-    kill_child(listener);
-    event
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(Some((true, event))) => {
+                kill_child(listener);
+                return event;
+            }
+            Ok(Some((false, event))) => observed.push(event),
+            Ok(None) => {
+                kill_child(listener);
+                panic!("listener closed before matching event; observed: {observed:?}");
+            }
+            Err(error) => {
+                kill_child(listener);
+                panic!("timed out waiting for event: {error}; observed: {observed:?}");
+            }
+        }
+    }
 }
 
 fn wait_for_detailed_state_event(
@@ -14529,6 +14543,9 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
         let listener = spawn_event_listener(&env, "DetailedStateChange");
         assert!(env.slopctl(&["send", &source, prompt]).status.success());
         wait_for_detailed_state_event(listener, &source, expected.as_str());
+        if expected == libslop::PaneDetailedState::AwaitingInputElicitation {
+            assert!(env.slopctl(&["interrupt", &source]).status.success());
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
             assert!(
@@ -14856,6 +14873,59 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
 }
 
 #[test]
+fn grok_reverse_elicitation_after_compaction_is_observed_before_terminal_update() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    assert!(
+        env.slopctl(&["send", &pane, "::mock compact"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok compaction primer did not return to ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
+    assert!(
+        env.slopctl(&["send", &pane, "::mock elicitation"])
+            .status
+            .success()
+    );
+    wait_for_detailed_state_event(listener, &pane, "awaiting_input_elicitation");
+    assert!(env.slopctl(&["interrupt", &pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "Grok elicitation terminal update did not restore ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn grok_cancelled_turn_without_stop_hook_returns_to_ready() {
     build_bin("slopd");
     build_bin("slopctl");
@@ -15112,7 +15182,7 @@ fn grok_delayed_cancel_terminal_cannot_override_the_replacement_prompt() {
 }
 
 #[test]
-fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
+fn grok_graveyard_revive_preserves_identity_and_reaps_detached_leaders() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_grok");
@@ -15121,7 +15191,7 @@ fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
     let working_dir = tempfile::tempdir().unwrap();
     let env = TestEnv::new(None).expect("tmux required");
     env.append_config(&format!(
-        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = [{:?}, \"--mock-detached-leader\"]\nconfig_dir = {:?}\n",
         mock_grok.to_str().unwrap(),
         grok_home.path().to_str().unwrap(),
     ));
@@ -15176,8 +15246,35 @@ fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
     let original_socket = String::from_utf8_lossy(&original_socket.stdout)
         .trim()
         .to_string();
+    let original_lock = PathBuf::from(&original_socket).with_extension("lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let original_leader_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&original_lock)
+            && let Ok(pid) = pid.trim().parse::<u32>()
+            && PathBuf::from(format!("/proc/{pid}")).exists()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original detached Grok leader did not start at {original_socket}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
 
     assert!(env.slopctl(&["kill", &original_pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while PathBuf::from(format!("/proc/{original_leader_pid}")).exists()
+        || PathBuf::from(&original_socket).exists()
+        || original_lock.exists()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "killed Grok pane left detached leader pid {original_leader_pid}, socket {original_socket}, or lock {} behind",
+            original_lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     let graveyard = env.slopctl(&["graveyard", "--json"]);
     assert!(graveyard.status.success());
     let graveyard: serde_json::Value = serde_json::from_slice(&graveyard.stdout).unwrap();
@@ -15250,6 +15347,25 @@ fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
         .trim()
         .to_string();
     assert_ne!(revived_socket, original_socket);
+    let revived_lock = PathBuf::from(&revived_socket).with_extension("lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let revived_leader_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&revived_lock)
+            && let Ok(pid) = pid.trim().parse::<u32>()
+            && PathBuf::from(format!("/proc/{pid}")).exists()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revived detached Grok leader did not start at {revived_socket}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_ne!(
+        revived_leader_pid, original_leader_pid,
+        "revive must create an independent native Grok leader"
+    );
 
     let transcript = env.slopctl(&["transcript", &revived_pane, "--limit", "50"]);
     assert!(transcript.status.success());
@@ -15288,6 +15404,18 @@ fn grok_graveyard_revive_preserves_identity_history_metadata_and_new_env() {
     assert_eq!(grave["revived_as"], revived_pane);
 
     assert!(env.slopctl(&["kill", &revived_pane]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while PathBuf::from(format!("/proc/{revived_leader_pid}")).exists()
+        || PathBuf::from(&revived_socket).exists()
+        || revived_lock.exists()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "killed revived Grok pane left detached leader pid {revived_leader_pid}, socket {revived_socket}, or lock {} behind",
+            revived_lock.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     kill_slopd(slopd);
 }
 
