@@ -427,6 +427,48 @@ fn handle_prompt(
     transcript: &Path,
 ) {
     let prompt_id = format!("prompt-{}", counter());
+    if prompt == "/compact" {
+        state.active_prompt_id = None;
+        append_json(
+            transcript,
+            &xai_update(
+                session_id,
+                "user_message_chunk",
+                json!({
+                    "_meta":{"hostTurn":true},
+                    "content":{"type":"text","text":prompt},
+                }),
+            ),
+        );
+        fire_hooks(
+            settings,
+            "PreCompact",
+            &hook_payload("PreCompact", session_id, cwd, transcript),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        append_json(
+            transcript,
+            &xai_update(
+                session_id,
+                "compaction_checkpoint",
+                json!({"checkpoint_id":format!("checkpoint-{}", counter())}),
+            ),
+        );
+        fire_hooks(
+            settings,
+            "PostCompact",
+            &hook_payload("PostCompact", session_id, cwd, transcript),
+        );
+        append_json(
+            transcript,
+            &xai_update(
+                session_id,
+                "turn_completed",
+                json!({"prompt_id":prompt_id,"stop_reason":"end_turn"}),
+            ),
+        );
+        return;
+    }
     state.active_prompt_id = Some(prompt_id.clone());
     let mut submitted =
         hook_payload_for_prompt("UserPromptSubmit", session_id, cwd, transcript, &prompt_id);

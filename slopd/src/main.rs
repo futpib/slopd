@@ -276,6 +276,7 @@ enum PaneStateEvent<'a> {
         record_type: &'a str,
         record: &'a serde_json::Value,
         active_prompt_id: Option<&'a str>,
+        grok_unbound_prompt_active: bool,
     },
 }
 
@@ -319,8 +320,9 @@ fn reduce_pane_state(
             backend: libslop::Backend::Grok,
             record,
             active_prompt_id,
+            grok_unbound_prompt_active,
             ..
-        } => grok::transcript_state(record, *active_prompt_id),
+        } => grok::transcript_state(record, *active_prompt_id, *grok_unbound_prompt_active),
 
         PaneStateEvent::TranscriptRecord {
             record_type,
@@ -416,12 +418,18 @@ async fn set_pane_detailed_state(
     .await;
 }
 
+#[derive(Clone, Copy)]
+enum GrokTerminalGuard<'a> {
+    ActivePrompt(&'a str),
+    NoActivePrompt,
+}
+
 async fn set_grok_terminal_detailed_state(
     config: &libslop::SlopdConfig,
     pane_id: &str,
     detailed: &libslop::PaneDetailedState,
     previous: Option<&libslop::PaneDetailedState>,
-    prompt_id: &str,
+    guard: GrokTerminalGuard<'_>,
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
@@ -431,7 +439,7 @@ async fn set_grok_terminal_detailed_state(
         detailed,
         previous,
         true,
-        Some(prompt_id),
+        Some(guard),
         event_tx,
         panes,
     )
@@ -459,17 +467,31 @@ async fn set_pane_detailed_state_inner(
     detailed: &libslop::PaneDetailedState,
     previous: Option<&libslop::PaneDetailedState>,
     reject_stale: bool,
-    grok_prompt_guard: Option<&str>,
+    grok_terminal_guard: Option<GrokTerminalGuard<'_>>,
     event_tx: &EventTx,
     panes: &PaneMap,
 ) {
     let pane_state = panes.get_or_insert(pane_id);
     let _guard = pane_state.state_update_mutex.lock().await;
 
-    if grok_prompt_guard.is_some_and(|expected| {
-        pane_state.grok_active_prompt_id.lock().unwrap().as_deref() != Some(expected)
-    }) {
-        return;
+    if let Some(guard) = grok_terminal_guard {
+        let mut active = pane_state.grok_active_prompt_id.lock().unwrap();
+        let matches = match guard {
+            GrokTerminalGuard::ActivePrompt(expected) => active.as_deref() == Some(expected),
+            GrokTerminalGuard::NoActivePrompt => {
+                active.is_none()
+                    && pane_state
+                        .grok_unbound_prompt_active
+                        .load(std::sync::atomic::Ordering::Acquire)
+            }
+        };
+        if !matches {
+            return;
+        }
+        *active = None;
+        pane_state
+            .grok_unbound_prompt_active
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     // State sources run concurrently (hooks, transcript tailers, and backend
@@ -698,6 +720,9 @@ struct PaneState {
     /// can lag hooks, so terminal records must be correlated before they are
     /// allowed to mark a newer turn ready.
     grok_active_prompt_id: std::sync::Mutex<Option<String>>,
+    /// Grok client-local commands such as `/compact` have a turn but omit the
+    /// normal UserPromptSubmit hook and its prompt id.
+    grok_unbound_prompt_active: std::sync::atomic::AtomicBool,
     /// Set just before slopd injects its own "continue" prompt, so the
     /// UserPromptSubmit that prompt triggers is not mistaken for the user
     /// manually taking over (which would reset the retry counter and let a
@@ -732,6 +757,7 @@ impl PaneState {
             transcript_path: std::sync::Mutex::new(None),
             retry_state: std::sync::Mutex::new(None),
             grok_active_prompt_id: std::sync::Mutex::new(None),
+            grok_unbound_prompt_active: std::sync::atomic::AtomicBool::new(false),
             expecting_auto_continue: std::sync::atomic::AtomicBool::new(false),
             runtime: std::sync::Mutex::new(PaneRuntime::default()),
             pinned_session_id: std::sync::Mutex::new(None),
@@ -1499,11 +1525,16 @@ async fn tail_transcript(
                             } else {
                                 None
                             };
+                            let grok_unbound_prompt_active = backend == libslop::Backend::Grok
+                                && pane_state
+                                    .grok_unbound_prompt_active
+                                    .load(std::sync::atomic::Ordering::Acquire);
                             let event = PaneStateEvent::TranscriptRecord {
                                 backend,
                                 record_type: &record_type,
                                 record: &record,
                                 active_prompt_id: active_prompt_id.as_deref(),
+                                grok_unbound_prompt_active,
                             };
                             if let Some(new_state) = reduce_pane_state(&current, &event) {
                                 debug!(
@@ -1513,12 +1544,17 @@ async fn tail_transcript(
                                 if backend == libslop::Backend::Grok
                                     && let Some(prompt_id) = grok::terminal_prompt_id(&record)
                                 {
+                                    let guard = if active_prompt_id.is_some() {
+                                        GrokTerminalGuard::ActivePrompt(prompt_id)
+                                    } else {
+                                        GrokTerminalGuard::NoActivePrompt
+                                    };
                                     set_grok_terminal_detailed_state(
                                         &config,
                                         &pane_id,
                                         &new_state,
                                         Some(&current),
-                                        prompt_id,
+                                        guard,
                                         &event_tx,
                                         &panes,
                                     )
@@ -2131,6 +2167,7 @@ async fn recover_state_from_transcript(
             record_type,
             record,
             active_prompt_id: None,
+            grok_unbound_prompt_active: false,
         };
         if let Some(new_state) = reduce_pane_state(&state, &event) {
             state = new_state;
@@ -5108,6 +5145,9 @@ async fn handle_request(
                     && let Some(prompt_id) =
                         payload.get("prompt_id").and_then(|value| value.as_str())
                 {
+                    pane_state
+                        .grok_unbound_prompt_active
+                        .store(false, std::sync::atomic::Ordering::Release);
                     *pane_state.grok_active_prompt_id.lock().unwrap() = Some(prompt_id.to_string());
                 }
                 pane_state.prompt_submitted.notify_waiters();
@@ -5127,6 +5167,18 @@ async fn handle_request(
                 } else {
                     *pane_state.retry_state.lock().unwrap() = None;
                 }
+            }
+            if hook_backend == libslop::Backend::Grok && event == "PreCompact" {
+                // Grok client-local slash commands do not emit UserPromptSubmit.
+                // PreCompact is the first authoritative acceptance signal for
+                // `/compact`, including when sandboxing disables ACP and send
+                // has to use the visible TUI.
+                let pane_state = panes.get_or_insert(pane);
+                *pane_state.grok_active_prompt_id.lock().unwrap() = None;
+                pane_state
+                    .grok_unbound_prompt_active
+                    .store(true, std::sync::atomic::Ordering::Release);
+                pane_state.prompt_submitted.notify_waiters();
             }
 
             // Unified state transition via reducer.
@@ -5182,6 +5234,9 @@ async fn handle_request(
                 let mut active = pane_state.grok_active_prompt_id.lock().unwrap();
                 if terminal_prompt.is_none() || terminal_prompt == active.as_deref() {
                     *active = None;
+                    pane_state
+                        .grok_unbound_prompt_active
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
             }
 
@@ -7032,6 +7087,7 @@ mod tests {
                 record_type: "event_msg",
                 record: &record,
                 active_prompt_id: None,
+                grok_unbound_prompt_active: false,
             };
             assert_eq!(
                 reduce_pane_state(&libslop::PaneDetailedState::AwaitingInputPermission, &event,),

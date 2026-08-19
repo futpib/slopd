@@ -14497,15 +14497,9 @@ fn grok_mock_full_lifecycle_uses_tui_hooks_native_acp_and_recovery() {
             libslop::PaneDetailedState::AwaitingInputElicitation,
         ),
     ] {
+        let listener = spawn_event_listener(&env, "DetailedStateChange");
         assert!(env.slopctl(&["send", &source, prompt]).status.success());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while env.pane_state(&source).1 != expected {
-            assert!(
-                Instant::now() < deadline,
-                "Grok {prompt} did not reach {expected:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_detailed_state_event(listener, &source, expected.as_str());
         let deadline = Instant::now() + Duration::from_secs(5);
         while env.pane_state(&source).1 != libslop::PaneDetailedState::Ready {
             assert!(
@@ -14856,6 +14850,71 @@ fn grok_cancelled_turn_without_stop_hook_returns_to_ready() {
                         == Some("cancelled")
             })
     );
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn grok_slash_command_without_user_prompt_hook_returns_to_ready() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_grok");
+    let mock_grok = cargo_bin("mock_grok");
+    let grok_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.grok]\nbackend = \"grok\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_grok.to_str().unwrap(),
+        grok_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "grok", "--ready-timeout", "20"]);
+    assert!(run.status.success());
+    let pane = String::from_utf8_lossy(&run.stdout).trim().to_string();
+
+    let listener = spawn_event_listener(&env, "DetailedStateChange");
+    let send = env.slopctl(&["send", &pane, "/compact", "--timeout", "5"]);
+    assert!(
+        send.status.success(),
+        "hookless Grok slash command was not accepted: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    wait_for_detailed_state_event(listener, &pane, "busy_compacting");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "hookless Grok /compact terminal record left the pane busy"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "20"]);
+    assert!(transcript.status.success());
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let records = transcript["records"].as_array().unwrap();
+    assert!(records.iter().any(|record| {
+        record["event_type"] == "compaction_checkpoint"
+            && record
+                .pointer("/payload/params/update/checkpoint_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+    }));
+    assert!(records.iter().any(|record| {
+        record["event_type"] == "turn_completed"
+            && record
+                .pointer("/payload/params/update/stop_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("end_turn")
+    }));
+    assert!(records.iter().any(|record| {
+        record["event_type"] == "user_message_chunk"
+            && record
+                .pointer("/payload/params/update/content/text")
+                .and_then(serde_json::Value::as_str)
+                == Some("/compact")
+    }));
 
     kill_slopd(slopd);
 }

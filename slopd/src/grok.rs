@@ -607,13 +607,18 @@ pub(super) fn prompt_submitted(record: &Value) -> bool {
 pub(super) fn transcript_state(
     record: &Value,
     active_prompt_id: Option<&str>,
+    unbound_prompt_active: bool,
 ) -> Option<libslop::PaneDetailedState> {
     let update = record
         .pointer("/params/update")
         .or_else(|| record.get("update"))?;
     let event = update.get("sessionUpdate").and_then(Value::as_str)?;
     let prompt_id = terminal_prompt_id(record);
-    if event == "turn_completed" && prompt_id.is_some() && prompt_id == active_prompt_id {
+    let stop_reason = update.get("stop_reason").and_then(Value::as_str);
+    let matching_prompt = prompt_id.is_some() && prompt_id == active_prompt_id;
+    let hookless_local_command =
+        active_prompt_id.is_none() && unbound_prompt_active && stop_reason != Some("cancelled");
+    if event == "turn_completed" && (matching_prompt || hookless_local_command) {
         return Some(libslop::PaneDetailedState::Ready);
     }
     None
@@ -851,7 +856,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            transcript_state(&completed, Some("prompt-1")),
+            transcript_state(&completed, Some("prompt-1"), false),
             Some(libslop::PaneDetailedState::Ready)
         );
         assert_eq!(
@@ -860,10 +865,26 @@ mod tests {
                     "session/update",
                     json!({"sessionUpdate":"agent_message_chunk"}),
                 ),
-                Some("prompt-1")
+                Some("prompt-1"),
+                false,
             ),
             None
         );
-        assert_eq!(transcript_state(&completed, Some("prompt-2")), None);
+        assert_eq!(transcript_state(&completed, Some("prompt-2"), false), None);
+        assert_eq!(transcript_state(&completed, None, true), None);
+
+        let local_command = envelope(
+            "_x.ai/session/update",
+            json!({
+                "sessionUpdate":"turn_completed",
+                "stop_reason":"end_turn",
+                "prompt_id":"local-command",
+            }),
+        );
+        assert_eq!(
+            transcript_state(&local_command, None, true),
+            Some(libslop::PaneDetailedState::Ready)
+        );
+        assert_eq!(transcript_state(&local_command, None, false), None);
     }
 }
