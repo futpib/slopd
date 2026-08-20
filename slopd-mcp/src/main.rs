@@ -50,6 +50,10 @@ struct Cli {
     /// behind a reverse proxy. Defaults to the incoming Host / X-Forwarded-* headers.
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
+
+    /// Durable OAuth journal. Defaults below $XDG_STATE_HOME/slopd.
+    #[arg(long, env = "SLOPD_MCP_OAUTH_STATE", value_name = "PATH")]
+    oauth_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -86,6 +90,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         .as_deref()
         .map(libslop::expand_path)
         .unwrap_or_else(libslop::socket_path);
+    let oauth_state = cli
+        .oauth_state
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(|| libslop::state_dir().join("slopd/mcp-oauth.jsonl"));
 
     let listener = TcpListener::bind(cli.bind)
         .await
@@ -117,14 +126,16 @@ async fn run(cli: Cli) -> Result<(), String> {
         format!("/{}", cli.path)
     };
     tracing::info!(
-        "listening on http://{bound}{path} (slopd socket {})",
-        socket.display()
+        "listening on http://{bound}{path} (slopd socket {}, OAuth journal {})",
+        socket.display(),
+        oauth_state.display()
     );
 
     serve(
         listener,
         ServeConfig {
             socket,
+            oauth_state,
             token: token.map(Arc::from),
             allowed_hosts,
             path,

@@ -25,6 +25,7 @@ pub use handler::{SlopdMcp, parse_backend};
 #[derive(Clone)]
 pub struct ServeConfig {
     pub socket: PathBuf,
+    pub oauth_state: PathBuf,
     pub token: Option<Arc<str>>,
     pub allowed_hosts: Vec<String>,
     pub path: String,
@@ -87,7 +88,7 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-pub fn router(config: ServeConfig) -> Router {
+pub fn router(config: ServeConfig) -> std::io::Result<Router> {
     let path = if config.path.starts_with('/') {
         config.path.clone()
     } else {
@@ -95,7 +96,10 @@ pub fn router(config: ServeConfig) -> Router {
     };
     let auth = Auth {
         password: config.token.clone(),
-        oauth: oauth::OAuthStore::new(),
+        oauth: oauth::OAuthStore::open(
+            config.oauth_state,
+            oauth::token_binding(config.token.as_deref().unwrap_or("")),
+        )?,
         public_url: config.public_url.clone(),
         mcp_path: path.clone(),
     };
@@ -119,11 +123,11 @@ pub fn router(config: ServeConfig) -> Router {
     } else {
         mcp_routes
     };
-    router.layer(middleware::from_fn(log_http))
+    Ok(router.layer(middleware::from_fn(log_http)))
 }
 
 pub async fn serve(listener: TcpListener, config: ServeConfig) -> std::io::Result<()> {
-    axum::serve(listener, router(config)).await
+    axum::serve(listener, router(config)?).await
 }
 
 async fn log_http(request: Request, next: Next) -> Response {

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use axum::Form;
@@ -8,30 +10,30 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use http::{HeaderMap, StatusCode, header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::Auth;
 
-const ACCESS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const CODE_TTL: Duration = Duration::from_secs(5 * 60);
 pub const PUBLIC_CLIENT_ID: &str = "slopd-mcp";
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct OAuthStore {
     inner: std::sync::Arc<Mutex<Inner>>,
 }
 
-#[derive(Default)]
 struct Inner {
     clients: HashMap<String, Client>,
     codes: HashMap<String, AuthCode>,
     tokens: HashMap<String, AccessToken>,
+    binding: String,
+    file: File,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Client {
     redirect_uris: Vec<String>,
 }
@@ -43,29 +45,68 @@ struct AuthCode {
     expires: Instant,
 }
 
+#[derive(Serialize, Deserialize)]
 struct AccessToken {
-    expires: Instant,
+    binding: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum OAuthEvent {
+    Version { version: u32 },
+    ClientRegistered { client_id: String, client: Client },
+    TokenIssued { token: String, access: AccessToken },
 }
 
 impl OAuthStore {
-    pub fn new() -> Self {
-        let mut inner = Inner::default();
-        inner.clients.insert(
+    pub fn open(path: PathBuf, binding: String) -> std::io::Result<Self> {
+        let mut clients = HashMap::new();
+        clients.insert(
             PUBLIC_CLIENT_ID.into(),
             Client {
                 redirect_uris: Vec::new(),
             },
         );
-        Self {
-            inner: std::sync::Arc::new(Mutex::new(inner)),
+        let mut tokens = HashMap::new();
+        let mut file = libslop::jsonl::open(&path)?;
+        libslop::jsonl::replay(&path, |event: OAuthEvent| match event {
+            OAuthEvent::Version { .. } => {}
+            OAuthEvent::ClientRegistered { client_id, client } => {
+                clients.insert(client_id, client);
+            }
+            OAuthEvent::TokenIssued { token, access } => {
+                tokens.insert(token, access);
+            }
+        })?;
+        if file.metadata()?.len() == 0 {
+            libslop::jsonl::append(&mut file, &OAuthEvent::Version { version: 1 })?;
+            file.sync_data()?;
         }
+        Ok(Self {
+            inner: std::sync::Arc::new(Mutex::new(Inner {
+                clients,
+                codes: HashMap::new(),
+                tokens,
+                binding,
+                file,
+            })),
+        })
     }
 
-    async fn register(&self, redirect_uris: Vec<String>) -> String {
+    async fn register(&self, redirect_uris: Vec<String>) -> std::io::Result<String> {
         let id = format!("dcr-{}", uuid::Uuid::new_v4());
         let mut inner = self.inner.lock().await;
-        inner.clients.insert(id.clone(), Client { redirect_uris });
-        id
+        let client = Client { redirect_uris };
+        libslop::jsonl::append(
+            &mut inner.file,
+            &OAuthEvent::ClientRegistered {
+                client_id: id.clone(),
+                client: client.clone(),
+            },
+        )?;
+        inner.file.sync_data()?;
+        inner.clients.insert(id.clone(), client);
+        Ok(id)
     }
 
     async fn client(&self, id: &str) -> Option<Client> {
@@ -86,13 +127,23 @@ impl OAuthStore {
         }
     }
 
-    async fn put_token(&self, token: String) {
-        self.inner.lock().await.tokens.insert(
-            token,
-            AccessToken {
-                expires: Instant::now() + ACCESS_TTL,
+    async fn put_token(&self, token: String) -> std::io::Result<()> {
+        let mut inner = self.inner.lock().await;
+        let access = AccessToken {
+            binding: inner.binding.clone(),
+        };
+        libslop::jsonl::append(
+            &mut inner.file,
+            &OAuthEvent::TokenIssued {
+                token: token.clone(),
+                access: AccessToken {
+                    binding: access.binding.clone(),
+                },
             },
-        );
+        )?;
+        inner.file.sync_data()?;
+        inner.tokens.insert(token, access);
+        Ok(())
     }
 
     pub async fn token_valid(&self, token: &str) -> bool {
@@ -100,7 +151,7 @@ impl OAuthStore {
         inner
             .tokens
             .get(token)
-            .is_some_and(|issued| issued.expires > Instant::now())
+            .is_some_and(|issued| issued.binding == inner.binding)
     }
 }
 
@@ -216,7 +267,10 @@ async fn register(State(auth): State<Auth>, Json(body): Json<RegisterBody>) -> i
         )
             .into_response();
     }
-    let client_id = auth.oauth.register(body.redirect_uris.clone()).await;
+    let client_id = match auth.oauth.register(body.redirect_uris.clone()).await {
+        Ok(client_id) => client_id,
+        Err(error) => return storage_error(error),
+    };
     (
         StatusCode::CREATED,
         Json(json!({
@@ -384,11 +438,12 @@ async fn token(State(auth): State<Auth>, Form(form): Form<TokenForm>) -> Respons
             .into_response();
     }
     let access_token = random_secret();
-    auth.oauth.put_token(access_token.clone()).await;
+    if let Err(error) = auth.oauth.put_token(access_token.clone()).await {
+        return storage_error(error);
+    }
     Json(json!({
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": ACCESS_TTL.as_secs(),
         "scope": "mcp",
     }))
     .into_response()
@@ -438,6 +493,20 @@ fn random_secret() -> String {
     uuid::Uuid::new_v4().simple().to_string() + &uuid::Uuid::new_v4().simple().to_string()
 }
 
+pub(crate) fn token_binding(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn storage_error(error: std::io::Error) -> Response {
+    tracing::error!(%error, "failed to persist OAuth state");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "server_error"})),
+    )
+        .into_response()
+}
+
 fn esc(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -461,7 +530,7 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{pkce_s256, redirect_ok};
+    use super::{OAuthStore, pkce_s256, redirect_ok};
 
     #[test]
     fn pkce_matches_rfc7636() {
@@ -476,5 +545,25 @@ mod tests {
         assert!(redirect_ok("https://grok.com/oauth/callback"));
         assert!(redirect_ok("http://127.0.0.1:9/cb"));
         assert!(!redirect_ok("http://example.com/cb"));
+    }
+
+    #[tokio::test]
+    async fn clients_and_tokens_survive_reopen() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.jsonl");
+        let store = OAuthStore::open(path.clone(), super::token_binding("password")).unwrap();
+        let client_id = store
+            .register(vec!["https://grok.com/oauth/callback".into()])
+            .await
+            .unwrap();
+        store.put_token("access-token".into()).await.unwrap();
+        drop(store);
+
+        let reopened = OAuthStore::open(path.clone(), super::token_binding("password")).unwrap();
+        assert!(reopened.client(&client_id).await.is_some());
+        assert!(reopened.token_valid("access-token").await);
+        let rotated = OAuthStore::open(path, super::token_binding("new-password")).unwrap();
+        assert!(rotated.client(&client_id).await.is_some());
+        assert!(!rotated.token_valid("access-token").await);
     }
 }

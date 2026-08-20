@@ -34,10 +34,12 @@ impl Drop for Daemon {
 }
 
 async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
+    let oauth_state = socket.with_extension("mcp-oauth.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
         socket,
+        oauth_state,
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
         path: "/mcp".into(),
@@ -697,8 +699,13 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         .json()
         .await
         .unwrap();
+    assert!(token.get("expires_in").is_none(), "{token}");
     let access = token["access_token"].as_str().unwrap();
 
     let (initialized, _) = initialize(&http_client(), addr, Some(access)).await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
+
+    let restarted = start_mcp(env.socket_path(), Some("secret")).await;
+    let (initialized, _) = initialize(&http_client(), restarted, Some(access)).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
 }

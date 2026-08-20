@@ -1466,7 +1466,11 @@ slopd-mcp \
 
 The MCP endpoint is `http://<bind>/mcp` (override with `--path`). `--bind`
 defaults to `127.0.0.1:8780`. `--public-url` is the origin reverse-proxied
-clients see; it is written into OAuth discovery documents.
+clients see; it is written into OAuth discovery documents. Registered clients
+and access tokens are kept in the same crash-safe JSONL storage used by the
+slopd lifecycle journal, at `$XDG_STATE_HOME/slopd/mcp-oauth.jsonl` by default.
+Use `--oauth-state` or `SLOPD_MCP_OAUTH_STATE` to override it. Access tokens
+survive restarts and remain valid until the server token/password is rotated.
 
 The same token is used two ways:
 

@@ -11,7 +11,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -586,13 +585,8 @@ fn open_generation(
         )
     })?;
     let path = dir.join(generation.file_name());
-    repair_final_line(&path)?;
     let exists = path.exists();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(&path)
+    let mut file = libslop::jsonl::open(&path)
         .map_err(|e| format!("failed to open lifecycle journal {}: {e}", path.display()))?;
     if !exists || file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
         append_event(
@@ -611,109 +605,47 @@ fn open_generation(
     Ok((file, state))
 }
 
-/// Make an append-only file writable again after a process died partway through
-/// its last `write_all`. A complete JSON record missing only its newline is
-/// terminated; an incomplete final record is truncated. Interior corruption is
-/// deliberately left for `read_generation` to report.
-fn repair_final_line(path: &Path) -> Result<(), String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
-    };
-    let mut end = bytes.len();
-    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
-        end -= 1;
-    }
-    if end == 0 {
-        return Ok(());
-    }
-    let start = bytes[..end]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let line = &bytes[start..end];
-    if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
-        if bytes.last() != Some(&b'\n') {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("failed to repair {}: {e}", path.display()))?;
-            file.write_all(b"\n")
-                .map_err(|e| format!("failed to repair {}: {e}", path.display()))?;
-        }
-    } else {
-        OpenOptions::new()
-            .write(true)
-            .open(path)
-            .and_then(|file| file.set_len(start as u64))
-            .map_err(|e| format!("failed to truncate incomplete {}: {e}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn read_generation(path: &Path) -> Result<GenerationState, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open lifecycle journal {}: {e}", path.display()))?;
     let mut state = GenerationState::default();
-    let mut lines = BufReader::new(file).lines().peekable();
-    while let Some(line) = lines.next() {
-        let line = line.map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: JournalEvent = match serde_json::from_str(&line) {
-            Ok(event) => event,
-            // A crash may leave only the final append incomplete. Ignore that
-            // tail; malformed records in the middle indicate real corruption.
-            Err(_) if lines.peek().is_none() => break,
-            Err(e) => {
-                return Err(format!(
-                    "malformed lifecycle journal {}: {e}",
-                    path.display()
-                ));
-            }
-        };
-        match event {
-            JournalEvent::Generation {
-                started_at,
+    libslop::jsonl::replay(path, |event: JournalEvent| match event {
+        JournalEvent::Generation {
+            started_at,
+            tmux_boot_id,
+            tmux_session_id,
+            ..
+        } => {
+            state.started_at = started_at;
+            state.key = Some(GenerationKey {
                 tmux_boot_id,
                 tmux_session_id,
-                ..
-            } => {
-                state.started_at = started_at;
-                state.key = Some(GenerationKey {
-                    tmux_boot_id,
-                    tmux_session_id,
-                });
-            }
-            JournalEvent::Pane { pane, .. } => {
-                state.pane_versions.insert(pane.pane_id.clone(), pane);
-            }
-            JournalEvent::Checkpoint { pane_ids, .. } => {
-                state.checkpoint = pane_ids
-                    .iter()
-                    .filter_map(|pane_id| state.pane_versions.get(pane_id).cloned())
-                    .collect();
-                let live_ids: HashSet<&str> = pane_ids.iter().map(String::as_str).collect();
-                state
-                    .pane_versions
-                    .retain(|pane_id, _| live_ids.contains(pane_id.as_str()));
-                state.has_checkpoint = true;
-            }
-            JournalEvent::Destroyed { entry } => state.graves.push(entry),
-            JournalEvent::Revived {
-                at,
-                grave_id,
-                pane_id,
-                ..
-            } => state.revivals.push((grave_id, at, pane_id)),
-            JournalEvent::RestoreResolved { source, .. } => {
-                state.resolved_sources.insert(source);
-            }
+            });
         }
-    }
+        JournalEvent::Pane { pane, .. } => {
+            state.pane_versions.insert(pane.pane_id.clone(), pane);
+        }
+        JournalEvent::Checkpoint { pane_ids, .. } => {
+            state.checkpoint = pane_ids
+                .iter()
+                .filter_map(|pane_id| state.pane_versions.get(pane_id).cloned())
+                .collect();
+            let live_ids: HashSet<&str> = pane_ids.iter().map(String::as_str).collect();
+            state
+                .pane_versions
+                .retain(|pane_id, _| live_ids.contains(pane_id.as_str()));
+            state.has_checkpoint = true;
+        }
+        JournalEvent::Destroyed { entry } => state.graves.push(entry),
+        JournalEvent::Revived {
+            at,
+            grave_id,
+            pane_id,
+            ..
+        } => state.revivals.push((grave_id, at, pane_id)),
+        JournalEvent::RestoreResolved { source, .. } => {
+            state.resolved_sources.insert(source);
+        }
+    })
+    .map_err(|e| format!("failed to read lifecycle journal {}: {e}", path.display()))?;
     Ok(state)
 }
 
@@ -737,10 +669,7 @@ fn select_generations<'a>(
 }
 
 fn append_event(file: &mut File, event: &JournalEvent) -> Result<(), String> {
-    let mut line = serde_json::to_vec(event)
-        .map_err(|e| format!("failed to serialize lifecycle event: {e}"))?;
-    line.push(b'\n');
-    file.write_all(&line)
+    libslop::jsonl::append(file, event)
         .map_err(|e| format!("failed to append lifecycle event: {e}"))
 }
 
