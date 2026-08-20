@@ -14,16 +14,15 @@ use tokio::net::UnixStream;
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
-    allow_run: bool,
 }
 
 impl SlopdMcp {
-    pub fn new(socket: PathBuf, allow_run: bool) -> Self {
-        Self { socket, allow_run }
+    pub fn new(socket: PathBuf) -> Self {
+        Self { socket }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
-        crate::tools::all(self.allow_run)
+        crate::tools::all()
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
@@ -46,7 +45,7 @@ impl SlopdMcp {
             "restore" => self.restore().await,
             "graveyard" => self.graveyard(request.arguments.as_ref()).await,
             "revive" => self.revive(request.arguments.as_ref()).await,
-            "run" if self.allow_run => self.run(request.arguments.as_ref()).await,
+            "run" => self.run(request.arguments.as_ref()).await,
             name => Err(McpError::invalid_params(
                 format!("unknown tool {name}"),
                 None,
@@ -513,7 +512,7 @@ impl ServerHandler for SlopdMcp {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Call ps to find a pane, send to submit a prompt, then transcript to read the answer. send returns when slopd accepts the prompt, not when the agent finishes. interrupt stops an in-flight turn. run exists only if this server was started with --allow-run.",
+                "Supervisor for slopd-managed agent panes. Call ps to find a pane, send to submit a prompt, then transcript to read the answer. send returns when slopd accepts the prompt, not when the agent finishes. interrupt stops an in-flight turn.",
             )
     }
 

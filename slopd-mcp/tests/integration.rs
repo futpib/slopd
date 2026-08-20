@@ -33,12 +33,11 @@ impl Drop for Daemon {
     }
 }
 
-async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>, allow_run: bool) -> SocketAddr {
+async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
         socket,
-        allow_run,
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
         path: "/mcp".into(),
@@ -234,7 +233,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         eprintln!("skipping: tmux is unavailable");
         return;
     };
-    let addr = start_mcp(env.socket_path(), Some("secret"), false).await;
+    let addr = start_mcp(env.socket_path(), Some("secret")).await;
     let client = http_client();
 
     let unauthorized = rpc(
@@ -290,6 +289,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "tmux_hook",
             "status",
             "ps",
+            "run",
             "fork",
             "kill",
             "send",
@@ -309,39 +309,12 @@ async fn lists_supervisor_tools_and_requires_bearer() {
 }
 
 #[tokio::test]
-async fn allow_run_advertises_run_tool() {
-    let Some((env, _daemon, _claude_config)) = spawn_env() else {
-        eprintln!("skipping: tmux is unavailable");
-        return;
-    };
-    let addr = start_mcp(env.socket_path(), None, true).await;
-    let client = http_client();
-    let (_, session) = initialize(&client, addr, None).await;
-    let listed = rpc_json(
-        &client,
-        addr,
-        None,
-        session.as_deref(),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        }),
-    )
-    .await;
-    let names = tool_names(&listed);
-    assert_eq!(names.len(), 19, "{names:?}");
-    assert_eq!(names[4], "run", "{names:?}");
-}
-
-#[tokio::test]
 async fn lifecycle_and_metadata_tools_round_trip() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {
         eprintln!("skipping: tmux is unavailable");
         return;
     };
-    let addr = start_mcp(env.socket_path(), None, true).await;
+    let addr = start_mcp(env.socket_path(), None).await;
     let client = http_client();
     let (_, session) = initialize(&client, addr, None).await;
     let session = session.as_deref();
@@ -504,7 +477,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
     assert!(run.status.success(), "slopctl run failed: {run:?}");
     let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
 
-    let addr = start_mcp(env.socket_path(), Some("secret"), false).await;
+    let addr = start_mcp(env.socket_path(), Some("secret")).await;
     let client = http_client();
     let (_, session) = initialize(&client, addr, Some("secret")).await;
     let session = session.as_deref();
@@ -639,7 +612,7 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         eprintln!("skipping: tmux is unavailable");
         return;
     };
-    let addr = start_mcp(env.socket_path(), Some("secret"), false).await;
+    let addr = start_mcp(env.socket_path(), Some("secret")).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::none())

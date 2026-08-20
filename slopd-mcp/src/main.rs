@@ -50,10 +50,6 @@ struct Cli {
     /// behind a reverse proxy. Defaults to the incoming Host / X-Forwarded-* headers.
     #[arg(long, value_name = "URL")]
     public_url: Option<String>,
-
-    /// Advertise and implement the run tool, which can spawn new panes.
-    #[arg(long)]
-    allow_run: bool,
 }
 
 #[tokio::main]
@@ -129,7 +125,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         listener,
         ServeConfig {
             socket,
-            allow_run: cli.allow_run,
             token: token.map(Arc::from),
             allowed_hosts,
             path,

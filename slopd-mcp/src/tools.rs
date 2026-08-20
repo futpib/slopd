@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 
 use crate::schema;
 
-pub fn all(allow_run: bool) -> Vec<Tool> {
-    let mut tools = vec![
+pub fn all() -> Vec<Tool> {
+    vec![
         tool(
             "hook",
             "Forward an agent lifecycle hook event to slopd.",
@@ -42,6 +42,7 @@ pub fn all(allow_run: bool) -> Vec<Tool> {
             "List live slopd panes. Optional filters are AND-ed.",
             filter_schema(),
         ),
+        tool("run", "Create an agent pane.", spawn_schema(false)),
         tool(
             "fork",
             "Fork a pane into an independent agent session.",
@@ -135,18 +136,7 @@ pub fn all(allow_run: bool) -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-    ];
-    if allow_run {
-        tools.insert(
-            4,
-            tool(
-                "run",
-                "Create an agent pane. Available only when slopd-mcp starts with --allow-run.",
-                spawn_schema(false),
-            ),
-        );
-    }
-    tools
+    ]
 }
 
 fn tool(name: &'static str, description: &'static str, input_schema: Value) -> Tool {

@@ -1460,8 +1460,7 @@ slopd-mcp \
   --bind 10.77.77.2:8780 \
   --token-file ~/.config/slopd-mcp/token \
   --public-url https://178.18.254.153 \
-  --allowed-host 178.18.254.153 \
-  --allow-run
+  --allowed-host 178.18.254.153
 ```
 
 The MCP endpoint is `http://<bind>/mcp` (override with `--path`). `--bind`
@@ -1488,7 +1487,7 @@ Tools:
 |------|---------|---------|
 | `hook`, `tmux_hook` | on | Forward agent and tmux lifecycle events |
 | `status`, `ps` | on | Inspect daemon state and filtered live panes |
-| `run` | off | Create a pane; advertised only with `--allow-run` |
+| `run` | on | Create a pane |
 | `fork`, `kill` | on | Fork or terminate a managed pane |
 | `send`, `interrupt` | on | Prompt or interrupt panes, including `one` / `any` / `all` filtered sends |
 | `listen`, `wait`, `transcript` | on | Collect events, wait on predicates, or read history |

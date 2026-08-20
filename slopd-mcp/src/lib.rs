@@ -21,7 +21,6 @@ pub use handler::{SlopdMcp, parse_backend};
 #[derive(Clone)]
 pub struct ServeConfig {
     pub socket: PathBuf,
-    pub allow_run: bool,
     pub token: Option<Arc<str>>,
     pub allowed_hosts: Vec<String>,
     pub path: String,
@@ -99,8 +98,7 @@ pub fn router(config: ServeConfig) -> Router {
     let mcp = StreamableHttpService::new(
         {
             let socket = config.socket.clone();
-            let allow_run = config.allow_run;
-            move || Ok(SlopdMcp::new(socket.clone(), allow_run))
+            move || Ok(SlopdMcp::new(socket.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
