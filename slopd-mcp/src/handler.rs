@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer};
@@ -27,33 +27,31 @@ impl SlopdMcp {
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         match request.name.as_ref() {
-            "status" => self.status().await,
-            "ps" => self.ps(request.arguments.as_ref()).await,
-            "fork" => self.fork(request.arguments.as_ref()).await,
-            "kill" => self.kill(request.arguments.as_ref()).await,
-            "transcript" => self.transcript(request.arguments.as_ref()).await,
-            "send" => self.send(request.arguments.as_ref()).await,
-            "interrupt" => self.interrupt(request.arguments.as_ref()).await,
-            "listen" => self.listen(request.arguments.as_ref()).await,
-            "wait" => self.wait(request.arguments.as_ref()).await,
-            "tag" => self.tag(request.arguments.as_ref()).await,
-            "untag" => self.untag(request.arguments.as_ref()).await,
-            "tags" => self.tags(request.arguments.as_ref()).await,
-            "backup" => self.backup().await,
-            "restore" => self.restore().await,
-            "graveyard" => self.graveyard(request.arguments.as_ref()).await,
-            "revive" => self.revive(request.arguments.as_ref()).await,
-            "run" => self.run(request.arguments.as_ref()).await,
-            name => Err(McpError::invalid_params(
-                format!("unknown tool {name}"),
-                None,
-            )),
+            "get_status" => self.status().await,
+            "list_panes" => self.ps(request.arguments.as_ref()).await,
+            "fork_pane" => self.fork(request.arguments.as_ref()).await,
+            "kill_pane" => self.kill(request.arguments.as_ref()).await,
+            "read_transcript" => self.transcript(request.arguments.as_ref()).await,
+            "send_prompt" => self.send(request.arguments.as_ref()).await,
+            "interrupt_pane" => self.interrupt(request.arguments.as_ref()).await,
+            "collect_events" => self.listen(request.arguments.as_ref()).await,
+            "wait_for_event" => self.wait(request.arguments.as_ref()).await,
+            "add_tag" => self.tag(request.arguments.as_ref()).await,
+            "remove_tag" => self.untag(request.arguments.as_ref()).await,
+            "list_tags" => self.tags(request.arguments.as_ref()).await,
+            "create_backup" => self.backup().await,
+            "restore_backup" => self.restore().await,
+            "list_dead_panes" => self.graveyard(request.arguments.as_ref()).await,
+            "revive_pane" => self.revive(request.arguments.as_ref()).await,
+            "create_pane" => self.run(request.arguments.as_ref()).await,
+            name => Err(invalid_argument(format!("unknown tool {name}"))),
         }
     }
 
     async fn status(&self) -> Result<CallToolResult, McpError> {
         let mut client = connect(&self.socket).await?;
-        let state = client.status().await.map_err(slopd_error)?;
+        let result = client.status().await;
+        let state = self.slopd_result(result).await?;
         ok_json(json!({
             "uptime_secs": state.uptime_secs,
             "subscriber_count": state.subscriber_count,
@@ -64,38 +62,42 @@ impl SlopdMcp {
 
     async fn ps(&self, arguments: Option<&Map<String, Value>>) -> Result<CallToolResult, McpError> {
         let filters = pane_filters(arguments)?;
+        let raw = optional_bool(arguments, "raw")?.unwrap_or(false);
         let mut client = connect(&self.socket).await?;
-        let panes = client.ps().await.map_err(slopd_error)?;
+        let result = client.ps().await;
+        let panes = self.slopd_result(result).await?;
         let panes = libslopctl::apply_filters(panes, &filters);
-        ok_json(json!({ "panes": panes }))
+        let count = panes.len();
+        let panes = if raw {
+            serde_json::to_value(panes).unwrap_or_default()
+        } else {
+            Value::Array(panes.iter().map(compact_pane).collect())
+        };
+        ok_json(json!({ "count": count, "panes": panes }))
     }
 
     async fn fork(
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let source_pane_id = required_pane_id(arguments, "pane_id")?;
+        let source_pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let spawn = spawn_arguments(arguments)?;
         let mut client = connect(&self.socket).await?;
         let mut subscription = if spawn.no_wait {
             None
         } else {
-            Some(
-                client
-                    .subscribe(ready_event_filters())
-                    .await
-                    .map_err(slopd_error)?,
-            )
+            let result = client.subscribe(ready_event_filters()).await;
+            Some(self.slopd_result(result).await?)
         };
-        let (pane_id, session_id) = client
+        let result = client
             .fork(
                 source_pane_id,
                 spawn.start_directory,
                 spawn.env,
                 spawn.extra_args,
             )
-            .await
-            .map_err(slopd_error)?;
+            .await;
+        let (pane_id, session_id) = self.slopd_result(result).await?;
         if let Some(subscription) = subscription.as_mut()
             && let Err(message) = wait_pane_ready(subscription, &pane_id, spawn.ready_timeout).await
         {
@@ -117,9 +119,10 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_pane_id(arguments, "pane_id")?;
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let mut client = connect(&self.socket).await?;
-        let pane_id = client.kill(pane_id).await.map_err(slopd_error)?;
+        let result = client.kill(pane_id).await;
+        let pane_id = self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id }))
     }
 
@@ -127,17 +130,22 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_pane_id(arguments, "pane_id")?;
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let before = optional_u64(arguments, "before")?;
         let limit = optional_u64(arguments, "limit")?
             .unwrap_or(50)
             .clamp(1, 500);
+        let raw = optional_bool(arguments, "raw")?.unwrap_or(false);
         let mut client = connect(&self.socket).await?;
-        let records = client
-            .read_transcript(pane_id, before, limit)
-            .await
-            .map_err(slopd_error)?;
-        ok_json(json!({ "records": records }))
+        let result = client.read_transcript(pane_id, before, limit).await;
+        let records = self.slopd_result(result).await?;
+        let count = records.len();
+        let records = if raw {
+            serde_json::to_value(records).unwrap_or_default()
+        } else {
+            Value::Array(records.iter().map(compact_record).collect())
+        };
+        ok_json(json!({ "count": count, "records": records }))
     }
 
     async fn send(
@@ -153,33 +161,32 @@ impl SlopdMcp {
             .unwrap_or(60)
             .clamp(1, 300);
         let select = parse_select(optional_string(arguments, "select").as_deref())?;
-        let pane_id = optional_pane_id(arguments, "pane_id")?;
+        let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
         let filters = pane_filters(arguments)?;
         if pane_id.is_none() && filters.is_empty() {
-            return tool_error("send requires pane_id or at least one of tag, backend, account");
+            return tool_error(
+                "send_prompt requires pane_id or at least one of tag, backend, account",
+            );
         }
 
         let mut client = connect(&self.socket).await?;
         let pane_ids = if filters.is_empty() {
             let pane_id = pane_id.expect("pane_id present when filters empty");
-            vec![
-                client
-                    .send_prompt(pane_id, prompt, timeout, interrupt)
-                    .await
-                    .map_err(slopd_error)?,
-            ]
+            let result = client
+                .send_prompt(pane_id, prompt, timeout, interrupt)
+                .await;
+            vec![self.slopd_result(result).await?]
         } else {
             if let Some(pane_id) = pane_id {
-                client
+                let result = client
                     .send_prompt(pane_id, prompt, timeout, interrupt)
-                    .await
-                    .map_err(slopd_error)
-                    .map(|id| vec![id])?
+                    .await;
+                vec![self.slopd_result(result).await?]
             } else {
-                client
+                let result = client
                     .send_filtered(&filters, &prompt, &select, timeout, interrupt)
-                    .await
-                    .map_err(slopd_error)?
+                    .await;
+                self.slopd_result(result).await?
             }
         };
         ok_json(json!({ "pane_ids": pane_ids }))
@@ -189,9 +196,10 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_pane_id(arguments, "pane_id")?;
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let mut client = connect(&self.socket).await?;
-        let pane_id = client.interrupt(pane_id).await.map_err(slopd_error)?;
+        let result = client.interrupt(pane_id).await;
+        let pane_id = self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id }))
     }
 
@@ -199,7 +207,8 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let events = event_arguments(arguments)?;
+        let mut events = event_arguments(arguments)?;
+        events.pane_id = self.optional_pane_id(arguments, "pane_id").await?;
         let replay = optional_u64(arguments, "replay")?;
         let limit = optional_u64(arguments, "limit")?
             .unwrap_or(50)
@@ -214,17 +223,11 @@ impl SlopdMcp {
         let mut client = connect(&self.socket).await?;
         let mut subscription = if let Some(last_n) = replay {
             if !where_parsed.is_empty() {
-                return Err(McpError::invalid_params(
-                    "where is incompatible with replay",
-                    None,
-                ));
+                return Err(invalid_argument("where is incompatible with replay"));
             }
-            let pane_id =
-                pane_id.ok_or_else(|| McpError::invalid_params("replay requires pane_id", None))?;
-            client
-                .subscribe_transcript(pane_id, last_n)
-                .await
-                .map_err(slopd_error)?
+            let pane_id = pane_id.ok_or_else(|| invalid_argument("replay requires pane_id"))?;
+            let result = client.subscribe_transcript(pane_id, last_n).await;
+            self.slopd_result(result).await?
         } else {
             let filters = libslopctl::build_listen_filters(
                 events.hooks,
@@ -234,7 +237,8 @@ impl SlopdMcp {
                 session_id,
                 where_parsed,
             );
-            client.subscribe(filters).await.map_err(slopd_error)?
+            let result = client.subscribe(filters).await;
+            self.slopd_result(result).await?
         };
 
         let deadline = (events.timeout != 0)
@@ -267,7 +271,8 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let events = event_arguments(arguments)?;
+        let mut events = event_arguments(arguments)?;
+        events.pane_id = self.optional_pane_id(arguments, "pane_id").await?;
         let until =
             libslopctl::parse_payload_predicates(optional_string_array(arguments, "until")?)
                 .map_err(slopd_error)?;
@@ -287,7 +292,8 @@ impl SlopdMcp {
             where_parsed.clone(),
         );
         let mut client = connect(&self.socket).await?;
-        let mut subscription = client.subscribe(filters).await.map_err(slopd_error)?;
+        let result = client.subscribe(filters).await;
+        let mut subscription = self.slopd_result(result).await?;
 
         if !optional_bool(arguments, "no_snapshot")?.unwrap_or(false)
             && (pane_id.is_some() || session_id.is_some())
@@ -295,7 +301,8 @@ impl SlopdMcp {
             && events.transcripts.is_empty()
             && state_events_requested(&events.events)
         {
-            let panes = client.ps().await.map_err(slopd_error)?;
+            let result = client.ps().await;
+            let panes = self.slopd_result(result).await?;
             if let Some(pane) = panes.iter().find(|pane| {
                 pane_id
                     .as_ref()
@@ -323,7 +330,7 @@ impl SlopdMcp {
                     }
                     Some(libslopctl::SubscriptionItem::Subscribed) => {}
                     None => {
-                        return Err(McpError::internal_error("event subscription closed", None));
+                        return Err(internal_failure("event subscription closed"));
                     }
                 }
             }
@@ -363,15 +370,15 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
         remove: bool,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_pane_id(arguments, "pane_id")?;
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let tag = required_string(arguments, "tag")?;
         let mut client = connect(&self.socket).await?;
-        let (pane_id, tag) = if remove {
+        let result = if remove {
             client.untag(pane_id, tag).await
         } else {
             client.tag(pane_id, tag).await
-        }
-        .map_err(slopd_error)?;
+        };
+        let (pane_id, tag) = self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id, "tag": tag }))
     }
 
@@ -379,21 +386,24 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_pane_id(arguments, "pane_id")?;
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
         let mut client = connect(&self.socket).await?;
-        let tags = client.tags(pane_id.clone()).await.map_err(slopd_error)?;
+        let result = client.tags(pane_id.clone()).await;
+        let tags = self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id, "tags": tags }))
     }
 
     async fn backup(&self) -> Result<CallToolResult, McpError> {
         let mut client = connect(&self.socket).await?;
-        let count = client.backup().await.map_err(slopd_error)?;
+        let result = client.backup().await;
+        let count = self.slopd_result(result).await?;
         ok_json(json!({ "count": count }))
     }
 
     async fn restore(&self) -> Result<CallToolResult, McpError> {
         let mut client = connect(&self.socket).await?;
-        let restored = client.restore().await.map_err(slopd_error)?;
+        let result = client.restore().await;
+        let restored = self.slopd_result(result).await?;
         ok_json(json!({ "restored": restored }))
     }
 
@@ -405,9 +415,17 @@ impl SlopdMcp {
         let limit = optional_u64(arguments, "limit")?
             .unwrap_or(50)
             .clamp(1, 500) as usize;
+        let raw = optional_bool(arguments, "raw")?.unwrap_or(false);
         let mut client = connect(&self.socket).await?;
-        let entries = client.graveyard(boot, limit).await.map_err(slopd_error)?;
-        ok_json(json!({ "entries": entries }))
+        let result = client.graveyard(boot, limit).await;
+        let entries = self.slopd_result(result).await?;
+        let count = entries.len();
+        let entries = if raw {
+            serde_json::to_value(entries).unwrap_or_default()
+        } else {
+            Value::Array(entries.iter().map(compact_grave).collect())
+        };
+        ok_json(json!({ "count": count, "entries": entries }))
     }
 
     async fn revive(
@@ -418,10 +436,8 @@ impl SlopdMcp {
         let boot = optional_i32(arguments, "boot")?;
         let env = environment(arguments)?;
         let mut client = connect(&self.socket).await?;
-        let (pane_id, grave_id) = client
-            .revive(target, boot, env)
-            .await
-            .map_err(slopd_error)?;
+        let result = client.revive(target, boot, env).await;
+        let (pane_id, grave_id) = self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id, "grave_id": grave_id }))
     }
 
@@ -430,26 +446,20 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let spawn = spawn_arguments(arguments)?;
-        let parent_pane_id = optional_pane_id(arguments, "parent_pane_id")?;
+        let parent_pane_id = self.optional_pane_id(arguments, "parent_pane_id").await?;
         let account = optional_string(arguments, "account");
         let backend = match optional_string(arguments, "backend") {
-            Some(name) => Some(
-                parse_backend(&name).map_err(|message| McpError::invalid_params(message, None))?,
-            ),
+            Some(name) => Some(parse_backend(&name).map_err(invalid_argument)?),
             None => None,
         };
         let mut client = connect(&self.socket).await?;
         let mut subscription = if spawn.no_wait {
             None
         } else {
-            Some(
-                client
-                    .subscribe(ready_event_filters())
-                    .await
-                    .map_err(slopd_error)?,
-            )
+            let result = client.subscribe(ready_event_filters()).await;
+            Some(self.slopd_result(result).await?)
         };
-        let pane_id = client
+        let result = client
             .run(
                 parent_pane_id,
                 spawn.extra_args,
@@ -458,8 +468,8 @@ impl SlopdMcp {
                 account,
                 backend,
             )
-            .await
-            .map_err(slopd_error)?;
+            .await;
+        let pane_id = self.slopd_result(result).await?;
         if let Some(subscription) = subscription.as_mut()
             && let Err(message) = wait_pane_ready(subscription, &pane_id, spawn.ready_timeout).await
         {
@@ -471,6 +481,75 @@ impl SlopdMcp {
         }
         ok_json(json!({ "pane_id": pane_id, "ready": !spawn.no_wait }))
     }
+
+    async fn required_pane_id(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+        key: &str,
+    ) -> Result<String, McpError> {
+        match arguments.and_then(|values| values.get(key)) {
+            None | Some(Value::Null) => {
+                let valid_panes = self.valid_pane_ids().await;
+                Err(actionable_invalid_params(
+                    "missing_pane_id",
+                    format!(
+                        "Missing {key}. Copy a pane_id exactly from list_panes, including its leading %."
+                    ),
+                    Some("list_panes"),
+                    valid_panes,
+                ))
+            }
+            Some(Value::String(value)) if valid_pane_id(value) => Ok(value.clone()),
+            Some(value) => Err(self.invalid_pane_id(key, value).await),
+        }
+    }
+
+    async fn optional_pane_id(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+        key: &str,
+    ) -> Result<Option<String>, McpError> {
+        match arguments.and_then(|values| values.get(key)) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if valid_pane_id(value) => Ok(Some(value.clone())),
+            Some(value) => Err(self.invalid_pane_id(key, value).await),
+        }
+    }
+
+    async fn invalid_pane_id(&self, key: &str, value: &Value) -> McpError {
+        let shown = value.as_str().unwrap_or_else(|| value_type(value));
+        let message = format!(
+            "Invalid {key} {shown:?}. Expected exactly \"%<digits>\", for example \"%151\". Copy pane_id unchanged from list_panes, create_pane, fork_pane, or revive_pane. Do not spell \"%\" as \"percent\" or remove it."
+        );
+        actionable_invalid_params(
+            "invalid_pane_id",
+            message,
+            Some("list_panes"),
+            self.valid_pane_ids().await,
+        )
+    }
+
+    async fn valid_pane_ids(&self) -> Vec<String> {
+        let Ok(mut client) = connect(&self.socket).await else {
+            return Vec::new();
+        };
+        let Ok(panes) = client.ps().await else {
+            return Vec::new();
+        };
+        let mut pane_ids = panes
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect::<Vec<_>>();
+        pane_ids.sort();
+        pane_ids
+    }
+
+    async fn slopd_result<T>(&self, result: Result<T, libslopctl::Error>) -> Result<T, McpError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => Err(slopd_error_with_panes(error, self.valid_pane_ids().await)),
+        }
+    }
 }
 
 impl ServerHandler for SlopdMcp {
@@ -481,7 +560,7 @@ impl ServerHandler for SlopdMcp {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Call ps to find a pane, send to submit a prompt, then transcript to read the answer. send returns when slopd accepts the prompt, not when the agent finishes. interrupt stops an in-flight turn.",
+                "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, wait_for_event with transcripts=[\"assistant\"], then read_transcript to read the answer. Preserve pane_id exactly, including its leading %. send_prompt returns when slopd accepts the prompt, not when the agent finishes. interrupt_pane stops an in-flight turn.",
             )
     }
 
@@ -513,9 +592,15 @@ async fn connect(
     McpError,
 > {
     let stream = UnixStream::connect(socket).await.map_err(|error| {
+        let message = format!("failed to connect to {}: {error}", socket.display());
         McpError::internal_error(
-            format!("failed to connect to {}: {error}", socket.display()),
-            None,
+            message.clone(),
+            Some(actionable_error(
+                "slopd_unavailable",
+                message,
+                Some("get_status"),
+                Vec::new(),
+            )),
         )
     })?;
     let (reader, writer) = stream.into_split();
@@ -535,9 +620,8 @@ fn spawn_arguments(arguments: Option<&Map<String, Value>>) -> Result<SpawnArgume
     if let Some(path) = start_directory.as_ref() {
         let raw = path.to_string_lossy();
         if !path.is_absolute() && !raw.starts_with('~') && !raw.contains('$') {
-            return Err(McpError::invalid_params(
+            return Err(invalid_argument(
                 "start_directory must be absolute or start with ~ or $VAR",
-                None,
             ));
         }
     }
@@ -719,13 +803,82 @@ fn current_state_record(pane: &libslop::PaneInfo) -> libslop::Record {
     }
 }
 
+fn compact_pane(pane: &libslop::PaneInfo) -> Value {
+    json!({
+        "pane_id": pane.pane_id,
+        "backend": pane.backend,
+        "account": pane.account,
+        "state": pane.state,
+        "detailed_state": pane.detailed_state,
+        "tags": pane.tags,
+        "title": pane.pane_title,
+        "working_dir": pane.working_dir,
+        "parent_pane_id": pane.parent_pane_id,
+    })
+}
+
+fn compact_grave(entry: &libslop::GraveEntry) -> Value {
+    json!({
+        "grave_id": entry.grave_id,
+        "destroyed_at": entry.destroyed_at,
+        "cause": entry.cause,
+        "pane_id": entry.pane.pane_id,
+        "backend": entry.pane.backend,
+        "account": entry.pane.account,
+        "title": entry.pane.pane_title,
+        "working_dir": entry.pane.working_dir,
+        "revived_at": entry.revived_at,
+        "revived_as": entry.revived_as,
+    })
+}
+
+fn compact_record(record: &libslop::Record) -> Value {
+    json!({
+        "cursor": record.cursor,
+        "type": record.event_type,
+        "text": transcript_text(&record.payload),
+    })
+}
+
+fn transcript_text(payload: &Value) -> Option<String> {
+    [
+        "/text",
+        "/message/content",
+        "/content",
+        "/part/text",
+        "/params/update/content/text",
+        "/delta/text",
+    ]
+    .into_iter()
+    .find_map(|path| payload.pointer(path).and_then(text_value))
+}
+
+fn text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(text_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(text_value)
+            .or_else(|| object.get("content").and_then(text_value)),
+        _ => None,
+    }
+}
+
 fn pane_filters(arguments: Option<&Map<String, Value>>) -> Result<Vec<(String, String)>, McpError> {
     let mut filters = Vec::new();
     if let Some(tag) = optional_string(arguments, "tag") {
         filters.push(("tag".into(), tag));
     }
     if let Some(backend) = optional_string(arguments, "backend") {
-        parse_backend(&backend).map_err(|message| McpError::invalid_params(message, None))?;
+        parse_backend(&backend).map_err(invalid_argument)?;
         filters.push(("backend".into(), backend));
     }
     if let Some(account) = optional_string(arguments, "account") {
@@ -755,28 +908,24 @@ fn optional_string(arguments: Option<&Map<String, Value>>, key: &str) -> Option<
 }
 
 fn required_string(arguments: Option<&Map<String, Value>>, key: &str) -> Result<String, McpError> {
-    optional_string(arguments, key)
-        .ok_or_else(|| McpError::invalid_params(format!("{key} is required"), None))
+    optional_string(arguments, key).ok_or_else(|| invalid_argument(format!("{key} is required")))
 }
 
-fn optional_pane_id(
-    arguments: Option<&Map<String, Value>>,
-    key: &str,
-) -> Result<Option<String>, McpError> {
-    optional_string(arguments, key)
-        .map(validate_pane_id)
-        .transpose()
+fn valid_pane_id(pane_id: &str) -> bool {
+    pane_id.strip_prefix('%').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
-fn required_pane_id(arguments: Option<&Map<String, Value>>, key: &str) -> Result<String, McpError> {
-    validate_pane_id(required_string(arguments, key)?)
-}
-
-fn validate_pane_id(pane_id: String) -> Result<String, McpError> {
-    libslopctl::resolve_pane_id_or_session(Some(pane_id), None)
-        .map_err(slopd_error)?
-        .0
-        .ok_or_else(|| McpError::invalid_params("pane_id is required", None))
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn optional_bool(
@@ -786,10 +935,7 @@ fn optional_bool(
     match arguments.and_then(|args| args.get(key)) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(McpError::invalid_params(
-            format!("{key} must be a boolean"),
-            None,
-        )),
+        Some(_) => Err(invalid_argument(format!("{key} must be a boolean"))),
     }
 }
 
@@ -801,14 +947,11 @@ fn optional_u64(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(number)) => number
             .as_u64()
-            .ok_or_else(|| {
-                McpError::invalid_params(format!("{key} must be a non-negative integer"), None)
-            })
+            .ok_or_else(|| invalid_argument(format!("{key} must be a non-negative integer")))
             .map(Some),
-        Some(_) => Err(McpError::invalid_params(
-            format!("{key} must be a non-negative integer"),
-            None,
-        )),
+        Some(_) => Err(invalid_argument(format!(
+            "{key} must be a non-negative integer"
+        ))),
     }
 }
 
@@ -821,14 +964,9 @@ fn optional_i32(
         Some(Value::Number(number)) => number
             .as_i64()
             .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| {
-                McpError::invalid_params(format!("{key} must be a 32-bit integer"), None)
-            })
+            .ok_or_else(|| invalid_argument(format!("{key} must be a 32-bit integer")))
             .map(Some),
-        Some(_) => Err(McpError::invalid_params(
-            format!("{key} must be an integer"),
-            None,
-        )),
+        Some(_) => Err(invalid_argument(format!("{key} must be an integer"))),
     }
 }
 
@@ -837,10 +975,9 @@ fn parse_select(value: Option<&str>) -> Result<libslopctl::SelectMode, McpError>
         "one" => Ok(libslopctl::SelectMode::One),
         "any" => Ok(libslopctl::SelectMode::Any),
         "all" => Ok(libslopctl::SelectMode::All),
-        other => Err(McpError::invalid_params(
-            format!("unknown select mode {other:?}; expected one, any, or all"),
-            None,
-        )),
+        other => Err(invalid_argument(format!(
+            "unknown select mode {other:?}; expected one, any, or all"
+        ))),
     }
 }
 
@@ -853,48 +990,141 @@ fn optional_string_array(
         Some(Value::Array(items)) => items
             .iter()
             .map(|item| {
-                item.as_str().map(str::to_string).ok_or_else(|| {
-                    McpError::invalid_params(format!("{key} items must be strings"), None)
-                })
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| invalid_argument(format!("{key} items must be strings")))
             })
             .collect(),
-        Some(_) => Err(McpError::invalid_params(
-            format!("{key} must be an array of strings"),
-            None,
-        )),
+        Some(_) => Err(invalid_argument(format!(
+            "{key} must be an array of strings"
+        ))),
     }
 }
 
 fn slopd_error(error: libslopctl::Error) -> McpError {
+    slopd_error_with_panes(error, Vec::new())
+}
+
+fn slopd_error_with_panes(error: libslopctl::Error, valid_panes: Vec<String>) -> McpError {
+    let message = error.to_string();
     match error {
-        libslopctl::Error::SelectError(message) | libslopctl::Error::FilterError(message) => {
-            McpError::invalid_params(message, None)
+        libslopctl::Error::SelectError(_) => actionable_invalid_params(
+            "invalid_selection",
+            message,
+            Some("list_panes"),
+            valid_panes,
+        ),
+        libslopctl::Error::FilterError(_) => {
+            actionable_invalid_params("invalid_filter", message, Some("list_panes"), valid_panes)
         }
-        other => McpError::internal_error(other.to_string(), None),
+        libslopctl::Error::Server(ref server_message)
+            if server_message.contains("not managed by slopd")
+                || server_message.contains("unknown pane") =>
+        {
+            actionable_invalid_params("unknown_pane_id", message, Some("list_panes"), valid_panes)
+        }
+        libslopctl::Error::Timeout => McpError::internal_error(
+            message.clone(),
+            Some(actionable_error(
+                "slopd_timeout",
+                message,
+                Some("get_status"),
+                valid_panes,
+            )),
+        ),
+        libslopctl::Error::Io(_) | libslopctl::Error::ConnectionClosed => McpError::internal_error(
+            message.clone(),
+            Some(actionable_error(
+                "slopd_unavailable",
+                message,
+                Some("get_status"),
+                valid_panes,
+            )),
+        ),
+        _ => McpError::internal_error(
+            message.clone(),
+            Some(actionable_error(
+                "slopd_error",
+                message,
+                Some("get_status"),
+                valid_panes,
+            )),
+        ),
     }
 }
 
 fn ok_json(value: Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
-    )]))
+    let mut result = CallToolResult::structured(value);
+    result.content.clear();
+    Ok(result)
 }
 
 fn tool_error(message: impl Into<String>) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![ContentBlock::text(
-        message.into(),
-    )]))
+    tool_json_error(json!({ "message": message.into() }))
 }
 
 fn tool_json_error(value: Value) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![ContentBlock::text(
-        serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
-    )]))
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    let message = object
+        .remove("message")
+        .or_else(|| object.remove("error"))
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "tool operation failed".to_string());
+    object.insert("code".into(), json!("operation_failed"));
+    object.insert("message".into(), json!(message));
+    object.insert("retry_with".into(), Value::Null);
+    object.insert("valid_panes".into(), json!([]));
+    let mut result = CallToolResult::structured_error(Value::Object(object));
+    result.content.clear();
+    Ok(result)
+}
+
+fn actionable_invalid_params(
+    code: &str,
+    message: String,
+    retry_tool: Option<&str>,
+    valid_panes: Vec<String>,
+) -> McpError {
+    McpError::invalid_params(
+        message.clone(),
+        Some(actionable_error(code, message, retry_tool, valid_panes)),
+    )
+}
+
+fn invalid_argument(message: impl Into<String>) -> McpError {
+    actionable_invalid_params("invalid_argument", message.into(), None, Vec::new())
+}
+
+fn internal_failure(message: impl Into<String>) -> McpError {
+    let message = message.into();
+    McpError::internal_error(
+        message.clone(),
+        Some(actionable_error(
+            "slopd_error",
+            message,
+            Some("get_status"),
+            Vec::new(),
+        )),
+    )
+}
+
+fn actionable_error(
+    code: &str,
+    message: String,
+    retry_tool: Option<&str>,
+    valid_panes: Vec<String>,
+) -> Value {
+    json!({
+        "code": code,
+        "message": message,
+        "retry_with": retry_tool.map(|tool| json!({ "tool": tool, "arguments": {} })),
+        "valid_panes": valid_panes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_wait_transcripts, parse_backend, validate_pane_id};
+    use super::{expand_wait_transcripts, parse_backend, transcript_text, valid_pane_id};
 
     #[test]
     fn parse_backend_accepts_canonical_names() {
@@ -916,7 +1146,27 @@ mod tests {
 
     #[test]
     fn pane_ids_keep_the_tmux_prefix() {
-        assert_eq!(validate_pane_id("%146".into()).unwrap(), "%146");
-        assert!(validate_pane_id("146".into()).is_err());
+        assert!(valid_pane_id("%146"));
+        assert!(!valid_pane_id("146"));
+        assert!(!valid_pane_id("percent146"));
+    }
+
+    #[test]
+    fn transcript_text_normalizes_supported_backends() {
+        assert_eq!(
+            transcript_text(&serde_json::json!({ "text": "codex" })).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            transcript_text(&serde_json::json!({
+                "message": { "content": [{ "type": "text", "text": "claude" }] }
+            }))
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            transcript_text(&serde_json::json!({ "part": { "text": "opencode" } })).as_deref(),
+            Some("opencode")
+        );
     }
 }

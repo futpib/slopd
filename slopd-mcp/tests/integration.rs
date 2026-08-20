@@ -240,10 +240,8 @@ async fn call_tool(
 }
 
 fn tool_payload(response: &Value) -> Value {
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("tool text result");
-    serde_json::from_str(text).expect("JSON tool result")
+    assert_eq!(response["result"]["content"], json!([]), "{response}");
+    response["result"]["structuredContent"].clone()
 }
 
 #[tokio::test]
@@ -304,30 +302,30 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         names,
         vec![
-            "status",
-            "ps",
-            "run",
-            "fork",
-            "kill",
-            "send",
-            "interrupt",
-            "listen",
-            "wait",
-            "transcript",
-            "tag",
-            "untag",
-            "tags",
-            "backup",
-            "restore",
-            "graveyard",
-            "revive",
+            "get_status",
+            "list_panes",
+            "create_pane",
+            "fork_pane",
+            "kill_pane",
+            "send_prompt",
+            "interrupt_pane",
+            "collect_events",
+            "wait_for_event",
+            "read_transcript",
+            "add_tag",
+            "remove_tag",
+            "list_tags",
+            "create_backup",
+            "restore_backup",
+            "list_dead_panes",
+            "revive_pane",
         ]
     );
     let send = listed["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "send")
+        .find(|tool| tool["name"] == "send_prompt")
         .unwrap();
     assert_eq!(
         send["inputSchema"]["properties"]["pane_id"]["pattern"],
@@ -339,6 +337,50 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             .unwrap()
             .contains("including %")
     );
+    assert_eq!(send["annotations"]["readOnlyHint"], false);
+    assert_eq!(send["annotations"]["destructiveHint"], false);
+    assert_eq!(send["annotations"]["idempotentHint"], false);
+    assert_eq!(send["annotations"]["openWorldHint"], false);
+    assert_eq!(send["outputSchema"]["type"], "object");
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        assert!(tool["title"].is_string(), "{tool}");
+        assert!(tool["outputSchema"].is_object(), "{tool}");
+        assert!(tool["annotations"].is_object(), "{tool}");
+        assert_eq!(tool["annotations"]["openWorldHint"], false, "{tool}");
+    }
+    let expected_annotations = [
+        ("get_status", true, false, true),
+        ("list_panes", true, false, true),
+        ("create_pane", false, false, false),
+        ("fork_pane", false, false, false),
+        ("kill_pane", false, true, true),
+        ("send_prompt", false, false, false),
+        ("interrupt_pane", false, true, false),
+        ("collect_events", true, false, true),
+        ("wait_for_event", true, false, true),
+        ("read_transcript", true, false, true),
+        ("add_tag", false, false, true),
+        ("remove_tag", false, true, true),
+        ("list_tags", true, false, true),
+        ("create_backup", false, false, false),
+        ("restore_backup", false, false, true),
+        ("list_dead_panes", true, false, true),
+        ("revive_pane", false, false, false),
+    ];
+    for (name, read_only, destructive, idempotent) in expected_annotations {
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], read_only, "{name}");
+        assert_eq!(
+            tool["annotations"]["destructiveHint"], destructive,
+            "{name}"
+        );
+        assert_eq!(tool["annotations"]["idempotentHint"], idempotent, "{name}");
+    }
 
     let missing = call_tool(
         &client,
@@ -346,11 +388,11 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         Some("secret"),
         session.as_deref(),
         3,
-        "transcript",
+        "read_transcript",
         json!({ "pane_id": "%999999" }),
     )
     .await;
-    assert_eq!(missing["error"]["code"], -32603, "{missing}");
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
     assert!(
         missing["error"]["message"]
             .as_str()
@@ -358,6 +400,9 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             .contains("pane %999999 is not managed by slopd"),
         "{missing}"
     );
+    assert_eq!(missing["error"]["data"]["code"], "unknown_pane_id");
+    assert_eq!(missing["error"]["data"]["retry_with"]["tool"], "list_panes");
+    assert!(missing["error"]["data"]["valid_panes"].is_array());
 }
 
 #[tokio::test]
@@ -377,7 +422,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         10,
-        "run",
+        "create_pane",
         json!({ "ready_timeout": 20 }),
     )
     .await;
@@ -391,7 +436,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         11,
-        "tag",
+        "add_tag",
         json!({ "pane_id": pane_id, "tag": "mcp-parity" }),
     )
     .await;
@@ -402,7 +447,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         12,
-        "tags",
+        "list_tags",
         json!({ "pane_id": pane_id }),
     )
     .await;
@@ -413,7 +458,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         13,
-        "untag",
+        "remove_tag",
         json!({ "pane_id": pane_id, "tag": "mcp-parity" }),
     )
     .await;
@@ -425,7 +470,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         14,
-        "wait",
+        "wait_for_event",
         json!({
             "pane_id": pane_id,
             "until": ["seeded_current=true"],
@@ -436,7 +481,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     let waited = tool_payload(&waited);
     assert_eq!(waited["snapshot"], true, "{waited}");
 
-    let backup = call_tool(&client, addr, None, session, 17, "backup", json!({})).await;
+    let backup = call_tool(&client, addr, None, session, 17, "create_backup", json!({})).await;
     assert!(tool_payload(&backup)["count"].as_u64().unwrap() >= 1);
 
     let forked = call_tool(
@@ -445,7 +490,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         18,
-        "fork",
+        "fork_pane",
         json!({ "pane_id": pane_id, "no_wait": true }),
     )
     .await;
@@ -459,7 +504,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         19,
-        "kill",
+        "kill_pane",
         json!({ "pane_id": fork_id }),
     )
     .await;
@@ -473,7 +518,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
             None,
             session,
             20,
-            "graveyard",
+            "list_dead_panes",
             json!({ "limit": 20 }),
         )
         .await;
@@ -482,13 +527,34 @@ async fn lifecycle_and_metadata_tools_round_trip() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["pane"]["pane_id"] == fork_id)
+            .find(|entry| entry["pane_id"] == fork_id)
         {
+            assert!(entry.get("tmux_boot_id").is_none(), "{entry}");
+            assert!(entry.get("tmux_session_id").is_none(), "{entry}");
             break entry["grave_id"].as_str().unwrap().to_string();
         }
         assert!(std::time::Instant::now() < deadline, "{graveyard}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    let raw_graveyard = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        23,
+        "list_dead_panes",
+        json!({ "limit": 20, "raw": true }),
+    )
+    .await;
+    let raw_graveyard = tool_payload(&raw_graveyard);
+    let raw_entry = raw_graveyard["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["grave_id"] == grave_id)
+        .unwrap();
+    assert!(raw_entry.get("tmux_boot_id").is_some(), "{raw_entry}");
+    assert!(raw_entry.get("pane").is_some(), "{raw_entry}");
 
     let revived = call_tool(
         &client,
@@ -496,14 +562,23 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         None,
         session,
         21,
-        "revive",
+        "revive_pane",
         json!({ "target": grave_id }),
     )
     .await;
     let revived = tool_payload(&revived);
     assert_eq!(revived["grave_id"], grave_id);
 
-    let restored = call_tool(&client, addr, None, session, 22, "restore", json!({})).await;
+    let restored = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        22,
+        "restore_backup",
+        json!({}),
+    )
+    .await;
     assert!(tool_payload(&restored)["restored"].is_u64(), "{restored}");
 }
 
@@ -531,12 +606,23 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": { "name": "ps", "arguments": {} }
+            "params": { "name": "list_panes", "arguments": {} }
         }),
     )
     .await;
-    let text = listed["result"]["content"][0]["text"].as_str().unwrap();
-    let payload: Value = serde_json::from_str(text).unwrap();
+    let payload = tool_payload(&listed);
+    assert_eq!(payload["count"], 1, "{payload}");
+    let compact_pane = payload["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"] == pane_id)
+        .unwrap();
+    assert!(compact_pane.get("session_id").is_none(), "{compact_pane}");
+    assert!(
+        compact_pane.get("transcript_path").is_none(),
+        "{compact_pane}"
+    );
     assert!(
         payload["panes"]
             .as_array()
@@ -545,6 +631,25 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
             .any(|pane| pane["pane_id"] == pane_id),
         "{payload}"
     );
+    let raw_panes = call_tool(
+        &client,
+        addr,
+        Some("secret"),
+        session,
+        20,
+        "list_panes",
+        json!({ "raw": true }),
+    )
+    .await;
+    let raw_panes = tool_payload(&raw_panes);
+    let raw_pane = raw_panes["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"] == pane_id)
+        .unwrap();
+    assert!(raw_pane.get("session_id").is_some(), "{raw_pane}");
+    assert!(raw_pane.get("transcript_path").is_some(), "{raw_pane}");
 
     let sent = rpc_json(
         &client,
@@ -556,7 +661,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "send",
+                "name": "send_prompt",
                 "arguments": {
                     "pane_id": pane_id,
                     "prompt": "MCP_CANARY"
@@ -565,11 +670,10 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         }),
     )
     .await;
-    let sent_text = sent["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(sent_text.contains(&pane_id), "{sent_text}");
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id]));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut transcript_text = String::new();
+    let mut transcript_payload = Value::Null;
     while std::time::Instant::now() < deadline {
         let transcript = rpc_json(
             &client,
@@ -581,24 +685,51 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
                 "id": 4,
                 "method": "tools/call",
                 "params": {
-                    "name": "transcript",
+                    "name": "read_transcript",
                     "arguments": { "pane_id": pane_id, "limit": 50 }
                 }
             }),
         )
         .await;
-        transcript_text = transcript["result"]["content"][0]["text"]
-            .as_str()
+        transcript_payload = tool_payload(&transcript);
+        if transcript_payload["records"]
+            .as_array()
             .unwrap()
-            .to_string();
-        if transcript_text.contains("MCP_CANARY") {
+            .iter()
+            .filter_map(|record| record["text"].as_str())
+            .any(|text| text.contains("MCP_CANARY"))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        transcript_text.contains("MCP_CANARY"),
-        "transcript missing canary: {transcript_text}"
+        transcript_payload["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|record| record["text"].as_str())
+            .any(|text| text.contains("MCP_CANARY")),
+        "transcript missing canary: {transcript_payload}"
+    );
+    let raw_transcript = call_tool(
+        &client,
+        addr,
+        Some("secret"),
+        session,
+        21,
+        "read_transcript",
+        json!({ "pane_id": pane_id, "limit": 50, "raw": true }),
+    )
+    .await;
+    let raw_transcript = tool_payload(&raw_transcript);
+    assert!(
+        raw_transcript["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record.get("payload").is_some()),
+        "{raw_transcript}"
     );
 
     let replayed = call_tool(
@@ -607,7 +738,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         Some("secret"),
         session,
         5,
-        "listen",
+        "collect_events",
         json!({
             "pane_id": pane_id,
             "replay": 1,
@@ -634,16 +765,13 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
             "id": 6,
             "method": "tools/call",
             "params": {
-                "name": "interrupt",
+                "name": "interrupt_pane",
                 "arguments": { "pane_id": pane_id }
             }
         }),
     )
     .await;
-    let interrupt_text = interrupted["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(interrupt_text.contains(&pane_id), "{interrupt_text}");
+    assert_eq!(tool_payload(&interrupted)["pane_id"], pane_id);
 }
 
 #[tokio::test]
@@ -661,23 +789,83 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         None,
         control_session.as_deref(),
         30,
-        "run",
+        "create_pane",
         json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
     )
     .await;
     let pane_id = tool_payload(&run)["pane_id"].as_str().unwrap().to_string();
 
-    let invalid = call_tool(
-        &client,
-        addr,
-        None,
-        control_session.as_deref(),
-        31,
-        "transcript",
-        json!({ "pane_id": pane_id.trim_start_matches('%') }),
-    )
-    .await;
-    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    let malformed = format!("percent{}", pane_id.trim_start_matches('%'));
+    let invalid_calls = [
+        (
+            "fork_pane",
+            json!({ "pane_id": malformed, "no_wait": true }),
+        ),
+        ("kill_pane", json!({ "pane_id": malformed })),
+        (
+            "send_prompt",
+            json!({ "pane_id": malformed, "prompt": "must not be sent" }),
+        ),
+        ("interrupt_pane", json!({ "pane_id": malformed })),
+        (
+            "collect_events",
+            json!({ "pane_id": malformed, "timeout": 1 }),
+        ),
+        (
+            "wait_for_event",
+            json!({ "pane_id": malformed, "timeout": 1 }),
+        ),
+        ("read_transcript", json!({ "pane_id": malformed })),
+        (
+            "add_tag",
+            json!({ "pane_id": malformed, "tag": "must-not-exist" }),
+        ),
+        (
+            "remove_tag",
+            json!({ "pane_id": malformed, "tag": "must-not-exist" }),
+        ),
+        ("list_tags", json!({ "pane_id": malformed })),
+        (
+            "create_pane",
+            json!({ "parent_pane_id": malformed, "no_wait": true }),
+        ),
+    ];
+    for (offset, (tool, arguments)) in invalid_calls.into_iter().enumerate() {
+        let invalid = call_tool(
+            &client,
+            addr,
+            None,
+            control_session.as_deref(),
+            100 + offset as u64,
+            tool,
+            arguments,
+        )
+        .await;
+        assert_eq!(invalid["error"]["code"], -32602, "{tool}: {invalid}");
+        assert_eq!(
+            invalid["error"]["data"]["code"], "invalid_pane_id",
+            "{tool}: {invalid}"
+        );
+        assert!(
+            invalid["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Expected exactly \"%<digits>\"")
+                    && message.contains("Do not spell \"%\" as \"percent\"")),
+            "{tool}: {invalid}"
+        );
+        assert_eq!(
+            invalid["error"]["data"]["retry_with"]["tool"], "list_panes",
+            "{tool}: {invalid}"
+        );
+        assert!(
+            invalid["error"]["data"]["valid_panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|valid| valid == &json!(pane_id)),
+            "{tool}: {invalid}"
+        );
+    }
 
     let (_, wait_session) = initialize(&client, addr, None).await;
     let (_, send_session) = initialize(&client, addr, None).await;
@@ -687,7 +875,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         None,
         wait_session.as_deref(),
         32,
-        "wait",
+        "wait_for_event",
         json!({
             "pane_id": pane_id.clone(),
             "transcripts": ["assistant"],
@@ -702,7 +890,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             None,
             send_session.as_deref(),
             33,
-            "send",
+            "send_prompt",
             json!({ "pane_id": pane_id.clone(), "prompt": "MCP_WAIT_CANARY" }),
         )
         .await
