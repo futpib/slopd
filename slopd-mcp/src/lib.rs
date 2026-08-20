@@ -5,6 +5,8 @@ mod tools;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -15,6 +17,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::{Map, Value};
 use tokio::net::TcpListener;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub use handler::{SlopdMcp, parse_backend};
 
@@ -110,15 +114,69 @@ pub fn router(config: ServeConfig) -> Router {
     let mcp_routes = Router::new()
         .nest_service(&path, mcp)
         .layer(middleware::from_fn_with_state(auth.clone(), require_bearer));
-    if config.token.is_some() {
+    let router = if config.token.is_some() {
         oauth::routes(auth).merge(mcp_routes)
     } else {
         mcp_routes
-    }
+    };
+    router.layer(middleware::from_fn(log_http))
 }
 
 pub async fn serve(listener: TcpListener, config: ServeConfig) -> std::io::Result<()> {
     axum::serve(listener, router(config)).await
+}
+
+async fn log_http(request: Request, next: Next) -> Response {
+    let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let accept = request_header(&request, "accept");
+    let user_agent = request_header(&request, "user-agent");
+    let forwarded_for = request_header(&request, "x-forwarded-for");
+    let protocol = request_header(&request, "mcp-protocol-version");
+    let mcp_method = request_header(&request, "mcp-method");
+    let mcp_name = request_header(&request, "mcp-name");
+    let session = request_header(&request, "mcp-session-id");
+    tracing::info!(
+        request_id = id,
+        %method,
+        %path,
+        accept = accept.as_deref().unwrap_or("-"),
+        user_agent = user_agent.as_deref().unwrap_or("-"),
+        forwarded_for = forwarded_for.as_deref().unwrap_or("-"),
+        mcp_protocol = protocol.as_deref().unwrap_or("-"),
+        mcp_method = mcp_method.as_deref().unwrap_or("-"),
+        mcp_name = mcp_name.as_deref().unwrap_or("-"),
+        mcp_session = session.as_deref().unwrap_or("-"),
+        "MCP HTTP request"
+    );
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    tracing::info!(
+        request_id = id,
+        %method,
+        %path,
+        %status,
+        content_type,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "MCP HTTP response"
+    );
+    response
+}
+
+fn request_header(request: &Request, name: &str) -> Option<String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn require_bearer(State(auth): State<Auth>, request: Request, next: Next) -> Response {
