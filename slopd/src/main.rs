@@ -6728,6 +6728,11 @@ async fn handle_request(
             before_cursor,
             limit,
         } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {} is not managed by slopd", pane_id),
+                };
+            }
             if let Some(state) = panes.get(&pane_id)
                 && let Some(result) = state.runtime().transcript(&pane_id).await
             {

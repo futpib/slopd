@@ -339,6 +339,25 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             .unwrap()
             .contains("including %")
     );
+
+    let missing = call_tool(
+        &client,
+        addr,
+        Some("secret"),
+        session.as_deref(),
+        3,
+        "transcript",
+        json!({ "pane_id": "%999999" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32603, "{missing}");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pane %999999 is not managed by slopd"),
+        "{missing}"
+    );
 }
 
 #[tokio::test]

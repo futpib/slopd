@@ -6013,9 +6013,9 @@ fn read_transcript_returns_paginated_records() {
     kill_slopd(slopd);
 }
 
-/// Verify that ReadTranscript returns empty page for pane without transcript.
+/// Verify that ReadTranscript distinguishes an empty transcript from an unknown pane.
 #[test]
-fn read_transcript_empty_for_pane_without_transcript() {
+fn read_transcript_distinguishes_empty_from_unknown_pane() {
     build_bin("slopd");
     build_bin("slopctl");
 
@@ -6043,6 +6043,17 @@ fn read_transcript_empty_for_pane_without_transcript() {
         records.is_empty(),
         "expected empty records for pane without transcript, got {}",
         records.len()
+    );
+
+    let missing = env.slopctl(&["transcript", "%999999"]);
+    assert!(
+        !missing.status.success(),
+        "unknown pane unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("pane %999999 is not managed by slopd"),
+        "unexpected error: {stderr}"
     );
 
     kill_slopd(slopd);
