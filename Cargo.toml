@@ -9,6 +9,7 @@ members = [
     "iroh-slopd",
     "iroh-slopctl",
     "slopd-acp",
+    "slopd-mcp",
 ]
 resolver = "2"
 

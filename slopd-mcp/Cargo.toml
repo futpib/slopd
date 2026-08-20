@@ -1,0 +1,29 @@
+[package]
+name = "slopd-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Streamable HTTP MCP supervisor for slopd-managed panes"
+
+[dependencies]
+axum = "0.8"
+http = "1"
+libslop = { path = "../libslop" }
+libslopctl = { path = "../libslopctl" }
+rmcp = { version = "3.1.4", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.6.0", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+libsloptest = { path = "../libsloptest" }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+[lints]
+workspace = true

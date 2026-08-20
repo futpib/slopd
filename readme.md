@@ -27,6 +27,7 @@ subscribers.
 - [Claude hook integration](#claude-hook-integration)
 - [Event system](#event-system)
 - [ACP adapter](#acp-adapter)
+- [MCP supervisor](#mcp-supervisor)
 - [Remote access (iroh)](#remote-access-iroh)
   - [iroh-slopd](#iroh-slopd)
   - [iroh-slopctl](#iroh-slopctl)
@@ -95,6 +96,8 @@ cargo install --path slopd
 cargo install --path slopctl
 # Optional: expose managed panes to ACP clients
 cargo install --path slopd-acp
+# Optional: Streamable HTTP MCP supervisor for Grok Voice / MCP clients
+cargo install --path slopd-mcp
 # Optional: remote access via iroh
 cargo install --path iroh-slopd
 cargo install --path iroh-slopctl
@@ -1439,6 +1442,50 @@ the shared `iroh-slopctl` default.
 
 ---
 
+## MCP supervisor
+
+`slopd-mcp` is a [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
+[MCP](https://modelcontextprotocol.io) server. It is a **supervisor**, not a
+second ACP host: MCP clients such as Grok Voice can list panes, submit prompts,
+read transcripts, and interrupt turns on a running slopd. It does not create
+ACP sessions and does not compete with `slopd-acp` / Buzz.
+
+```bash
+# Loopback is anonymous. Non-loopback binds require a bearer token.
+slopd-mcp --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock"
+
+slopd-mcp \
+  --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock" \
+  --bind 10.77.77.2:8780 \
+  --token-file ~/.config/slopd-mcp/token \
+  --allowed-host 178.18.254.153
+```
+
+The MCP endpoint is `http://<bind>/mcp`. Point a custom Grok connector at the
+public HTTPS URL that reverse-proxies that path, with the same bearer token in
+the connector's authorization field.
+
+Tools:
+
+| Tool | Default | Purpose |
+|------|---------|---------|
+| `status` | on | Daemon uptime and subscriber count |
+| `ps` | on | List live panes (`tag` / `backend` / `account` filters) |
+| `transcript` | on | Read recent records from a pane |
+| `send` | on | Submit a prompt; returns when slopd **accepts** it, not when the agent finishes |
+| `interrupt` | on | Interrupt an in-flight turn |
+| `run` | off | Spawn a pane; advertised only with `--allow-run` |
+
+`send` does not wait for the underlying agent to finish. Call `transcript`
+afterward for the answer. Tool results are compact JSON so Streamable HTTP/SSE
+does not split on newlines.
+
+A bearer token is required whenever `--bind` is not loopback. `--allowed-host`
+adds `Host` header values beyond loopback and the bind address; a reverse proxy
+must list the public hostname or IP Grok will send.
+
+---
+
 ## Remote access (iroh)
 
 `iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance by exposing the Unix socket over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine via an encrypted P2P connection with EndpointId allowlist authentication.
@@ -1567,4 +1614,5 @@ iroh-slopctl ps
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
+| `slopd-mcp` | Streamable HTTP MCP supervisor — `ps` / `send` / `transcript` / `interrupt` for MCP clients such as Grok Voice |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |
