@@ -2430,15 +2430,44 @@ impl Projection {
                     | "toolCall"
             )
         {
+            let embedded = record
+                .payload
+                .get("arguments")
+                .and_then(Value::as_str)
+                .filter(|_| name == "exec")
+                .map(embedded_tool_calls)
+                .unwrap_or_default();
+            let plan_input = if name == "update_plan" || record.event_type == "plan" {
+                Some(decoded_tool_input(record.payload.get("arguments")))
+            } else {
+                embedded
+                    .iter()
+                    .find(|(name, _)| name == "update_plan")
+                    .map(|(_, input)| input.clone())
+            };
+            if let Some(input) = plan_input
+                && let Some(mut plan) = plan_updates(&input)
+            {
+                updates.append(&mut plan);
+                if name != "exec" || embedded.iter().all(|(name, _)| name == "update_plan") {
+                    return;
+                }
+            }
+            let (title, kind, raw_input) = projected_tool(
+                record.event_type.as_str(),
+                name,
+                record.payload.get("arguments"),
+                &embedded,
+            );
             let id = tool_id(record, name);
             if self.open_tools.insert(id.clone()) {
                 updates.push(json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": id,
-                    "title": name,
-                    "kind": "other",
+                    "title": title,
+                    "kind": kind,
                     "status": "in_progress",
-                    "rawInput": record.payload.get("arguments").cloned().unwrap_or(Value::Null),
+                    "rawInput": raw_input,
                 }));
             }
         }
@@ -2459,6 +2488,12 @@ impl Projection {
             && let Some(part) = record.payload.get("part")
         {
             let name = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let (title, kind, raw_input) = projected_tool(
+                record.event_type.as_str(),
+                name,
+                part.pointer("/state/input"),
+                &[],
+            );
             let id = part
                 .get("callID")
                 .or_else(|| part.get("callId"))
@@ -2475,10 +2510,10 @@ impl Projection {
                         updates.push(json!({
                             "sessionUpdate": "tool_call",
                             "toolCallId": id,
-                            "title": name,
-                            "kind": "other",
+                            "title": title,
+                            "kind": kind,
                             "status": if status == "pending" { "pending" } else { "in_progress" },
-                            "rawInput": part.pointer("/state/input").cloned().unwrap_or(Value::Null),
+                            "rawInput": raw_input,
                         }));
                     } else if status == "running" {
                         updates.push(json!({
@@ -2523,6 +2558,8 @@ impl Projection {
             match block.get("type").and_then(Value::as_str) {
                 Some("tool_use") => {
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let (title, kind, raw_input) =
+                        projected_tool(record.event_type.as_str(), name, block.get("input"), &[]);
                     let id = block
                         .get("id")
                         .and_then(Value::as_str)
@@ -2532,10 +2569,10 @@ impl Projection {
                         updates.push(json!({
                             "sessionUpdate": "tool_call",
                             "toolCallId": id,
-                            "title": name,
-                            "kind": "other",
+                            "title": title,
+                            "kind": kind,
                             "status": "in_progress",
-                            "rawInput": block.get("input").cloned().unwrap_or(Value::Null),
+                            "rawInput": raw_input,
                         }));
                     }
                 }
@@ -2668,6 +2705,184 @@ fn content_text(value: Option<&Value>) -> Option<String> {
         .collect::<Vec<_>>()
         .join("");
     (!text.is_empty()).then_some(text)
+}
+
+fn projected_tool(
+    event_type: &str,
+    name: &str,
+    input: Option<&Value>,
+    embedded: &[(String, Value)],
+) -> (String, &'static str, Value) {
+    let (name, input) = if name == "exec" {
+        embedded
+            .iter()
+            .find(|(name, _)| name != "update_plan")
+            .map(|(name, input)| (name.as_str(), input.clone()))
+            .unwrap_or_else(|| {
+                (
+                    "exec_command",
+                    json!({"command": input.and_then(Value::as_str).unwrap_or_default()}),
+                )
+            })
+    } else {
+        (name, decoded_tool_input(input))
+    };
+    (name.to_string(), tool_kind(event_type, name), input)
+}
+
+fn decoded_tool_input(input: Option<&Value>) -> Value {
+    match input {
+        Some(Value::String(input)) => {
+            jsonish_value(input).unwrap_or_else(|| json!({"input": input}))
+        }
+        Some(input) => input.clone(),
+        None => Value::Null,
+    }
+}
+
+fn embedded_tool_calls(input: &str) -> Vec<(String, Value)> {
+    let mut tools = Vec::new();
+    let mut offset = 0;
+    while let Some(found) = input[offset..].find("tools.") {
+        let start = offset + found + "tools.".len();
+        let rest = &input[start..];
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        if name_len == 0 {
+            offset = start;
+            continue;
+        }
+        let name = &rest[..name_len];
+        let after_name = rest[name_len..].trim_start();
+        let Some(arguments) = after_name.strip_prefix('(') else {
+            offset = start + name_len;
+            continue;
+        };
+        let argument = first_js_argument(arguments).unwrap_or(arguments).trim();
+        let input = jsonish_value(argument).unwrap_or_else(|| json!({"input": argument}));
+        tools.push((name.to_string(), input));
+        offset = start + name_len;
+    }
+    tools
+}
+
+fn first_js_argument(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let first = input.as_bytes().first().copied()?;
+    if !matches!(first, b'{' | b'[' | b'"' | b'\'' | b'`') {
+        return input
+            .find([',', ')'])
+            .map(|end| &input[..end])
+            .or(Some(input));
+    }
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in input.bytes().enumerate() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+                if stack.is_empty() {
+                    return Some(&input[..=index]);
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'{' | b'[' => stack.push(byte),
+            b'}' if stack.pop() == Some(b'{') && stack.is_empty() => {
+                return Some(&input[..=index]);
+            }
+            b']' if stack.pop() == Some(b'[') && stack.is_empty() => {
+                return Some(&input[..=index]);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn jsonish_value(input: &str) -> Option<Value> {
+    json5::from_str(input).ok()
+}
+
+fn tool_kind(event_type: &str, name: &str) -> &'static str {
+    match event_type {
+        "commandExecution" => return "execute",
+        "fileChange" => return "edit",
+        "plan" => return "think",
+        "webSearch" => return "search",
+        _ => {}
+    }
+    let name = name.to_ascii_lowercase();
+    if name.contains("delete") || name.contains("remove_file") || name.contains("unlink") {
+        "delete"
+    } else if name.contains("move") || name.contains("rename") {
+        "move"
+    } else if name.contains("patch") || name.contains("edit") || name.contains("write_file") {
+        "edit"
+    } else if name.contains("search") || name.contains("grep") || name.contains("glob") {
+        "search"
+    } else if name.contains("fetch") || name.contains("web") {
+        "fetch"
+    } else if name.contains("read") || name.contains("view") || name.contains("load_skill") {
+        "read"
+    } else if name.contains("exec")
+        || name.contains("shell")
+        || name.contains("bash")
+        || name.contains("command")
+        || name == "wait"
+    {
+        "execute"
+    } else if name.contains("plan") || name.contains("todo") || name.contains("think") {
+        "think"
+    } else if name.contains("switch_mode") {
+        "switch_mode"
+    } else {
+        "other"
+    }
+}
+
+fn plan_updates(input: &Value) -> Option<Vec<Value>> {
+    let entries = input.get("plan")?.as_array()?;
+    let entries = entries
+        .iter()
+        .filter_map(|entry| {
+            let content = entry
+                .get("step")
+                .or_else(|| entry.get("content"))
+                .and_then(Value::as_str)?;
+            let status = match entry.get("status").and_then(Value::as_str) {
+                Some("completed") => "completed",
+                Some("in_progress" | "running") => "in_progress",
+                _ => "pending",
+            };
+            let priority = match entry.get("priority").and_then(Value::as_str) {
+                Some("high") => "high",
+                Some("low") => "low",
+                _ => "medium",
+            };
+            Some(json!({"content": content, "status": status, "priority": priority}))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    let mut updates = Vec::with_capacity(2);
+    if let Some(explanation) = input.get("explanation").and_then(Value::as_str)
+        && !explanation.is_empty()
+    {
+        updates.push(thought_chunk(explanation));
+    }
+    updates.push(json!({"sessionUpdate": "plan", "entries": entries}));
+    Some(updates)
 }
 
 fn tool_id(record: &libslop::Record, name: &str) -> String {
@@ -3004,6 +3219,105 @@ mod tests {
         assert_eq!(updates[0]["sessionUpdate"], "agent_thought_chunk");
         assert_eq!(updates[0]["messageId"], "reason-1");
         assert_eq!(updates[0]["content"]["text"], "Inspecting files.");
+    }
+
+    #[test]
+    fn codex_plan_tool_projects_standard_plan_and_explanation() {
+        let mut projection = Projection::default();
+        let updates = projection.updates(
+            libslop::Backend::Codex,
+            &record(
+                "plan",
+                json!({
+                    "name": "update_plan",
+                    "call_id": "plan-1",
+                    "arguments": r#"{"explanation":"Tests pass.","plan":[{"step":"Inspect","status":"completed"},{"step":"Smoke test","status":"in_progress"}]}"#,
+                }),
+            ),
+        );
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(updates[0]["content"]["text"], "Tests pass.");
+        assert_eq!(updates[1]["sessionUpdate"], "plan");
+        assert_eq!(updates[1]["entries"][0]["content"], "Inspect");
+        assert_eq!(updates[1]["entries"][0]["priority"], "medium");
+        assert_eq!(updates[1]["entries"][1]["status"], "in_progress");
+        assert!(projection.open_tools.is_empty());
+    }
+
+    #[test]
+    fn codex_exec_unwraps_jsonish_plan_and_real_tool() {
+        let mut projection = Projection::default();
+        let updates = projection.updates(
+            libslop::Backend::Codex,
+            &record(
+                "toolCall",
+                json!({
+                    "name": "exec",
+                    "call_id": "exec-1",
+                    "arguments": r#"const p = await tools.update_plan({explanation:"Репозиторий проверен.",plan:[{step:"Inspect",status:"completed"},{step:"Проверить",status:"in_progress"}]});
+const r = await tools.exec_command({"cmd":"cargo test","workdir":"/work"}); text(r.output);"#,
+                }),
+            ),
+        );
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(updates[0]["content"]["text"], "Репозиторий проверен.");
+        assert_eq!(updates[1]["sessionUpdate"], "plan");
+        assert_eq!(updates[1]["entries"][1]["content"], "Проверить");
+        assert_eq!(updates[2]["sessionUpdate"], "tool_call");
+        assert_eq!(updates[2]["title"], "exec_command");
+        assert_eq!(updates[2]["kind"], "execute");
+        assert_eq!(updates[2]["rawInput"]["cmd"], "cargo test");
+    }
+
+    #[test]
+    fn codex_exec_uses_nested_tool_identity_and_structured_input() {
+        let mut projection = Projection::default();
+        let updates = projection.updates(
+            libslop::Backend::Codex,
+            &record(
+                "toolCall",
+                json!({
+                    "name": "exec",
+                    "call_id": "exec-2",
+                    "arguments": r#"const r = await tools.web__run({search_query:[{q:"ACP activity"}],response_length:"short"}); text(r);"#,
+                }),
+            ),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["title"], "web__run");
+        assert_eq!(updates[0]["kind"], "fetch");
+        assert_eq!(
+            updates[0]["rawInput"]["search_query"][0]["q"],
+            "ACP activity"
+        );
+    }
+
+    #[test]
+    fn backend_tools_share_semantic_names_kinds_and_inputs() {
+        let mut projection = Projection::default();
+        let opencode = projection.updates(
+            libslop::Backend::Opencode,
+            &record(
+                "tool",
+                json!({"part":{"tool":"bash","callID":"oc-1","state":{"status":"running","input":{"command":"pwd"}}}}),
+            ),
+        );
+        assert_eq!(opencode[0]["title"], "bash");
+        assert_eq!(opencode[0]["kind"], "execute");
+        assert_eq!(opencode[0]["rawInput"]["command"], "pwd");
+
+        let claude = projection.updates(
+            libslop::Backend::Claude,
+            &record(
+                "assistant",
+                json!({"message":{"content":[{"type":"tool_use","id":"claude-1","name":"Read","input":{"path":"/tmp/a"}}]}}),
+            ),
+        );
+        assert_eq!(claude[0]["title"], "Read");
+        assert_eq!(claude[0]["kind"], "read");
+        assert_eq!(claude[0]["rawInput"]["path"], "/tmp/a");
     }
 
     #[test]
