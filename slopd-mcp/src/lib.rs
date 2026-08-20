@@ -1,5 +1,6 @@
 mod handler;
 mod oauth;
+mod tools;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

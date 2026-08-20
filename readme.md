@@ -1447,9 +1447,9 @@ the shared `iroh-slopctl` default.
 
 `slopd-mcp` is a [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
 [MCP](https://modelcontextprotocol.io) server. It is a **supervisor**, not a
-second ACP host: MCP clients such as Grok Voice can list panes, submit prompts,
-read transcripts, and interrupt turns on a running slopd. It does not create
-ACP sessions and does not compete with `slopd-acp` / Buzz.
+second ACP host: MCP clients such as Grok Voice can use slopd's complete control
+surface without competing with `slopd-acp` / Buzz. Pane creation still happens
+inside slopd; `slopd-mcp` only translates MCP tools to control-socket requests.
 
 ```bash
 # Loopback is anonymous. Non-loopback binds require a token.
@@ -1460,7 +1460,8 @@ slopd-mcp \
   --bind 10.77.77.2:8780 \
   --token-file ~/.config/slopd-mcp/token \
   --public-url https://178.18.254.153 \
-  --allowed-host 178.18.254.153
+  --allowed-host 178.18.254.153 \
+  --allow-run
 ```
 
 The MCP endpoint is `http://<bind>/mcp` (override with `--path`). `--bind`
@@ -1485,16 +1486,21 @@ Tools:
 
 | Tool | Default | Purpose |
 |------|---------|---------|
-| `status` | on | Daemon uptime and subscriber count |
-| `ps` | on | List live panes (`tag` / `backend` / `account` filters) |
-| `transcript` | on | Read recent records from a pane |
-| `send` | on | Submit a prompt; returns when slopd **accepts** it, not when the agent finishes |
-| `interrupt` | on | Interrupt an in-flight turn |
-| `run` | off | Spawn a pane; advertised only with `--allow-run` |
+| `hook`, `tmux_hook` | on | Forward agent and tmux lifecycle events |
+| `status`, `ps` | on | Inspect daemon state and filtered live panes |
+| `run` | off | Create a pane; advertised only with `--allow-run` |
+| `fork`, `kill` | on | Fork or terminate a managed pane |
+| `send`, `interrupt` | on | Prompt or interrupt panes, including `one` / `any` / `all` filtered sends |
+| `listen`, `wait`, `transcript` | on | Collect events, wait on predicates, or read history |
+| `tag`, `untag`, `tags` | on | Manage pane tags |
+| `backup`, `restore` | on | Checkpoint or restore lifecycle state |
+| `graveyard`, `revive` | on | Inspect or resume durable pane deaths |
 
 `send` does not wait for the underlying agent to finish. Call `transcript`
 afterward for the answer. Tool results are compact JSON so Streamable HTTP/SSE
-does not split on newlines.
+does not split on newlines. Because an MCP tool call must eventually return,
+`listen` adds `limit` and `timeout` bounds around slopctl's otherwise unbounded
+stream. Local terminal attachment is not exposed over the remote MCP transport.
 
 A token is required whenever `--bind` is not loopback (`--token`,
 `--token-file`, or `SLOPD_MCP_TOKEN`). `--allowed-host` adds `Host` header
@@ -1631,5 +1637,5 @@ iroh-slopctl ps
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
-| `slopd-mcp` | Streamable HTTP MCP supervisor — `status` / `ps` / `send` / `transcript` / `interrupt` (`run` opt-in) |
+| `slopd-mcp` | Streamable HTTP MCP supervisor for the complete slopctl control surface (`run` opt-in) |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |

@@ -197,6 +197,37 @@ fn tool_names(list: &Value) -> Vec<String> {
         .collect()
 }
 
+async fn call_tool(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: Option<&str>,
+    session: Option<&str>,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    rpc_json(
+        client,
+        addr,
+        token,
+        session,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }),
+    )
+    .await
+}
+
+fn tool_payload(response: &Value) -> Value {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text result");
+    serde_json::from_str(text).expect("JSON tool result")
+}
+
 #[tokio::test]
 async fn lists_supervisor_tools_and_requires_bearer() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {
@@ -254,7 +285,26 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     let names = tool_names(&listed);
     assert_eq!(
         names,
-        vec!["status", "ps", "transcript", "send", "interrupt"]
+        vec![
+            "hook",
+            "tmux_hook",
+            "status",
+            "ps",
+            "fork",
+            "kill",
+            "send",
+            "interrupt",
+            "listen",
+            "wait",
+            "transcript",
+            "tag",
+            "untag",
+            "tags",
+            "backup",
+            "restore",
+            "graveyard",
+            "revive",
+        ]
     );
 }
 
@@ -281,7 +331,167 @@ async fn allow_run_advertises_run_tool() {
     )
     .await;
     let names = tool_names(&listed);
-    assert!(names.contains(&"run".to_string()), "{names:?}");
+    assert_eq!(names.len(), 19, "{names:?}");
+    assert_eq!(names[4], "run", "{names:?}");
+}
+
+#[tokio::test]
+async fn lifecycle_and_metadata_tools_round_trip() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None, true).await;
+    let client = http_client();
+    let (_, session) = initialize(&client, addr, None).await;
+    let session = session.as_deref();
+
+    let run = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        10,
+        "run",
+        json!({ "ready_timeout": 20 }),
+    )
+    .await;
+    let run = tool_payload(&run);
+    let pane_id = run["pane_id"].as_str().unwrap().to_string();
+    assert_eq!(run["ready"], true, "{run}");
+
+    let tagged = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        11,
+        "tag",
+        json!({ "pane_id": pane_id, "tag": "mcp-parity" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tagged)["tag"], "mcp-parity");
+    let tags = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        12,
+        "tags",
+        json!({ "pane_id": pane_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tags)["tags"], json!(["mcp-parity"]));
+    let untagged = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        13,
+        "untag",
+        json!({ "pane_id": pane_id, "tag": "mcp-parity" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&untagged)["tag"], "mcp-parity");
+
+    let waited = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        14,
+        "wait",
+        json!({
+            "pane_id": pane_id,
+            "until": ["seeded_current=true"],
+            "timeout": 5
+        }),
+    )
+    .await;
+    let waited = tool_payload(&waited);
+    assert_eq!(waited["snapshot"], true, "{waited}");
+
+    for (id, name, arguments) in [
+        (
+            15,
+            "hook",
+            json!({ "event": "McpProbe", "payload": { "ok": true } }),
+        ),
+        (16, "tmux_hook", json!({ "event": "mcp-probe" })),
+    ] {
+        let result = call_tool(&client, addr, None, session, id, name, arguments).await;
+        assert_eq!(tool_payload(&result)["forwarded"], true, "{result}");
+    }
+
+    let backup = call_tool(&client, addr, None, session, 17, "backup", json!({})).await;
+    assert!(tool_payload(&backup)["count"].as_u64().unwrap() >= 1);
+
+    let forked = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        18,
+        "fork",
+        json!({ "pane_id": pane_id, "no_wait": true }),
+    )
+    .await;
+    let forked = tool_payload(&forked);
+    let fork_id = forked["pane_id"].as_str().unwrap().to_string();
+    assert_eq!(forked["ready"], false, "{forked}");
+
+    let killed = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        19,
+        "kill",
+        json!({ "pane_id": fork_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&killed)["pane_id"], fork_id);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let grave_id = loop {
+        let graveyard = call_tool(
+            &client,
+            addr,
+            None,
+            session,
+            20,
+            "graveyard",
+            json!({ "limit": 20 }),
+        )
+        .await;
+        let graveyard = tool_payload(&graveyard);
+        if let Some(entry) = graveyard["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["pane"]["pane_id"] == fork_id)
+        {
+            break entry["grave_id"].as_str().unwrap().to_string();
+        }
+        assert!(std::time::Instant::now() < deadline, "{graveyard}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let revived = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        21,
+        "revive",
+        json!({ "target": grave_id }),
+    )
+    .await;
+    let revived = tool_payload(&revived);
+    assert_eq!(revived["grave_id"], grave_id);
+
+    let restored = call_tool(&client, addr, None, session, 22, "restore", json!({})).await;
+    assert!(tool_payload(&restored)["restored"].is_u64(), "{restored}");
 }
 
 #[tokio::test]
@@ -378,6 +588,29 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         "transcript missing canary: {transcript_text}"
     );
 
+    let replayed = call_tool(
+        &client,
+        addr,
+        Some("secret"),
+        session,
+        5,
+        "listen",
+        json!({
+            "pane_id": pane_id,
+            "replay": 1,
+            "limit": 1,
+            "timeout": 5
+        }),
+    )
+    .await;
+    let replayed = tool_payload(&replayed);
+    assert_eq!(
+        replayed["records"].as_array().unwrap().len(),
+        1,
+        "{replayed}"
+    );
+    assert_eq!(replayed["timed_out"], false, "{replayed}");
+
     let interrupted = rpc_json(
         &client,
         addr,
@@ -385,7 +618,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         session,
         json!({
             "jsonrpc": "2.0",
-            "id": 5,
+            "id": 6,
             "method": "tools/call",
             "params": {
                 "name": "interrupt",
