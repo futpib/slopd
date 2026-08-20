@@ -1486,6 +1486,11 @@ secret, PKCE S256). Dynamically registered clients work too. There is no
 Grok-specific allowlist: whoever can complete bearer or the password form
 can call the tools.
 
+Use `-v` for HTTP request and response metadata. `-vv` also logs decoded MCP
+requests, arguments, results, and errors; these may contain prompts and
+transcripts. `-vvv` adds transport-level traces. Authorization headers and
+OAuth form bodies are never logged.
+
 Tools:
 
 | Tool | Default | Purpose |
