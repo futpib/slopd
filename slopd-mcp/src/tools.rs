@@ -6,33 +6,6 @@ use crate::schema;
 pub fn all() -> Vec<Tool> {
     vec![
         tool(
-            "hook",
-            "Forward an agent lifecycle hook event to slopd.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "event": { "type": "string" },
-                    "payload": {},
-                    "pane_id": { "type": "string" }
-                },
-                "required": ["event", "payload"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "tmux_hook",
-            "Forward a tmux hook event to slopd.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "event": { "type": "string" },
-                    "pane_id": { "type": "string" }
-                },
-                "required": ["event"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
             "status",
             "Show slopd daemon uptime and state.",
             empty_schema(),

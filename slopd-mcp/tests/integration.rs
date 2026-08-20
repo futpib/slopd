@@ -285,8 +285,6 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         names,
         vec![
-            "hook",
-            "tmux_hook",
             "status",
             "ps",
             "run",
@@ -383,18 +381,6 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     .await;
     let waited = tool_payload(&waited);
     assert_eq!(waited["snapshot"], true, "{waited}");
-
-    for (id, name, arguments) in [
-        (
-            15,
-            "hook",
-            json!({ "event": "McpProbe", "payload": { "ok": true } }),
-        ),
-        (16, "tmux_hook", json!({ "event": "mcp-probe" })),
-    ] {
-        let result = call_tool(&client, addr, None, session, id, name, arguments).await;
-        assert_eq!(tool_payload(&result)["forwarded"], true, "{result}");
-    }
 
     let backup = call_tool(&client, addr, None, session, 17, "backup", json!({})).await;
     assert!(tool_payload(&backup)["count"].as_u64().unwrap() >= 1);

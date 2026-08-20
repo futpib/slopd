@@ -27,8 +27,6 @@ impl SlopdMcp {
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         match request.name.as_ref() {
-            "hook" => self.hook(request.arguments.as_ref()).await,
-            "tmux_hook" => self.tmux_hook(request.arguments.as_ref()).await,
             "status" => self.status().await,
             "ps" => self.ps(request.arguments.as_ref()).await,
             "fork" => self.fork(request.arguments.as_ref()).await,
@@ -51,35 +49,6 @@ impl SlopdMcp {
                 None,
             )),
         }
-    }
-
-    async fn hook(
-        &self,
-        arguments: Option<&Map<String, Value>>,
-    ) -> Result<CallToolResult, McpError> {
-        let event = required_string(arguments, "event")?;
-        let payload = required_value(arguments, "payload")?;
-        let pane_id = optional_string(arguments, "pane_id");
-        let mut client = connect(&self.socket).await?;
-        client
-            .hook(event, payload, pane_id)
-            .await
-            .map_err(slopd_error)?;
-        ok_json(json!({ "forwarded": true }))
-    }
-
-    async fn tmux_hook(
-        &self,
-        arguments: Option<&Map<String, Value>>,
-    ) -> Result<CallToolResult, McpError> {
-        let event = required_string(arguments, "event")?;
-        let pane_id = optional_string(arguments, "pane_id");
-        let mut client = connect(&self.socket).await?;
-        client
-            .tmux_hook(event, pane_id)
-            .await
-            .map_err(slopd_error)?;
-        ok_json(json!({ "forwarded": true }))
     }
 
     async fn status(&self) -> Result<CallToolResult, McpError> {
@@ -765,13 +734,6 @@ fn optional_string(arguments: Option<&Map<String, Value>>, key: &str) -> Option<
 
 fn required_string(arguments: Option<&Map<String, Value>>, key: &str) -> Result<String, McpError> {
     optional_string(arguments, key)
-        .ok_or_else(|| McpError::invalid_params(format!("{key} is required"), None))
-}
-
-fn required_value(arguments: Option<&Map<String, Value>>, key: &str) -> Result<Value, McpError> {
-    arguments
-        .and_then(|args| args.get(key))
-        .cloned()
         .ok_or_else(|| McpError::invalid_params(format!("{key} is required"), None))
 }
 

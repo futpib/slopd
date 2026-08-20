@@ -1447,9 +1447,10 @@ the shared `iroh-slopctl` default.
 
 `slopd-mcp` is a [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
 [MCP](https://modelcontextprotocol.io) server. It is a **supervisor**, not a
-second ACP host: MCP clients such as Grok Voice can use slopd's complete control
+second ACP host: MCP clients such as Grok Voice can use slopd's remote control
 surface without competing with `slopd-acp` / Buzz. Pane creation still happens
 inside slopd; `slopd-mcp` only translates MCP tools to control-socket requests.
+The local event-ingestion commands `hook` and `tmux-hook` are not exposed.
 
 ```bash
 # Loopback is anonymous. Non-loopback binds require a token.
@@ -1485,7 +1486,6 @@ Tools:
 
 | Tool | Default | Purpose |
 |------|---------|---------|
-| `hook`, `tmux_hook` | on | Forward agent and tmux lifecycle events |
 | `status`, `ps` | on | Inspect daemon state and filtered live panes |
 | `run` | on | Create a pane |
 | `fork`, `kill` | on | Fork or terminate a managed pane |
@@ -1636,5 +1636,5 @@ iroh-slopctl ps
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
-| `slopd-mcp` | Streamable HTTP MCP supervisor for the complete slopctl control surface (`run` opt-in) |
+| `slopd-mcp` | Streamable HTTP MCP supervisor for remote slopctl operations |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |
