@@ -15,20 +15,24 @@ pub fn all() -> Vec<Tool> {
             "List live slopd panes. Optional filters are AND-ed.",
             filter_schema(),
         ),
-        tool("run", "Create an agent pane.", spawn_schema(false)),
+        tool(
+            "run",
+            "Create an agent pane. Reuse the returned pane_id exactly, including its leading %.",
+            spawn_schema(false),
+        ),
         tool(
             "fork",
-            "Fork a pane into an independent agent session.",
+            "Fork a pane into an independent agent session. Reuse the returned pane_id exactly, including its leading %.",
             spawn_schema(true),
         ),
         tool("kill", "Terminate a managed agent pane.", pane_schema()),
         tool(
             "send",
-            "Submit a prompt to panes and wait until slopd accepts it.",
+            "Submit a prompt and wait only until slopd accepts it. Copy pane_id exactly from run or ps, including %. To retrieve the reply, wait on transcripts=[\"assistant\"] and then call transcript with the same pane_id.",
             json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string" },
+                    "pane_id": pane_id_schema(),
                     "tag": { "type": "string" },
                     "backend": backend_schema(),
                     "account": { "type": "string" },
@@ -53,7 +57,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "wait",
-            "Wait for the first event matching filters and predicates.",
+            "Wait for the first matching event. After send, use the same exact pane_id and transcripts=[\"assistant\"] to wait for a reply before calling transcript.",
             event_schema(true),
         ),
         tool(
@@ -62,7 +66,7 @@ pub fn all() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "pane_id": { "type": "string" },
+                    "pane_id": pane_id_schema(),
                     "before": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
                 },
@@ -123,9 +127,17 @@ fn empty_schema() -> Value {
 fn pane_schema() -> Value {
     json!({
         "type": "object",
-        "properties": { "pane_id": { "type": "string" } },
+        "properties": { "pane_id": pane_id_schema() },
         "required": ["pane_id"],
         "additionalProperties": false
+    })
+}
+
+fn pane_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^%[0-9]+$",
+        "description": "Exact tmux pane_id returned by run or ps, including the leading % (for example %146)."
     })
 }
 
@@ -133,7 +145,7 @@ fn tag_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "pane_id": { "type": "string" },
+            "pane_id": pane_id_schema(),
             "tag": { "type": "string" }
         },
         "required": ["pane_id", "tag"],
@@ -176,10 +188,10 @@ fn spawn_schema(fork: bool) -> Value {
     });
     let properties = schema["properties"].as_object_mut().unwrap();
     if fork {
-        properties.insert("pane_id".into(), json!({ "type": "string" }));
+        properties.insert("pane_id".into(), pane_id_schema());
         schema["required"] = json!(["pane_id"]);
     } else {
-        properties.insert("parent_pane_id".into(), json!({ "type": "string" }));
+        properties.insert("parent_pane_id".into(), pane_id_schema());
         properties.insert("account".into(), json!({ "type": "string" }));
         properties.insert("backend".into(), backend_schema());
     }
@@ -187,13 +199,20 @@ fn spawn_schema(fork: bool) -> Value {
 }
 
 fn event_schema(wait: bool) -> Value {
+    let transcripts = if wait {
+        string_array(
+            "Transcript types. Portable aliases include assistant and user; backend-native types are also accepted.",
+        )
+    } else {
+        string_array("Backend-native transcript record types.")
+    };
     let mut schema = json!({
         "type": "object",
         "properties": {
             "hooks": string_array("Hook event names."),
             "events": string_array("slopd event names."),
-            "transcripts": string_array("Transcript record types."),
-            "pane_id": { "type": "string" },
+            "transcripts": transcripts,
+            "pane_id": pane_id_schema(),
             "session_id": { "type": "string" },
             "where": string_array("Server-side payload predicates in PATH=VALUE form."),
             "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 60 }

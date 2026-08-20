@@ -189,6 +189,23 @@ fn spawn_env() -> Option<(TestEnv, Daemon, libsloptest::tempfile::TempDir)> {
     Some((env, daemon, claude_config))
 }
 
+fn spawn_codex_env() -> Option<(TestEnv, Daemon, libsloptest::tempfile::TempDir)> {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let env = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None)?;
+    env.append_config(&format!(
+        "\n[accounts.codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+    let daemon = Daemon(Some(env.spawn_slopd()));
+    Some((env, daemon, codex_home))
+}
+
 fn tool_names(list: &Value) -> Vec<String> {
     list["result"]["tools"]
         .as_array()
@@ -305,6 +322,22 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "graveyard",
             "revive",
         ]
+    );
+    let send = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "send")
+        .unwrap();
+    assert_eq!(
+        send["inputSchema"]["properties"]["pane_id"]["pattern"],
+        "^%[0-9]+$"
+    );
+    assert!(
+        send["description"]
+            .as_str()
+            .unwrap()
+            .contains("including %")
     );
 }
 
@@ -592,6 +625,79 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         .as_str()
         .unwrap();
     assert!(interrupt_text.contains(&pane_id), "{interrupt_text}");
+}
+
+#[tokio::test]
+async fn wait_assistant_alias_catches_a_codex_reply() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, control_session) = initialize(&client, addr, None).await;
+    let run = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        30,
+        "run",
+        json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+    )
+    .await;
+    let pane_id = tool_payload(&run)["pane_id"].as_str().unwrap().to_string();
+
+    let invalid = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        31,
+        "transcript",
+        json!({ "pane_id": pane_id.trim_start_matches('%') }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+
+    let (_, wait_session) = initialize(&client, addr, None).await;
+    let (_, send_session) = initialize(&client, addr, None).await;
+    let wait = call_tool(
+        &client,
+        addr,
+        None,
+        wait_session.as_deref(),
+        32,
+        "wait",
+        json!({
+            "pane_id": pane_id.clone(),
+            "transcripts": ["assistant"],
+            "timeout": 10
+        }),
+    );
+    let send = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call_tool(
+            &client,
+            addr,
+            None,
+            send_session.as_deref(),
+            33,
+            "send",
+            json!({ "pane_id": pane_id.clone(), "prompt": "MCP_WAIT_CANARY" }),
+        )
+        .await
+    };
+    let (waited, sent) = tokio::join!(wait, send);
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id]));
+    let waited = tool_payload(&waited);
+    assert_eq!(waited["record"]["event_type"], "agentMessage", "{waited}");
+    assert!(
+        waited["record"]["payload"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("MCP_WAIT_CANARY")),
+        "{waited}"
+    );
 }
 
 #[tokio::test]

@@ -1504,10 +1504,13 @@ Tools:
 | `backup`, `restore` | on | Checkpoint or restore lifecycle state |
 | `graveyard`, `revive` | on | Inspect or resume durable pane deaths |
 
-`send` does not wait for the underlying agent to finish. Call `transcript`
-afterward for the answer. Tool results are compact JSON so Streamable HTTP/SSE
-does not split on newlines. Because an MCP tool call must eventually return,
-`listen` adds `limit` and `timeout` bounds around slopctl's otherwise unbounded
+`send` does not wait for the underlying agent to finish. Keep the exact
+`pane_id` returned by `run` or `ps`, including its leading `%`; call `wait` with
+`transcripts: ["assistant"]`, then call `transcript` for the answer. The
+`assistant` and `user` wait aliases cover backend-native record names. Tool
+results are compact JSON so Streamable HTTP/SSE does not split on newlines.
+Because an MCP tool call must eventually return, `listen` adds `limit` and
+`timeout` bounds around slopctl's otherwise unbounded
 stream. Local terminal attachment is not exposed over the remote MCP transport.
 
 A token is required whenever `--bind` is not loopback (`--token`,

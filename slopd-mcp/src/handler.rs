@@ -74,7 +74,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let source_pane_id = required_string(arguments, "pane_id")?;
+        let source_pane_id = required_pane_id(arguments, "pane_id")?;
         let spawn = spawn_arguments(arguments)?;
         let mut client = connect(&self.socket).await?;
         let mut subscription = if spawn.no_wait {
@@ -117,7 +117,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_string(arguments, "pane_id")?;
+        let pane_id = required_pane_id(arguments, "pane_id")?;
         let mut client = connect(&self.socket).await?;
         let pane_id = client.kill(pane_id).await.map_err(slopd_error)?;
         ok_json(json!({ "pane_id": pane_id }))
@@ -127,7 +127,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_string(arguments, "pane_id")?;
+        let pane_id = required_pane_id(arguments, "pane_id")?;
         let before = optional_u64(arguments, "before")?;
         let limit = optional_u64(arguments, "limit")?
             .unwrap_or(50)
@@ -153,7 +153,7 @@ impl SlopdMcp {
             .unwrap_or(60)
             .clamp(1, 300);
         let select = parse_select(optional_string(arguments, "select").as_deref())?;
-        let pane_id = optional_string(arguments, "pane_id");
+        let pane_id = optional_pane_id(arguments, "pane_id")?;
         let filters = pane_filters(arguments)?;
         if pane_id.is_none() && filters.is_empty() {
             return tool_error("send requires pane_id or at least one of tag, backend, account");
@@ -189,7 +189,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_string(arguments, "pane_id")?;
+        let pane_id = required_pane_id(arguments, "pane_id")?;
         let mut client = connect(&self.socket).await?;
         let pane_id = client.interrupt(pane_id).await.map_err(slopd_error)?;
         ok_json(json!({ "pane_id": pane_id }))
@@ -281,7 +281,7 @@ impl SlopdMcp {
         let filters = libslopctl::build_listen_filters(
             events.hooks.clone(),
             events.events.clone(),
-            events.transcripts.clone(),
+            expand_wait_transcripts(events.transcripts.clone()),
             pane_id.clone(),
             session_id.clone(),
             where_parsed.clone(),
@@ -363,7 +363,7 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
         remove: bool,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_string(arguments, "pane_id")?;
+        let pane_id = required_pane_id(arguments, "pane_id")?;
         let tag = required_string(arguments, "tag")?;
         let mut client = connect(&self.socket).await?;
         let (pane_id, tag) = if remove {
@@ -379,7 +379,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = required_string(arguments, "pane_id")?;
+        let pane_id = required_pane_id(arguments, "pane_id")?;
         let mut client = connect(&self.socket).await?;
         let tags = client.tags(pane_id.clone()).await.map_err(slopd_error)?;
         ok_json(json!({ "pane_id": pane_id, "tags": tags }))
@@ -430,7 +430,7 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let spawn = spawn_arguments(arguments)?;
-        let parent_pane_id = optional_string(arguments, "parent_pane_id");
+        let parent_pane_id = optional_pane_id(arguments, "parent_pane_id")?;
         let account = optional_string(arguments, "account");
         let backend = match optional_string(arguments, "backend") {
             Some(name) => Some(
@@ -581,6 +581,28 @@ fn event_arguments(arguments: Option<&Map<String, Value>>) -> Result<EventArgume
         where_preds: optional_string_array(arguments, "where")?,
         timeout: optional_u64(arguments, "timeout")?.unwrap_or(60).min(300),
     })
+}
+
+fn expand_wait_transcripts(transcripts: Vec<String>) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for transcript in transcripts {
+        let aliases: &[&str] = match transcript.as_str() {
+            "assistant" => &["assistant", "agentMessage", "turn_completed"],
+            "user" => &["user", "userMessage", "user_message_chunk"],
+            _ => {
+                if !expanded.contains(&transcript) {
+                    expanded.push(transcript);
+                }
+                continue;
+            }
+        };
+        for alias in aliases {
+            if !expanded.iter().any(|existing| existing == alias) {
+                expanded.push((*alias).to_string());
+            }
+        }
+    }
+    expanded
 }
 
 fn ready_event_filters() -> Vec<libslop::EventFilter> {
@@ -737,6 +759,26 @@ fn required_string(arguments: Option<&Map<String, Value>>, key: &str) -> Result<
         .ok_or_else(|| McpError::invalid_params(format!("{key} is required"), None))
 }
 
+fn optional_pane_id(
+    arguments: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<String>, McpError> {
+    optional_string(arguments, key)
+        .map(validate_pane_id)
+        .transpose()
+}
+
+fn required_pane_id(arguments: Option<&Map<String, Value>>, key: &str) -> Result<String, McpError> {
+    validate_pane_id(required_string(arguments, key)?)
+}
+
+fn validate_pane_id(pane_id: String) -> Result<String, McpError> {
+    libslopctl::resolve_pane_id_or_session(Some(pane_id), None)
+        .map_err(slopd_error)?
+        .0
+        .ok_or_else(|| McpError::invalid_params("pane_id is required", None))
+}
+
 fn optional_bool(
     arguments: Option<&Map<String, Value>>,
     key: &str,
@@ -852,11 +894,29 @@ fn tool_json_error(value: Value) -> Result<CallToolResult, McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_backend;
+    use super::{expand_wait_transcripts, parse_backend, validate_pane_id};
 
     #[test]
     fn parse_backend_accepts_canonical_names() {
         assert_eq!(parse_backend("grok").unwrap(), libslop::Backend::Grok);
         assert!(parse_backend("claude-code").is_err());
+    }
+
+    #[test]
+    fn wait_transcript_aliases_cover_backend_event_names() {
+        assert_eq!(
+            expand_wait_transcripts(vec!["assistant".into()]),
+            ["assistant", "agentMessage", "turn_completed"]
+        );
+        assert_eq!(
+            expand_wait_transcripts(vec!["user".into()]),
+            ["user", "userMessage", "user_message_chunk"]
+        );
+    }
+
+    #[test]
+    fn pane_ids_keep_the_tmux_prefix() {
+        assert_eq!(validate_pane_id("%146".into()).unwrap(), "%146");
+        assert!(validate_pane_id("146".into()).is_err());
     }
 }
