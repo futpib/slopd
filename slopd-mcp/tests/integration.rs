@@ -42,6 +42,7 @@ async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>, allow_run: b
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
         path: "/mcp".into(),
+        public_url: None,
     };
     tokio::spawn(async move {
         serve(listener, config).await.expect("serve mcp");
@@ -223,6 +224,15 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     )
     .await;
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let www = unauthorized
+        .headers()
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        www.contains("resource_metadata="),
+        "expected OAuth discovery challenge, got {www:?}"
+    );
 
     let (initialized, session) = initialize(&client, addr, Some("secret")).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
@@ -388,4 +398,115 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         .as_str()
         .unwrap();
     assert!(interrupt_text.contains(&pane_id), "{interrupt_text}");
+}
+
+#[tokio::test]
+async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), Some("secret"), false).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let metadata: Value = client
+        .get(format!(
+            "http://{addr}/.well-known/oauth-protected-resource"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["resource"], format!("http://{addr}/mcp"));
+    assert!(
+        metadata["authorization_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server == &json!(format!("http://{addr}")))
+    );
+
+    let as_meta: Value = client
+        .get(format!(
+            "http://{addr}/.well-known/oauth-authorization-server"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        as_meta["authorization_endpoint"],
+        format!("http://{addr}/oauth/authorize")
+    );
+
+    let registered: Value = client
+        .post(format!("http://{addr}/oauth/register"))
+        .json(&json!({
+            "redirect_uris": ["http://127.0.0.1:9/cb"],
+            "token_endpoint_auth_method": "none"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let client_id = registered["client_id"].as_str().unwrap();
+
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let authorize = client
+        .post(format!("http://{addr}/oauth/authorize"))
+        .form(&[
+            ("password", "secret"),
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", "http://127.0.0.1:9/cb"),
+            ("state", "xyz"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), reqwest::StatusCode::SEE_OTHER);
+    let location = authorize
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(location.starts_with("http://127.0.0.1:9/cb?"), "{location}");
+    let code = location
+        .split(['?', '&'])
+        .find_map(|part| part.strip_prefix("code="))
+        .expect("code");
+
+    let token: Value = client
+        .post(format!("http://{addr}/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", "http://127.0.0.1:9/cb"),
+            ("client_id", client_id),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let access = token["access_token"].as_str().unwrap();
+
+    let (initialized, _) = initialize(&http_client(), addr, Some(access)).await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
 }

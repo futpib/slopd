@@ -87,7 +87,8 @@ yay -S slopd-git
 ```
 
 The package installs `slopd`, `slopctl`, `iroh-slopd`, `iroh-slopctl`, and the
-systemd user service. Install from source if you also need `slopd-acp`.
+systemd user service. Install from source if you also need `slopd-acp` or
+`slopd-mcp`.
 
 To install from source:
 
@@ -1451,19 +1452,34 @@ read transcripts, and interrupt turns on a running slopd. It does not create
 ACP sessions and does not compete with `slopd-acp` / Buzz.
 
 ```bash
-# Loopback is anonymous. Non-loopback binds require a bearer token.
+# Loopback is anonymous. Non-loopback binds require a token.
 slopd-mcp --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock"
 
 slopd-mcp \
   --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock" \
   --bind 10.77.77.2:8780 \
   --token-file ~/.config/slopd-mcp/token \
+  --public-url https://178.18.254.153 \
   --allowed-host 178.18.254.153
 ```
 
-The MCP endpoint is `http://<bind>/mcp`. Point a custom Grok connector at the
-public HTTPS URL that reverse-proxies that path, with the same bearer token in
-the connector's authorization field.
+The MCP endpoint is `http://<bind>/mcp` (override with `--path`). `--bind`
+defaults to `127.0.0.1:8780`. `--public-url` is the origin reverse-proxied
+clients see; it is written into OAuth discovery documents.
+
+The same token is used two ways:
+
+- **Static bearer** — `Authorization: Bearer <token>`. Use this from the xAI
+  API `authorization` field, curl, or any MCP client that can set a header.
+- **MCP OAuth** — clients that only have a server URL (Grok.com custom
+  connectors, Claude.ai, ChatGPT, …) get a 401 with protected-resource
+  metadata, register if they speak DCR, then open `/oauth/authorize`. The
+  authorize page is a single password field; the password is that token.
+
+OAuth client id `slopd-mcp` is pre-registered as a public client (empty
+secret, PKCE S256). Dynamically registered clients work too. There is no
+Grok-specific allowlist: whoever can complete bearer or the password form
+can call the tools.
 
 Tools:
 
@@ -1480,9 +1496,10 @@ Tools:
 afterward for the answer. Tool results are compact JSON so Streamable HTTP/SSE
 does not split on newlines.
 
-A bearer token is required whenever `--bind` is not loopback. `--allowed-host`
-adds `Host` header values beyond loopback and the bind address; a reverse proxy
-must list the public hostname or IP Grok will send.
+A token is required whenever `--bind` is not loopback (`--token`,
+`--token-file`, or `SLOPD_MCP_TOKEN`). `--allowed-host` adds `Host` header
+values beyond loopback, the bind address, and `--public-url`. A reverse proxy
+must list the public hostname or IP clients send.
 
 ---
 
@@ -1614,5 +1631,5 @@ iroh-slopctl ps
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
-| `slopd-mcp` | Streamable HTTP MCP supervisor — `ps` / `send` / `transcript` / `interrupt` for MCP clients such as Grok Voice |
+| `slopd-mcp` | Streamable HTTP MCP supervisor — `status` / `ps` / `send` / `transcript` / `interrupt` (`run` opt-in) |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |

@@ -46,6 +46,11 @@ struct Cli {
     #[arg(long = "allowed-host", value_name = "HOST")]
     allowed_hosts: Vec<String>,
 
+    /// Public origin of this server (scheme://host[:port]), used in OAuth metadata
+    /// behind a reverse proxy. Defaults to the incoming Host / X-Forwarded-* headers.
+    #[arg(long, value_name = "URL")]
+    public_url: Option<String>,
+
     /// Advertise and implement the run tool, which can spawn new panes.
     #[arg(long)]
     allow_run: bool,
@@ -75,7 +80,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let token = token.filter(|value| !value.is_empty());
     if !is_loopback(cli.bind) && token.is_none() {
         return Err(
-            "a bearer token is required when binding a non-loopback address; pass --token, --token-file, or SLOPD_MCP_TOKEN"
+            "a token is required when binding a non-loopback address; pass --token, --token-file, or SLOPD_MCP_TOKEN"
                 .into(),
         );
     }
@@ -93,8 +98,20 @@ async fn run(cli: Cli) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read bind address: {error}"))?;
 
+    let public_url = match cli.public_url {
+        Some(url) => Some(parse_public_url(&url)?),
+        None => None,
+    };
+
     let mut allowed_hosts = default_allowed_hosts(bound);
     allowed_hosts.extend(cli.allowed_hosts);
+    if let Some(url) = public_url.as_deref()
+        && let Ok(uri) = url.parse::<http::Uri>()
+        && let Some(authority) = uri.authority()
+    {
+        allowed_hosts.push(authority.as_str().to_string());
+        allowed_hosts.push(authority.host().to_string());
+    }
     allowed_hosts.sort();
     allowed_hosts.dedup();
 
@@ -116,10 +133,30 @@ async fn run(cli: Cli) -> Result<(), String> {
             token: token.map(Arc::from),
             allowed_hosts,
             path,
+            public_url,
         },
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+fn parse_public_url(url: &str) -> Result<String, String> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|error| format!("invalid --public-url: {error}"))?;
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        other => {
+            return Err(format!(
+                "--public-url must be http(s), got {}",
+                other.unwrap_or("no scheme")
+            ));
+        }
+    }
+    if uri.authority().is_none() {
+        return Err("--public-url must include a host".into());
+    }
+    Ok(url.trim_end_matches('/').to_string())
 }
 
 fn read_token_file(path: &std::path::Path) -> Result<String, String> {
