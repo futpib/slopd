@@ -25,7 +25,6 @@ pub use handler::{SlopdMcp, parse_backend};
 #[derive(Clone)]
 pub struct ServeConfig {
     pub socket: PathBuf,
-    pub advanced: bool,
     pub oauth_state: PathBuf,
     pub token: Option<Arc<str>>,
     pub allowed_hosts: Vec<String>,
@@ -107,8 +106,7 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
     let mcp = StreamableHttpService::new(
         {
             let socket = config.socket.clone();
-            let advanced = config.advanced;
-            move || Ok(SlopdMcp::new(socket.clone(), advanced))
+            move || Ok(SlopdMcp::new(socket.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()

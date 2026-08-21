@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 
 use crate::schema;
 
-pub fn all(advanced: bool) -> Vec<Tool> {
-    let mut tools = vec![
+pub fn all() -> Vec<Tool> {
+    let tools = vec![
         tool(
             "get_status",
             "Show slopd daemon uptime and state.",
@@ -69,12 +69,8 @@ pub fn all(advanced: bool) -> Vec<Tool> {
         ),
         tool(
             "read_transcript",
-            if advanced {
-                "Read historical transcript records from a pane. Returns compact records unless raw is true."
-            } else {
-                "Read only useful conversation text from a pane. Internal context, progress, reasoning, tools, payloads, event names, and cursors are omitted."
-            },
-            transcript_schema(advanced),
+            "Read only useful conversation text from a pane. Set advanced=true for diagnostic records; internal context, progress, reasoning, tools, payloads, event names, and cursors are otherwise omitted.",
+            transcript_schema(),
         ),
         tool("add_tag", "Add a tag to a pane.", tag_schema()),
         tool("remove_tag", "Remove a tag from a pane.", tag_schema()),
@@ -117,23 +113,6 @@ pub fn all(advanced: bool) -> Vec<Tool> {
             }),
         ),
     ];
-    if advanced {
-        tools.splice(
-            8..8,
-            [
-                tool(
-                    "collect_events",
-                    "Collect matching slopd events. MCP bounds the CLI stream by limit and timeout.",
-                    event_schema(false),
-                ),
-                tool(
-                    "wait_for_event",
-                    "Wait for the first matching raw event.",
-                    event_schema(true),
-                ),
-            ],
-        );
-    }
     tools
 }
 
@@ -240,30 +219,17 @@ fn output_schema(name: &str) -> Value {
     json!({ "type": "object", "properties": properties, "additionalProperties": true })
 }
 
-fn transcript_schema(advanced: bool) -> Value {
-    if advanced {
-        json!({
-            "type": "object",
-            "properties": {
-                "pane_id": pane_id_schema(),
-                "before": { "type": "integer", "minimum": 0 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
-                "raw": { "type": "boolean", "default": false }
-            },
-            "required": ["pane_id"],
-            "additionalProperties": false
-        })
-    } else {
-        json!({
-            "type": "object",
-            "properties": {
-                "pane_id": pane_id_schema(),
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
-            },
-            "required": ["pane_id"],
-            "additionalProperties": false
-        })
-    }
+fn transcript_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pane_id": pane_id_schema(),
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+            "advanced": { "type": "boolean", "default": false, "description": "Return diagnostic transcript records instead of conversation-only text." }
+        },
+        "required": ["pane_id"],
+        "additionalProperties": false
+    })
 }
 
 fn empty_schema() -> Value {
@@ -344,50 +310,6 @@ fn spawn_schema(fork: bool) -> Value {
         properties.insert(
             "prompt".into(),
             json!({ "type": "string", "description": "Optional first prompt, sent after the new pane becomes ready." }),
-        );
-    }
-    schema
-}
-
-fn event_schema(wait: bool) -> Value {
-    let transcripts = if wait {
-        string_array(
-            "Transcript types. Portable aliases include assistant and user; backend-native types are also accepted.",
-        )
-    } else {
-        string_array("Backend-native transcript record types.")
-    };
-    let mut schema = json!({
-        "type": "object",
-        "properties": {
-            "hooks": string_array("Hook event names."),
-            "events": string_array("slopd event names."),
-            "transcripts": transcripts,
-            "pane_id": pane_id_schema(),
-            "session_id": { "type": "string" },
-            "where": string_array("Server-side payload predicates in PATH=VALUE form."),
-            "timeout": { "type": "integer", "minimum": 0, "maximum": 300, "default": 60 }
-        },
-        "additionalProperties": false
-    });
-    let properties = schema["properties"].as_object_mut().unwrap();
-    if wait {
-        properties.insert(
-            "until".into(),
-            string_array("Stop predicates in PATH=VALUE form."),
-        );
-        properties.insert(
-            "no_snapshot".into(),
-            json!({ "type": "boolean", "default": false }),
-        );
-    } else {
-        properties.insert(
-            "replay".into(),
-            json!({ "type": "integer", "minimum": 0, "maximum": 500 }),
-        );
-        properties.insert(
-            "limit".into(),
-            json!({ "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }),
         );
     }
     schema

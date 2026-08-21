@@ -14,23 +14,24 @@ use tokio::net::UnixStream;
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
-    advanced: bool,
 }
 
 impl SlopdMcp {
-    pub fn new(socket: PathBuf, advanced: bool) -> Self {
-        Self { socket, advanced }
+    pub fn new(socket: PathBuf) -> Self {
+        Self { socket }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
-        crate::tools::all(self.advanced)
+        crate::tools::all()
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         let name = canonical_tool_name(request.name.as_ref());
-        if !self.advanced && matches!(name, "collect_events" | "wait_for_event") {
+        if matches!(name, "collect_events" | "wait_for_event")
+            && !optional_bool(request.arguments.as_ref(), "advanced")?.unwrap_or(false)
+        {
             return Err(invalid_argument(format!(
-                "{name} is an advanced tool; restart slopd-mcp with --advanced to enable raw event access"
+                "{name} is an advanced tool; pass advanced=true to use raw event access"
             )));
         }
         match name {
@@ -139,18 +140,18 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let pane_id = self.required_pane_id(arguments, "pane_id").await?;
-        if !self.advanced
+        let advanced = optional_bool(arguments, "advanced")?.unwrap_or(false);
+        if !advanced
             && arguments
                 .is_some_and(|values| values.contains_key("before") || values.contains_key("raw"))
         {
             return Err(invalid_argument(
-                "read_transcript only accepts pane_id and limit by default; restart slopd-mcp with --advanced for cursors and raw records",
+                "read_transcript only accepts pane_id and limit by default; pass advanced=true for cursors and raw records",
             ));
         }
-        let limit =
-            optional_u64(arguments, "limit")?.unwrap_or(if self.advanced { 50 } else { 20 });
+        let limit = optional_u64(arguments, "limit")?.unwrap_or(if advanced { 50 } else { 20 });
         let mut client = connect(&self.socket).await?;
-        let result = if self.advanced {
+        let result = if advanced {
             client
                 .read_transcript(
                     pane_id,
@@ -162,8 +163,8 @@ impl SlopdMcp {
             client.read_transcript(pane_id, None, 500).await
         };
         let records = self.slopd_result(result).await?;
-        let records = if self.advanced {
-            if optional_bool(arguments, "raw")?.unwrap_or(false) {
+        let records = if advanced {
+            if optional_bool(arguments, "raw")?.unwrap_or(true) {
                 serde_json::to_value(records).unwrap_or_default()
             } else {
                 Value::Array(records.iter().map(compact_record).collect())
@@ -695,14 +696,11 @@ fn canonical_tool_name(name: &str) -> &str {
 
 impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
-        let instructions = if self.advanced {
-            "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, and wait_for_reply once with the same pane_id. Raw transcript events and predicates are also enabled. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working."
-        } else {
-            "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, then wait_for_reply once with the same pane_id. read_transcript returns only user prompts and completed agent text. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working."
-        };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions)
+            .with_instructions(
+                "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, then wait_for_reply once with the same pane_id. read_transcript returns only user prompts and completed agent text by default. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working.",
+            )
     }
 
     async fn list_tools(

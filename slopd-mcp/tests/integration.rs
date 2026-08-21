@@ -34,24 +34,11 @@ impl Drop for Daemon {
 }
 
 async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
-    start_mcp_mode(socket, token, true).await
-}
-
-async fn start_mcp_simple(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
-    start_mcp_mode(socket, token, false).await
-}
-
-async fn start_mcp_mode(
-    socket: std::path::PathBuf,
-    token: Option<&str>,
-    advanced: bool,
-) -> SocketAddr {
     let oauth_state = socket.with_extension("mcp-oauth.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
         socket,
-        advanced,
         oauth_state,
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
@@ -323,8 +310,6 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "send_prompt",
             "wait_for_reply",
             "interrupt_pane",
-            "collect_events",
-            "wait_for_event",
             "read_transcript",
             "add_tag",
             "remove_tag",
@@ -371,8 +356,6 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         ("send_prompt", false, false, false),
         ("wait_for_reply", true, false, true),
         ("interrupt_pane", false, true, false),
-        ("collect_events", true, false, true),
-        ("wait_for_event", true, false, true),
         ("read_transcript", true, false, true),
         ("add_tag", false, false, true),
         ("remove_tag", false, true, true),
@@ -487,6 +470,7 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         14,
         "wait_for_event",
         json!({
+            "advanced": true,
             "pane_id": pane_id,
             "until": ["seeded_current=true"],
             "timeout": 5
@@ -734,7 +718,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         session,
         21,
         "read_transcript",
-        json!({ "pane_id": pane_id, "limit": 50, "raw": true }),
+        json!({ "pane_id": pane_id, "limit": 50, "advanced": true, "raw": true }),
     )
     .await;
     let raw_transcript = tool_payload(&raw_transcript);
@@ -755,6 +739,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         5,
         "collect_events",
         json!({
+            "advanced": true,
             "pane_id": pane_id,
             "replay": 1,
             "limit": 1,
@@ -893,11 +878,11 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         ("interrupt_pane", json!({ "pane_id": malformed })),
         (
             "collect_events",
-            json!({ "pane_id": malformed, "timeout": 1 }),
+            json!({ "advanced": true, "pane_id": malformed, "timeout": 1 }),
         ),
         (
             "wait_for_event",
-            json!({ "pane_id": malformed, "timeout": 1 }),
+            json!({ "advanced": true, "pane_id": malformed, "timeout": 1 }),
         ),
         ("read_transcript", json!({ "pane_id": malformed })),
         (
@@ -961,6 +946,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         32,
         "wait_for_event",
         json!({
+            "advanced": true,
             "pane_id": pane_id.clone(),
             "transcripts": ["assistant"],
             "timeout": 10
@@ -997,7 +983,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         eprintln!("skipping: tmux is unavailable");
         return;
     };
-    let addr = start_mcp_simple(env.socket_path(), None).await;
+    let addr = start_mcp(env.socket_path(), None).await;
     let client = http_client();
     let (initialized, control_session) = initialize(&client, addr, None).await;
     assert!(
@@ -1031,7 +1017,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
             .keys()
             .cloned()
             .collect::<Vec<_>>(),
-        ["limit", "pane_id"]
+        ["advanced", "limit", "pane_id"]
     );
 
     let hidden = call_tool(
@@ -1048,7 +1034,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert!(
         hidden["error"]["message"]
             .as_str()
-            .is_some_and(|text| text.contains("--advanced")),
+            .is_some_and(|text| text.contains("advanced=true")),
         "{hidden}"
     );
 
@@ -1126,12 +1112,32 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
             .any(|record| { record["text"] == "I am still working after the helper runs." })
     );
 
-    let raw = call_tool(
+    let advanced = call_tool(
         &client,
         addr,
         None,
         control_session.as_deref(),
         86,
+        "read_transcript",
+        json!({ "pane_id": pane_id.clone(), "advanced": true, "limit": 20 }),
+    )
+    .await;
+    let advanced = tool_payload(&advanced);
+    assert!(
+        advanced["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record.get("payload").is_some()),
+        "{advanced}"
+    );
+
+    let raw = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        87,
         "read_transcript",
         json!({ "pane_id": pane_id.clone(), "raw": true }),
     )
@@ -1140,7 +1146,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert!(
         raw["error"]["message"]
             .as_str()
-            .is_some_and(|text| text.contains("--advanced")),
+            .is_some_and(|text| text.contains("advanced=true")),
         "{raw}"
     );
 
@@ -1149,7 +1155,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         addr,
         None,
         control_session.as_deref(),
-        87,
+        88,
         "kill_pane",
         json!({ "pane_id": pane_id }),
     )

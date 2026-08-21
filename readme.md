@@ -1507,10 +1507,12 @@ Tools:
 Every tool declares an output schema and returns only MCP `structuredContent`.
 By default, `read_transcript` returns only `{role, text}` records and omits
 internal context, progress, reasoning, tool activity, backend event names,
-payloads, and cursors. Start `slopd-mcp --advanced` to expose
-`collect_events`, `wait_for_event`, transcript cursors, and `raw: true` records.
-`list_panes` and `list_dead_panes` remain compact by default. Tool annotations
-identify read-only, destructive, idempotent, and closed-world operations.
+payloads, and cursors. Pass `advanced: true` on a diagnostic call to unlock
+those details for that call only. `collect_events` and `wait_for_event` are not
+advertised to ordinary models but remain callable with `advanced: true` for
+clients that need full event filters and predicates. `list_panes` and
+`list_dead_panes` remain compact by default. Tool annotations identify
+read-only, destructive, idempotent, and closed-world operations.
 
 The former terse tool names remain accepted as hidden compatibility aliases for
 clients that cache MCP schemas, but they are not returned by `tools/list`.
@@ -1520,9 +1522,10 @@ clients that cache MCP schemas, but they are not returned by `tools/list`.
 invalid forms return the current valid pane IDs and an exact retry. Call
 `wait_for_reply` once with that pane ID; it ignores progress and tool activity
 and returns the completed reply. Do not resend while the pane is working.
-Advanced mode retains bounded event collection and predicate waits for clients
-that need slopctl-level diagnostics. Local terminal attachment is not exposed
-over the remote MCP transport.
+Advanced calls retain bounded event collection and predicate waits for clients
+that need slopctl-level diagnostics. They do not require a different server
+process or restart. Local terminal attachment is not exposed over the remote
+MCP transport.
 
 A token is required whenever `--bind` is not loopback (`--token`,
 `--token-file`, or `SLOPD_MCP_TOKEN`). `--allowed-host` adds `Host` header
