@@ -193,7 +193,8 @@ async fn require_bearer(State(auth): State<Auth>, request: Request, next: Next) 
         .and_then(|value| value.to_str().ok());
     if let Some(presented) = presented_bearer(authorization) {
         let static_ok = constant_time_eq(expected.as_bytes(), presented.as_bytes());
-        if static_ok || auth.oauth.token_valid(presented).await {
+        let resource = oauth::resource_url(&auth, request.headers());
+        if static_ok || auth.oauth.token_valid(presented, &resource).await {
             return next.run(request).await;
         }
         return oauth::challenge(&auth, request.headers(), true);

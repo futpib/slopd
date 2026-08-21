@@ -34,6 +34,14 @@ impl Drop for Daemon {
 }
 
 async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
+    start_mcp_with_public_url(socket, token, None).await
+}
+
+async fn start_mcp_with_public_url(
+    socket: std::path::PathBuf,
+    token: Option<&str>,
+    public_url: Option<String>,
+) -> SocketAddr {
     let oauth_state = socket.with_extension("mcp-oauth.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
@@ -43,7 +51,7 @@ async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAdd
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
         path: "/mcp".into(),
-        public_url: None,
+        public_url,
     };
     tokio::spawn(async move {
         serve(listener, config).await.expect("serve mcp");
@@ -1169,7 +1177,9 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         eprintln!("skipping: tmux is unavailable");
         return;
     };
-    let addr = start_mcp(env.socket_path(), Some("secret")).await;
+    let public_url = "https://mcp.example";
+    let addr =
+        start_mcp_with_public_url(env.socket_path(), Some("secret"), Some(public_url.into())).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::none())
@@ -1186,13 +1196,13 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         .json()
         .await
         .unwrap();
-    assert_eq!(metadata["resource"], format!("http://{addr}/mcp"));
+    assert_eq!(metadata["resource"], format!("{public_url}/mcp"));
     assert!(
         metadata["authorization_servers"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|server| server == &json!(format!("http://{addr}")))
+            .any(|server| server == &json!(public_url))
     );
 
     let as_meta: Value = client
@@ -1207,7 +1217,11 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         .unwrap();
     assert_eq!(
         as_meta["authorization_endpoint"],
-        format!("http://{addr}/oauth/authorize")
+        format!("{public_url}/oauth/authorize")
+    );
+    assert_eq!(
+        as_meta["authorization_response_iss_parameter_supported"],
+        true
     );
 
     let registered: Value = client
@@ -1226,6 +1240,7 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
 
     let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let resource = format!("{public_url}/mcp");
     let authorize = client
         .post(format!("http://{addr}/oauth/authorize"))
         .form(&[
@@ -1236,6 +1251,7 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
             ("state", "xyz"),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
+            ("resource", &resource),
         ])
         .send()
         .await
@@ -1248,6 +1264,10 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
         .to_str()
         .unwrap();
     assert!(location.starts_with("http://127.0.0.1:9/cb?"), "{location}");
+    assert!(
+        location.contains("iss=https%3A%2F%2Fmcp.example"),
+        "{location}"
+    );
     let code = location
         .split(['?', '&'])
         .find_map(|part| part.strip_prefix("code="))
@@ -1261,6 +1281,7 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
             ("redirect_uri", "http://127.0.0.1:9/cb"),
             ("client_id", client_id),
             ("code_verifier", verifier),
+            ("resource", &resource),
         ])
         .send()
         .await
@@ -1274,7 +1295,8 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
     let (initialized, _) = initialize(&http_client(), addr, Some(access)).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
 
-    let restarted = start_mcp(env.socket_path(), Some("secret")).await;
+    let restarted =
+        start_mcp_with_public_url(env.socket_path(), Some("secret"), Some(public_url.into())).await;
     let (initialized, _) = initialize(&http_client(), restarted, Some(access)).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
 }

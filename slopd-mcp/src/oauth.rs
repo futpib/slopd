@@ -42,12 +42,15 @@ struct AuthCode {
     client_id: String,
     redirect_uri: String,
     challenge: String,
+    resource: Option<String>,
     expires: Instant,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AccessToken {
     binding: String,
+    #[serde(default)]
+    resource: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,10 +130,11 @@ impl OAuthStore {
         }
     }
 
-    async fn put_token(&self, token: String) -> std::io::Result<()> {
+    async fn put_token(&self, token: String, resource: Option<String>) -> std::io::Result<()> {
         let mut inner = self.inner.lock().await;
         let access = AccessToken {
             binding: inner.binding.clone(),
+            resource,
         };
         libslop::jsonl::append(
             &mut inner.file,
@@ -138,6 +142,7 @@ impl OAuthStore {
                 token: token.clone(),
                 access: AccessToken {
                     binding: access.binding.clone(),
+                    resource: access.resource.clone(),
                 },
             },
         )?;
@@ -146,12 +151,15 @@ impl OAuthStore {
         Ok(())
     }
 
-    pub async fn token_valid(&self, token: &str) -> bool {
+    pub async fn token_valid(&self, token: &str, resource: &str) -> bool {
         let inner = self.inner.lock().await;
-        inner
-            .tokens
-            .get(token)
-            .is_some_and(|issued| issued.binding == inner.binding)
+        inner.tokens.get(token).is_some_and(|issued| {
+            issued.binding == inner.binding
+                && issued
+                    .resource
+                    .as_deref()
+                    .is_none_or(|issued| issued == resource)
+        })
     }
 }
 
@@ -216,7 +224,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str>
     headers.get(name)?.to_str().ok()
 }
 
-fn resource_url(auth: &Auth, headers: &HeaderMap) -> String {
+pub(crate) fn resource_url(auth: &Auth, headers: &HeaderMap) -> String {
     format!("{}{}", issuer(auth, headers), auth.mcp_path)
 }
 
@@ -235,6 +243,7 @@ async fn authorization_server(State(auth): State<Auth>, headers: HeaderMap) -> J
     let issuer = issuer(&auth, &headers);
     Json(json!({
         "issuer": issuer,
+        "authorization_response_iss_parameter_supported": true,
         "authorization_endpoint": format!("{issuer}/oauth/authorize"),
         "token_endpoint": format!("{issuer}/oauth/token"),
         "registration_endpoint": format!("{issuer}/oauth/register"),
@@ -298,6 +307,8 @@ struct AuthorizeQuery {
     code_challenge: String,
     #[serde(default)]
     code_challenge_method: String,
+    #[serde(default)]
+    resource: String,
 }
 
 #[derive(Deserialize)]
@@ -309,16 +320,26 @@ struct AuthorizeForm {
     code_challenge: String,
     code_challenge_method: String,
     response_type: String,
+    #[serde(default)]
+    resource: String,
 }
 
-async fn authorize_get(State(auth): State<Auth>, Query(query): Query<AuthorizeQuery>) -> Response {
-    match validate_authorize(&auth, &query).await {
+async fn authorize_get(
+    State(auth): State<Auth>,
+    headers: HeaderMap,
+    Query(query): Query<AuthorizeQuery>,
+) -> Response {
+    match validate_authorize(&auth, &headers, &query).await {
         Ok(()) => login_page(&query, None),
         Err(error) => error,
     }
 }
 
-async fn authorize_post(State(auth): State<Auth>, Form(form): Form<AuthorizeForm>) -> Response {
+async fn authorize_post(
+    State(auth): State<Auth>,
+    headers: HeaderMap,
+    Form(form): Form<AuthorizeForm>,
+) -> Response {
     let query = AuthorizeQuery {
         response_type: form.response_type,
         client_id: form.client_id,
@@ -326,8 +347,9 @@ async fn authorize_post(State(auth): State<Auth>, Form(form): Form<AuthorizeForm
         state: form.state,
         code_challenge: form.code_challenge,
         code_challenge_method: form.code_challenge_method,
+        resource: form.resource,
     };
-    if let Err(error) = validate_authorize(&auth, &query).await {
+    if let Err(error) = validate_authorize(&auth, &headers, &query).await {
         return error;
     }
     let Some(expected) = auth.password.as_deref() else {
@@ -344,6 +366,7 @@ async fn authorize_post(State(auth): State<Auth>, Form(form): Form<AuthorizeForm
                 client_id: query.client_id,
                 redirect_uri: query.redirect_uri.clone(),
                 challenge: query.code_challenge,
+                resource: (!query.resource.is_empty()).then_some(query.resource),
                 expires: Instant::now() + CODE_TTL,
             },
         )
@@ -356,10 +379,16 @@ async fn authorize_post(State(auth): State<Auth>, Form(form): Form<AuthorizeForm
         location.push_str("&state=");
         location.push_str(&urlencode(&query.state));
     }
+    location.push_str("&iss=");
+    location.push_str(&urlencode(&issuer(&auth, &headers)));
     Redirect::to(&location).into_response()
 }
 
-async fn validate_authorize(auth: &Auth, query: &AuthorizeQuery) -> Result<(), Response> {
+async fn validate_authorize(
+    auth: &Auth,
+    headers: &HeaderMap,
+    query: &AuthorizeQuery,
+) -> Result<(), Response> {
     if query.response_type != "code" {
         return Err((StatusCode::BAD_REQUEST, "response_type must be code").into_response());
     }
@@ -377,6 +406,13 @@ async fn validate_authorize(auth: &Auth, query: &AuthorizeQuery) -> Result<(), R
         return Err((
             StatusCode::BAD_REQUEST,
             "redirect_uri must be https or loopback http",
+        )
+            .into_response());
+    }
+    if !query.resource.is_empty() && query.resource != resource_url(auth, headers) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "resource does not match MCP server",
         )
             .into_response());
     }
@@ -406,6 +442,8 @@ struct TokenForm {
     client_id: String,
     #[serde(default)]
     code_verifier: String,
+    #[serde(default)]
+    resource: String,
 }
 
 async fn token(State(auth): State<Auth>, Form(form): Form<TokenForm>) -> Response {
@@ -423,7 +461,13 @@ async fn token(State(auth): State<Auth>, Form(form): Form<TokenForm>) -> Respons
         )
             .into_response();
     };
-    if code.client_id != form.client_id || code.redirect_uri != form.redirect_uri {
+    if code.client_id != form.client_id
+        || code.redirect_uri != form.redirect_uri
+        || code
+            .resource
+            .as_deref()
+            .is_some_and(|resource| resource != form.resource)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "invalid_grant"})),
@@ -438,7 +482,11 @@ async fn token(State(auth): State<Auth>, Form(form): Form<TokenForm>) -> Respons
             .into_response();
     }
     let access_token = random_secret();
-    if let Err(error) = auth.oauth.put_token(access_token.clone()).await {
+    if let Err(error) = auth
+        .oauth
+        .put_token(access_token.clone(), code.resource)
+        .await
+    {
         return storage_error(error);
     }
     Json(json!({
@@ -462,6 +510,7 @@ fn login_page(query: &AuthorizeQuery, error: Option<&str>) -> Response {
          <input type=hidden name=state value=\"{}\">\
          <input type=hidden name=code_challenge value=\"{}\">\
          <input type=hidden name=code_challenge_method value=\"{}\">\
+         <input type=hidden name=resource value=\"{}\">\
          <label>Password <input type=password name=password required autofocus></label>\
          <button type=submit>Allow</button></form>",
         esc(&query.response_type),
@@ -470,6 +519,7 @@ fn login_page(query: &AuthorizeQuery, error: Option<&str>) -> Response {
         esc(&query.state),
         esc(&query.code_challenge),
         esc(&query.code_challenge_method),
+        esc(&query.resource),
     ))
     .into_response()
 }
@@ -556,14 +606,33 @@ mod tests {
             .register(vec!["https://grok.com/oauth/callback".into()])
             .await
             .unwrap();
-        store.put_token("access-token".into()).await.unwrap();
+        store
+            .put_token(
+                "access-token".into(),
+                Some("https://mcp.example/mcp".into()),
+            )
+            .await
+            .unwrap();
         drop(store);
 
         let reopened = OAuthStore::open(path.clone(), super::token_binding("password")).unwrap();
         assert!(reopened.client(&client_id).await.is_some());
-        assert!(reopened.token_valid("access-token").await);
+        assert!(
+            reopened
+                .token_valid("access-token", "https://mcp.example/mcp")
+                .await
+        );
+        assert!(
+            !reopened
+                .token_valid("access-token", "https://other.example/mcp")
+                .await
+        );
         let rotated = OAuthStore::open(path, super::token_binding("new-password")).unwrap();
         assert!(rotated.client(&client_id).await.is_some());
-        assert!(!rotated.token_valid("access-token").await);
+        assert!(
+            !rotated
+                .token_valid("access-token", "https://mcp.example/mcp")
+                .await
+        );
     }
 }
