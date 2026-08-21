@@ -349,6 +349,22 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(send["annotations"]["idempotentHint"], false);
     assert_eq!(send["annotations"]["openWorldHint"], false);
     assert_eq!(send["outputSchema"]["type"], "object");
+    let list_panes = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "list_panes")
+        .unwrap();
+    assert!(
+        list_panes["description"]
+            .as_str()
+            .unwrap()
+            .contains("busy means actively working")
+    );
+    assert_eq!(
+        list_panes["outputSchema"]["properties"]["panes"]["items"]["properties"]["state"]["enum"],
+        json!(["busy", "ready", "awaiting_input", "booting_up"])
+    );
     for tool in listed["result"]["tools"].as_array().unwrap() {
         assert!(tool["title"].is_string(), "{tool}");
         assert!(tool["outputSchema"].is_object(), "{tool}");
@@ -678,6 +694,11 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
     .await;
     let payload = tool_payload(&listed);
     assert_eq!(payload["count"], 1, "{payload}");
+    assert_eq!(
+        payload["state_counts"],
+        json!({ "busy": 0, "ready": 1, "awaiting_input": 0, "booting_up": 0 }),
+        "{payload}"
+    );
     let compact_pane = payload["panes"]
         .as_array()
         .unwrap()

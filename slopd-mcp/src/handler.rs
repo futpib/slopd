@@ -79,12 +79,18 @@ impl SlopdMcp {
         let panes = self.slopd_result(result).await?;
         let panes = libslopctl::apply_filters(panes, &filters);
         let count = panes.len();
+        let state_counts = json!({
+            "busy": panes.iter().filter(|pane| pane.state == libslop::PaneState::Busy).count(),
+            "ready": panes.iter().filter(|pane| pane.state == libslop::PaneState::Ready).count(),
+            "awaiting_input": panes.iter().filter(|pane| pane.state == libslop::PaneState::AwaitingInput).count(),
+            "booting_up": panes.iter().filter(|pane| pane.state == libslop::PaneState::BootingUp).count(),
+        });
         let panes = if raw {
             serde_json::to_value(panes).unwrap_or_default()
         } else {
             Value::Array(panes.iter().map(compact_pane).collect())
         };
-        ok_json(json!({ "count": count, "panes": panes }))
+        ok_json(json!({ "count": count, "state_counts": state_counts, "panes": panes }))
     }
 
     async fn fork(

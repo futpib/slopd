@@ -12,7 +12,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "list_panes",
-            "List live slopd panes. Optional filters are AND-ed. Returns compact records unless raw is true.",
+            "List live slopd panes and state counts. busy means actively working; ready means idle and available; awaiting_input means blocked on the user; booting_up means starting. Optional filters are AND-ed. Returns compact records unless raw is true.",
             filter_schema(),
         ),
         tool(
@@ -164,7 +164,18 @@ fn output_schema(name: &str) -> Value {
         }),
         "list_panes" => json!({
             "count": { "type": "integer" },
-            "panes": { "type": "array", "items": { "type": "object" } }
+            "state_counts": {
+                "type": "object",
+                "properties": {
+                    "busy": { "type": "integer", "description": "Panes actively working." },
+                    "ready": { "type": "integer", "description": "Idle panes available for a prompt." },
+                    "awaiting_input": { "type": "integer", "description": "Panes blocked on user input." },
+                    "booting_up": { "type": "integer", "description": "Panes still starting." }
+                },
+                "required": ["busy", "ready", "awaiting_input", "booting_up"],
+                "additionalProperties": false
+            },
+            "panes": { "type": "array", "items": compact_pane_schema() }
         }),
         "create_pane" => json!({
             "pane_id": pane_id_schema(),
@@ -217,6 +228,29 @@ fn output_schema(name: &str) -> Value {
         _ => unreachable!("missing MCP output schema for {name}"),
     };
     json!({ "type": "object", "properties": properties, "additionalProperties": true })
+}
+
+fn compact_pane_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pane_id": pane_id_schema(),
+            "backend": backend_schema(),
+            "account": { "type": "string" },
+            "state": {
+                "type": "string",
+                "enum": ["busy", "ready", "awaiting_input", "booting_up"],
+                "description": "busy is actively working; ready is idle; awaiting_input is blocked on the user; booting_up is starting."
+            },
+            "detailed_state": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "title": { "type": ["string", "null"] },
+            "working_dir": { "type": "string" },
+            "parent_pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }] }
+        },
+        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "parent_pane_id"],
+        "additionalProperties": true
+    })
 }
 
 fn transcript_schema() -> Value {
