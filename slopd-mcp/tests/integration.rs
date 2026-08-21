@@ -435,6 +435,17 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     let run = tool_payload(&run);
     let pane_id = run["pane_id"].as_str().unwrap().to_string();
     assert_eq!(run["ready"], true, "{run}");
+    let tags = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        100,
+        "list_tags",
+        json!({ "pane_id": pane_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tags)["tags"], json!(["slopd-mcp"]));
 
     let tagged = call_tool(
         &client,
@@ -457,7 +468,10 @@ async fn lifecycle_and_metadata_tools_round_trip() {
         json!({ "pane_id": pane_id }),
     )
     .await;
-    assert_eq!(tool_payload(&tags)["tags"], json!(["mcp-parity"]));
+    let tags = tool_payload(&tags);
+    let tags = tags["tags"].as_array().unwrap();
+    assert!(tags.iter().any(|tag| tag == "slopd-mcp"), "{tags:?}");
+    assert!(tags.iter().any(|tag| tag == "mcp-parity"), "{tags:?}");
     let untagged = call_tool(
         &client,
         addr,
@@ -469,6 +483,17 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     )
     .await;
     assert_eq!(tool_payload(&untagged)["tag"], "mcp-parity");
+    let untagged = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        101,
+        "remove_tag",
+        json!({ "pane_id": pane_id, "tag": "slopd-mcp" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&untagged)["tag"], "slopd-mcp");
 
     let waited = call_tool(
         &client,
@@ -504,6 +529,28 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     let forked = tool_payload(&forked);
     let fork_id = forked["pane_id"].as_str().unwrap().to_string();
     assert_eq!(forked["ready"], false, "{forked}");
+    let tags = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        102,
+        "list_tags",
+        json!({ "pane_id": fork_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tags)["tags"], json!(["slopd-mcp"]));
+    let untagged = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        103,
+        "remove_tag",
+        json!({ "pane_id": fork_id, "tag": "slopd-mcp" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&untagged)["tag"], "slopd-mcp");
 
     let killed = call_tool(
         &client,
@@ -575,6 +622,18 @@ async fn lifecycle_and_metadata_tools_round_trip() {
     .await;
     let revived = tool_payload(&revived);
     assert_eq!(revived["grave_id"], grave_id);
+    let revived_id = revived["pane_id"].as_str().unwrap();
+    let tags = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        104,
+        "list_tags",
+        json!({ "pane_id": revived_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tags)["tags"], json!(["slopd-mcp"]));
 
     let restored = call_tool(
         &client,

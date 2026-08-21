@@ -11,6 +11,8 @@ use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
 
+const MCP_PANE_TAG: &str = "slopd-mcp";
+
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
@@ -107,6 +109,8 @@ impl SlopdMcp {
             )
             .await;
         let (pane_id, session_id) = self.slopd_result(result).await?;
+        let result = client.tag(pane_id.clone(), MCP_PANE_TAG.into()).await;
+        self.slopd_result(result).await?;
         if let Some(subscription) = subscription.as_mut()
             && let Err(message) = wait_pane_ready(subscription, &pane_id, spawn.ready_timeout).await
         {
@@ -544,6 +548,8 @@ impl SlopdMcp {
         let mut client = connect(&self.socket).await?;
         let result = client.revive(target, boot, env).await;
         let (pane_id, grave_id) = self.slopd_result(result).await?;
+        let result = client.tag(pane_id.clone(), MCP_PANE_TAG.into()).await;
+        self.slopd_result(result).await?;
         ok_json(json!({ "pane_id": pane_id, "grave_id": grave_id }))
     }
 
@@ -578,6 +584,8 @@ impl SlopdMcp {
             )
             .await;
         let pane_id = self.slopd_result(result).await?;
+        let result = client.tag(pane_id.clone(), MCP_PANE_TAG.into()).await;
+        self.slopd_result(result).await?;
         if let Some(subscription) = subscription.as_mut()
             && let Err(message) = wait_pane_ready(subscription, &pane_id, spawn.ready_timeout).await
         {
