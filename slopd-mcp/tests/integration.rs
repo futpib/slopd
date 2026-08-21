@@ -34,11 +34,24 @@ impl Drop for Daemon {
 }
 
 async fn start_mcp(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
+    start_mcp_mode(socket, token, true).await
+}
+
+async fn start_mcp_simple(socket: std::path::PathBuf, token: Option<&str>) -> SocketAddr {
+    start_mcp_mode(socket, token, false).await
+}
+
+async fn start_mcp_mode(
+    socket: std::path::PathBuf,
+    token: Option<&str>,
+    advanced: bool,
+) -> SocketAddr {
     let oauth_state = socket.with_extension("mcp-oauth.jsonl");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
         socket,
+        advanced,
         oauth_state,
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
@@ -308,6 +321,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "fork_pane",
             "kill_pane",
             "send_prompt",
+            "wait_for_reply",
             "interrupt_pane",
             "collect_events",
             "wait_for_event",
@@ -355,6 +369,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         ("fork_pane", false, false, false),
         ("kill_pane", false, true, true),
         ("send_prompt", false, false, false),
+        ("wait_for_reply", true, false, true),
         ("interrupt_pane", false, true, false),
         ("collect_events", true, false, true),
         ("wait_for_event", true, false, true),
@@ -670,7 +685,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
         }),
     )
     .await;
-    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id]));
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id.clone()]));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut transcript_payload = Value::Null;
@@ -974,6 +989,172 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             .is_some_and(|text| text.contains("MCP_WAIT_CANARY")),
         "{waited}"
     );
+}
+
+#[tokio::test]
+async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp_simple(env.socket_path(), None).await;
+    let client = http_client();
+    let (initialized, control_session) = initialize(&client, addr, None).await;
+    assert!(
+        initialized["result"]["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("wait_for_reply once")),
+        "{initialized}"
+    );
+    let listed = rpc_json(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        json!({ "jsonrpc": "2.0", "id": 80, "method": "tools/list" }),
+    )
+    .await;
+    let names = tool_names(&listed);
+    assert!(names.iter().any(|name| name == "wait_for_reply"));
+    assert!(!names.iter().any(|name| name == "collect_events"));
+    assert!(!names.iter().any(|name| name == "wait_for_event"));
+    let transcript_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_transcript")
+        .unwrap();
+    assert_eq!(
+        transcript_tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["limit", "pane_id"]
+    );
+
+    let hidden = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        81,
+        "collect_events",
+        json!({ "timeout": 1 }),
+    )
+    .await;
+    assert_eq!(hidden["error"]["code"], -32602, "{hidden}");
+    assert!(
+        hidden["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("--advanced")),
+        "{hidden}"
+    );
+
+    let run = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        82,
+        "create_pane",
+        json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+    )
+    .await;
+    let pane_id = tool_payload(&run)["pane_id"].as_str().unwrap().to_string();
+    let (_, wait_session) = initialize(&client, addr, None).await;
+    let (_, send_session) = initialize(&client, addr, None).await;
+    let wait = call_tool(
+        &client,
+        addr,
+        None,
+        wait_session.as_deref(),
+        83,
+        "wait_for_reply",
+        json!({ "pane_id": pane_id.clone(), "timeout": 10 }),
+    );
+    let send = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call_tool(
+            &client,
+            addr,
+            None,
+            send_session.as_deref(),
+            84,
+            "send_prompt",
+            json!({ "pane_id": pane_id.clone(), "prompt": "FOREIGN_HELPER_CANARY" }),
+        )
+        .await
+    };
+    let (waited, sent) = tokio::join!(wait, send);
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id]));
+    let waited = tool_payload(&waited);
+    assert_eq!(waited["pane_id"], pane_id);
+    assert_eq!(waited["reply"], "main session finished");
+
+    let transcript = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        85,
+        "read_transcript",
+        json!({ "pane_id": pane_id.clone(), "limit": 20 }),
+    )
+    .await;
+    let transcript = tool_payload(&transcript);
+    let records = transcript["records"].as_array().unwrap();
+    assert!(records.iter().all(|record| {
+        record.as_object().is_some_and(|record| {
+            record.len() == 2 && record.contains_key("role") && record.contains_key("text")
+        })
+    }));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["text"] == "FOREIGN_HELPER_CANARY")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["text"] == "main session finished")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| { record["text"] == "I am still working after the helper runs." })
+    );
+
+    let raw = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        86,
+        "read_transcript",
+        json!({ "pane_id": pane_id.clone(), "raw": true }),
+    )
+    .await;
+    assert_eq!(raw["error"]["code"], -32602, "{raw}");
+    assert!(
+        raw["error"]["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("--advanced")),
+        "{raw}"
+    );
+
+    let killed = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        87,
+        "kill_pane",
+        json!({ "pane_id": pane_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&killed)["pane_id"], waited["pane_id"]);
 }
 
 #[tokio::test]

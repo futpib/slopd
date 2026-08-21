@@ -1498,17 +1498,19 @@ Tools:
 | `get_status`, `list_panes` | Inspect daemon state and filtered live panes |
 | `create_pane` | Create a pane and optionally send its first `prompt` |
 | `fork_pane`, `kill_pane` | Fork or terminate a managed pane |
-| `send_prompt`, `interrupt_pane` | Prompt or interrupt panes, including `one` / `any` / `all` filtered sends |
-| `collect_events`, `wait_for_event`, `read_transcript` | Collect events, wait on predicates, or read history |
+| `send_prompt`, `wait_for_reply`, `interrupt_pane` | Prompt a pane, wait for its completed reply, or interrupt it |
+| `read_transcript` | Read user prompts and completed agent text |
 | `add_tag`, `remove_tag`, `list_tags` | Manage pane tags |
 | `create_backup`, `restore_backup` | Checkpoint or restore lifecycle state |
 | `list_dead_panes`, `revive_pane` | Inspect or resume durable pane deaths |
 
 Every tool declares an output schema and returns only MCP `structuredContent`.
-`list_panes`, `read_transcript`, and `list_dead_panes` return compact records by
-default; pass `raw: true` for complete structured diagnostic records. Tool
-annotations identify read-only, destructive, idempotent, and closed-world
-operations.
+By default, `read_transcript` returns only `{role, text}` records and omits
+internal context, progress, reasoning, tool activity, backend event names,
+payloads, and cursors. Start `slopd-mcp --advanced` to expose
+`collect_events`, `wait_for_event`, transcript cursors, and `raw: true` records.
+`list_panes` and `list_dead_panes` remain compact by default. Tool annotations
+identify read-only, destructive, idempotent, and closed-world operations.
 
 The former terse tool names remain accepted as hidden compatibility aliases for
 clients that cache MCP schemas, but they are not returned by `tools/list`.
@@ -1516,11 +1518,11 @@ clients that cache MCP schemas, but they are not returned by `tools/list`.
 `send_prompt` does not wait for the underlying agent to finish. Keep the exact
 `pane_id` returned by `create_pane` or `list_panes`, including its leading `%`;
 invalid forms return the current valid pane IDs and an exact retry. Call
-`wait_for_event` with `transcripts: ["assistant"]`, then call `read_transcript`
-for the answer. The `assistant` and `user` wait aliases cover backend-native
-record names. Because an MCP tool call must eventually return, `collect_events`
-adds `limit` and `timeout` bounds around slopctl's otherwise unbounded stream.
-Local terminal attachment is not exposed over the remote MCP transport.
+`wait_for_reply` once with that pane ID; it ignores progress and tool activity
+and returns the completed reply. Do not resend while the pane is working.
+Advanced mode retains bounded event collection and predicate waits for clients
+that need slopctl-level diagnostics. Local terminal attachment is not exposed
+over the remote MCP transport.
 
 A token is required whenever `--bind` is not loopback (`--token`,
 `--token-file`, or `SLOPD_MCP_TOKEN`). `--allowed-host` adds `Host` header

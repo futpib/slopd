@@ -54,6 +54,10 @@ struct Cli {
     /// Durable OAuth journal. Defaults below $XDG_STATE_HOME/slopd.
     #[arg(long, env = "SLOPD_MCP_OAUTH_STATE", value_name = "PATH")]
     oauth_state: Option<PathBuf>,
+
+    /// Expose raw transcript records, event streams, predicates, and cursors.
+    #[arg(long)]
+    advanced: bool,
 }
 
 #[tokio::main]
@@ -135,6 +139,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         listener,
         ServeConfig {
             socket,
+            advanced: cli.advanced,
             oauth_state,
             token: token.map(Arc::from),
             allowed_hosts,

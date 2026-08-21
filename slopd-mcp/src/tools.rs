@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 
 use crate::schema;
 
-pub fn all() -> Vec<Tool> {
-    vec![
+pub fn all(advanced: bool) -> Vec<Tool> {
+    let mut tools = vec![
         tool(
             "get_status",
             "Show slopd daemon uptime and state.",
@@ -32,7 +32,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "send_prompt",
-            "Submit a prompt and wait only until slopd accepts it. Copy pane_id exactly from create_pane or list_panes, including %. To retrieve the reply, call wait_for_event with transcripts=[\"assistant\"], then read_transcript with the same pane_id.",
+            "Submit a prompt and wait only until slopd accepts it. Copy pane_id exactly, including %. Then call wait_for_reply once with that pane_id. Do not resend while the agent is working.",
             json!({
                 "type": "object",
                 "properties": {
@@ -50,34 +50,31 @@ pub fn all() -> Vec<Tool> {
             }),
         ),
         tool(
+            "wait_for_reply",
+            "Wait for the agent's completed reply after send_prompt. Progress updates, reasoning, and tool calls are ignored.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": pane_id_schema(),
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 300, "default": 120 }
+                },
+                "required": ["pane_id"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "interrupt_pane",
             "Send Ctrl+C, Ctrl+D, and Escape to interrupt a pane.",
             pane_schema(),
         ),
         tool(
-            "collect_events",
-            "Collect matching slopd events. MCP bounds the CLI stream by limit and timeout.",
-            event_schema(false),
-        ),
-        tool(
-            "wait_for_event",
-            "Wait for the first matching event. After send_prompt, use the same exact pane_id and transcripts=[\"assistant\"] before calling read_transcript.",
-            event_schema(true),
-        ),
-        tool(
             "read_transcript",
-            "Read historical transcript records from a pane. Returns compact records unless raw is true.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pane_id": pane_id_schema(),
-                    "before": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
-                    "raw": { "type": "boolean", "default": false }
-                },
-                "required": ["pane_id"],
-                "additionalProperties": false
-            }),
+            if advanced {
+                "Read historical transcript records from a pane. Returns compact records unless raw is true."
+            } else {
+                "Read only useful conversation text from a pane. Internal context, progress, reasoning, tools, payloads, event names, and cursors are omitted."
+            },
+            transcript_schema(advanced),
         ),
         tool("add_tag", "Add a tag to a pane.", tag_schema()),
         tool("remove_tag", "Remove a tag from a pane.", tag_schema()),
@@ -119,7 +116,25 @@ pub fn all() -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-    ]
+    ];
+    if advanced {
+        tools.splice(
+            8..8,
+            [
+                tool(
+                    "collect_events",
+                    "Collect matching slopd events. MCP bounds the CLI stream by limit and timeout.",
+                    event_schema(false),
+                ),
+                tool(
+                    "wait_for_event",
+                    "Wait for the first matching raw event.",
+                    event_schema(true),
+                ),
+            ],
+        );
+    }
+    tools
 }
 
 fn tool(name: &'static str, description: &'static str, input_schema: Value) -> Tool {
@@ -144,6 +159,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "fork_pane" => ("Fork pane", false, false, false),
         "kill_pane" => ("Kill pane", false, true, true),
         "send_prompt" => ("Send prompt", false, false, false),
+        "wait_for_reply" => ("Wait for reply", true, false, true),
         "interrupt_pane" => ("Interrupt pane", false, true, false),
         "collect_events" => ("Collect events", true, false, true),
         "wait_for_event" => ("Wait for event", true, false, true),
@@ -185,6 +201,10 @@ fn output_schema(name: &str) -> Value {
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
         }),
+        "wait_for_reply" => json!({
+            "pane_id": pane_id_schema(),
+            "reply": { "type": "string" }
+        }),
         "collect_events" => json!({
             "records": { "type": "array", "items": { "type": "object" } },
             "timed_out": { "type": "boolean" }
@@ -218,6 +238,32 @@ fn output_schema(name: &str) -> Value {
         _ => unreachable!("missing MCP output schema for {name}"),
     };
     json!({ "type": "object", "properties": properties, "additionalProperties": true })
+}
+
+fn transcript_schema(advanced: bool) -> Value {
+    if advanced {
+        json!({
+            "type": "object",
+            "properties": {
+                "pane_id": pane_id_schema(),
+                "before": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 },
+                "raw": { "type": "boolean", "default": false }
+            },
+            "required": ["pane_id"],
+            "additionalProperties": false
+        })
+    } else {
+        json!({
+            "type": "object",
+            "properties": {
+                "pane_id": pane_id_schema(),
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+            },
+            "required": ["pane_id"],
+            "additionalProperties": false
+        })
+    }
 }
 
 fn empty_schema() -> Value {

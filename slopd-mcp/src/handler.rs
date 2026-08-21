@@ -14,25 +14,33 @@ use tokio::net::UnixStream;
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
+    advanced: bool,
 }
 
 impl SlopdMcp {
-    pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+    pub fn new(socket: PathBuf, advanced: bool) -> Self {
+        Self { socket, advanced }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
-        crate::tools::all()
+        crate::tools::all(self.advanced)
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
-        match canonical_tool_name(request.name.as_ref()) {
+        let name = canonical_tool_name(request.name.as_ref());
+        if !self.advanced && matches!(name, "collect_events" | "wait_for_event") {
+            return Err(invalid_argument(format!(
+                "{name} is an advanced tool; restart slopd-mcp with --advanced to enable raw event access"
+            )));
+        }
+        match name {
             "get_status" => self.status().await,
             "list_panes" => self.ps(request.arguments.as_ref()).await,
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
             "kill_pane" => self.kill(request.arguments.as_ref()).await,
             "read_transcript" => self.transcript(request.arguments.as_ref()).await,
             "send_prompt" => self.send(request.arguments.as_ref()).await,
+            "wait_for_reply" => self.wait_for_reply(request.arguments.as_ref()).await,
             "interrupt_pane" => self.interrupt(request.arguments.as_ref()).await,
             "collect_events" => self.listen(request.arguments.as_ref()).await,
             "wait_for_event" => self.wait(request.arguments.as_ref()).await,
@@ -131,20 +139,44 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let pane_id = self.required_pane_id(arguments, "pane_id").await?;
-        let before = optional_u64(arguments, "before")?;
-        let limit = optional_u64(arguments, "limit")?
-            .unwrap_or(50)
-            .clamp(1, 500);
-        let raw = optional_bool(arguments, "raw")?.unwrap_or(false);
+        if !self.advanced
+            && arguments
+                .is_some_and(|values| values.contains_key("before") || values.contains_key("raw"))
+        {
+            return Err(invalid_argument(
+                "read_transcript only accepts pane_id and limit by default; restart slopd-mcp with --advanced for cursors and raw records",
+            ));
+        }
+        let limit =
+            optional_u64(arguments, "limit")?.unwrap_or(if self.advanced { 50 } else { 20 });
         let mut client = connect(&self.socket).await?;
-        let result = client.read_transcript(pane_id, before, limit).await;
-        let records = self.slopd_result(result).await?;
-        let count = records.len();
-        let records = if raw {
-            serde_json::to_value(records).unwrap_or_default()
+        let result = if self.advanced {
+            client
+                .read_transcript(
+                    pane_id,
+                    optional_u64(arguments, "before")?,
+                    limit.clamp(1, 500),
+                )
+                .await
         } else {
-            Value::Array(records.iter().map(compact_record).collect())
+            client.read_transcript(pane_id, None, 500).await
         };
+        let records = self.slopd_result(result).await?;
+        let records = if self.advanced {
+            if optional_bool(arguments, "raw")?.unwrap_or(false) {
+                serde_json::to_value(records).unwrap_or_default()
+            } else {
+                Value::Array(records.iter().map(compact_record).collect())
+            }
+        } else {
+            let mut records = records.iter().filter_map(simple_record).collect::<Vec<_>>();
+            let keep = limit.clamp(1, 100) as usize;
+            if records.len() > keep {
+                records.drain(..records.len() - keep);
+            }
+            Value::Array(records)
+        };
+        let count = records.as_array().map_or(0, Vec::len);
         ok_json(json!({ "count": count, "records": records }))
     }
 
@@ -190,6 +222,79 @@ impl SlopdMcp {
             }
         };
         ok_json(json!({ "pane_ids": pane_ids }))
+    }
+
+    async fn wait_for_reply(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
+        let timeout = optional_u64(arguments, "timeout")?
+            .unwrap_or(120)
+            .clamp(1, 300);
+        let filters = vec![
+            libslop::EventFilter {
+                source: Some("transcript".into()),
+                pane_id: Some(pane_id.clone()),
+                ..Default::default()
+            },
+            libslop::EventFilter {
+                source: Some("slopd".into()),
+                event_type: Some("DetailedStateChange".into()),
+                pane_id: Some(pane_id.clone()),
+                ..Default::default()
+            },
+            libslop::EventFilter {
+                source: Some("slopd".into()),
+                event_type: Some("PaneDestroyed".into()),
+                pane_id: Some(pane_id.clone()),
+                ..Default::default()
+            },
+        ];
+        let mut client = connect(&self.socket).await?;
+        let result = client.subscribe(filters).await;
+        let mut subscription = self.slopd_result(result).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+
+        loop {
+            let result = client.read_transcript(pane_id.clone(), None, 500).await;
+            let records = self.slopd_result(result).await?;
+            let snapshot = reply_snapshot(&records);
+            let result = client.ps().await;
+            let panes = self.slopd_result(result).await?;
+            let pane = panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .ok_or_else(|| invalid_argument(format!("pane {pane_id} no longer exists")))?;
+            if let Some(reply) = snapshot.reply
+                && (snapshot.explicit_complete || pane.state == libslop::PaneState::Ready)
+            {
+                return ok_json(json!({ "pane_id": pane_id, "reply": reply }));
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return tool_error(format!(
+                    "timed out after {timeout}s waiting for pane {pane_id} to finish; do not resend the prompt automatically"
+                ));
+            }
+            match tokio::time::timeout(remaining, subscription.next()).await {
+                Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
+                    if record.source == "slopd" && record.event_type == "PaneDestroyed" =>
+                {
+                    return tool_error(format!("pane {pane_id} exited before replying"));
+                }
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    return Err(internal_failure("reply subscription closed"));
+                }
+                Err(_) => {
+                    return tool_error(format!(
+                        "timed out after {timeout}s waiting for pane {pane_id} to finish; do not resend the prompt automatically"
+                    ));
+                }
+            }
+        }
     }
 
     async fn interrupt(
@@ -590,14 +695,14 @@ fn canonical_tool_name(name: &str) -> &str {
 
 impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
+        let instructions = if self.advanced {
+            "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, and wait_for_reply once with the same pane_id. Raw transcript events and predicates are also enabled. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working."
+        } else {
+            "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, then wait_for_reply once with the same pane_id. read_transcript returns only user prompts and completed agent text. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working."
+        };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "slopd-mcp",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_instructions(
-                "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, wait_for_event with transcripts=[\"assistant\"], then read_transcript to read the answer. Preserve pane_id exactly, including its leading %. send_prompt returns when slopd accepts the prompt, not when the agent finishes. interrupt_pane stops an in-flight turn.",
-            )
+            .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -868,6 +973,87 @@ fn compact_grave(entry: &libslop::GraveEntry) -> Value {
     })
 }
 
+struct ReplySnapshot {
+    reply: Option<String>,
+    explicit_complete: bool,
+}
+
+fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
+    let last_user = records.iter().rposition(|record| {
+        conversation_role(record) == Some("user")
+            && transcript_text(&record.payload).is_some_and(|text| !internal_text(&text))
+    });
+    let Some(last_user) = last_user else {
+        return ReplySnapshot {
+            reply: None,
+            explicit_complete: false,
+        };
+    };
+    let mut reply = None;
+    let mut chunks = String::new();
+    let mut explicit_complete = false;
+    for record in records.iter().skip(last_user + 1) {
+        if record.event_type == "turn_completed" {
+            explicit_complete = true;
+            continue;
+        }
+        if conversation_role(record) != Some("assistant") || progress_record(record) {
+            continue;
+        }
+        let Some(text) = transcript_text(&record.payload) else {
+            continue;
+        };
+        if record.event_type == "agent_message_chunk" {
+            chunks.push_str(&text);
+            reply = Some(chunks.clone());
+        } else {
+            reply = Some(text);
+        }
+        if record.payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+            explicit_complete = true;
+        }
+    }
+    ReplySnapshot {
+        reply,
+        explicit_complete,
+    }
+}
+
+fn simple_record(record: &libslop::Record) -> Option<Value> {
+    let role = conversation_role(record)?;
+    if progress_record(record) {
+        return None;
+    }
+    let text = transcript_text(&record.payload)?;
+    if role == "user" && internal_text(&text) {
+        return None;
+    }
+    Some(json!({ "role": role, "text": text }))
+}
+
+fn conversation_role(record: &libslop::Record) -> Option<&'static str> {
+    match record.event_type.as_str() {
+        "user" | "userMessage" | "user_message_chunk" => Some("user"),
+        "assistant" | "agentMessage" | "agent_message_chunk" => Some("assistant"),
+        _ => match record.payload.get("role").and_then(Value::as_str) {
+            Some("user") => Some("user"),
+            Some("assistant") => Some("assistant"),
+            _ => None,
+        },
+    }
+}
+
+fn progress_record(record: &libslop::Record) -> bool {
+    record.payload.get("phase").and_then(Value::as_str) == Some("commentary")
+}
+
+fn internal_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("<permissions instructions>")
+}
+
 fn compact_record(record: &libslop::Record) -> Value {
     json!({
         "cursor": record.cursor,
@@ -881,6 +1067,7 @@ fn transcript_text(payload: &Value) -> Option<String> {
         "/text",
         "/message/content",
         "/content",
+        "/parts",
         "/part/text",
         "/params/update/content/text",
         "/delta/text",
@@ -1161,8 +1348,10 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_tool_name, expand_wait_transcripts, parse_backend, transcript_text, valid_pane_id,
+        canonical_tool_name, expand_wait_transcripts, parse_backend, reply_snapshot, simple_record,
+        transcript_text, valid_pane_id,
     };
+    use serde_json::{Value, json};
 
     #[test]
     fn parse_backend_accepts_canonical_names() {
@@ -1233,5 +1422,80 @@ mod tests {
             transcript_text(&serde_json::json!({ "part": { "text": "opencode" } })).as_deref(),
             Some("opencode")
         );
+    }
+
+    #[test]
+    fn simple_transcript_keeps_only_conversation_text() {
+        let record = |event_type: &str, payload: Value| libslop::Record {
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%1".into()),
+            payload,
+            cursor: Some(1),
+        };
+        assert!(
+            simple_record(&record(
+                "userMessage",
+                json!({ "text": "# AGENTS.md instructions\nprivate" }),
+            ))
+            .is_none()
+        );
+        assert!(
+            simple_record(&record(
+                "agentMessage",
+                json!({ "text": "working", "phase": "commentary" }),
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            simple_record(&record(
+                "agentMessage",
+                json!({ "text": "done", "phase": "final_answer" }),
+            )),
+            Some(json!({ "role": "assistant", "text": "done" }))
+        );
+        assert!(simple_record(&record("toolCall", json!({ "name": "exec" }))).is_none());
+    }
+
+    #[test]
+    fn reply_snapshot_ignores_progress_and_joins_grok_chunks() {
+        let record = |event_type: &str, payload: Value| libslop::Record {
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%1".into()),
+            payload,
+            cursor: Some(1),
+        };
+        let codex = reply_snapshot(&[
+            record("userMessage", json!({ "text": "question" })),
+            record(
+                "agentMessage",
+                json!({ "text": "working", "phase": "commentary" }),
+            ),
+            record(
+                "agentMessage",
+                json!({ "text": "answer", "phase": "final_answer" }),
+            ),
+        ]);
+        assert_eq!(codex.reply.as_deref(), Some("answer"));
+        assert!(codex.explicit_complete);
+
+        let grok = reply_snapshot(&[
+            record(
+                "user_message_chunk",
+                json!({ "params": { "update": { "content": { "text": "question" } } } }),
+            ),
+            record(
+                "agent_message_chunk",
+                json!({ "params": { "update": { "content": { "text": "an" } } } }),
+            ),
+            record(
+                "agent_message_chunk",
+                json!({ "params": { "update": { "content": { "text": "swer" } } } }),
+            ),
+            record("turn_completed", json!({})),
+        ]);
+        assert_eq!(grok.reply.as_deref(), Some("answer"));
+        assert!(grok.explicit_complete);
     }
 }
