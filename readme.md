@@ -1496,7 +1496,7 @@ Tools:
 | Tool | Purpose |
 |------|---------|
 | `get_status`, `list_panes` | Inspect daemon state and filtered live panes |
-| `create_pane` | Create a pane |
+| `create_pane` | Create a pane and optionally send its first `prompt` |
 | `fork_pane`, `kill_pane` | Fork or terminate a managed pane |
 | `send_prompt`, `interrupt_pane` | Prompt or interrupt panes, including `one` / `any` / `all` filtered sends |
 | `collect_events`, `wait_for_event`, `read_transcript` | Collect events, wait on predicates, or read history |
@@ -1509,6 +1509,9 @@ Every tool declares an output schema and returns only MCP `structuredContent`.
 default; pass `raw: true` for complete structured diagnostic records. Tool
 annotations identify read-only, destructive, idempotent, and closed-world
 operations.
+
+The former terse tool names remain accepted as hidden compatibility aliases for
+clients that cache MCP schemas, but they are not returned by `tools/list`.
 
 `send_prompt` does not wait for the underlying agent to finish. Keep the exact
 `pane_id` returned by `create_pane` or `list_panes`, including its leading `%`;

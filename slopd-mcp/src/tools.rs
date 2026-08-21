@@ -17,7 +17,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "create_pane",
-            "Create an agent pane. Reuse the returned pane_id exactly, including its leading %.",
+            "Create an agent pane and optionally send its first prompt. Reuse the returned pane_id exactly, including its leading %.",
             spawn_schema(false),
         ),
         tool(
@@ -173,7 +173,8 @@ fn output_schema(name: &str) -> Value {
         }),
         "create_pane" => json!({
             "pane_id": pane_id_schema(),
-            "ready": { "type": "boolean" }
+            "ready": { "type": "boolean" },
+            "prompt_sent": { "type": "boolean" }
         }),
         "fork_pane" => json!({
             "pane_id": pane_id_schema(),
@@ -294,6 +295,10 @@ fn spawn_schema(fork: bool) -> Value {
         properties.insert("parent_pane_id".into(), pane_id_schema());
         properties.insert("account".into(), json!({ "type": "string" }));
         properties.insert("backend".into(), backend_schema());
+        properties.insert(
+            "prompt".into(),
+            json!({ "type": "string", "description": "Optional first prompt, sent after the new pane becomes ready." }),
+        );
     }
     schema
 }

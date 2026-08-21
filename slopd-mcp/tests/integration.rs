@@ -775,6 +775,75 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
 }
 
 #[tokio::test]
+async fn cached_run_alias_creates_and_prompts_a_pane() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize(&client, addr, None).await;
+    let session = session.as_deref();
+
+    let created = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        70,
+        "run",
+        json!({
+            "backend": "claude",
+            "prompt": "CACHED_RUN_CANARY",
+            "ready_timeout": 20
+        }),
+    )
+    .await;
+    let created = tool_payload(&created);
+    let pane_id = created["pane_id"].as_str().unwrap().to_string();
+    assert_eq!(created["ready"], true, "{created}");
+    assert_eq!(created["prompt_sent"], true, "{created}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let transcript = call_tool(
+            &client,
+            addr,
+            None,
+            session,
+            71,
+            "transcript",
+            json!({ "pane_id": pane_id, "limit": 50 }),
+        )
+        .await;
+        let transcript = tool_payload(&transcript);
+        if transcript["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|record| record["text"].as_str())
+            .any(|text| text.contains("CACHED_RUN_CANARY"))
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{transcript}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let killed = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        72,
+        "kill",
+        json!({ "pane_id": pane_id }),
+    )
+    .await;
+    assert_eq!(tool_payload(&killed)["pane_id"], pane_id);
+}
+
+#[tokio::test]
 async fn wait_assistant_alias_catches_a_codex_reply() {
     let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
         eprintln!("skipping: tmux is unavailable");

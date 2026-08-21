@@ -26,7 +26,7 @@ impl SlopdMcp {
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
-        match request.name.as_ref() {
+        match canonical_tool_name(request.name.as_ref()) {
             "get_status" => self.status().await,
             "list_panes" => self.ps(request.arguments.as_ref()).await,
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
@@ -446,6 +446,7 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let spawn = spawn_arguments(arguments)?;
+        let prompt = optional_string(arguments, "prompt");
         let parent_pane_id = self.optional_pane_id(arguments, "parent_pane_id").await?;
         let account = optional_string(arguments, "account");
         let backend = match optional_string(arguments, "backend") {
@@ -453,7 +454,8 @@ impl SlopdMcp {
             None => None,
         };
         let mut client = connect(&self.socket).await?;
-        let mut subscription = if spawn.no_wait {
+        let wait_for_ready = !spawn.no_wait || prompt.is_some();
+        let mut subscription = if !wait_for_ready {
             None
         } else {
             let result = client.subscribe(ready_event_filters()).await;
@@ -479,7 +481,18 @@ impl SlopdMcp {
                 "error": message,
             }));
         }
-        ok_json(json!({ "pane_id": pane_id, "ready": !spawn.no_wait }))
+        let prompt_sent = if let Some(prompt) = prompt {
+            let result = client.send_prompt(pane_id.clone(), prompt, 60, false).await;
+            self.slopd_result(result).await?;
+            true
+        } else {
+            false
+        };
+        ok_json(json!({
+            "pane_id": pane_id,
+            "ready": wait_for_ready,
+            "prompt_sent": prompt_sent,
+        }))
     }
 
     async fn required_pane_id(
@@ -549,6 +562,29 @@ impl SlopdMcp {
             Ok(value) => Ok(value),
             Err(error) => Err(slopd_error_with_panes(error, self.valid_pane_ids().await)),
         }
+    }
+}
+
+fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "status" => "get_status",
+        "ps" => "list_panes",
+        "run" => "create_pane",
+        "fork" => "fork_pane",
+        "kill" => "kill_pane",
+        "send" => "send_prompt",
+        "interrupt" => "interrupt_pane",
+        "listen" => "collect_events",
+        "wait" => "wait_for_event",
+        "transcript" => "read_transcript",
+        "tag" => "add_tag",
+        "untag" => "remove_tag",
+        "tags" => "list_tags",
+        "backup" => "create_backup",
+        "restore" => "restore_backup",
+        "graveyard" => "list_dead_panes",
+        "revive" => "revive_pane",
+        current => current,
     }
 }
 
@@ -1124,7 +1160,9 @@ fn actionable_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_wait_transcripts, parse_backend, transcript_text, valid_pane_id};
+    use super::{
+        canonical_tool_name, expand_wait_transcripts, parse_backend, transcript_text, valid_pane_id,
+    };
 
     #[test]
     fn parse_backend_accepts_canonical_names() {
@@ -1149,6 +1187,33 @@ mod tests {
         assert!(valid_pane_id("%146"));
         assert!(!valid_pane_id("146"));
         assert!(!valid_pane_id("percent146"));
+    }
+
+    #[test]
+    fn legacy_tool_names_dispatch_to_current_tools() {
+        let aliases = [
+            ("status", "get_status"),
+            ("ps", "list_panes"),
+            ("run", "create_pane"),
+            ("fork", "fork_pane"),
+            ("kill", "kill_pane"),
+            ("send", "send_prompt"),
+            ("interrupt", "interrupt_pane"),
+            ("listen", "collect_events"),
+            ("wait", "wait_for_event"),
+            ("transcript", "read_transcript"),
+            ("tag", "add_tag"),
+            ("untag", "remove_tag"),
+            ("tags", "list_tags"),
+            ("backup", "create_backup"),
+            ("restore", "restore_backup"),
+            ("graveyard", "list_dead_panes"),
+            ("revive", "revive_pane"),
+        ];
+        for (legacy, current) in aliases {
+            assert_eq!(canonical_tool_name(legacy), current);
+        }
+        assert_eq!(canonical_tool_name("create_pane"), "create_pane");
     }
 
     #[test]
