@@ -66,6 +66,17 @@ impl Mailbox {
             .cloned()
             .collect()
     }
+
+    fn recent_pane_ids(&self) -> Vec<String> {
+        let entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
+        let mut pane_ids = Vec::new();
+        for entry in entries.iter().rev() {
+            if !pane_ids.contains(&entry.pane_id) {
+                pane_ids.push(entry.pane_id.clone());
+            }
+        }
+        pane_ids
+    }
 }
 
 impl MailboxEntry {
@@ -300,7 +311,7 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
+        let pane_id = self.resolve_agent_pane(arguments).await?;
         let prompt = required_string(arguments, "prompt")?;
         if prompt.trim().is_empty() {
             return tool_error("prompt must not be empty");
@@ -341,6 +352,31 @@ impl SlopdMcp {
 
         wait_for_mailbox_entry(&entry, wait_seconds).await;
         ok_json(entry.json())
+    }
+
+    async fn resolve_agent_pane(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<String, McpError> {
+        if let Some(pane_id) = self.optional_pane_id(arguments, "pane_id").await? {
+            return Ok(pane_id);
+        }
+        let filters = pane_filters(arguments)?;
+        let mut client = connect(&self.socket).await?;
+        let result = client.ps().await;
+        let panes = libslopctl::apply_filters(self.slopd_result(result).await?, &filters);
+        preferred_pane_id(panes, &self.mailbox.recent_pane_ids()).ok_or_else(|| {
+            invalid_argument(if filters.is_empty() {
+                "no live agent panes are available".into()
+            } else {
+                let filters = filters
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("no live agent pane matches {filters}")
+            })
+        })
     }
 
     async fn read_mailbox(
@@ -876,7 +912,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply: it returns fast replies inline and keeps slow replies in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Use send_prompt only for fire-and-forget input. read_transcript returns only user prompts and completed agent text by default. Preserve pane_id exactly, including its leading %. Never resend a pending mailbox request.",
+                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply. For requests such as 'ask my Codex agent', call ask_agent with backend=codex; do not ask the user for a pane ID or call list_panes first. Omit all target fields to use the best live agent based on recent MCP use, MCP ownership, and activity. Fast replies return inline and slow replies remain in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Use send_prompt only for fire-and-forget input. Never resend a pending mailbox request.",
             )
     }
 
@@ -1212,6 +1248,26 @@ fn compact_pane(pane: &libslop::PaneInfo) -> Value {
         "working_dir": pane.working_dir,
         "parent_pane_id": pane.parent_pane_id,
     })
+}
+
+fn preferred_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option<String> {
+    let priority = |pane: &libslop::PaneInfo| {
+        let used = recent
+            .iter()
+            .position(|pane_id| pane_id == &pane.pane_id)
+            .map_or(0, |index| recent.len() - index);
+        (
+            used,
+            pane.tags.iter().any(|tag| tag == MCP_PANE_TAG),
+            pane.last_active,
+            pane.created_at,
+            pane.pane_id.clone(),
+        )
+    };
+    panes
+        .into_iter()
+        .max_by(|left, right| priority(left).cmp(&priority(right)))
+        .map(|pane| pane.pane_id)
 }
 
 fn compact_grave(entry: &libslop::GraveEntry) -> Value {
@@ -1653,8 +1709,8 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_tool_name, expand_wait_transcripts, parse_backend, reply_snapshot, simple_record,
-        transcript_text, valid_pane_id,
+        canonical_tool_name, expand_wait_transcripts, parse_backend, preferred_pane_id,
+        reply_snapshot, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
 
@@ -1681,6 +1737,38 @@ mod tests {
         assert!(valid_pane_id("%146"));
         assert!(!valid_pane_id("146"));
         assert!(!valid_pane_id("percent146"));
+    }
+
+    #[test]
+    fn agent_selection_prefers_mcp_history_then_tags_then_activity() {
+        let pane = |pane_id: &str, last_active: u64, tags: &[&str]| libslop::PaneInfo {
+            pane_id: pane_id.into(),
+            created_at: last_active,
+            last_active,
+            session_id: None,
+            parent_pane_id: None,
+            tags: tags.iter().map(|tag| (*tag).into()).collect(),
+            state: libslop::PaneState::Ready,
+            detailed_state: libslop::PaneDetailedState::Ready,
+            working_dir: None,
+            transcript_path: None,
+            account: "codex".into(),
+            backend: libslop::Backend::Codex,
+            pane_title: None,
+        };
+        let panes = || {
+            vec![
+                pane("%1", 30, &[]),
+                pane("%2", 20, &["slopd-mcp"]),
+                pane("%3", 10, &[]),
+            ]
+        };
+
+        assert_eq!(preferred_pane_id(panes(), &[]).as_deref(), Some("%2"));
+        assert_eq!(
+            preferred_pane_id(panes(), &["%3".into(), "%1".into()]).as_deref(),
+            Some("%3")
+        );
     }
 
     #[test]

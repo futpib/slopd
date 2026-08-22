@@ -32,16 +32,19 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_agent",
-            "Preferred way to ask one agent and get its completed reply. Sends the prompt exactly once, waits up to wait_seconds, and returns the reply synchronously when ready. If still working, it returns pending and keeps collecting the reply in the server-wide mailbox; call read_mailbox later. Grok does not need to remember request_id because read_mailbox works with no arguments.",
+            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. If pane_id is omitted, matching agents are ranked by recent use through this MCP, the slopd-mcp tag, then activity; no selector considers every live agent. Do not call list_panes just to obtain an ID. Fast replies return inline; slow replies stay in the server-wide mailbox for read_mailbox.",
             json!({
                 "type": "object",
                 "properties": {
                     "pane_id": pane_id_schema(),
+                    "tag": { "type": "string" },
+                    "backend": backend_schema(),
+                    "account": { "type": "string" },
                     "prompt": { "type": "string" },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
                     "interrupt": { "type": "boolean", "default": false }
                 },
-                "required": ["pane_id", "prompt"],
+                "required": ["prompt"],
                 "additionalProperties": false
             }),
         ),

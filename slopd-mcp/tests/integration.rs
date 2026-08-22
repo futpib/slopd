@@ -1118,6 +1118,18 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
             .collect::<Vec<_>>(),
         ["advanced", "limit", "pane_id"]
     );
+    let ask_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "ask_agent")
+        .unwrap();
+    assert_eq!(ask_tool["inputSchema"]["required"], json!(["prompt"]));
+    assert!(
+        ask_tool["inputSchema"]["properties"]
+            .get("backend")
+            .is_some()
+    );
 
     let hidden = call_tool(
         &client,
@@ -1186,7 +1198,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         89,
         "ask_agent",
         json!({
-            "pane_id": pane_id.clone(),
+            "backend": "codex",
             "prompt": "MAILBOX_SYNC_CANARY",
             "wait_seconds": 10
         }),
