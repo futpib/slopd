@@ -31,6 +31,35 @@ pub fn all() -> Vec<Tool> {
             pane_schema(),
         ),
         tool(
+            "ask_agent",
+            "Preferred way to ask one agent and get its completed reply. Sends the prompt exactly once, waits up to wait_seconds, and returns the reply synchronously when ready. If still working, it returns pending and keeps collecting the reply in the server-wide mailbox; call read_mailbox later. Grok does not need to remember request_id because read_mailbox works with no arguments.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": pane_id_schema(),
+                    "prompt": { "type": "string" },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
+                    "interrupt": { "type": "boolean", "default": false }
+                },
+                "required": ["pane_id", "prompt"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "read_mailbox",
+            "Read recent ask_agent requests and replies across all MCP sessions. Call with no arguments when you do not remember a request ID. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "pane_id": pane_id_schema(),
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 0 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "send_prompt",
             "Submit a prompt and wait only until slopd accepts it. Copy pane_id exactly, including %. Then call wait_for_reply once with that pane_id. Do not resend while the agent is working.",
             json!({
@@ -137,6 +166,8 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "create_pane" => ("Create pane", false, false, false),
         "fork_pane" => ("Fork pane", false, false, false),
         "kill_pane" => ("Kill pane", false, true, true),
+        "ask_agent" => ("Ask agent", false, false, false),
+        "read_mailbox" => ("Read mailbox", true, false, true),
         "send_prompt" => ("Send prompt", false, false, false),
         "wait_for_reply" => ("Wait for reply", true, false, true),
         "interrupt_pane" => ("Interrupt pane", false, true, false),
@@ -188,6 +219,11 @@ fn output_schema(name: &str) -> Value {
             "ready": { "type": "boolean" }
         }),
         "kill_pane" | "interrupt_pane" => json!({ "pane_id": pane_id_schema() }),
+        "ask_agent" => mailbox_entry_schema()["properties"].clone(),
+        "read_mailbox" => json!({
+            "count": { "type": "integer" },
+            "entries": { "type": "array", "items": mailbox_entry_schema() }
+        }),
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
         }),
@@ -228,6 +264,23 @@ fn output_schema(name: &str) -> Value {
         _ => unreachable!("missing MCP output schema for {name}"),
     };
     json!({ "type": "object", "properties": properties, "additionalProperties": true })
+}
+
+fn mailbox_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "request_id": { "type": "string" },
+            "pane_id": pane_id_schema(),
+            "prompt": { "type": "string" },
+            "created_at_unix_ms": { "type": "integer" },
+            "status": { "type": "string", "enum": ["pending", "completed", "failed"] },
+            "reply": { "type": ["string", "null"] },
+            "error": { "type": ["string", "null"] }
+        },
+        "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "reply", "error"],
+        "additionalProperties": false
+    })
 }
 
 fn compact_pane_schema() -> Value {

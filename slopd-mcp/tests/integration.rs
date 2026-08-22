@@ -315,6 +315,8 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "create_pane",
             "fork_pane",
             "kill_pane",
+            "ask_agent",
+            "read_mailbox",
             "send_prompt",
             "wait_for_reply",
             "interrupt_pane",
@@ -377,6 +379,8 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         ("create_pane", false, false, false),
         ("fork_pane", false, false, false),
         ("kill_pane", false, true, true),
+        ("ask_agent", false, false, false),
+        ("read_mailbox", true, false, true),
         ("send_prompt", false, false, false),
         ("wait_for_reply", true, false, true),
         ("interrupt_pane", false, true, false),
@@ -960,6 +964,11 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         ),
         ("kill_pane", json!({ "pane_id": malformed })),
         (
+            "ask_agent",
+            json!({ "pane_id": malformed, "prompt": "must not be sent" }),
+        ),
+        ("read_mailbox", json!({ "pane_id": malformed })),
+        (
             "send_prompt",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),
         ),
@@ -1077,7 +1086,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert!(
         initialized["result"]["instructions"]
             .as_str()
-            .is_some_and(|text| text.contains("wait_for_reply once")),
+            .is_some_and(|text| text.contains("read_mailbox with no arguments")),
         "{initialized}"
     );
     let listed = rpc_json(
@@ -1089,6 +1098,8 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     )
     .await;
     let names = tool_names(&listed);
+    assert!(names.iter().any(|name| name == "ask_agent"));
+    assert!(names.iter().any(|name| name == "read_mailbox"));
     assert!(names.iter().any(|name| name == "wait_for_reply"));
     assert!(!names.iter().any(|name| name == "collect_events"));
     assert!(!names.iter().any(|name| name == "wait_for_event"));
@@ -1167,6 +1178,25 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert_eq!(waited["pane_id"], pane_id);
     assert_eq!(waited["reply"], "main session finished");
 
+    let asked = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        89,
+        "ask_agent",
+        json!({
+            "pane_id": pane_id.clone(),
+            "prompt": "MAILBOX_SYNC_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let asked = tool_payload(&asked);
+    assert_eq!(asked["pane_id"], pane_id);
+    assert_eq!(asked["status"], "completed");
+    assert_eq!(asked["reply"], "mock response: MAILBOX_SYNC_CANARY");
+
     let transcript = call_tool(
         &client,
         addr,
@@ -1236,6 +1266,78 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
             .as_str()
             .is_some_and(|text| text.contains("advanced=true")),
         "{raw}"
+    );
+
+    let pending = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        90,
+        "ask_agent",
+        json!({
+            "pane_id": pane_id.clone(),
+            "prompt": "::mock active",
+            "wait_seconds": 0
+        }),
+    )
+    .await;
+    let pending = tool_payload(&pending);
+    assert_eq!(pending["status"], "pending");
+    let pending_id = pending["request_id"].as_str().unwrap().to_string();
+
+    let (_, fresh_session) = initialize(&client, addr, None).await;
+    let mailbox = call_tool(
+        &client,
+        addr,
+        None,
+        fresh_session.as_deref(),
+        91,
+        "read_mailbox",
+        json!({}),
+    )
+    .await;
+    let mailbox = tool_payload(&mailbox);
+    assert_eq!(mailbox["count"], 2);
+    assert!(mailbox["entries"].as_array().unwrap().iter().any(|entry| {
+        entry["request_id"] == pending_id
+            && entry["prompt"] == "::mock active"
+            && entry["status"] == "pending"
+    }));
+
+    let steered = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        92,
+        "send_prompt",
+        json!({ "pane_id": pane_id.clone(), "prompt": "MAILBOX_ASYNC_FINISH" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&steered)["pane_ids"], json!([pane_id]));
+
+    let completed = call_tool(
+        &client,
+        addr,
+        None,
+        fresh_session.as_deref(),
+        93,
+        "read_mailbox",
+        json!({ "wait_seconds": 10 }),
+    )
+    .await;
+    let completed = tool_payload(&completed);
+    assert!(
+        completed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["request_id"] == pending_id
+                    && entry["status"] == "completed"
+                    && entry["reply"] == "steered: MAILBOX_ASYNC_FINISH"
+            })
     );
 
     let killed = call_tool(

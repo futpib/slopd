@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -12,15 +14,116 @@ use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
 
 const MCP_PANE_TAG: &str = "slopd-mcp";
+const MAILBOX_LIMIT: usize = 100;
+const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Default)]
+struct Mailbox {
+    entries: Arc<Mutex<VecDeque<Arc<MailboxEntry>>>>,
+}
+
+struct MailboxEntry {
+    request_id: String,
+    pane_id: String,
+    prompt: String,
+    created_at_unix_ms: u64,
+    state: Mutex<MailboxState>,
+}
+
+#[derive(Clone)]
+enum MailboxState {
+    Pending,
+    Completed(String),
+    Failed(String),
+}
+
+impl Mailbox {
+    fn insert(&self, entry: Arc<MailboxEntry>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
+        while entries.len() >= MAILBOX_LIMIT {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    fn get(&self, request_id: &str) -> Option<Arc<MailboxEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .find(|entry| entry.request_id == request_id)
+            .cloned()
+    }
+
+    fn recent(&self, pane_id: Option<&str>, limit: usize) -> Vec<Arc<MailboxEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .rev()
+            .filter(|entry| pane_id.is_none_or(|pane_id| entry.pane_id == pane_id))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+impl MailboxEntry {
+    fn new(pane_id: String, prompt: String) -> Self {
+        let created_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            pane_id,
+            prompt,
+            created_at_unix_ms,
+            state: Mutex::new(MailboxState::Pending),
+        }
+    }
+
+    fn state(&self) -> MailboxState {
+        self.state
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone()
+    }
+
+    fn finish(&self, state: MailboxState) {
+        *self.state.lock().unwrap_or_else(|lock| lock.into_inner()) = state;
+    }
+
+    fn json(&self) -> Value {
+        let (status, reply, error) = match self.state() {
+            MailboxState::Pending => ("pending", Value::Null, Value::Null),
+            MailboxState::Completed(reply) => ("completed", json!(reply), Value::Null),
+            MailboxState::Failed(error) => ("failed", Value::Null, json!(error)),
+        };
+        json!({
+            "request_id": self.request_id,
+            "pane_id": self.pane_id,
+            "prompt": self.prompt,
+            "created_at_unix_ms": self.created_at_unix_ms,
+            "status": status,
+            "reply": reply,
+            "error": error,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
+    mailbox: Mailbox,
 }
 
 impl SlopdMcp {
     pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            mailbox: Mailbox::default(),
+        }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
@@ -42,6 +145,8 @@ impl SlopdMcp {
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
             "kill_pane" => self.kill(request.arguments.as_ref()).await,
             "read_transcript" => self.transcript(request.arguments.as_ref()).await,
+            "ask_agent" => self.ask_agent(request.arguments.as_ref()).await,
+            "read_mailbox" => self.read_mailbox(request.arguments.as_ref()).await,
             "send_prompt" => self.send(request.arguments.as_ref()).await,
             "wait_for_reply" => self.wait_for_reply(request.arguments.as_ref()).await,
             "interrupt_pane" => self.interrupt(request.arguments.as_ref()).await,
@@ -191,6 +296,83 @@ impl SlopdMcp {
         ok_json(json!({ "count": count, "records": records }))
     }
 
+    async fn ask_agent(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
+        let prompt = required_string(arguments, "prompt")?;
+        if prompt.trim().is_empty() {
+            return tool_error("prompt must not be empty");
+        }
+        let wait_seconds = optional_u64(arguments, "wait_seconds")?
+            .unwrap_or(45)
+            .min(300);
+        let interrupt = optional_bool(arguments, "interrupt")?.unwrap_or(false);
+
+        let mut client = connect(&self.socket).await?;
+        let result = client.subscribe(reply_event_filters(&pane_id)).await;
+        let subscription = self.slopd_result(result).await?;
+        let result = client.read_transcript(pane_id.clone(), None, 500).await;
+        let records = self.slopd_result(result).await?;
+        let after_cursor = records
+            .iter()
+            .filter_map(|record| record.cursor)
+            .max()
+            .unwrap_or(0);
+        let result = client
+            .send_prompt(pane_id.clone(), prompt.clone(), 60, interrupt)
+            .await;
+        self.slopd_result(result).await?;
+
+        let entry = Arc::new(MailboxEntry::new(pane_id.clone(), prompt.clone()));
+        self.mailbox.insert(Arc::clone(&entry));
+        let worker_entry = Arc::clone(&entry);
+        tokio::spawn(async move {
+            let state =
+                match wait_for_mailbox_reply(client, subscription, &pane_id, &prompt, after_cursor)
+                    .await
+                {
+                    Ok(reply) => MailboxState::Completed(reply),
+                    Err(error) => MailboxState::Failed(error),
+                };
+            worker_entry.finish(state);
+        });
+
+        wait_for_mailbox_entry(&entry, wait_seconds).await;
+        ok_json(entry.json())
+    }
+
+    async fn read_mailbox(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let request_id = optional_string(arguments, "request_id");
+        let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
+        let limit = optional_u64(arguments, "limit")?
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let wait_seconds = optional_u64(arguments, "wait_seconds")?
+            .unwrap_or(0)
+            .min(300);
+
+        let entries = if let Some(request_id) = request_id {
+            let entry = self.mailbox.get(&request_id).ok_or_else(|| {
+                invalid_argument(format!(
+                    "unknown mailbox request_id {request_id:?}; omit request_id to list recent mailbox entries"
+                ))
+            })?;
+            wait_for_mailbox_entry(&entry, wait_seconds).await;
+            vec![entry]
+        } else {
+            let entries = self.mailbox.recent(pane_id.as_deref(), limit);
+            wait_for_any_mailbox_entry(&entries, wait_seconds).await;
+            self.mailbox.recent(pane_id.as_deref(), limit)
+        };
+        let entries = entries.iter().map(|entry| entry.json()).collect::<Vec<_>>();
+        ok_json(json!({ "count": entries.len(), "entries": entries }))
+    }
+
     async fn send(
         &self,
         arguments: Option<&Map<String, Value>>,
@@ -243,27 +425,8 @@ impl SlopdMcp {
         let timeout = optional_u64(arguments, "timeout")?
             .unwrap_or(120)
             .clamp(1, 300);
-        let filters = vec![
-            libslop::EventFilter {
-                source: Some("transcript".into()),
-                pane_id: Some(pane_id.clone()),
-                ..Default::default()
-            },
-            libslop::EventFilter {
-                source: Some("slopd".into()),
-                event_type: Some("DetailedStateChange".into()),
-                pane_id: Some(pane_id.clone()),
-                ..Default::default()
-            },
-            libslop::EventFilter {
-                source: Some("slopd".into()),
-                event_type: Some("PaneDestroyed".into()),
-                pane_id: Some(pane_id.clone()),
-                ..Default::default()
-            },
-        ];
         let mut client = connect(&self.socket).await?;
-        let result = client.subscribe(filters).await;
+        let result = client.subscribe(reply_event_filters(&pane_id)).await;
         let mut subscription = self.slopd_result(result).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
 
@@ -713,7 +876,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Call list_panes to find a pane, send_prompt to submit a prompt, then wait_for_reply once with the same pane_id. read_transcript returns only user prompts and completed agent text by default. Preserve pane_id exactly, including its leading %. Do not resend a prompt while its pane is working.",
+                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply: it returns fast replies inline and keeps slow replies in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Use send_prompt only for fire-and-forget input. read_transcript returns only user prompts and completed agent text by default. Preserve pane_id exactly, including its leading %. Never resend a pending mailbox request.",
             )
     }
 
@@ -758,6 +921,87 @@ async fn connect(
     })?;
     let (reader, writer) = stream.into_split();
     Ok(libslopctl::Client::new(reader, writer))
+}
+
+async fn wait_for_mailbox_reply(
+    mut client: libslopctl::Client<
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    >,
+    mut subscription: libslopctl::Subscription,
+    pane_id: &str,
+    prompt: &str,
+    after_cursor: u64,
+) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + MAILBOX_WORKER_TIMEOUT;
+    loop {
+        let records = client
+            .read_transcript(pane_id.to_string(), None, 500)
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = request_reply_snapshot(&records, after_cursor, prompt);
+        let panes = client.ps().await.map_err(|error| error.to_string())?;
+        let pane = panes
+            .iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .ok_or_else(|| format!("pane {pane_id} no longer exists"))?;
+        if let Some(reply) = snapshot.reply
+            && (snapshot.explicit_complete || pane.state == libslop::PaneState::Ready)
+        {
+            return Ok(reply);
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("pane {pane_id} did not reply within 24 hours"));
+        }
+        match tokio::time::timeout(remaining, subscription.next()).await {
+            Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
+                if record.source == "slopd" && record.event_type == "PaneDestroyed" =>
+            {
+                return Err(format!("pane {pane_id} exited before replying"));
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) => return Err("reply subscription closed".into()),
+            Err(_) => return Err(format!("pane {pane_id} did not reply within 24 hours")),
+        }
+    }
+}
+
+async fn wait_for_mailbox_entry(entry: &MailboxEntry, wait_seconds: u64) {
+    if wait_seconds == 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
+    while matches!(entry.state(), MailboxState::Pending) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+}
+
+async fn wait_for_any_mailbox_entry(entries: &[Arc<MailboxEntry>], wait_seconds: u64) {
+    let pending = entries
+        .iter()
+        .filter(|entry| matches!(entry.state(), MailboxState::Pending))
+        .cloned()
+        .collect::<Vec<_>>();
+    if wait_seconds == 0 || pending.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
+    while pending
+        .iter()
+        .all(|entry| matches!(entry.state(), MailboxState::Pending))
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
 }
 
 struct SpawnArguments {
@@ -990,6 +1234,28 @@ struct ReplySnapshot {
     explicit_complete: bool,
 }
 
+fn reply_event_filters(pane_id: &str) -> Vec<libslop::EventFilter> {
+    vec![
+        libslop::EventFilter {
+            source: Some("transcript".into()),
+            pane_id: Some(pane_id.into()),
+            ..Default::default()
+        },
+        libslop::EventFilter {
+            source: Some("slopd".into()),
+            event_type: Some("DetailedStateChange".into()),
+            pane_id: Some(pane_id.into()),
+            ..Default::default()
+        },
+        libslop::EventFilter {
+            source: Some("slopd".into()),
+            event_type: Some("PaneDestroyed".into()),
+            pane_id: Some(pane_id.into()),
+            ..Default::default()
+        },
+    ]
+}
+
 fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
     let last_user = records.iter().rposition(|record| {
         conversation_role(record) == Some("user")
@@ -1001,13 +1267,39 @@ fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
             explicit_complete: false,
         };
     };
+    reply_snapshot_from(records, last_user)
+}
+
+fn request_reply_snapshot(
+    records: &[libslop::Record],
+    after_cursor: u64,
+    prompt: &str,
+) -> ReplySnapshot {
+    let matching_user = records.iter().position(|record| {
+        record.cursor.is_some_and(|cursor| cursor > after_cursor)
+            && conversation_role(record) == Some("user")
+            && transcript_text(&record.payload).is_some_and(|text| text.trim() == prompt.trim())
+    });
+    let Some(matching_user) = matching_user else {
+        return ReplySnapshot {
+            reply: None,
+            explicit_complete: false,
+        };
+    };
+    reply_snapshot_from(records, matching_user)
+}
+
+fn reply_snapshot_from(records: &[libslop::Record], user_index: usize) -> ReplySnapshot {
     let mut reply = None;
     let mut chunks = String::new();
     let mut explicit_complete = false;
-    for record in records.iter().skip(last_user + 1) {
+    for record in records.iter().skip(user_index + 1) {
         if record.event_type == "turn_completed" {
             explicit_complete = true;
-            continue;
+            break;
+        }
+        if conversation_role(record) == Some("user") && reply.is_some() {
+            break;
         }
         if conversation_role(record) != Some("assistant") || progress_record(record) {
             continue;
@@ -1023,6 +1315,7 @@ fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
         }
         if record.payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
             explicit_complete = true;
+            break;
         }
     }
     ReplySnapshot {

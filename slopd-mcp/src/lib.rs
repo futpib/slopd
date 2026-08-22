@@ -103,11 +103,9 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
         public_url: config.public_url.clone(),
         mcp_path: path.clone(),
     };
+    let handler = SlopdMcp::new(config.socket.clone());
     let mcp = StreamableHttpService::new(
-        {
-            let socket = config.socket.clone();
-            move || Ok(SlopdMcp::new(socket.clone()))
-        },
+        move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)
