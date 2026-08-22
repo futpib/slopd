@@ -32,7 +32,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_agent",
-            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. If pane_id is omitted, matching agents are ranked by recent use through this MCP, the slopd-mcp tag, then activity; no selector considers every live agent. Do not call list_panes just to obtain an ID. Fast replies return inline; slow replies stay in the server-wide mailbox for read_mailbox.",
+            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay in the server-wide mailbox for read_mailbox.",
             json!({
                 "type": "object",
                 "properties": {
@@ -64,7 +64,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "send_prompt",
-            "Submit a prompt and wait only until slopd accepts it. Copy pane_id exactly, including %. Then call wait_for_reply once with that pane_id. Do not resend while the agent is working.",
+            "Submit a prompt and wait only until slopd accepts it. Without pane_id, only slopd-mcp-tagged agents are eligible and one is created if needed. An explicit pane_id may target any managed pane; copy it exactly, including %. Then call wait_for_reply once with the returned pane_id. Do not resend while the agent is working.",
             json!({
                 "type": "object",
                 "properties": {

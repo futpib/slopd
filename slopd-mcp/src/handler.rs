@@ -127,6 +127,7 @@ impl MailboxEntry {
 pub struct SlopdMcp {
     socket: PathBuf,
     mailbox: Mailbox,
+    spawn_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SlopdMcp {
@@ -134,6 +135,7 @@ impl SlopdMcp {
         Self {
             socket,
             mailbox: Mailbox::default(),
+            spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -361,22 +363,63 @@ impl SlopdMcp {
         if let Some(pane_id) = self.optional_pane_id(arguments, "pane_id").await? {
             return Ok(pane_id);
         }
+        if let Some(pane_id) = self.find_agent_pane(arguments).await? {
+            return Ok(pane_id);
+        }
+        let _guard = self.spawn_lock.lock().await;
+        if let Some(pane_id) = self.find_agent_pane(arguments).await? {
+            return Ok(pane_id);
+        }
+        self.create_agent_pane(arguments).await
+    }
+
+    async fn find_agent_pane(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, McpError> {
         let filters = pane_filters(arguments)?;
         let mut client = connect(&self.socket).await?;
         let result = client.ps().await;
         let panes = libslopctl::apply_filters(self.slopd_result(result).await?, &filters);
-        preferred_pane_id(panes, &self.mailbox.recent_pane_ids()).ok_or_else(|| {
-            invalid_argument(if filters.is_empty() {
-                "no live agent panes are available".into()
-            } else {
-                let filters = filters
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("no live agent pane matches {filters}")
-            })
-        })
+        Ok(preferred_mcp_pane_id(
+            panes,
+            &self.mailbox.recent_pane_ids(),
+        ))
+    }
+
+    async fn create_agent_pane(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<String, McpError> {
+        let account = optional_string(arguments, "account");
+        let backend = match optional_string(arguments, "backend") {
+            Some(name) => Some(parse_backend(&name).map_err(invalid_argument)?),
+            None => None,
+        };
+        let extra_tag = optional_string(arguments, "tag");
+        let mut client = connect(&self.socket).await?;
+        let result = client.subscribe(ready_event_filters()).await;
+        let mut subscription = self.slopd_result(result).await?;
+        let result = client
+            .run(None, Vec::new(), None, Vec::new(), account, backend)
+            .await;
+        let pane_id = self.slopd_result(result).await?;
+        let result = client.tag(pane_id.clone(), MCP_PANE_TAG.into()).await;
+        self.slopd_result(result).await?;
+        if let Some(tag) = extra_tag.filter(|tag| tag != MCP_PANE_TAG) {
+            let result = client.tag(pane_id.clone(), tag).await;
+            self.slopd_result(result).await?;
+        }
+        if let Err(message) = wait_pane_ready(&mut subscription, &pane_id, 30).await {
+            let cleanup = client.kill(pane_id.clone()).await.err();
+            let cleanup = cleanup
+                .map(|error| format!("; cleanup also failed: {error}"))
+                .unwrap_or_default();
+            return Err(internal_failure(format!(
+                "created pane {pane_id} but it did not become ready: {message}{cleanup}"
+            )));
+        }
+        Ok(pane_id)
     }
 
     async fn read_mailbox(
@@ -423,31 +466,40 @@ impl SlopdMcp {
             .clamp(1, 300);
         let select = parse_select(optional_string(arguments, "select").as_deref())?;
         let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
-        let filters = pane_filters(arguments)?;
-        if pane_id.is_none() && filters.is_empty() {
-            return tool_error(
-                "send_prompt requires pane_id or at least one of tag, backend, account",
-            );
-        }
-
         let mut client = connect(&self.socket).await?;
-        let pane_ids = if filters.is_empty() {
-            let pane_id = pane_id.expect("pane_id present when filters empty");
+        let pane_ids = if let Some(pane_id) = pane_id {
             let result = client
                 .send_prompt(pane_id, prompt, timeout, interrupt)
                 .await;
             vec![self.slopd_result(result).await?]
         } else {
-            if let Some(pane_id) = pane_id {
-                let result = client
-                    .send_prompt(pane_id, prompt, timeout, interrupt)
-                    .await;
-                vec![self.slopd_result(result).await?]
-            } else {
-                let result = client
-                    .send_filtered(&filters, &prompt, &select, timeout, interrupt)
-                    .await;
-                self.slopd_result(result).await?
+            match select {
+                libslopctl::SelectMode::One => {
+                    let pane_id = self.resolve_agent_pane(arguments).await?;
+                    let result = client
+                        .send_prompt(pane_id, prompt, timeout, interrupt)
+                        .await;
+                    vec![self.slopd_result(result).await?]
+                }
+                libslopctl::SelectMode::Any | libslopctl::SelectMode::All => {
+                    let mut filters = pane_filters(arguments)?;
+                    filters.push(("tag".into(), MCP_PANE_TAG.into()));
+                    let result = client.ps().await;
+                    let matches =
+                        libslopctl::apply_filters(self.slopd_result(result).await?, &filters);
+                    if matches.is_empty() {
+                        let pane_id = self.resolve_agent_pane(arguments).await?;
+                        let result = client
+                            .send_prompt(pane_id, prompt, timeout, interrupt)
+                            .await;
+                        vec![self.slopd_result(result).await?]
+                    } else {
+                        let result = client
+                            .send_filtered(&filters, &prompt, &select, timeout, interrupt)
+                            .await;
+                        self.slopd_result(result).await?
+                    }
+                }
             }
         };
         ok_json(json!({ "pane_ids": pane_ids }))
@@ -912,7 +964,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply. For requests such as 'ask my Codex agent', call ask_agent with backend=codex; do not ask the user for a pane ID or call list_panes first. Omit all target fields to use the best live agent based on recent MCP use, MCP ownership, and activity. Fast replies return inline and slow replies remain in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Use send_prompt only for fire-and-forget input. Never resend a pending mailbox request.",
+                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply. For requests such as 'ask my Codex agent', call ask_agent with backend=codex; do not ask the user for a pane ID or call list_panes first. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed, so they never select a human-owned pane. Fast replies return inline and slow replies remain in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Never resend a pending mailbox request.",
             )
     }
 
@@ -1250,7 +1302,7 @@ fn compact_pane(pane: &libslop::PaneInfo) -> Value {
     })
 }
 
-fn preferred_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option<String> {
+fn preferred_mcp_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option<String> {
     let priority = |pane: &libslop::PaneInfo| {
         let used = recent
             .iter()
@@ -1258,7 +1310,6 @@ fn preferred_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option
             .map_or(0, |index| recent.len() - index);
         (
             used,
-            pane.tags.iter().any(|tag| tag == MCP_PANE_TAG),
             pane.last_active,
             pane.created_at,
             pane.pane_id.clone(),
@@ -1266,6 +1317,7 @@ fn preferred_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option
     };
     panes
         .into_iter()
+        .filter(|pane| pane.tags.iter().any(|tag| tag == MCP_PANE_TAG))
         .max_by(|left, right| priority(left).cmp(&priority(right)))
         .map(|pane| pane.pane_id)
 }
@@ -1459,6 +1511,7 @@ fn text_value(value: &Value) -> Option<String> {
 fn pane_filters(arguments: Option<&Map<String, Value>>) -> Result<Vec<(String, String)>, McpError> {
     let mut filters = Vec::new();
     if let Some(tag) = optional_string(arguments, "tag") {
+        libslop::tag_option_name(&tag).map_err(invalid_argument)?;
         filters.push(("tag".into(), tag));
     }
     if let Some(backend) = optional_string(arguments, "backend") {
@@ -1709,7 +1762,7 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_tool_name, expand_wait_transcripts, parse_backend, preferred_pane_id,
+        canonical_tool_name, expand_wait_transcripts, parse_backend, preferred_mcp_pane_id,
         reply_snapshot, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
@@ -1740,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_selection_prefers_mcp_history_then_tags_then_activity() {
+    fn implicit_agent_selection_ignores_unowned_panes() {
         let pane = |pane_id: &str, last_active: u64, tags: &[&str]| libslop::PaneInfo {
             pane_id: pane_id.into(),
             created_at: last_active,
@@ -1761,13 +1814,18 @@ mod tests {
                 pane("%1", 30, &[]),
                 pane("%2", 20, &["slopd-mcp"]),
                 pane("%3", 10, &[]),
+                pane("%4", 5, &["slopd-mcp"]),
             ]
         };
 
-        assert_eq!(preferred_pane_id(panes(), &[]).as_deref(), Some("%2"));
+        assert_eq!(preferred_mcp_pane_id(panes(), &[]).as_deref(), Some("%2"));
         assert_eq!(
-            preferred_pane_id(panes(), &["%3".into(), "%1".into()]).as_deref(),
-            Some("%3")
+            preferred_mcp_pane_id(panes(), &["%3".into(), "%1".into()]).as_deref(),
+            Some("%2")
+        );
+        assert_eq!(
+            preferred_mcp_pane_id(panes(), &["%4".into()]).as_deref(),
+            Some("%4")
         );
     }
 

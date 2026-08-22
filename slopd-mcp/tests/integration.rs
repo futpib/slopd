@@ -1075,6 +1075,106 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
 }
 
 #[tokio::test]
+async fn implicit_mutations_create_owned_panes_instead_of_using_untagged_matches() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize(&client, addr, None).await;
+
+    let created = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        73,
+        "create_pane",
+        json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+    )
+    .await;
+    let unowned = tool_payload(&created)["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let removed = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        74,
+        "remove_tag",
+        json!({ "pane_id": unowned, "tag": "slopd-mcp" }),
+    )
+    .await;
+    assert_eq!(tool_payload(&removed)["pane_id"], unowned);
+
+    let asked = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        75,
+        "ask_agent",
+        json!({
+            "account": "codex",
+            "backend": "codex",
+            "prompt": "IMPLICIT_OWNERSHIP_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let asked = tool_payload(&asked);
+    let owned = asked["pane_id"].as_str().unwrap().to_string();
+    assert_ne!(owned, unowned);
+    assert_eq!(asked["status"], "completed");
+    assert_eq!(asked["reply"], "mock response: IMPLICIT_OWNERSHIP_CANARY");
+
+    let tags = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        76,
+        "list_tags",
+        json!({ "pane_id": owned }),
+    )
+    .await;
+    assert_eq!(tool_payload(&tags)["tags"], json!(["slopd-mcp"]));
+
+    let sent = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        77,
+        "send_prompt",
+        json!({
+            "account": "codex",
+            "backend": "codex",
+            "prompt": "FILTERED_OWNERSHIP_CANARY"
+        }),
+    )
+    .await;
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([owned]));
+
+    for (id, pane_id) in [(78, owned), (79, unowned)] {
+        let killed = call_tool(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            id,
+            "kill_pane",
+            json!({ "pane_id": pane_id }),
+        )
+        .await;
+        assert_eq!(tool_payload(&killed)["pane_id"], pane_id);
+    }
+}
+
+#[tokio::test]
 async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
         eprintln!("skipping: tmux is unavailable");
