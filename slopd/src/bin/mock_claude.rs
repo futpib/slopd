@@ -466,6 +466,23 @@ const FLAGS: &[&str] = &[
     "--mock-exit=immediate",
 ];
 
+fn argument_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str)
+}
+
+fn running_session_id(args: &[String], forking: bool) -> &str {
+    argument_value(args, "--session-id")
+        .or_else(|| {
+            (!forking)
+                .then(|| argument_value(args, "--resume"))
+                .flatten()
+        })
+        .unwrap_or("mock-session-id-1234")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     for arg in args.iter().skip(1).filter(|arg| arg.starts_with("--mock-")) {
@@ -556,21 +573,8 @@ fn main() {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
-    // Honor `--session-id <id>` like real Claude: it pins the id of the session
-    // this process actually runs as — the one the transcript file is named for.
-    // slopd's fork path passes the minted fork id here. Absent → default id.
-    let session_id: &str = args
-        .iter()
-        .position(|a| a == "--session-id")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-        .unwrap_or("mock-session-id-1234");
     // The `--resume <id>` target, if any (the session being resumed / forked from).
-    let resume_src: Option<&str> = args
-        .iter()
-        .position(|a| a == "--resume")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str);
+    let resume_src = argument_value(&args, "--resume");
     // Fork mode: `--fork-session` copies the resumed session into a NEW one
     // (`--session-id`). CRUCIAL fidelity detail (verified against real Claude
     // v2.1.x): the SessionStart hook then fires with the RESUMED SOURCE id
@@ -578,6 +582,9 @@ fn main() {
     // points at the fork's new file. slopd must not trust that id (it pins the
     // minted fork id instead). A fresh run or a plain `--resume` reports its own id.
     let forking = args.iter().any(|a| a == "--fork-session");
+    // `--session-id` pins the running session, while a plain resume continues
+    // the requested session. Forks use their separately minted `--session-id`.
+    let session_id = running_session_id(&args, forking);
     let session_start_sid: &str = if forking {
         resume_src.unwrap_or(session_id)
     } else {
@@ -1344,5 +1351,33 @@ fn main() {
 
     unsafe {
         libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::running_session_id;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn plain_resume_runs_as_the_resumed_session() {
+        let args = args(&["mock_claude", "--resume", "resumed-id"]);
+        assert_eq!(running_session_id(&args, false), "resumed-id");
+    }
+
+    #[test]
+    fn fork_runs_as_its_explicit_session() {
+        let args = args(&[
+            "mock_claude",
+            "--resume",
+            "source-id",
+            "--fork-session",
+            "--session-id",
+            "fork-id",
+        ]);
+        assert_eq!(running_session_id(&args, true), "fork-id");
     }
 }
