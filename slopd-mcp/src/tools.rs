@@ -11,8 +11,13 @@ pub fn all() -> Vec<Tool> {
             empty_schema(),
         ),
         tool(
+            "get_work_overview",
+            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. It already reads compact recent conversation excerpts; do not also call get_agent_result, send a prompt, or inspect dead panes. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
+            overview_schema(),
+        ),
+        tool(
             "list_panes",
-            "List live slopd panes and state counts. busy means actively working; ready means idle and available; awaiting_input means blocked on the user; booting_up means starting. Optional filters are AND-ed. Returns compact records unless raw is true.",
+            "List live slopd panes and state counts without reading their conversations. Use get_work_overview when the user asks what agents are doing or where work left off. busy means actively working; ready means idle and available; awaiting_input means blocked on the user; booting_up means starting. Optional filters are AND-ed. The backend field is authoritative; title is only a label. Returns compact records unless raw is true.",
             filter_schema(),
         ),
         tool(
@@ -50,7 +55,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the latest agent request, completion status, and reply. Use this when the user naturally asks whether an agent finished, what it said, or for the latest agent result. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative; use it to answer the user. Never claim you lack access after this tool returns. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
+            "Get the latest request submitted through ask_agent, its completion status, and reply. Use this when the user asks whether that request finished or for its result. This is not a live-pane inventory or general conversation history; use get_work_overview when asked what agents are doing or where work left off. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
             json!({
                 "type": "object",
                 "properties": {
@@ -164,6 +169,7 @@ fn tool(name: &'static str, description: &'static str, input_schema: Value) -> T
 fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
     match name {
         "get_status" => ("Get daemon status", true, false, true),
+        "get_work_overview" => ("Get work overview", true, false, true),
         "list_panes" => ("List live panes", true, false, true),
         "create_pane" => ("Create pane", false, false, false),
         "fork_pane" => ("Fork pane", false, false, false),
@@ -194,6 +200,22 @@ fn output_schema(name: &str) -> Value {
             "subscriber_count": { "type": "integer" },
             "config_generation": { "type": "integer" },
             "pending_restore": { "type": ["integer", "null"] }
+        }),
+        "get_work_overview" => json!({
+            "count": { "type": "integer" },
+            "state_counts": {
+                "type": "object",
+                "properties": {
+                    "busy": { "type": "integer" },
+                    "ready": { "type": "integer" },
+                    "awaiting_input": { "type": "integer" },
+                    "booting_up": { "type": "integer" }
+                },
+                "required": ["busy", "ready", "awaiting_input", "booting_up"],
+                "additionalProperties": false
+            },
+            "panes": { "type": "array", "items": overview_pane_schema() },
+            "answer": { "type": "string", "description": "Authoritative summary grounded in live pane state and recent useful conversation text." }
         }),
         "list_panes" => json!({
             "count": { "type": "integer" },
@@ -309,12 +331,34 @@ fn compact_pane_schema() -> Value {
             },
             "detailed_state": { "type": "string" },
             "tags": { "type": "array", "items": { "type": "string" } },
-            "title": { "type": ["string", "null"] },
+            "title": { "type": ["string", "null"], "description": "User-facing pane label, not the agent type. Use backend for the agent type." },
             "working_dir": { "type": "string" },
             "parent_pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }] }
         },
         "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "parent_pane_id"],
         "additionalProperties": true
+    })
+}
+
+fn overview_pane_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pane_id": pane_id_schema(),
+            "backend": backend_schema(),
+            "account": { "type": "string" },
+            "state": { "type": "string", "enum": ["busy", "ready", "awaiting_input", "booting_up"] },
+            "detailed_state": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "title": { "type": ["string", "null"], "description": "User-facing label, not the agent type." },
+            "working_dir": { "type": ["string", "null"] },
+            "last_request_excerpt": { "type": ["string", "null"] },
+            "latest_reply_excerpt": { "type": ["string", "null"] },
+            "reply_complete": { "type": "boolean" },
+            "transcript_error": { "type": ["string", "null"] }
+        },
+        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "last_request_excerpt", "latest_reply_excerpt", "reply_complete", "transcript_error"],
+        "additionalProperties": false
     })
 }
 
@@ -376,6 +420,19 @@ fn filter_schema() -> Value {
             "backend": backend_schema(),
             "account": { "type": "string" },
             "raw": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn overview_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pane_id": pane_id_schema(),
+            "tag": { "type": "string" },
+            "backend": backend_schema(),
+            "account": { "type": "string" }
         },
         "additionalProperties": false
     })

@@ -174,6 +174,7 @@ impl SlopdMcp {
         }
         match name {
             "get_status" => self.status().await,
+            "get_work_overview" => self.overview(request.arguments.as_ref()).await,
             "list_panes" => self.ps(request.arguments.as_ref()).await,
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
             "kill_pane" => self.kill(request.arguments.as_ref()).await,
@@ -209,6 +210,71 @@ impl SlopdMcp {
         }))
     }
 
+    async fn overview(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
+        let filters = pane_filters(arguments)?;
+        let mut client = connect(&self.socket).await?;
+        let result = client.ps().await;
+        let panes = self.slopd_result(result).await?;
+        let panes = libslopctl::apply_filters(panes, &filters)
+            .into_iter()
+            .filter(|pane| {
+                pane_id
+                    .as_ref()
+                    .is_none_or(|pane_id| &pane.pane_id == pane_id)
+            })
+            .collect::<Vec<_>>();
+        let state_counts = pane_state_counts(&panes);
+        let mut overview = Vec::with_capacity(panes.len());
+        for pane in &panes {
+            let result = client
+                .read_transcript(pane.pane_id.clone(), None, 500)
+                .await;
+            let record = match result {
+                Ok(records) => {
+                    let mut last_request = latest_user_request(&records);
+                    let mut before = records.first().and_then(|record| record.cursor);
+                    let mut transcript_error = None;
+                    for _ in 0..3 {
+                        if last_request.is_some() {
+                            break;
+                        }
+                        let Some(cursor) = before else {
+                            break;
+                        };
+                        match client
+                            .read_transcript(pane.pane_id.clone(), Some(cursor), 500)
+                            .await
+                        {
+                            Ok(older) if older.is_empty() => break,
+                            Ok(older) => {
+                                last_request = latest_user_request(&older);
+                                before = older.first().and_then(|record| record.cursor);
+                            }
+                            Err(error) => {
+                                transcript_error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    overview_pane(pane, &records, last_request, transcript_error)
+                }
+                Err(error) => overview_pane(pane, &[], None, Some(error.to_string())),
+            };
+            overview.push(record);
+        }
+        let answer = overview_answer(&state_counts, &overview);
+        ok_json(json!({
+            "count": overview.len(),
+            "state_counts": state_counts,
+            "panes": overview,
+            "answer": answer,
+        }))
+    }
+
     async fn ps(&self, arguments: Option<&Map<String, Value>>) -> Result<CallToolResult, McpError> {
         let filters = pane_filters(arguments)?;
         let raw = optional_bool(arguments, "raw")?.unwrap_or(false);
@@ -217,12 +283,7 @@ impl SlopdMcp {
         let panes = self.slopd_result(result).await?;
         let panes = libslopctl::apply_filters(panes, &filters);
         let count = panes.len();
-        let state_counts = json!({
-            "busy": panes.iter().filter(|pane| pane.state == libslop::PaneState::Busy).count(),
-            "ready": panes.iter().filter(|pane| pane.state == libslop::PaneState::Ready).count(),
-            "awaiting_input": panes.iter().filter(|pane| pane.state == libslop::PaneState::AwaitingInput).count(),
-            "booting_up": panes.iter().filter(|pane| pane.state == libslop::PaneState::BootingUp).count(),
-        });
+        let state_counts = pane_state_counts(&panes);
         let panes = if raw {
             serde_json::to_value(panes).unwrap_or_default()
         } else {
@@ -996,7 +1057,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex; do not call list_panes first. If the user asks whether prior agent work finished, what an agent said, or for its latest result, call get_agent_result with no arguments before answering. Its top-level answer is authoritative; use it to answer the user. Never claim you lack access after the tool returns. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed, so they never select a human-owned pane. Fast replies return inline and slow replies remain available through get_agent_result, including across new MCP sessions. Never resend a pending request.",
+                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
             )
     }
 
@@ -1310,6 +1371,114 @@ fn compact_pane(pane: &libslop::PaneInfo) -> Value {
         "working_dir": pane.working_dir,
         "parent_pane_id": pane.parent_pane_id,
     })
+}
+
+fn pane_state_counts(panes: &[libslop::PaneInfo]) -> Value {
+    json!({
+        "busy": panes.iter().filter(|pane| pane.state == libslop::PaneState::Busy).count(),
+        "ready": panes.iter().filter(|pane| pane.state == libslop::PaneState::Ready).count(),
+        "awaiting_input": panes.iter().filter(|pane| pane.state == libslop::PaneState::AwaitingInput).count(),
+        "booting_up": panes.iter().filter(|pane| pane.state == libslop::PaneState::BootingUp).count(),
+    })
+}
+
+fn overview_pane(
+    pane: &libslop::PaneInfo,
+    records: &[libslop::Record],
+    last_request: Option<String>,
+    transcript_error: Option<String>,
+) -> Value {
+    let reply = reply_snapshot(records);
+    let last_request = last_request.as_deref().map(brief);
+    let latest_reply = reply.reply.as_deref().map(brief);
+    let reply_complete = reply.explicit_complete
+        || (latest_reply.is_some() && pane.state == libslop::PaneState::Ready);
+    json!({
+        "pane_id": pane.pane_id,
+        "backend": pane.backend,
+        "account": pane.account,
+        "state": pane.state,
+        "detailed_state": pane.detailed_state,
+        "tags": pane.tags,
+        "title": pane.pane_title,
+        "working_dir": pane.working_dir,
+        "last_request_excerpt": last_request,
+        "latest_reply_excerpt": latest_reply,
+        "reply_complete": reply_complete,
+        "transcript_error": transcript_error,
+    })
+}
+
+fn latest_user_request(records: &[libslop::Record]) -> Option<String> {
+    records.iter().rev().find_map(|record| {
+        if conversation_role(record) != Some("user") {
+            return None;
+        }
+        let text = transcript_text(&record.payload)?;
+        (!internal_text(&text)).then_some(text)
+    })
+}
+
+fn overview_answer(state_counts: &Value, panes: &[Value]) -> String {
+    if panes.is_empty() {
+        return "No live panes match the request.".into();
+    }
+    let count = panes.len();
+    let busy = state_counts["busy"].as_u64().unwrap_or(0);
+    let ready = state_counts["ready"].as_u64().unwrap_or(0);
+    let awaiting = state_counts["awaiting_input"].as_u64().unwrap_or(0);
+    let booting = state_counts["booting_up"].as_u64().unwrap_or(0);
+    let noun = if count == 1 { "pane" } else { "panes" };
+    let mut answer = format!(
+        "{count} live {noun}: {busy} busy, {ready} ready, {awaiting} awaiting input, {booting} booting."
+    );
+    for pane in panes {
+        let pane_id = pane["pane_id"].as_str().unwrap_or("unknown pane");
+        let backend = pane["backend"].as_str().unwrap_or("unknown backend");
+        let state = pane["state"].as_str().unwrap_or("unknown state");
+        answer.push_str(&format!("\n{pane_id}: {backend}, {state}."));
+        if let Some(request) = pane["last_request_excerpt"].as_str() {
+            answer.push_str(&format!(" Last request excerpt: {}", brief(request)));
+        }
+        if let Some(reply) = pane["latest_reply_excerpt"].as_str() {
+            let status = if pane["reply_complete"].as_bool() == Some(true) {
+                "Completed reply excerpt"
+            } else {
+                "Current reply excerpt"
+            };
+            answer.push_str(&format!(" {status}: {}", brief(reply)));
+        } else if pane["transcript_error"].is_null() {
+            answer.push_str(" No reply to the latest request is available yet.");
+        } else {
+            answer.push_str(" Recent conversation could not be read.");
+        }
+    }
+    answer
+}
+
+fn brief(text: &str) -> String {
+    const LIMIT: usize = 400;
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some((cutoff, _)) = text.char_indices().nth(LIMIT) else {
+        return text;
+    };
+    let prefix = &text[..cutoff];
+    if let Some((end, character)) = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| matches!(character, '.' | '!' | '?'))
+    {
+        let end = end + character.len_utf8();
+        if prefix[..end].chars().count() >= LIMIT / 3 {
+            return prefix[..end].trim_end().into();
+        }
+    }
+    let end = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(prefix.len(), |(index, _)| index);
+    prefix[..end].trim_end().into()
 }
 
 fn preferred_mcp_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option<String> {
@@ -1772,8 +1941,8 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_tool_name, expand_wait_transcripts, parse_backend, preferred_mcp_pane_id,
-        reply_snapshot, simple_record, transcript_text, valid_pane_id,
+        brief, canonical_tool_name, expand_wait_transcripts, latest_user_request, parse_backend,
+        preferred_mcp_pane_id, reply_snapshot, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
 
@@ -1781,6 +1950,39 @@ mod tests {
     fn parse_backend_accepts_canonical_names() {
         assert_eq!(parse_backend("grok").unwrap(), libslop::Backend::Grok);
         assert!(parse_backend("claude-code").is_err());
+    }
+
+    #[test]
+    fn overview_snippets_are_compact() {
+        let text = "word ".repeat(200);
+        let snippet = brief(&text);
+        assert!(snippet.chars().count() <= 400);
+        assert!(!snippet.ends_with('…'));
+        assert!(!snippet.contains("  "));
+
+        let text = format!("{} done. {}", "x".repeat(150), "later ".repeat(100));
+        assert_eq!(brief(&text), format!("{} done.", "x".repeat(150)));
+    }
+
+    #[test]
+    fn overview_finds_the_latest_useful_request_in_a_page() {
+        let record = |event_type: &str, text: &str| libslop::Record {
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%1".into()),
+            payload: json!({ "text": text }),
+            cursor: Some(1),
+        };
+        let records = [
+            record("userMessage", "older"),
+            record("userMessage", "# AGENTS.md instructions\ninternal"),
+            record("userMessage", "current request"),
+            record("toolCall", "ignored"),
+        ];
+        assert_eq!(
+            latest_user_request(&records).as_deref(),
+            Some("current request")
+        );
     }
 
     #[test]

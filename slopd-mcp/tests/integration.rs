@@ -297,7 +297,11 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         instructions.contains("never require the user to name MCP"),
         "{initialized}"
     );
-    assert!(instructions.contains("what an agent said"), "{initialized}");
+    assert!(instructions.contains("get_work_overview"), "{initialized}");
+    assert!(
+        instructions.contains("Never combine an overview with get_agent_result"),
+        "{initialized}"
+    );
 
     let listed = rpc_json(
         &client,
@@ -317,6 +321,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         names,
         vec![
             "get_status",
+            "get_work_overview",
             "list_panes",
             "create_pane",
             "fork_pane",
@@ -367,13 +372,13 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         get_agent_result["description"]
             .as_str()
             .unwrap()
-            .contains("whether an agent finished")
+            .contains("latest request submitted through ask_agent")
     );
     assert!(
         get_agent_result["description"]
             .as_str()
             .unwrap()
-            .contains("answer is authoritative")
+            .contains("not a live-pane inventory")
     );
     assert!(
         get_agent_result["inputSchema"]["properties"]
@@ -390,6 +395,27 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     );
     assert_eq!(
         get_agent_result["outputSchema"]["properties"]["answer"]["type"],
+        "string"
+    );
+    let overview = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "get_work_overview")
+        .unwrap();
+    assert!(
+        overview["description"]
+            .as_str()
+            .unwrap()
+            .contains("where work left off")
+    );
+    assert_eq!(
+        overview["outputSchema"]["properties"]["panes"]["items"]["properties"]["latest_reply_excerpt"]
+            ["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        overview["outputSchema"]["properties"]["answer"]["type"],
         "string"
     );
     let list_panes = listed["result"]["tools"]
@@ -416,6 +442,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     }
     let expected_annotations = [
         ("get_status", true, false, true),
+        ("get_work_overview", true, false, true),
         ("list_panes", true, false, true),
         ("create_pane", false, false, false),
         ("fork_pane", false, false, false),
@@ -1008,6 +1035,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             "ask_agent",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),
         ),
+        ("get_work_overview", json!({ "pane_id": malformed })),
         ("get_agent_result", json!({ "pane_id": malformed })),
         (
             "send_prompt",
@@ -1381,6 +1409,35 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         !records
             .iter()
             .any(|record| { record["text"] == "I am still working after the helper runs." })
+    );
+
+    let overview = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        96,
+        "get_work_overview",
+        json!({ "pane_id": pane_id.clone() }),
+    )
+    .await;
+    let overview = tool_payload(&overview);
+    assert_eq!(overview["count"], 1, "{overview}");
+    assert_eq!(overview["state_counts"]["ready"], 1, "{overview}");
+    assert_eq!(overview["panes"][0]["backend"], "codex", "{overview}");
+    assert_eq!(
+        overview["panes"][0]["last_request_excerpt"], "MAILBOX_SYNC_CANARY",
+        "{overview}"
+    );
+    assert_eq!(
+        overview["panes"][0]["latest_reply_excerpt"], "mock response: MAILBOX_SYNC_CANARY",
+        "{overview}"
+    );
+    assert!(
+        overview["answer"]
+            .as_str()
+            .is_some_and(|answer| answer.contains("codex, ready")),
+        "{overview}"
     );
 
     let advanced = call_tool(
