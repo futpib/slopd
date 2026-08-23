@@ -367,6 +367,11 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         instructions.contains("message_existing_agent"),
         "{initialized}"
     );
+    assert!(instructions.contains("progress"), "{initialized}");
+    assert!(
+        instructions.contains("additional independent"),
+        "{initialized}"
+    );
     assert!(
         instructions.contains("Preserve the language"),
         "{initialized}"
@@ -659,7 +664,50 @@ async fn natural_surface_separates_new_and_existing_agents() {
                 .contains("Translate the user's task to English"),
             "{tool}"
         );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["wait_seconds"]["default"], 3,
+            "{tool}"
+        );
     }
+    let start = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "start_new_agent")
+        .unwrap();
+    assert!(
+        start["description"]
+            .as_str()
+            .unwrap()
+            .contains("changed or repeated wording"),
+        "{start}"
+    );
+    let message = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "message_existing_agent")
+        .unwrap();
+    assert!(
+        message["description"]
+            .as_str()
+            .unwrap()
+            .contains("corrections, clarifications"),
+        "{message}"
+    );
+    let result = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "get_agent_result")
+        .unwrap();
+    assert!(
+        result["description"]
+            .as_str()
+            .unwrap()
+            .contains("status, progress, completion, or result"),
+        "{result}"
+    );
 
     let hidden = call_tool_at(
         &client,
@@ -762,6 +810,46 @@ async fn natural_surface_separates_new_and_existing_agents() {
     let overview = tool_payload(&overview);
     assert_eq!(overview["count"], 1, "{overview}");
     assert_eq!(overview["panes"][0]["pane_id"], pane_id, "{overview}");
+}
+
+#[tokio::test]
+async fn natural_surface_mailboxes_slow_work_after_three_seconds() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+
+    let before = std::time::Instant::now();
+    let pending = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        16,
+        "start_new_agent",
+        json!({ "prompt": "::mock sleep 10s" }),
+    )
+    .await;
+    let elapsed = before.elapsed();
+    let pending = tool_payload(&pending);
+    assert_eq!(pending["status"], "pending", "{pending}");
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    assert_eq!(
+        pending["answer"],
+        "The agent accepted the task and is still working in the background."
+    );
+    let guidance = pending["follow_up_instruction"].as_str().unwrap();
+    assert!(guidance.contains("get_agent_result"), "{pending}");
+    assert!(guidance.contains("message_existing_agent"), "{pending}");
+    assert!(
+        guidance.contains("additional independent agent"),
+        "{pending}"
+    );
 }
 
 #[tokio::test]
@@ -1912,7 +2000,15 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert_eq!(pending["finished"], false);
     assert_eq!(
         pending["answer"],
-        "The agent is still running. Do not submit this request again; use get_agent_result later."
+        "The agent accepted the task and is still working in the background."
+    );
+    assert!(
+        pending["follow_up_instruction"]
+            .as_str()
+            .is_some_and(|text| text.contains("get_agent_result")
+                && text.contains("message_existing_agent")
+                && text.contains("additional independent agent")),
+        "{pending}"
     );
     let pending_id = pending["request_id"].as_str().unwrap().to_string();
 

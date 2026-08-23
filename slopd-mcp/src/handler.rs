@@ -16,6 +16,7 @@ use tokio::net::UnixStream;
 const MCP_PANE_TAG: &str = "slopd-mcp";
 const MAILBOX_LIMIT: usize = 100;
 const MAILBOX_DEDUPE_WINDOW_MS: u64 = 60_000;
+const MAILBOX_DEFAULT_WAIT_SECONDS: u64 = 3;
 const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const OVERVIEW_CONTEXT_LIMIT: u64 = 100;
 const OVERVIEW_PAGE_LIMIT: u64 = 500;
@@ -178,15 +179,23 @@ impl MailboxEntry {
     }
 
     fn json(&self) -> Value {
-        let (status, finished, reply, error, answer) = match self.state() {
+        let pane_id = self.pane_id();
+        let result_instruction = format!(
+            "On a later user turn asking for status, progress, completion, or the result, call get_agent_result with request_id {:?}; do not call start_new_agent or resend the prompt.",
+            self.request_id
+        );
+        let update_instruction = pane_id.as_ref().map_or_else(
+            || "On a later correction, clarification, update, redirect, or continuation, call message_existing_agent exactly once; do not call start_new_agent.".to_string(),
+            |pane_id| format!("On a later correction, clarification, update, redirect, or continuation, call message_existing_agent exactly once with pane_id {pane_id:?}; do not call start_new_agent."),
+        );
+        let (status, finished, reply, error, answer, follow_up_instruction) = match self.state() {
             MailboxState::Pending => (
                 "pending",
                 false,
                 Value::Null,
                 Value::Null,
-                json!(
-                    "The agent is still running. Do not submit this request again; use get_agent_result later."
-                ),
+                json!("The agent accepted the task and is still working in the background."),
+                format!("Stop calling tools for this turn and tell the user the agent is working in the background. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks for an additional independent agent."),
             ),
             MailboxState::Completed(reply) => (
                 "completed",
@@ -194,6 +203,7 @@ impl MailboxEntry {
                 json!(reply.clone()),
                 Value::Null,
                 json!(reply),
+                format!("Give the completed answer to the user and stop calling tools for this turn. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks for an additional independent agent."),
             ),
             MailboxState::Failed(error) => (
                 "failed",
@@ -203,11 +213,12 @@ impl MailboxEntry {
                 json!(format!(
                     "The request failed and no agent reply was received: {error}. Do not claim that the agent accepted or completed it."
                 )),
+                "Tell the user this request failed. Do not retry, resend it, or start another agent unless the user explicitly asks you to.".to_string(),
             ),
         };
         json!({
             "request_id": self.request_id,
-            "pane_id": self.pane_id(),
+            "pane_id": pane_id,
             "prompt": self.prompt,
             "created_at_unix_ms": self.created_at_unix_ms,
             "status": status,
@@ -216,7 +227,7 @@ impl MailboxEntry {
             "error": error,
             "answer": answer,
             "agent_reply_received": status == "completed",
-            "follow_up_instruction": "If the user later asks to tell, update, correct, or continue this agent, call message_existing_agent exactly once. Never claim you contacted the agent without a completed reply.",
+            "follow_up_instruction": follow_up_instruction,
         })
     }
 }
@@ -552,7 +563,7 @@ impl SlopdMcp {
             return tool_error("prompt must not be empty");
         }
         let wait_seconds = optional_u64(arguments, "wait_seconds")?
-            .unwrap_or(45)
+            .unwrap_or(MAILBOX_DEFAULT_WAIT_SECONDS)
             .min(300);
         let interrupt = optional_bool(arguments, "interrupt")?.unwrap_or(false);
         let explicit_pane_id = self.optional_pane_id(arguments, "pane_id").await?;
@@ -576,19 +587,25 @@ impl SlopdMcp {
         let entry = self.mailbox.insert_or_recent_duplicate(candidate);
         let request_reused = entry.request_id != candidate_id;
 
-        if !request_reused
-            && let Err(error) = self
-                .start_agent_request(
-                    arguments,
-                    explicit_pane_id,
-                    target,
-                    &selector_key,
-                    Arc::clone(&entry),
-                    interrupt,
-                )
-                .await
-        {
-            entry.finish(MailboxState::Failed(error.message.into_owned()));
+        if !request_reused {
+            let handler = self.clone();
+            let arguments = arguments.cloned();
+            let worker_entry = Arc::clone(&entry);
+            tokio::spawn(async move {
+                if let Err(error) = handler
+                    .start_agent_request(
+                        arguments.as_ref(),
+                        explicit_pane_id,
+                        target,
+                        &selector_key,
+                        Arc::clone(&worker_entry),
+                        interrupt,
+                    )
+                    .await
+                {
+                    worker_entry.finish(MailboxState::Failed(error.message.into_owned()));
+                }
+            });
         }
 
         wait_for_mailbox_entry(&entry, wait_seconds).await;
@@ -823,7 +840,7 @@ impl SlopdMcp {
                 "error": null,
                 "answer": "No prior agent result exists.",
                 "agent_reply_received": false,
-                "follow_up_instruction": "Call start_new_agent for a new agent or message_existing_agent for an existing agent.",
+                "follow_up_instruction": "No background request was found. Do not invent a result. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of an existing agent. Use start_new_agent only when the user explicitly asks for an additional independent agent.",
             }));
         };
         wait_for_mailbox_entry(&entry, wait_seconds).await;
@@ -1338,10 +1355,10 @@ impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             ToolSurface::Simple => {
-                "Natural-language supervisor for slopd agents. When the user explicitly asks for a new, separate, or additional agent, call start_new_agent exactly once; it always creates one new agent and returns only that request's real result. When the user asks, tells, updates, corrects, or continues an existing or same agent, call message_existing_agent exactly once; it never creates an agent. If the intended existing agent is unclear, call get_work_overview first, then call message_existing_agent with the selected pane_id. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language. Use get_agent_result only when the user later asks for a pending request's result."
+                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks for a new, separate, or additional independent agent. A correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work is not a request for another agent. For a correction, clarification, update, redirect, or continuation, call message_existing_agent exactly once; it never creates an agent. For status, progress, completion, or result, call get_agent_result; never resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Pending work continues in the background: obey follow_up_instruction, tell the user it is running, and stop calling tools for that turn. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
             }
             ToolSurface::Full => {
-                "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent when the user explicitly asks for a new agent and message_existing_agent for work on an existing agent. Both operations send once, wait, deduplicate, and report only the real result. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. Use get_agent_result with no arguments only when the user later asks for a pending request's result. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
+                "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
             }
         };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())

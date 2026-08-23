@@ -35,14 +35,14 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "start_new_agent",
-            "Start exactly one new agent, give it the user's task, wait for its real reply, and return that reply. Use only when the user explicitly asks for a new, separate, or additional agent. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Start exactly one new independent agent. Use only when the user explicitly asks for a new, separate, or additional agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. A changed or repeated wording does not mean the user wants another agent. This tool waits three seconds by default; pending means the task continues in the background, so obey follow_up_instruction, tell the user it is running, and stop calling tools for this turn. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
                     "backend": backend_schema(),
                     "account": { "type": "string" },
                     "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 }
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." }
                 },
                 "required": ["prompt"],
                 "additionalProperties": false
@@ -50,7 +50,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "message_existing_agent",
-            "Send one task or follow-up to an existing agent, wait for its real reply, and return that reply. This tool never creates an agent. Use pane_id when get_work_overview identified a specific pane; omit it for the most recently contacted existing agent. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Send one task or follow-up to an existing agent. Use this for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; pending means the task continues in the background, so obey follow_up_instruction, tell the user it is running, and stop calling tools for this turn. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -59,7 +59,7 @@ pub fn all() -> Vec<Tool> {
                     "backend": backend_schema(),
                     "account": { "type": "string" },
                     "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." },
                     "interrupt": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks to interrupt or redirect a busy agent." }
                 },
                 "required": ["prompt"],
@@ -88,7 +88,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_or_tell_agent",
-            "The one tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits for a reply, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional agent; otherwise the latest matching agent is reused and a dead previous agent is reported instead of replaced. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending means call get_agent_result later without resending; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
+            "The one lower-level tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits three seconds by default, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional independent agent; corrections, clarifications, updates, redirects, continuations, retries, and result questions are not new-agent requests. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending continues in the background, so obey follow_up_instruction and stop calling tools for this turn; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -97,7 +97,7 @@ pub fn all() -> Vec<Tool> {
                     "backend": backend_schema(),
                     "account": { "type": "string" },
                     "prompt": { "type": "string" },
-                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." },
                     "interrupt": { "type": "boolean", "default": false },
                     "new_agent": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks for a new, separate, or additional agent." }
                 },
@@ -107,7 +107,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the latest ask_or_tell_agent request, including creation or startup failures, so an old unrelated result is never substituted. Use only when the user asks whether that request finished or for its result. Call with no arguments first. Never call this immediately after ask_or_tell_agent returned completed or failed, and never resend the request. The top-level status and answer are authoritative.",
+            "Get the mailbox state or completed answer for prior agent work, including creation or startup failures, so an old unrelated result is never substituted. Use for questions such as whether it is ready, what happened, current progress, when the result will arrive, or what the result was. Call with no arguments first unless a prior tool result supplied the exact request_id or pane_id. Never call start_new_agent or resend the prompt for a status, progress, completion, or result question. Pending means tell the user it is still running and stop calling tools for this turn. Completed means speak the answer and stop calling tools for this turn. The top-level status, answer, and follow_up_instruction are authoritative.",
             json!({
                 "type": "object",
                 "properties": {
