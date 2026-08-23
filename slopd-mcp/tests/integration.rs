@@ -398,6 +398,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "get_work_overview",
             "start_new_agent",
             "message_existing_agent",
+            "close_agent",
             "list_panes",
             "create_pane",
             "fork_pane",
@@ -621,6 +622,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
         instructions.contains("message_existing_agent"),
         "{initialized}"
     );
+    assert!(instructions.contains("close_agent"), "{initialized}");
 
     let listed = read_rpc_message(
         rpc_at(
@@ -640,6 +642,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
             "get_work_overview",
             "start_new_agent",
             "message_existing_agent",
+            "close_agent",
             "get_agent_result",
         ]
     );
@@ -707,6 +710,28 @@ async fn natural_surface_separates_new_and_existing_agents() {
             .unwrap()
             .contains("status, progress, completion, or result"),
         "{result}"
+    );
+    let close = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "close_agent")
+        .unwrap();
+    assert!(
+        close["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Every new close")
+                && description.contains("without get_work_overview")),
+        "{close}"
+    );
+    assert_eq!(close["inputSchema"]["required"], json!(["pane_id"]));
+    assert_eq!(close["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        close["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
     );
 
     let hidden = call_tool_at(
@@ -810,6 +835,189 @@ async fn natural_surface_separates_new_and_existing_agents() {
     let overview = tool_payload(&overview);
     assert_eq!(overview["count"], 1, "{overview}");
     assert_eq!(overview["panes"][0]["pane_id"], pane_id, "{overview}");
+}
+
+#[tokio::test]
+async fn natural_surface_blocks_unconfirmed_parallel_starts() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+
+    let first = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        160,
+        "start_new_agent",
+        json!({ "prompt": "::mock sleep 10s" }),
+    )
+    .await;
+    let first = tool_payload(&first);
+    assert_eq!(first["status"], "pending", "{first}");
+    let first_pane = first["pane_id"].as_str().unwrap().to_string();
+
+    let blocked = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        161,
+        "start_new_agent",
+        json!({ "prompt": "Actually use the corrected repository name" }),
+    )
+    .await;
+    assert_eq!(blocked["result"]["isError"], true, "{blocked}");
+    let blocked = tool_payload(&blocked);
+    assert_eq!(blocked["status"], "blocked_pending_agent", "{blocked}");
+    assert_eq!(blocked["pane_id"], first_pane, "{blocked}");
+    assert_eq!(blocked["next_tool"], "message_existing_agent", "{blocked}");
+    assert!(
+        blocked["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("parallel=true")),
+        "{blocked}"
+    );
+
+    let overview = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        162,
+        "get_work_overview",
+        json!({}),
+    )
+    .await;
+    let overview = tool_payload(&overview);
+    assert_eq!(overview["count"], 1, "{overview}");
+    assert_eq!(overview["panes"][0]["pane_id"], first_pane, "{overview}");
+
+    let parallel = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        163,
+        "start_new_agent",
+        json!({
+            "prompt": "PARALLEL_AGENT_CANARY",
+            "parallel": true,
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let parallel = tool_payload(&parallel);
+    let parallel_pane = parallel["pane_id"].as_str().unwrap().to_string();
+    assert_ne!(parallel_pane, first_pane, "{parallel}");
+
+    for (id, pane_id) in [(164, first_pane), (165, parallel_pane)] {
+        let closed = call_tool_at(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            "/mcp",
+            id,
+            "close_agent",
+            json!({ "pane_id": pane_id }),
+        )
+        .await;
+        assert_eq!(tool_payload(&closed)["closed"], true, "{closed}");
+    }
+}
+
+#[tokio::test]
+async fn natural_surface_closes_only_the_named_agent() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, control_session) = initialize(&client, addr, None).await;
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+
+    let mut pane_ids = Vec::new();
+    for id in [170, 171] {
+        let started = call_tool(
+            &client,
+            addr,
+            None,
+            control_session.as_deref(),
+            id,
+            "create_pane",
+            json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+        )
+        .await;
+        let started = tool_payload(&started);
+        pane_ids.push(started["pane_id"].as_str().unwrap().to_string());
+    }
+
+    let closed = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        172,
+        "close_agent",
+        json!({ "pane_id": pane_ids[0] }),
+    )
+    .await;
+    let closed = tool_payload(&closed);
+    assert_eq!(closed["pane_id"], pane_ids[0], "{closed}");
+    assert_eq!(closed["closed"], true, "{closed}");
+    assert_eq!(closed["status"], "closed", "{closed}");
+
+    let overview = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        173,
+        "get_work_overview",
+        json!({}),
+    )
+    .await;
+    let overview = tool_payload(&overview);
+    assert_eq!(overview["count"], 1, "{overview}");
+    assert_eq!(overview["panes"][0]["pane_id"], pane_ids[1], "{overview}");
+
+    let bulk = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        174,
+        "close_agent",
+        json!({ "pane_id": pane_ids }),
+    )
+    .await;
+    assert_eq!(bulk["error"]["code"], -32602, "{bulk}");
+
+    let closed = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        175,
+        "close_agent",
+        json!({ "pane_id": overview["panes"][0]["pane_id"] }),
+    )
+    .await;
+    assert_eq!(tool_payload(&closed)["closed"], true, "{closed}");
 }
 
 #[tokio::test]
@@ -1376,6 +1584,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             json!({ "pane_id": malformed, "no_wait": true }),
         ),
         ("kill_pane", json!({ "pane_id": malformed })),
+        ("close_agent", json!({ "pane_id": malformed })),
         (
             "ask_or_tell_agent",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),

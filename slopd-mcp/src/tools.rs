@@ -7,6 +7,7 @@ const SIMPLE_NAMES: &[&str] = &[
     "get_work_overview",
     "start_new_agent",
     "message_existing_agent",
+    "close_agent",
     "get_agent_result",
 ];
 
@@ -35,13 +36,14 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "start_new_agent",
-            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
                     "backend": backend_schema(),
                     "account": { "type": "string" },
                     "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
+                    "parallel": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks for another independent agent to run concurrently with pending work." },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." }
                 },
                 "required": ["prompt"],
@@ -65,6 +67,11 @@ pub fn all() -> Vec<Tool> {
                 "required": ["prompt"],
                 "additionalProperties": false
             }),
+        ),
+        tool(
+            "close_agent",
+            "Close exactly one live agent pane selected by its exact pane_id. Every new close, cleanup, or deletion request requires a fresh call to this tool; never answer from a prior close result. When the user provides pane_id, call this tool directly without get_work_overview. Call get_work_overview first only when the target is unclear. Call this tool separately once for each pane the user asked to close. Never infer or close additional panes, and never claim a pane was closed unless this call confirms that same pane_id.",
+            pane_schema(),
         ),
         tool(
             "list_panes",
@@ -224,6 +231,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "get_work_overview" => ("Get work overview", true, false, true),
         "start_new_agent" => ("Start new agent", false, false, false),
         "message_existing_agent" => ("Message existing agent", false, false, false),
+        "close_agent" => ("Close agent", false, true, true),
         "list_panes" => ("List live panes", true, false, true),
         "create_pane" => ("Create pane", false, false, false),
         "fork_pane" => ("Fork pane", false, false, false),
@@ -296,6 +304,12 @@ fn output_schema(name: &str) -> Value {
             "ready": { "type": "boolean" }
         }),
         "kill_pane" | "interrupt_pane" => json!({ "pane_id": pane_id_schema() }),
+        "close_agent" => json!({
+            "pane_id": pane_id_schema(),
+            "closed": { "type": "boolean" },
+            "status": { "type": "string", "enum": ["closed"] },
+            "answer": { "type": "string" }
+        }),
         "start_new_agent" | "message_existing_agent" | "ask_or_tell_agent" => {
             let mut properties = mailbox_entry_schema()["properties"].clone();
             properties["request_reused"] = json!({ "type": "boolean", "description": "True when an identical recent call returned the original request instead of submitting duplicate work." });

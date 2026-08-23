@@ -68,8 +68,13 @@ enum MailboxState {
     Failed(String),
 }
 
+enum MailboxInsert {
+    Accepted(Arc<MailboxEntry>, bool),
+    Blocked(Arc<MailboxEntry>),
+}
+
 impl Mailbox {
-    fn insert_or_recent_duplicate(&self, entry: Arc<MailboxEntry>) -> Arc<MailboxEntry> {
+    fn insert(&self, entry: Arc<MailboxEntry>, block_on_pending: bool) -> MailboxInsert {
         let mut entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
         if let Some(existing) = entries.iter().rev().find(|existing| {
             existing.dedupe_key == entry.dedupe_key
@@ -78,13 +83,21 @@ impl Mailbox {
                     .saturating_sub(existing.created_at_unix_ms)
                     <= MAILBOX_DEDUPE_WINDOW_MS
         }) {
-            return Arc::clone(existing);
+            return MailboxInsert::Accepted(Arc::clone(existing), true);
+        }
+        if block_on_pending
+            && let Some(existing) = entries
+                .iter()
+                .rev()
+                .find(|existing| matches!(existing.state(), MailboxState::Pending))
+        {
+            return MailboxInsert::Blocked(Arc::clone(existing));
         }
         while entries.len() >= MAILBOX_LIMIT {
             entries.pop_front();
         }
         entries.push_back(Arc::clone(&entry));
-        entry
+        MailboxInsert::Accepted(entry, false)
     }
 
     fn get(&self, request_id: &str) -> Option<Arc<MailboxEntry>> {
@@ -289,6 +302,7 @@ impl SlopdMcp {
                 self.message_existing_agent(request.arguments.as_ref())
                     .await
             }
+            "close_agent" => self.close_agent(request.arguments.as_ref()).await,
             "ask_or_tell_agent" => self.ask_agent(request.arguments.as_ref()).await,
             "get_agent_result" => self.get_agent_result(request.arguments.as_ref()).await,
             "send_prompt" => self.send(request.arguments.as_ref()).await,
@@ -469,6 +483,22 @@ impl SlopdMcp {
         ok_json(json!({ "pane_id": pane_id }))
     }
 
+    async fn close_agent(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        let pane_id = self.required_pane_id(arguments, "pane_id").await?;
+        let mut client = connect(&self.socket).await?;
+        let result = client.kill(pane_id).await;
+        let pane_id = self.slopd_result(result).await?;
+        ok_json(json!({
+            "pane_id": pane_id,
+            "closed": true,
+            "status": "closed",
+            "answer": format!("Closed agent pane {pane_id}."),
+        }))
+    }
+
     async fn transcript(
         &self,
         arguments: Option<&Map<String, Value>>,
@@ -524,7 +554,7 @@ impl SlopdMcp {
         } else {
             AgentTarget::Automatic
         };
-        self.agent_request(arguments, target).await
+        self.agent_request(arguments, target, false).await
     }
 
     async fn start_new_agent(
@@ -538,7 +568,9 @@ impl SlopdMcp {
                 "start_new_agent does not accept pane_id or new_agent; it always creates exactly one new agent",
             ));
         }
-        self.agent_request(arguments, AgentTarget::New).await
+        let block_on_pending = !optional_bool(arguments, "parallel")?.unwrap_or(false);
+        self.agent_request(arguments, AgentTarget::New, block_on_pending)
+            .await
     }
 
     async fn message_existing_agent(
@@ -550,13 +582,15 @@ impl SlopdMcp {
                 "message_existing_agent does not accept new_agent; it never creates an agent",
             ));
         }
-        self.agent_request(arguments, AgentTarget::Existing).await
+        self.agent_request(arguments, AgentTarget::Existing, false)
+            .await
     }
 
     async fn agent_request(
         &self,
         arguments: Option<&Map<String, Value>>,
         target: AgentTarget,
+        block_on_pending: bool,
     ) -> Result<CallToolResult, McpError> {
         let prompt = required_string(arguments, "prompt")?;
         if prompt.trim().is_empty() {
@@ -584,8 +618,25 @@ impl SlopdMcp {
             dedupe_key,
         ));
         let candidate_id = candidate.request_id.clone();
-        let entry = self.mailbox.insert_or_recent_duplicate(candidate);
-        let request_reused = entry.request_id != candidate_id;
+        let (entry, request_reused) = match self.mailbox.insert(candidate, block_on_pending) {
+            MailboxInsert::Accepted(entry, request_reused) => (entry, request_reused),
+            MailboxInsert::Blocked(entry) => {
+                let pane_id = entry.pane_id();
+                let target = pane_id.as_deref().unwrap_or("the current agent");
+                let message = format!(
+                    "Agent {target} already has pending work. For a correction, clarification, update, redirect, or continuation, call message_existing_agent with that pane_id. Retry start_new_agent with parallel=true only when the user explicitly asks for another independent concurrent agent."
+                );
+                return tool_json_error(json!({
+                    "message": message,
+                    "status": "blocked_pending_agent",
+                    "pane_id": pane_id,
+                    "request_id": entry.request_id,
+                    "answer": message,
+                    "next_tool": "message_existing_agent",
+                }));
+            }
+        };
+        debug_assert_eq!(request_reused, entry.request_id != candidate_id);
 
         if !request_reused {
             let handler = self.clone();
@@ -1355,7 +1406,7 @@ impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             ToolSurface::Simple => {
-                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
+                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
             }
             ToolSurface::Full => {
                 "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
