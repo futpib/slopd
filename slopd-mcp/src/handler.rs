@@ -16,6 +16,10 @@ use tokio::net::UnixStream;
 const MCP_PANE_TAG: &str = "slopd-mcp";
 const MAILBOX_LIMIT: usize = 100;
 const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const OVERVIEW_CONTEXT_LIMIT: u64 = 100;
+const OVERVIEW_PAGE_LIMIT: u64 = 500;
+const OVERVIEW_MAX_PAGES: usize = 8;
+const OVERVIEW_DEEP_MAX_PAGES: usize = 20;
 
 #[derive(Clone, Default)]
 struct Mailbox {
@@ -215,6 +219,8 @@ impl SlopdMcp {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
+        let context_before = overview_context_limit(arguments, "context_before")?;
+        let context_after = overview_context_limit(arguments, "context_after")?;
         let filters = pane_filters(arguments)?;
         let mut client = connect(&self.socket).await?;
         let result = client.ps().await;
@@ -229,41 +235,54 @@ impl SlopdMcp {
             .collect::<Vec<_>>();
         let state_counts = pane_state_counts(&panes);
         let mut overview = Vec::with_capacity(panes.len());
+        let max_pages = if pane_id.is_some() && (context_before > 0 || context_after > 0) {
+            OVERVIEW_DEEP_MAX_PAGES
+        } else {
+            OVERVIEW_MAX_PAGES
+        };
         for pane in &panes {
-            let result = client
-                .read_transcript(pane.pane_id.clone(), None, 500)
-                .await;
-            let record = match result {
-                Ok(records) => {
-                    let mut last_request = latest_user_request(&records);
-                    let mut before = records.first().and_then(|record| record.cursor);
-                    let mut transcript_error = None;
-                    for _ in 0..3 {
-                        if last_request.is_some() {
-                            break;
-                        }
-                        let Some(cursor) = before else {
-                            break;
-                        };
-                        match client
-                            .read_transcript(pane.pane_id.clone(), Some(cursor), 500)
-                            .await
-                        {
-                            Ok(older) if older.is_empty() => break,
-                            Ok(older) => {
-                                last_request = latest_user_request(&older);
-                                before = older.first().and_then(|record| record.cursor);
-                            }
-                            Err(error) => {
-                                transcript_error = Some(error.to_string());
-                                break;
-                            }
-                        }
+            let mut records = Vec::new();
+            let mut before = None;
+            let mut transcript_error = None;
+            for _ in 0..max_pages {
+                let result = client
+                    .read_transcript(pane.pane_id.clone(), before, OVERVIEW_PAGE_LIMIT)
+                    .await;
+                let mut older = match result {
+                    Ok(records) if records.is_empty() => break,
+                    Ok(records) => records,
+                    Err(error) => {
+                        transcript_error = Some(error.to_string());
+                        break;
                     }
-                    overview_pane(pane, &records, last_request, transcript_error)
+                };
+                let next_before = older.first().and_then(|record| record.cursor);
+                older.append(&mut records);
+                records = older;
+                let messages = overview_messages(&records);
+                if let Some(last_user) = messages.iter().rposition(|message| message.role == "user")
+                {
+                    let before_messages = &messages[..last_user];
+                    let enough_history = before_messages.len() > context_before
+                        && before_messages
+                            .iter()
+                            .any(|message| message.role == "assistant");
+                    if enough_history {
+                        break;
+                    }
                 }
-                Err(error) => overview_pane(pane, &[], None, Some(error.to_string())),
-            };
+                if next_before.is_none() || next_before == before {
+                    break;
+                }
+                before = next_before;
+            }
+            let record = overview_pane(
+                pane,
+                &records,
+                context_before,
+                context_after,
+                transcript_error,
+            );
             overview.push(record);
         }
         let answer = overview_answer(&state_counts, &overview);
@@ -1057,7 +1076,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. Write prompts sent to agents in English unless the user explicitly requests another language. Preserve the language of agent replies and transcript excerpts; never translate them unless the user asks, and present agent work in that same language. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
+                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. Write prompts sent to agents in English unless the user explicitly requests another language. Preserve the language of agent replies and transcript excerpts; never translate them unless the user asks, and present agent work in that same language. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. If the user asks for more detail about one pane, call get_work_overview again with its pane_id and increase context_before for earlier task context or context_after for work since the latest user prompt. Keep increasing while more_before or more_after is true. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
             )
     }
 
@@ -1382,14 +1401,63 @@ fn pane_state_counts(panes: &[libslop::PaneInfo]) -> Value {
     })
 }
 
+#[derive(Clone)]
+struct OverviewMessage {
+    source_index: usize,
+    role: &'static str,
+    kind: &'static str,
+    text: String,
+    chunked: bool,
+}
+
 fn overview_pane(
     pane: &libslop::PaneInfo,
     records: &[libslop::Record],
-    last_request: Option<String>,
+    context_before: usize,
+    context_after: usize,
     transcript_error: Option<String>,
 ) -> Value {
+    let messages = overview_messages(records);
+    let last_user = messages.iter().rposition(|message| message.role == "user");
+    let last_request = last_user.map(|index| brief(&messages[index].text));
+    let task_context = last_user.and_then(|index| {
+        messages[..index]
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| brief(&message.text))
+    });
+    let current_activity = last_user.and_then(|index| {
+        messages[index + 1..]
+            .iter()
+            .rev()
+            .find(|message| message.kind == "progress")
+            .map(|message| brief(&message.text))
+    });
+    let latest_tool_name = last_user.and_then(|index| {
+        records[messages[index].source_index + 1..]
+            .iter()
+            .rev()
+            .find_map(tool_name)
+    });
+    let (before, after, more_before, more_after) = if let Some(index) = last_user {
+        let earlier = &messages[..index];
+        let later = &messages[index + 1..];
+        let before_start = earlier.len().saturating_sub(context_before);
+        let after_start = later.len().saturating_sub(context_after);
+        (
+            earlier[before_start..]
+                .iter()
+                .map(overview_context)
+                .collect(),
+            later[after_start..].iter().map(overview_context).collect(),
+            earlier.len() > context_before,
+            later.len() > context_after,
+        )
+    } else {
+        (Vec::new(), Vec::new(), false, false)
+    };
     let reply = reply_snapshot(records);
-    let last_request = last_request.as_deref().map(brief);
     let latest_reply = reply.reply.as_deref().map(brief);
     let reply_complete = reply.explicit_complete
         || (latest_reply.is_some() && pane.state == libslop::PaneState::Ready);
@@ -1403,20 +1471,88 @@ fn overview_pane(
         "title": pane.pane_title,
         "working_dir": pane.working_dir,
         "last_request_excerpt": last_request,
+        "task_context_excerpt": task_context,
+        "current_activity_excerpt": current_activity,
+        "latest_tool_name": latest_tool_name,
         "latest_reply_excerpt": latest_reply,
         "reply_complete": reply_complete,
+        "context_before": before,
+        "context_after": after,
+        "more_before": more_before,
+        "more_after": more_after,
         "transcript_error": transcript_error,
     })
 }
 
-fn latest_user_request(records: &[libslop::Record]) -> Option<String> {
-    records.iter().rev().find_map(|record| {
-        if conversation_role(record) != Some("user") {
-            return None;
+fn overview_messages(records: &[libslop::Record]) -> Vec<OverviewMessage> {
+    let mut messages: Vec<OverviewMessage> = Vec::new();
+    for (source_index, record) in records.iter().enumerate() {
+        let Some(role) = conversation_role(record) else {
+            continue;
+        };
+        let Some(text) = transcript_text(&record.payload) else {
+            continue;
+        };
+        if role == "user" && internal_text(&text) {
+            continue;
         }
-        let text = transcript_text(&record.payload)?;
-        (!internal_text(&text)).then_some(text)
+        let kind = if role == "user" {
+            "request"
+        } else if progress_record(record) {
+            "progress"
+        } else {
+            "reply"
+        };
+        let chunked = record.event_type.ends_with("_chunk");
+        if chunked
+            && messages.last().is_some_and(|message| {
+                message.chunked && message.role == role && message.kind == kind
+            })
+        {
+            let message = messages.last_mut().unwrap();
+            message.text.push_str(&text);
+            message.source_index = source_index;
+            continue;
+        }
+        messages.push(OverviewMessage {
+            source_index,
+            role,
+            kind,
+            text,
+            chunked,
+        });
+    }
+    messages
+}
+
+fn overview_context(message: &OverviewMessage) -> Value {
+    json!({
+        "role": message.role,
+        "kind": message.kind,
+        "text": brief(&message.text),
     })
+}
+
+fn tool_name(record: &libslop::Record) -> Option<String> {
+    if conversation_role(record).is_some() {
+        return None;
+    }
+    record
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+fn latest_user_request(records: &[libslop::Record]) -> Option<String> {
+    overview_messages(records)
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.text)
 }
 
 fn overview_answer(state_counts: &Value, panes: &[Value]) -> String {
@@ -1439,6 +1575,16 @@ fn overview_answer(state_counts: &Value, panes: &[Value]) -> String {
         answer.push_str(&format!("\n{pane_id}: {backend}, {state}."));
         if let Some(request) = pane["last_request_excerpt"].as_str() {
             answer.push_str(&format!(" Last request excerpt: {}", brief(request)));
+        }
+        if state != "ready" {
+            if let Some(context) = pane["task_context_excerpt"].as_str() {
+                answer.push_str(&format!(" Task context: {}", brief(context)));
+            }
+            if let Some(activity) = pane["current_activity_excerpt"].as_str() {
+                answer.push_str(&format!(" Latest progress: {}", brief(activity)));
+            } else if let Some(tool) = pane["latest_tool_name"].as_str() {
+                answer.push_str(&format!(" Latest recorded tool: {}.", brief(tool)));
+            }
         }
         if let Some(reply) = pane["latest_reply_excerpt"].as_str() {
             let status = if pane["reply_complete"].as_bool() == Some(true) {
@@ -1771,6 +1917,19 @@ fn optional_u64(
     }
 }
 
+fn overview_context_limit(
+    arguments: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<usize, McpError> {
+    let value = optional_u64(arguments, key)?.unwrap_or(0);
+    if value > OVERVIEW_CONTEXT_LIMIT {
+        return Err(invalid_argument(format!(
+            "{key} must be between 0 and {OVERVIEW_CONTEXT_LIMIT}; retry with a smaller value"
+        )));
+    }
+    Ok(value as usize)
+}
+
 fn optional_i32(
     arguments: Option<&Map<String, Value>>,
     key: &str,
@@ -1941,8 +2100,9 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        brief, canonical_tool_name, expand_wait_transcripts, latest_user_request, parse_backend,
-        preferred_mcp_pane_id, reply_snapshot, simple_record, transcript_text, valid_pane_id,
+        brief, canonical_tool_name, expand_wait_transcripts, latest_user_request, overview_pane,
+        parse_backend, preferred_mcp_pane_id, reply_snapshot, simple_record, transcript_text,
+        valid_pane_id,
     };
     use serde_json::{Value, json};
 
@@ -1983,6 +2143,78 @@ mod tests {
             latest_user_request(&records).as_deref(),
             Some("current request")
         );
+    }
+
+    #[test]
+    fn overview_resolves_references_and_exposes_bounded_progress() {
+        let record = |event_type: &str, payload: Value| libslop::Record {
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%1".into()),
+            payload,
+            cursor: Some(1),
+        };
+        let records = [
+            record(
+                "userMessage",
+                json!({ "text": "Which design should we use?" }),
+            ),
+            record(
+                "agentMessage",
+                json!({ "text": "Option 4 is the lifecycle coordinator.", "phase": "final_answer" }),
+            ),
+            record(
+                "user_message_chunk",
+                json!({ "params": { "update": { "content": { "text": "do option " } } } }),
+            ),
+            record(
+                "user_message_chunk",
+                json!({ "params": { "update": { "content": { "text": "4" } } } }),
+            ),
+            record(
+                "agentMessage",
+                json!({ "text": "Implementing lifecycle events.", "phase": "commentary" }),
+            ),
+            record("toolCall", json!({ "name": "exec" })),
+            record(
+                "agentMessage",
+                json!({ "text": "Testing reaction aggregation.", "phase": "commentary" }),
+            ),
+        ];
+        let pane = libslop::PaneInfo {
+            pane_id: "%1".into(),
+            created_at: 1,
+            last_active: 1,
+            session_id: None,
+            parent_pane_id: None,
+            tags: Vec::new(),
+            state: libslop::PaneState::Busy,
+            detailed_state: libslop::PaneDetailedState::BusyToolUse,
+            working_dir: Some("/work".into()),
+            transcript_path: None,
+            account: "codex".into(),
+            backend: libslop::Backend::Codex,
+            pane_title: None,
+        };
+
+        let overview = overview_pane(&pane, &records, 1, 1, None);
+        assert_eq!(overview["last_request_excerpt"], "do option 4");
+        assert_eq!(
+            overview["task_context_excerpt"],
+            "Option 4 is the lifecycle coordinator."
+        );
+        assert_eq!(
+            overview["current_activity_excerpt"],
+            "Testing reaction aggregation."
+        );
+        assert_eq!(overview["latest_tool_name"], "exec");
+        assert_eq!(overview["context_before"][0]["kind"], "reply");
+        assert_eq!(
+            overview["context_after"][0]["text"],
+            "Testing reaction aggregation."
+        );
+        assert_eq!(overview["more_before"], true);
+        assert_eq!(overview["more_after"], true);
     }
 
     #[test]

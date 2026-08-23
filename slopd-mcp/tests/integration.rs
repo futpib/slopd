@@ -423,6 +423,29 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             .unwrap()
             .contains("where work left off")
     );
+    assert!(
+        overview["description"]
+            .as_str()
+            .unwrap()
+            .contains("call this same tool again")
+    );
+    assert_eq!(
+        overview["inputSchema"]["properties"]["context_before"]["maximum"],
+        100
+    );
+    assert_eq!(
+        overview["inputSchema"]["properties"]["context_after"]["maximum"],
+        100
+    );
+    assert_eq!(
+        overview["outputSchema"]["properties"]["panes"]["items"]["properties"]["current_activity_excerpt"]
+            ["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        overview["outputSchema"]["properties"]["panes"]["items"]["properties"]["context_after"]["type"],
+        "array"
+    );
     assert_eq!(
         overview["outputSchema"]["properties"]["panes"]["items"]["properties"]["latest_reply_excerpt"]
             ["type"],

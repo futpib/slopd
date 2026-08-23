@@ -12,7 +12,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_work_overview",
-            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. It already reads compact recent conversation excerpts; do not also call get_agent_result, send a prompt, or inspect dead panes. Preserve the language of every agent excerpt and never translate it unless the user asks. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
+            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. task_context_excerpt resolves references such as 'option 4' from before the latest user prompt; current_activity_excerpt reports progress since that prompt. If the compact answer is not enough, call this same tool again for one pane with context_before and/or context_after. Increase them while more_before or more_after is true. Do not use raw transcript tools for ordinary questions. Preserve the language of every agent excerpt and never translate it unless the user asks. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
             overview_schema(),
         ),
         tool(
@@ -353,11 +353,31 @@ fn overview_pane_schema() -> Value {
             "title": { "type": ["string", "null"], "description": "User-facing label, not the agent type." },
             "working_dir": { "type": ["string", "null"] },
             "last_request_excerpt": { "type": ["string", "null"], "description": "Verbatim excerpt in its original language." },
+            "task_context_excerpt": { "type": ["string", "null"], "description": "Nearest preceding agent message, useful for resolving short references in the latest user prompt." },
+            "current_activity_excerpt": { "type": ["string", "null"], "description": "Latest agent progress message since the latest user prompt." },
+            "latest_tool_name": { "type": ["string", "null"], "description": "Latest tool name recorded since the latest user prompt; a fallback when no progress message is available." },
             "latest_reply_excerpt": { "type": ["string", "null"], "description": "Verbatim agent excerpt in its original language; do not translate unless asked." },
             "reply_complete": { "type": "boolean" },
+            "context_before": { "type": "array", "items": overview_context_schema(), "description": "Requested messages immediately before the latest user prompt, oldest first." },
+            "context_after": { "type": "array", "items": overview_context_schema(), "description": "Requested agent messages after the latest user prompt, oldest first. The newest requested messages are returned." },
+            "more_before": { "type": "boolean", "description": "More meaningful messages exist before context_before. Increase context_before to retrieve them." },
+            "more_after": { "type": "boolean", "description": "More meaningful messages exist after context_after. Increase context_after to retrieve them." },
             "transcript_error": { "type": ["string", "null"] }
         },
-        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "last_request_excerpt", "latest_reply_excerpt", "reply_complete", "transcript_error"],
+        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "last_request_excerpt", "task_context_excerpt", "current_activity_excerpt", "latest_tool_name", "latest_reply_excerpt", "reply_complete", "context_before", "context_after", "more_before", "more_after", "transcript_error"],
+        "additionalProperties": false
+    })
+}
+
+fn overview_context_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "role": { "type": "string", "enum": ["user", "assistant"] },
+            "kind": { "type": "string", "enum": ["request", "progress", "reply"] },
+            "text": { "type": "string", "description": "Verbatim compact excerpt in its original language." }
+        },
+        "required": ["role", "kind", "text"],
         "additionalProperties": false
     })
 }
@@ -432,7 +452,9 @@ fn overview_schema() -> Value {
             "pane_id": pane_id_schema(),
             "tag": { "type": "string" },
             "backend": backend_schema(),
-            "account": { "type": "string" }
+            "account": { "type": "string" },
+            "context_before": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0, "description": "Number of meaningful messages to return from immediately before the latest user prompt. Increase this when task_context_excerpt is not enough." },
+            "context_after": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0, "description": "Number of the newest agent progress or reply messages to return from after the latest user prompt. Increase this when current_activity_excerpt is not enough." }
         },
         "additionalProperties": false
     })
