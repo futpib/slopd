@@ -106,10 +106,28 @@ impl MailboxEntry {
     }
 
     fn json(&self) -> Value {
-        let (status, reply, error) = match self.state() {
-            MailboxState::Pending => ("pending", Value::Null, Value::Null),
-            MailboxState::Completed(reply) => ("completed", json!(reply), Value::Null),
-            MailboxState::Failed(error) => ("failed", Value::Null, json!(error)),
+        let (status, finished, reply, error, answer) = match self.state() {
+            MailboxState::Pending => (
+                "pending",
+                false,
+                Value::Null,
+                Value::Null,
+                json!("The agent is still running and has not replied yet."),
+            ),
+            MailboxState::Completed(reply) => (
+                "completed",
+                true,
+                json!(reply),
+                Value::Null,
+                json!(format!("The agent finished successfully. Reply: {reply}")),
+            ),
+            MailboxState::Failed(error) => (
+                "failed",
+                true,
+                Value::Null,
+                json!(error),
+                json!(format!("The agent finished with an error: {error}")),
+            ),
         };
         json!({
             "request_id": self.request_id,
@@ -117,8 +135,10 @@ impl MailboxEntry {
             "prompt": self.prompt,
             "created_at_unix_ms": self.created_at_unix_ms,
             "status": status,
+            "finished": finished,
             "reply": reply,
             "error": error,
+            "answer": answer,
         })
     }
 }
@@ -159,7 +179,7 @@ impl SlopdMcp {
             "kill_pane" => self.kill(request.arguments.as_ref()).await,
             "read_transcript" => self.transcript(request.arguments.as_ref()).await,
             "ask_agent" => self.ask_agent(request.arguments.as_ref()).await,
-            "read_mailbox" => self.read_mailbox(request.arguments.as_ref()).await,
+            "get_agent_result" => self.get_agent_result(request.arguments.as_ref()).await,
             "send_prompt" => self.send(request.arguments.as_ref()).await,
             "wait_for_reply" => self.wait_for_reply(request.arguments.as_ref()).await,
             "interrupt_pane" => self.interrupt(request.arguments.as_ref()).await,
@@ -422,34 +442,46 @@ impl SlopdMcp {
         Ok(pane_id)
     }
 
-    async fn read_mailbox(
+    async fn get_agent_result(
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
         let request_id = optional_string(arguments, "request_id");
         let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
-        let limit = optional_u64(arguments, "limit")?
-            .unwrap_or(20)
-            .clamp(1, 100) as usize;
         let wait_seconds = optional_u64(arguments, "wait_seconds")?
             .unwrap_or(0)
             .min(300);
 
-        let entries = if let Some(request_id) = request_id {
-            let entry = self.mailbox.get(&request_id).ok_or_else(|| {
+        let entry = if let Some(request_id) = request_id {
+            Some(self.mailbox.get(&request_id).ok_or_else(|| {
                 invalid_argument(format!(
-                    "unknown mailbox request_id {request_id:?}; omit request_id to list recent mailbox entries"
+                    "unknown agent request_id {request_id:?}; omit request_id to get the latest agent result"
                 ))
-            })?;
-            wait_for_mailbox_entry(&entry, wait_seconds).await;
-            vec![entry]
+            })?)
         } else {
-            let entries = self.mailbox.recent(pane_id.as_deref(), limit);
-            wait_for_any_mailbox_entry(&entries, wait_seconds).await;
-            self.mailbox.recent(pane_id.as_deref(), limit)
+            self.mailbox
+                .recent(pane_id.as_deref(), 1)
+                .into_iter()
+                .next()
         };
-        let entries = entries.iter().map(|entry| entry.json()).collect::<Vec<_>>();
-        ok_json(json!({ "count": entries.len(), "entries": entries }))
+        let Some(entry) = entry else {
+            return ok_json(json!({
+                "found": false,
+                "request_id": null,
+                "pane_id": null,
+                "prompt": null,
+                "created_at_unix_ms": null,
+                "status": "not_found",
+                "finished": null,
+                "reply": null,
+                "error": null,
+                "answer": "No prior agent result exists.",
+            }));
+        };
+        wait_for_mailbox_entry(&entry, wait_seconds).await;
+        let mut result = entry.json();
+        result["found"] = json!(true);
+        ok_json(result)
     }
 
     async fn send(
@@ -964,7 +996,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Prefer ask_agent for a request and reply. For requests such as 'ask my Codex agent', call ask_agent with backend=codex; do not ask the user for a pane ID or call list_panes first. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed, so they never select a human-owned pane. Fast replies return inline and slow replies remain in the server-wide mailbox. Call read_mailbox with no arguments later, even from a new MCP session; no request ID is required. Never resend a pending mailbox request.",
+                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex; do not call list_panes first. If the user asks whether prior agent work finished, what an agent said, or for its latest result, call get_agent_result with no arguments before answering. Its top-level answer is authoritative; use it to answer the user. Never claim you lack access after the tool returns. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed, so they never select a human-owned pane. Fast replies return inline and slow replies remain available through get_agent_result, including across new MCP sessions. Never resend a pending request.",
             )
     }
 
@@ -1062,28 +1094,6 @@ async fn wait_for_mailbox_entry(entry: &MailboxEntry, wait_seconds: u64) {
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
     while matches!(entry.state(), MailboxState::Pending) {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
-    }
-}
-
-async fn wait_for_any_mailbox_entry(entries: &[Arc<MailboxEntry>], wait_seconds: u64) {
-    let pending = entries
-        .iter()
-        .filter(|entry| matches!(entry.state(), MailboxState::Pending))
-        .cloned()
-        .collect::<Vec<_>>();
-    if wait_seconds == 0 || pending.is_empty() {
-        return;
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
-    while pending
-        .iter()
-        .all(|entry| matches!(entry.state(), MailboxState::Pending))
-    {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;

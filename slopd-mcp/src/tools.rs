@@ -32,7 +32,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_agent",
-            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay in the server-wide mailbox for read_mailbox.",
+            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay available through get_agent_result.",
             json!({
                 "type": "object",
                 "properties": {
@@ -49,14 +49,13 @@ pub fn all() -> Vec<Tool> {
             }),
         ),
         tool(
-            "read_mailbox",
-            "Read recent ask_agent requests and replies across all MCP sessions. Call with no arguments when you do not remember a request ID. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
+            "get_agent_result",
+            "Get the latest agent request, completion status, and reply. Use this when the user naturally asks whether an agent finished, what it said, or for the latest agent result. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative; use it to answer the user. Never claim you lack access after this tool returns. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
             json!({
                 "type": "object",
                 "properties": {
                     "request_id": { "type": "string" },
                     "pane_id": pane_id_schema(),
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 0 }
                 },
                 "additionalProperties": false
@@ -170,7 +169,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "fork_pane" => ("Fork pane", false, false, false),
         "kill_pane" => ("Kill pane", false, true, true),
         "ask_agent" => ("Ask agent", false, false, false),
-        "read_mailbox" => ("Read mailbox", true, false, true),
+        "get_agent_result" => ("Get agent result", true, false, true),
         "send_prompt" => ("Send prompt", false, false, false),
         "wait_for_reply" => ("Wait for reply", true, false, true),
         "interrupt_pane" => ("Interrupt pane", false, true, false),
@@ -223,9 +222,17 @@ fn output_schema(name: &str) -> Value {
         }),
         "kill_pane" | "interrupt_pane" => json!({ "pane_id": pane_id_schema() }),
         "ask_agent" => mailbox_entry_schema()["properties"].clone(),
-        "read_mailbox" => json!({
-            "count": { "type": "integer" },
-            "entries": { "type": "array", "items": mailbox_entry_schema() }
+        "get_agent_result" => json!({
+            "found": { "type": "boolean" },
+            "request_id": { "type": ["string", "null"] },
+            "pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }] },
+            "prompt": { "type": ["string", "null"] },
+            "created_at_unix_ms": { "type": ["integer", "null"] },
+            "status": { "type": "string", "enum": ["not_found", "pending", "completed", "failed"] },
+            "finished": { "type": ["boolean", "null"], "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
+            "reply": { "type": ["string", "null"] },
+            "error": { "type": ["string", "null"] },
+            "answer": { "type": "string", "description": "Authoritative natural-language answer to give the user." }
         }),
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
@@ -278,10 +285,12 @@ fn mailbox_entry_schema() -> Value {
             "prompt": { "type": "string" },
             "created_at_unix_ms": { "type": "integer" },
             "status": { "type": "string", "enum": ["pending", "completed", "failed"] },
+            "finished": { "type": "boolean", "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
             "reply": { "type": ["string", "null"] },
-            "error": { "type": ["string", "null"] }
+            "error": { "type": ["string", "null"] },
+            "answer": { "type": "string", "description": "Authoritative natural-language answer to give the user." }
         },
-        "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "reply", "error"],
+        "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "finished", "reply", "error", "answer"],
         "additionalProperties": false
     })
 }

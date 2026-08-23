@@ -292,6 +292,12 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     let (initialized, session) = initialize(&client, addr, Some("secret")).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
     assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
+    let instructions = initialized["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("never require the user to name MCP"),
+        "{initialized}"
+    );
+    assert!(instructions.contains("what an agent said"), "{initialized}");
 
     let listed = rpc_json(
         &client,
@@ -316,7 +322,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "fork_pane",
             "kill_pane",
             "ask_agent",
-            "read_mailbox",
+            "get_agent_result",
             "send_prompt",
             "wait_for_reply",
             "interrupt_pane",
@@ -351,6 +357,41 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(send["annotations"]["idempotentHint"], false);
     assert_eq!(send["annotations"]["openWorldHint"], false);
     assert_eq!(send["outputSchema"]["type"], "object");
+    let get_agent_result = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "get_agent_result")
+        .unwrap();
+    assert!(
+        get_agent_result["description"]
+            .as_str()
+            .unwrap()
+            .contains("whether an agent finished")
+    );
+    assert!(
+        get_agent_result["description"]
+            .as_str()
+            .unwrap()
+            .contains("answer is authoritative")
+    );
+    assert!(
+        get_agent_result["inputSchema"]["properties"]
+            .get("limit")
+            .is_none()
+    );
+    assert_eq!(
+        get_agent_result["outputSchema"]["properties"]["reply"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        get_agent_result["outputSchema"]["properties"]["finished"]["type"],
+        json!(["boolean", "null"])
+    );
+    assert_eq!(
+        get_agent_result["outputSchema"]["properties"]["answer"]["type"],
+        "string"
+    );
     let list_panes = listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -380,7 +421,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         ("fork_pane", false, false, false),
         ("kill_pane", false, true, true),
         ("ask_agent", false, false, false),
-        ("read_mailbox", true, false, true),
+        ("get_agent_result", true, false, true),
         ("send_prompt", false, false, false),
         ("wait_for_reply", true, false, true),
         ("interrupt_pane", false, true, false),
@@ -967,7 +1008,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             "ask_agent",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),
         ),
-        ("read_mailbox", json!({ "pane_id": malformed })),
+        ("get_agent_result", json!({ "pane_id": malformed })),
         (
             "send_prompt",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),
@@ -1186,7 +1227,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert!(
         initialized["result"]["instructions"]
             .as_str()
-            .is_some_and(|text| text.contains("read_mailbox with no arguments")),
+            .is_some_and(|text| text.contains("get_agent_result with no arguments")),
         "{initialized}"
     );
     let listed = rpc_json(
@@ -1199,7 +1240,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     .await;
     let names = tool_names(&listed);
     assert!(names.iter().any(|name| name == "ask_agent"));
-    assert!(names.iter().any(|name| name == "read_mailbox"));
+    assert!(names.iter().any(|name| name == "get_agent_result"));
     assert!(names.iter().any(|name| name == "wait_for_reply"));
     assert!(!names.iter().any(|name| name == "collect_events"));
     assert!(!names.iter().any(|name| name == "wait_for_event"));
@@ -1396,6 +1437,11 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     .await;
     let pending = tool_payload(&pending);
     assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["finished"], false);
+    assert_eq!(
+        pending["answer"],
+        "The agent is still running and has not replied yet."
+    );
     let pending_id = pending["request_id"].as_str().unwrap().to_string();
 
     let (_, fresh_session) = initialize(&client, addr, None).await;
@@ -1405,17 +1451,16 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         None,
         fresh_session.as_deref(),
         91,
-        "read_mailbox",
+        "get_agent_result",
         json!({}),
     )
     .await;
     let mailbox = tool_payload(&mailbox);
-    assert_eq!(mailbox["count"], 2);
-    assert!(mailbox["entries"].as_array().unwrap().iter().any(|entry| {
-        entry["request_id"] == pending_id
-            && entry["prompt"] == "::mock active"
-            && entry["status"] == "pending"
-    }));
+    assert_eq!(mailbox["found"], true);
+    assert_eq!(mailbox["request_id"], pending_id);
+    assert_eq!(mailbox["prompt"], "::mock active");
+    assert_eq!(mailbox["status"], "pending");
+    assert_eq!(mailbox["finished"], false);
 
     let steered = call_tool(
         &client,
@@ -1435,21 +1480,19 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         None,
         fresh_session.as_deref(),
         93,
-        "read_mailbox",
+        "get_agent_result",
         json!({ "wait_seconds": 10 }),
     )
     .await;
     let completed = tool_payload(&completed);
-    assert!(
-        completed["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| {
-                entry["request_id"] == pending_id
-                    && entry["status"] == "completed"
-                    && entry["reply"] == "steered: MAILBOX_ASYNC_FINISH"
-            })
+    assert_eq!(completed["found"], true);
+    assert_eq!(completed["request_id"], pending_id);
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["finished"], true);
+    assert_eq!(completed["reply"], "steered: MAILBOX_ASYNC_FINISH");
+    assert_eq!(
+        completed["answer"],
+        "The agent finished successfully. Reply: steered: MAILBOX_ASYNC_FINISH"
     );
 
     let killed = call_tool(
