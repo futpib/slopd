@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+use handler::ToolSurface;
 pub use handler::{SlopdMcp, parse_backend};
 
 #[derive(Clone)]
@@ -104,8 +105,10 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
         mcp_path: path.clone(),
     };
     let handler = SlopdMcp::new(config.socket.clone());
-    let mcp = StreamableHttpService::new(
-        move || Ok(handler.clone()),
+    let simple_handler = handler.with_surface(ToolSurface::Simple);
+    let full_handler = handler.with_surface(ToolSurface::Full);
+    let simple_mcp = StreamableHttpService::new(
+        move || Ok(simple_handler.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)
@@ -113,8 +116,19 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
             .with_sse_retry(None)
             .with_allowed_hosts(config.allowed_hosts.clone()),
     );
+    let full_mcp = StreamableHttpService::new(
+        move || Ok(full_handler.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_sse_keep_alive(None)
+            .with_sse_retry(None)
+            .with_allowed_hosts(config.allowed_hosts.clone()),
+    );
+    let full_path = format!("{}/slopctl", path.trim_end_matches('/'));
     let mcp_routes = Router::new()
-        .nest_service(&path, mcp)
+        .nest_service(&full_path, full_mcp)
+        .nest_service(&path, simple_mcp)
         .layer(middleware::from_fn_with_state(auth.clone(), require_bearer));
     let router = if config.token.is_some() {
         oauth::routes(auth).merge(mcp_routes)

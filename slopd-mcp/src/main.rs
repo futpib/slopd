@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8780", value_name = "ADDR")]
     bind: SocketAddr,
 
-    /// HTTP path of the MCP endpoint.
+    /// HTTP path of the natural-language MCP endpoint. Full parity is at PATH/slopctl.
     #[arg(long, default_value = "/mcp", value_name = "PATH")]
     path: String,
 
@@ -126,7 +126,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         format!("/{}", cli.path)
     };
     tracing::info!(
-        "listening on http://{bound}{path} (slopd socket {}, OAuth journal {})",
+        "listening on http://{bound}{path} (full surface {path}/slopctl; slopd socket {}, OAuth journal {})",
         socket.display(),
         oauth_state.display()
     );

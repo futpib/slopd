@@ -15,11 +15,35 @@ use tokio::net::UnixStream;
 
 const MCP_PANE_TAG: &str = "slopd-mcp";
 const MAILBOX_LIMIT: usize = 100;
+const MAILBOX_DEDUPE_WINDOW_MS: u64 = 60_000;
 const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const OVERVIEW_CONTEXT_LIMIT: u64 = 100;
 const OVERVIEW_PAGE_LIMIT: u64 = 500;
 const OVERVIEW_MAX_PAGES: usize = 8;
 const OVERVIEW_DEEP_MAX_PAGES: usize = 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolSurface {
+    Simple,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+enum AgentTarget {
+    Automatic,
+    New,
+    Existing,
+}
+
+impl AgentTarget {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::New => "new",
+            Self::Existing => "existing",
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct Mailbox {
@@ -28,8 +52,10 @@ struct Mailbox {
 
 struct MailboxEntry {
     request_id: String,
-    pane_id: String,
+    pane_id: Mutex<Option<String>>,
     prompt: String,
+    selector_key: String,
+    dedupe_key: String,
     created_at_unix_ms: u64,
     state: Mutex<MailboxState>,
 }
@@ -42,12 +68,22 @@ enum MailboxState {
 }
 
 impl Mailbox {
-    fn insert(&self, entry: Arc<MailboxEntry>) {
+    fn insert_or_recent_duplicate(&self, entry: Arc<MailboxEntry>) -> Arc<MailboxEntry> {
         let mut entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
+        if let Some(existing) = entries.iter().rev().find(|existing| {
+            existing.dedupe_key == entry.dedupe_key
+                && entry
+                    .created_at_unix_ms
+                    .saturating_sub(existing.created_at_unix_ms)
+                    <= MAILBOX_DEDUPE_WINDOW_MS
+        }) {
+            return Arc::clone(existing);
+        }
         while entries.len() >= MAILBOX_LIMIT {
             entries.pop_front();
         }
-        entries.push_back(entry);
+        entries.push_back(Arc::clone(&entry));
+        entry
     }
 
     fn get(&self, request_id: &str) -> Option<Arc<MailboxEntry>> {
@@ -65,18 +101,37 @@ impl Mailbox {
             .unwrap_or_else(|lock| lock.into_inner())
             .iter()
             .rev()
-            .filter(|entry| pane_id.is_none_or(|pane_id| entry.pane_id == pane_id))
+            .filter(|entry| {
+                pane_id.is_none_or(|pane_id| entry.pane_id().as_deref() == Some(pane_id))
+            })
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    fn previous_for_selector(
+        &self,
+        selector_key: &str,
+        request_id: &str,
+    ) -> Option<Arc<MailboxEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .rev()
+            .find(|entry| entry.selector_key == selector_key && entry.request_id != request_id)
+            .cloned()
     }
 
     fn recent_pane_ids(&self) -> Vec<String> {
         let entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
         let mut pane_ids = Vec::new();
         for entry in entries.iter().rev() {
-            if !pane_ids.contains(&entry.pane_id) {
-                pane_ids.push(entry.pane_id.clone());
+            let Some(pane_id) = entry.pane_id() else {
+                continue;
+            };
+            if !pane_ids.contains(&pane_id) {
+                pane_ids.push(pane_id);
             }
         }
         pane_ids
@@ -84,18 +139,31 @@ impl Mailbox {
 }
 
 impl MailboxEntry {
-    fn new(pane_id: String, prompt: String) -> Self {
+    fn new(prompt: String, selector_key: String, dedupe_key: String) -> Self {
         let created_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
-            pane_id,
+            pane_id: Mutex::new(None),
             prompt,
+            selector_key,
+            dedupe_key,
             created_at_unix_ms,
             state: Mutex::new(MailboxState::Pending),
         }
+    }
+
+    fn pane_id(&self) -> Option<String> {
+        self.pane_id
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone()
+    }
+
+    fn set_pane_id(&self, pane_id: String) {
+        *self.pane_id.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(pane_id);
     }
 
     fn state(&self) -> MailboxState {
@@ -116,7 +184,9 @@ impl MailboxEntry {
                 false,
                 Value::Null,
                 Value::Null,
-                json!("The agent is still running and has not replied yet."),
+                json!(
+                    "The agent is still running. Do not submit this request again; use get_agent_result later."
+                ),
             ),
             MailboxState::Completed(reply) => (
                 "completed",
@@ -130,12 +200,14 @@ impl MailboxEntry {
                 true,
                 Value::Null,
                 json!(error),
-                json!(format!("The agent finished with an error: {error}")),
+                json!(format!(
+                    "The request failed and no agent reply was received: {error}. Do not claim that the agent accepted or completed it."
+                )),
             ),
         };
         json!({
             "request_id": self.request_id,
-            "pane_id": self.pane_id,
+            "pane_id": self.pane_id(),
             "prompt": self.prompt,
             "created_at_unix_ms": self.created_at_unix_ms,
             "status": status,
@@ -143,6 +215,8 @@ impl MailboxEntry {
             "reply": reply,
             "error": error,
             "answer": answer,
+            "agent_reply_received": status == "completed",
+            "follow_up_instruction": "If the user later asks to tell, update, correct, or continue this agent, call message_existing_agent exactly once. Never claim you contacted the agent without a completed reply.",
         })
     }
 }
@@ -152,6 +226,7 @@ pub struct SlopdMcp {
     socket: PathBuf,
     mailbox: Mailbox,
     spawn_lock: Arc<tokio::sync::Mutex<()>>,
+    surface: ToolSurface,
 }
 
 impl SlopdMcp {
@@ -160,15 +235,30 @@ impl SlopdMcp {
             socket,
             mailbox: Mailbox::default(),
             spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            surface: ToolSurface::Full,
         }
     }
 
+    pub(crate) fn with_surface(&self, surface: ToolSurface) -> Self {
+        let mut handler = self.clone();
+        handler.surface = surface;
+        handler
+    }
+
     pub fn tools(&self) -> Vec<Tool> {
-        crate::tools::all()
+        match self.surface {
+            ToolSurface::Simple => crate::tools::simple(),
+            ToolSurface::Full => crate::tools::all(),
+        }
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         let name = canonical_tool_name(request.name.as_ref());
+        if self.surface == ToolSurface::Simple && !crate::tools::simple_names().contains(&name) {
+            return Err(invalid_argument(format!(
+                "tool {name} is not available on the natural-language MCP endpoint; use start_new_agent for a new agent or message_existing_agent for an existing agent"
+            )));
+        }
         if matches!(name, "collect_events" | "wait_for_event")
             && !optional_bool(request.arguments.as_ref(), "advanced")?.unwrap_or(false)
         {
@@ -183,7 +273,12 @@ impl SlopdMcp {
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
             "kill_pane" => self.kill(request.arguments.as_ref()).await,
             "read_transcript" => self.transcript(request.arguments.as_ref()).await,
-            "ask_agent" => self.ask_agent(request.arguments.as_ref()).await,
+            "start_new_agent" => self.start_new_agent(request.arguments.as_ref()).await,
+            "message_existing_agent" => {
+                self.message_existing_agent(request.arguments.as_ref())
+                    .await
+            }
+            "ask_or_tell_agent" => self.ask_agent(request.arguments.as_ref()).await,
             "get_agent_result" => self.get_agent_result(request.arguments.as_ref()).await,
             "send_prompt" => self.send(request.arguments.as_ref()).await,
             "wait_for_reply" => self.wait_for_reply(request.arguments.as_ref()).await,
@@ -413,7 +508,45 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
-        let pane_id = self.resolve_agent_pane(arguments).await?;
+        let target = if optional_bool(arguments, "new_agent")?.unwrap_or(false) {
+            AgentTarget::New
+        } else {
+            AgentTarget::Automatic
+        };
+        self.agent_request(arguments, target).await
+    }
+
+    async fn start_new_agent(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        if arguments.is_some_and(|arguments| {
+            arguments.contains_key("pane_id") || arguments.contains_key("new_agent")
+        }) {
+            return Err(invalid_argument(
+                "start_new_agent does not accept pane_id or new_agent; it always creates exactly one new agent",
+            ));
+        }
+        self.agent_request(arguments, AgentTarget::New).await
+    }
+
+    async fn message_existing_agent(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        if arguments.is_some_and(|arguments| arguments.contains_key("new_agent")) {
+            return Err(invalid_argument(
+                "message_existing_agent does not accept new_agent; it never creates an agent",
+            ));
+        }
+        self.agent_request(arguments, AgentTarget::Existing).await
+    }
+
+    async fn agent_request(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+        target: AgentTarget,
+    ) -> Result<CallToolResult, McpError> {
         let prompt = required_string(arguments, "prompt")?;
         if prompt.trim().is_empty() {
             return tool_error("prompt must not be empty");
@@ -422,47 +555,165 @@ impl SlopdMcp {
             .unwrap_or(45)
             .min(300);
         let interrupt = optional_bool(arguments, "interrupt")?.unwrap_or(false);
+        let explicit_pane_id = self.optional_pane_id(arguments, "pane_id").await?;
+        pane_filters(arguments)?;
+        if matches!(target, AgentTarget::New) && explicit_pane_id.is_some() {
+            return Err(invalid_argument(
+                "a new-agent request cannot include pane_id; omit pane_id to create exactly one new agent",
+            ));
+        }
+        let selector_key = agent_selector_key(arguments, explicit_pane_id.as_deref());
+        let dedupe_key = format!(
+            "{selector_key}\ntarget={}\ninterrupt={interrupt}\nprompt={prompt}",
+            target.key()
+        );
+        let candidate = Arc::new(MailboxEntry::new(
+            prompt.clone(),
+            selector_key.clone(),
+            dedupe_key,
+        ));
+        let candidate_id = candidate.request_id.clone();
+        let entry = self.mailbox.insert_or_recent_duplicate(candidate);
+        let request_reused = entry.request_id != candidate_id;
 
+        if !request_reused
+            && let Err(error) = self
+                .start_agent_request(
+                    arguments,
+                    explicit_pane_id,
+                    target,
+                    &selector_key,
+                    Arc::clone(&entry),
+                    interrupt,
+                )
+                .await
+        {
+            entry.finish(MailboxState::Failed(error.message.into_owned()));
+        }
+
+        wait_for_mailbox_entry(&entry, wait_seconds).await;
+        let mut result = entry.json();
+        result["request_reused"] = json!(request_reused);
+        ok_json(result)
+    }
+
+    async fn start_agent_request(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+        explicit_pane_id: Option<String>,
+        target: AgentTarget,
+        selector_key: &str,
+        entry: Arc<MailboxEntry>,
+        interrupt: bool,
+    ) -> Result<(), McpError> {
+        let pane_id = self
+            .resolve_agent_pane(arguments, explicit_pane_id, target, selector_key, &entry)
+            .await?;
+        entry.set_pane_id(pane_id.clone());
         let mut client = connect(&self.socket).await?;
         let result = client.subscribe(reply_event_filters(&pane_id)).await;
         let subscription = self.slopd_result(result).await?;
-        let result = client.read_transcript(pane_id.clone(), None, 500).await;
-        let records = self.slopd_result(result).await?;
-        let after_cursor = records
+        let after_cursor = client
+            .read_transcript(pane_id.clone(), None, 500)
+            .await
+            .unwrap_or_default()
             .iter()
             .filter_map(|record| record.cursor)
             .max()
             .unwrap_or(0);
         let result = client
-            .send_prompt(pane_id.clone(), prompt.clone(), 60, interrupt)
+            .send_prompt(pane_id.clone(), entry.prompt.clone(), 60, interrupt)
             .await;
         self.slopd_result(result).await?;
 
-        let entry = Arc::new(MailboxEntry::new(pane_id.clone(), prompt.clone()));
-        self.mailbox.insert(Arc::clone(&entry));
         let worker_entry = Arc::clone(&entry);
         tokio::spawn(async move {
-            let state =
-                match wait_for_mailbox_reply(client, subscription, &pane_id, &prompt, after_cursor)
-                    .await
-                {
-                    Ok(reply) => MailboxState::Completed(reply),
-                    Err(error) => MailboxState::Failed(error),
-                };
+            let state = match wait_for_mailbox_reply(
+                client,
+                subscription,
+                &pane_id,
+                &worker_entry.prompt,
+                after_cursor,
+            )
+            .await
+            {
+                Ok(reply) => MailboxState::Completed(reply),
+                Err(error) => MailboxState::Failed(error),
+            };
             worker_entry.finish(state);
         });
-
-        wait_for_mailbox_entry(&entry, wait_seconds).await;
-        ok_json(entry.json())
+        Ok(())
     }
 
     async fn resolve_agent_pane(
         &self,
         arguments: Option<&Map<String, Value>>,
+        explicit_pane_id: Option<String>,
+        target: AgentTarget,
+        selector_key: &str,
+        entry: &MailboxEntry,
     ) -> Result<String, McpError> {
-        if let Some(pane_id) = self.optional_pane_id(arguments, "pane_id").await? {
+        if let Some(pane_id) = explicit_pane_id {
             return Ok(pane_id);
         }
+        if matches!(target, AgentTarget::New) {
+            let _guard = self.spawn_lock.lock().await;
+            return self.create_agent_pane(arguments, Some(entry)).await;
+        }
+        let existing = if matches!(target, AgentTarget::Existing) {
+            self.find_existing_agent_pane(arguments).await?
+        } else {
+            self.find_agent_pane(arguments).await?
+        };
+        if let Some(pane_id) = existing {
+            return Ok(pane_id);
+        }
+        if matches!(target, AgentTarget::Existing) {
+            if let Some(previous) = self
+                .mailbox
+                .previous_for_selector(selector_key, &entry.request_id)
+            {
+                let target = previous.pane_id().map_or_else(
+                    || "the previous agent".to_string(),
+                    |pane_id| {
+                        entry.set_pane_id(pane_id.clone());
+                        format!("pane {pane_id}")
+                    },
+                );
+                return Err(internal_failure(format!(
+                    "{target} is no longer running, so no message was sent and no new agent was created"
+                )));
+            }
+            return Err(internal_failure(
+                "no existing agent matched, so no message was sent and no new agent was created; use get_work_overview to identify an existing pane",
+            ));
+        }
+        let _guard = self.spawn_lock.lock().await;
+        if let Some(pane_id) = self.find_agent_pane(arguments).await? {
+            return Ok(pane_id);
+        }
+        if let Some(previous) = self
+            .mailbox
+            .previous_for_selector(selector_key, &entry.request_id)
+        {
+            let target = previous.pane_id().map_or_else(
+                || "the previous agent".to_string(),
+                |pane_id| {
+                    entry.set_pane_id(pane_id.clone());
+                    format!("pane {pane_id}")
+                },
+            );
+            return Err(internal_failure(format!(
+                "{target} is no longer running, so no follow-up was sent and no new pane was created; set new_agent=true only when the user explicitly asks for a new agent"
+            )));
+        }
+        self.create_agent_pane(arguments, Some(entry)).await
+    }
+
+    async fn resolve_send_pane(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<String, McpError> {
         if let Some(pane_id) = self.find_agent_pane(arguments).await? {
             return Ok(pane_id);
         }
@@ -470,7 +721,7 @@ impl SlopdMcp {
         if let Some(pane_id) = self.find_agent_pane(arguments).await? {
             return Ok(pane_id);
         }
-        self.create_agent_pane(arguments).await
+        self.create_agent_pane(arguments, None).await
     }
 
     async fn find_agent_pane(
@@ -487,9 +738,24 @@ impl SlopdMcp {
         ))
     }
 
+    async fn find_existing_agent_pane(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, McpError> {
+        let filters = pane_filters(arguments)?;
+        let mut client = connect(&self.socket).await?;
+        let result = client.ps().await;
+        let panes = libslopctl::apply_filters(self.slopd_result(result).await?, &filters);
+        Ok(preferred_existing_pane_id(
+            panes,
+            &self.mailbox.recent_pane_ids(),
+        ))
+    }
+
     async fn create_agent_pane(
         &self,
         arguments: Option<&Map<String, Value>>,
+        entry: Option<&MailboxEntry>,
     ) -> Result<String, McpError> {
         let account = optional_string(arguments, "account");
         let backend = match optional_string(arguments, "backend") {
@@ -504,6 +770,9 @@ impl SlopdMcp {
             .run(None, Vec::new(), None, Vec::new(), account, backend)
             .await;
         let pane_id = self.slopd_result(result).await?;
+        if let Some(entry) = entry {
+            entry.set_pane_id(pane_id.clone());
+        }
         let result = client.tag(pane_id.clone(), MCP_PANE_TAG.into()).await;
         self.slopd_result(result).await?;
         if let Some(tag) = extra_tag.filter(|tag| tag != MCP_PANE_TAG) {
@@ -511,12 +780,9 @@ impl SlopdMcp {
             self.slopd_result(result).await?;
         }
         if let Err(message) = wait_pane_ready(&mut subscription, &pane_id, 30).await {
-            let cleanup = client.kill(pane_id.clone()).await.err();
-            let cleanup = cleanup
-                .map(|error| format!("; cleanup also failed: {error}"))
-                .unwrap_or_default();
+            let _ = client.kill(pane_id.clone()).await;
             return Err(internal_failure(format!(
-                "created pane {pane_id} but it did not become ready: {message}{cleanup}"
+                "created pane {pane_id} but it did not become ready: {message}"
             )));
         }
         Ok(pane_id)
@@ -556,6 +822,8 @@ impl SlopdMcp {
                 "reply": null,
                 "error": null,
                 "answer": "No prior agent result exists.",
+                "agent_reply_received": false,
+                "follow_up_instruction": "Call start_new_agent for a new agent or message_existing_agent for an existing agent.",
             }));
         };
         wait_for_mailbox_entry(&entry, wait_seconds).await;
@@ -587,7 +855,7 @@ impl SlopdMcp {
         } else {
             match select {
                 libslopctl::SelectMode::One => {
-                    let pane_id = self.resolve_agent_pane(arguments).await?;
+                    let pane_id = self.resolve_send_pane(arguments).await?;
                     let result = client
                         .send_prompt(pane_id, prompt, timeout, interrupt)
                         .await;
@@ -600,7 +868,7 @@ impl SlopdMcp {
                     let matches =
                         libslopctl::apply_filters(self.slopd_result(result).await?, &filters);
                     if matches.is_empty() {
-                        let pane_id = self.resolve_agent_pane(arguments).await?;
+                        let pane_id = self.resolve_send_pane(arguments).await?;
                         let result = client
                             .send_prompt(pane_id, prompt, timeout, interrupt)
                             .await;
@@ -926,8 +1194,12 @@ impl SlopdMcp {
         &self,
         arguments: Option<&Map<String, Value>>,
     ) -> Result<CallToolResult, McpError> {
+        if arguments.is_some_and(|arguments| arguments.contains_key("prompt")) {
+            return Err(invalid_argument(
+                "create_pane does not accept a prompt; use one ask_or_tell_agent call for agent work",
+            ));
+        }
         let spawn = spawn_arguments(arguments)?;
-        let prompt = optional_string(arguments, "prompt");
         let parent_pane_id = self.optional_pane_id(arguments, "parent_pane_id").await?;
         let account = optional_string(arguments, "account");
         let backend = match optional_string(arguments, "backend") {
@@ -935,8 +1207,7 @@ impl SlopdMcp {
             None => None,
         };
         let mut client = connect(&self.socket).await?;
-        let wait_for_ready = !spawn.no_wait || prompt.is_some();
-        let mut subscription = if !wait_for_ready {
+        let mut subscription = if spawn.no_wait {
             None
         } else {
             let result = client.subscribe(ready_event_filters()).await;
@@ -964,17 +1235,9 @@ impl SlopdMcp {
                 "error": message,
             }));
         }
-        let prompt_sent = if let Some(prompt) = prompt {
-            let result = client.send_prompt(pane_id.clone(), prompt, 60, false).await;
-            self.slopd_result(result).await?;
-            true
-        } else {
-            false
-        };
         ok_json(json!({
             "pane_id": pane_id,
-            "ready": wait_for_ready,
-            "prompt_sent": prompt_sent,
+            "ready": !spawn.no_wait,
         }))
     }
 
@@ -1073,11 +1336,17 @@ fn canonical_tool_name(name: &str) -> &str {
 
 impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
+        let instructions = match self.surface {
+            ToolSurface::Simple => {
+                "Natural-language supervisor for slopd agents. When the user explicitly asks for a new, separate, or additional agent, call start_new_agent exactly once; it always creates one new agent and returns only that request's real result. When the user asks, tells, updates, corrects, or continues an existing or same agent, call message_existing_agent exactly once; it never creates an agent. If the intended existing agent is unclear, call get_work_overview first, then call message_existing_agent with the selected pane_id. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language. Use get_agent_result only when the user later asks for a pending request's result."
+            }
+            ToolSurface::Full => {
+                "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent when the user explicitly asks for a new agent and message_existing_agent for work on an existing agent. Both operations send once, wait, deduplicate, and report only the real result. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. Use get_agent_result with no arguments only when the user later asks for a pending request's result. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
+            }
+        };
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. Write prompts sent to agents in English unless the user explicitly requests another language. Preserve the language of agent replies and transcript excerpts; never translate them unless the user asks, and present agent work in that same language. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. If the user asks for more detail about one pane, call get_work_overview again with its pane_id and increase context_before for earlier task context or context_after for work since the latest user prompt. Keep increasing while more_before or more_after is true. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
-            )
+            .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -1138,7 +1407,7 @@ async fn wait_for_mailbox_reply(
         let records = client
             .read_transcript(pane_id.to_string(), None, 500)
             .await
-            .map_err(|error| error.to_string())?;
+            .unwrap_or_default();
         let snapshot = request_reply_snapshot(&records, after_cursor, prompt);
         let panes = client.ps().await.map_err(|error| error.to_string())?;
         let pane = panes
@@ -1325,7 +1594,14 @@ async fn wait_pane_ready(
                             .and_then(Value::as_i64)
                             .map(|value| format!(" with exit status {value}"))
                             .unwrap_or_default();
-                        return Err(format!("pane {pane_id} died before ready{status}"));
+                        let output = record
+                            .payload
+                            .get("output")
+                            .and_then(Value::as_str)
+                            .filter(|output| !output.trim().is_empty())
+                            .map(|output| format!(": {output}"))
+                            .unwrap_or_default();
+                        return Err(format!("pane {pane_id} died before ready{status}{output}"));
                     }
                     ("slopd", "DetailedStateChange") => {
                         let live = record
@@ -1647,6 +1923,15 @@ fn preferred_mcp_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Op
         .map(|pane| pane.pane_id)
 }
 
+fn preferred_existing_pane_id(panes: Vec<libslop::PaneInfo>, recent: &[String]) -> Option<String> {
+    for pane_id in recent {
+        if panes.iter().any(|pane| &pane.pane_id == pane_id) {
+            return Some(pane_id.clone());
+        }
+    }
+    preferred_mcp_pane_id(panes, recent)
+}
+
 fn compact_grave(entry: &libslop::GraveEntry) -> Value {
     json!({
         "grave_id": entry.grave_id,
@@ -1847,6 +2132,16 @@ fn pane_filters(arguments: Option<&Map<String, Value>>) -> Result<Vec<(String, S
         filters.push(("account".into(), account));
     }
     Ok(filters)
+}
+
+fn agent_selector_key(arguments: Option<&Map<String, Value>>, pane_id: Option<&str>) -> String {
+    json!({
+        "pane_id": pane_id,
+        "tag": optional_string(arguments, "tag"),
+        "backend": optional_string(arguments, "backend"),
+        "account": optional_string(arguments, "account"),
+    })
+    .to_string()
 }
 
 pub fn parse_backend(name: &str) -> Result<libslop::Backend, String> {

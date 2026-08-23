@@ -3,6 +3,24 @@ use serde_json::{Value, json};
 
 use crate::schema;
 
+const SIMPLE_NAMES: &[&str] = &[
+    "get_work_overview",
+    "start_new_agent",
+    "message_existing_agent",
+    "get_agent_result",
+];
+
+pub fn simple_names() -> &'static [&'static str] {
+    SIMPLE_NAMES
+}
+
+pub fn simple() -> Vec<Tool> {
+    all()
+        .into_iter()
+        .filter(|tool| SIMPLE_NAMES.contains(&tool.name.as_ref()))
+        .collect()
+}
+
 pub fn all() -> Vec<Tool> {
     let tools = vec![
         tool(
@@ -12,8 +30,41 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_work_overview",
-            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. task_context_excerpt resolves references such as 'option 4' from before the latest user prompt; current_activity_excerpt reports progress since that prompt. If the compact answer is not enough, call this same tool again for one pane with context_before and/or context_after. Increase them while more_before or more_after is true. Do not use raw transcript tools for ordinary questions. Preserve the language of every agent excerpt and never translate it unless the user asks. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
+            "See which agents exist, what they are doing, and where work left off. Use this to identify an existing agent from human context before calling message_existing_agent. Do not call it when the user explicitly asks for a new agent. Call with no arguments for every live pane or pane_id for one pane. If more context is needed, call this same tool again with larger context_before or context_after. The backend field is the agent type; title is only a label.",
             overview_schema(),
+        ),
+        tool(
+            "start_new_agent",
+            "Start exactly one new agent, give it the user's task, wait for its real reply, and return that reply. Use only when the user explicitly asks for a new, separate, or additional agent. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "backend": backend_schema(),
+                    "account": { "type": "string" },
+                    "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "message_existing_agent",
+            "Send one task or follow-up to an existing agent, wait for its real reply, and return that reply. This tool never creates an agent. Use pane_id when get_work_overview identified a specific pane; omit it for the most recently contacted existing agent. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": pane_id_schema(),
+                    "tag": { "type": "string" },
+                    "backend": backend_schema(),
+                    "account": { "type": "string" },
+                    "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
+                    "interrupt": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks to interrupt or redirect a busy agent." }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
         ),
         tool(
             "list_panes",
@@ -22,7 +73,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "create_pane",
-            "Create an agent pane and optionally send its first prompt. Reuse the returned pane_id exactly, including its leading %.",
+            "Low-level: create an idle agent pane without giving it work. Never use this before or instead of ask_or_tell_agent. For any request that asks or tells an agent to do something, call ask_or_tell_agent exactly once.",
             spawn_schema(false),
         ),
         tool(
@@ -36,8 +87,8 @@ pub fn all() -> Vec<Tool> {
             pane_schema(),
         ),
         tool(
-            "ask_agent",
-            "Preferred way to ask one agent and get its completed reply. Write the prompt in English unless the user explicitly requests another language. Identify the agent with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay available through get_agent_result. Preserve the reply's language and do not translate it unless asked.",
+            "ask_or_tell_agent",
+            "The one tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits for a reply, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional agent; otherwise the latest matching agent is reused and a dead previous agent is reported instead of replaced. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending means call get_agent_result later without resending; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -47,7 +98,8 @@ pub fn all() -> Vec<Tool> {
                     "account": { "type": "string" },
                     "prompt": { "type": "string" },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 45 },
-                    "interrupt": { "type": "boolean", "default": false }
+                    "interrupt": { "type": "boolean", "default": false },
+                    "new_agent": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks for a new, separate, or additional agent." }
                 },
                 "required": ["prompt"],
                 "additionalProperties": false
@@ -55,7 +107,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the latest request submitted through ask_agent, its completion status, and reply. Use this when the user asks whether that request finished or for its result. This is not a live-pane inventory or general conversation history; use get_work_overview when asked what agents are doing or where work left off. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative and preserves the agent's language; do not translate it unless asked. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
+            "Get the latest ask_or_tell_agent request, including creation or startup failures, so an old unrelated result is never substituted. Use only when the user asks whether that request finished or for its result. Call with no arguments first. Never call this immediately after ask_or_tell_agent returned completed or failed, and never resend the request. The top-level status and answer are authoritative.",
             json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +120,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "send_prompt",
-            "Submit a prompt in English unless the user explicitly requests another language, then wait only until slopd accepts it. Without pane_id, only slopd-mcp-tagged agents are eligible and one is created if needed. An explicit pane_id may target any managed pane; copy it exactly, including %. Then call wait_for_reply once with the returned pane_id. Preserve the reply's language and do not translate it unless asked. Do not resend while the agent is working.",
+            "Low-level asynchronous send for explicit pane control. Use ask_or_tell_agent for ordinary agent work. This returns acceptance, not an agent reply; do not claim completion from it. Never combine it with ask_or_tell_agent for the same request.",
             json!({
                 "type": "object",
                 "properties": {
@@ -170,11 +222,13 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
     match name {
         "get_status" => ("Get daemon status", true, false, true),
         "get_work_overview" => ("Get work overview", true, false, true),
+        "start_new_agent" => ("Start new agent", false, false, false),
+        "message_existing_agent" => ("Message existing agent", false, false, false),
         "list_panes" => ("List live panes", true, false, true),
         "create_pane" => ("Create pane", false, false, false),
         "fork_pane" => ("Fork pane", false, false, false),
         "kill_pane" => ("Kill pane", false, true, true),
-        "ask_agent" => ("Ask agent", false, false, false),
+        "ask_or_tell_agent" => ("Ask or tell agent", false, false, false),
         "get_agent_result" => ("Get agent result", true, false, true),
         "send_prompt" => ("Send prompt", false, false, false),
         "wait_for_reply" => ("Wait for reply", true, false, true),
@@ -234,8 +288,7 @@ fn output_schema(name: &str) -> Value {
         }),
         "create_pane" => json!({
             "pane_id": pane_id_schema(),
-            "ready": { "type": "boolean" },
-            "prompt_sent": { "type": "boolean" }
+            "ready": { "type": "boolean" }
         }),
         "fork_pane" => json!({
             "pane_id": pane_id_schema(),
@@ -243,7 +296,11 @@ fn output_schema(name: &str) -> Value {
             "ready": { "type": "boolean" }
         }),
         "kill_pane" | "interrupt_pane" => json!({ "pane_id": pane_id_schema() }),
-        "ask_agent" => mailbox_entry_schema()["properties"].clone(),
+        "start_new_agent" | "message_existing_agent" | "ask_or_tell_agent" => {
+            let mut properties = mailbox_entry_schema()["properties"].clone();
+            properties["request_reused"] = json!({ "type": "boolean", "description": "True when an identical recent call returned the original request instead of submitting duplicate work." });
+            properties
+        }
         "get_agent_result" => json!({
             "found": { "type": "boolean" },
             "request_id": { "type": ["string", "null"] },
@@ -254,7 +311,9 @@ fn output_schema(name: &str) -> Value {
             "finished": { "type": ["boolean", "null"], "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
             "reply": { "type": ["string", "null"], "description": "Verbatim agent reply in its original language." },
             "error": { "type": ["string", "null"] },
-            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." }
+            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." },
+            "agent_reply_received": { "type": "boolean", "description": "True only when reply contains a real completed agent reply." },
+            "follow_up_instruction": { "type": "string", "description": "Required routing rule for a later user turn about this agent." }
         }),
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
@@ -303,16 +362,18 @@ fn mailbox_entry_schema() -> Value {
         "type": "object",
         "properties": {
             "request_id": { "type": "string" },
-            "pane_id": pane_id_schema(),
+            "pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }], "description": "The selected pane, or null if startup failed before one was allocated." },
             "prompt": { "type": "string" },
             "created_at_unix_ms": { "type": "integer" },
             "status": { "type": "string", "enum": ["pending", "completed", "failed"] },
             "finished": { "type": "boolean", "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
             "reply": { "type": ["string", "null"], "description": "Verbatim agent reply in its original language." },
             "error": { "type": ["string", "null"] },
-            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." }
+            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." },
+            "agent_reply_received": { "type": "boolean", "description": "True only when reply contains a real completed agent reply." },
+            "follow_up_instruction": { "type": "string", "description": "Required routing rule for a later user turn about this agent." }
         },
-        "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "finished", "reply", "error", "answer"],
+        "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "finished", "reply", "error", "answer", "agent_reply_received", "follow_up_instruction"],
         "additionalProperties": false
     })
 }
@@ -429,7 +490,11 @@ fn tag_schema() -> Value {
 }
 
 fn backend_schema() -> Value {
-    json!({ "type": "string", "enum": ["claude", "opencode", "codex", "grok"] })
+    json!({
+        "type": "string",
+        "enum": ["claude", "opencode", "codex", "grok"],
+        "description": "Set only when the user explicitly names Claude, OpenCode, Codex, or Grok. Omit for 'default', 'usual', or an unspecified agent type so slopd chooses its configured default. Never infer this from the current voice model or client."
+    })
 }
 
 fn filter_schema() -> Value {
@@ -485,10 +550,6 @@ fn spawn_schema(fork: bool) -> Value {
         properties.insert("parent_pane_id".into(), pane_id_schema());
         properties.insert("account".into(), json!({ "type": "string" }));
         properties.insert("backend".into(), backend_schema());
-        properties.insert(
-            "prompt".into(),
-            json!({ "type": "string", "description": "Optional first prompt, sent after the new pane becomes ready." }),
-        );
     }
     schema
 }

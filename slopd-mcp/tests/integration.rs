@@ -73,8 +73,19 @@ async fn rpc(
     session: Option<&str>,
     body: Value,
 ) -> reqwest::Response {
+    rpc_at(client, addr, token, session, "/mcp/slopctl", body).await
+}
+
+async fn rpc_at(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: Option<&str>,
+    session: Option<&str>,
+    path: &str,
+    body: Value,
+) -> reqwest::Response {
     let mut request = client
-        .post(format!("http://{addr}/mcp"))
+        .post(format!("http://{addr}{path}"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .json(&body);
@@ -143,11 +154,21 @@ async fn initialize(
     addr: SocketAddr,
     token: Option<&str>,
 ) -> (Value, Option<String>) {
-    let response = rpc(
+    initialize_at(client, addr, token, "/mcp/slopctl").await
+}
+
+async fn initialize_at(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: Option<&str>,
+    path: &str,
+) -> (Value, Option<String>) {
+    let response = rpc_at(
         client,
         addr,
         token,
         None,
+        path,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -166,11 +187,12 @@ async fn initialize(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let body = read_rpc_message(response).await;
-    let _ = rpc(
+    let _ = rpc_at(
         client,
         addr,
         token,
         session.as_deref(),
+        path,
         json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
@@ -214,6 +236,20 @@ fn spawn_codex_env() -> Option<(TestEnv, Daemon, libsloptest::tempfile::TempDir)
     Some((env, daemon, codex_home))
 }
 
+fn spawn_failing_codex_env() -> Option<(TestEnv, Daemon, libsloptest::tempfile::TempDir)> {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let env = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None)?;
+    env.append_config(&format!(
+        "\n[accounts.broken]\nbackend = \"codex\"\nexecutable = \"/usr/bin/false\"\nconfig_dir = {:?}\n",
+        codex_home.path().to_str().unwrap(),
+    ));
+    let daemon = Daemon(Some(env.spawn_slopd()));
+    Some((env, daemon, codex_home))
+}
+
 fn tool_names(list: &Value) -> Vec<String> {
     list["result"]["tools"]
         .as_array()
@@ -232,17 +268,45 @@ async fn call_tool(
     name: &str,
     arguments: Value,
 ) -> Value {
-    rpc_json(
+    call_tool_at(
         client,
         addr,
         token,
         session,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": { "name": name, "arguments": arguments }
-        }),
+        "/mcp/slopctl",
+        id,
+        name,
+        arguments,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_tool_at(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: Option<&str>,
+    session: Option<&str>,
+    path: &str,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    read_rpc_message(
+        rpc_at(
+            client,
+            addr,
+            token,
+            session,
+            path,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }),
+        )
+        .await,
     )
     .await
 }
@@ -294,20 +358,17 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("never require the user to name MCP"),
+        instructions.contains("Full slopctl-compatible"),
         "{initialized}"
     );
     assert!(instructions.contains("get_work_overview"), "{initialized}");
+    assert!(instructions.contains("start_new_agent"), "{initialized}");
     assert!(
-        instructions.contains("Never combine an overview with get_agent_result"),
+        instructions.contains("message_existing_agent"),
         "{initialized}"
     );
     assert!(
-        instructions.contains("Write prompts sent to agents in English"),
-        "{initialized}"
-    );
-    assert!(
-        instructions.contains("Preserve the language of agent replies"),
+        instructions.contains("Preserve the language"),
         "{initialized}"
     );
 
@@ -330,11 +391,13 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         vec![
             "get_status",
             "get_work_overview",
+            "start_new_agent",
+            "message_existing_agent",
             "list_panes",
             "create_pane",
             "fork_pane",
             "kill_pane",
-            "ask_agent",
+            "ask_or_tell_agent",
             "get_agent_result",
             "send_prompt",
             "wait_for_reply",
@@ -363,7 +426,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         send["description"]
             .as_str()
             .unwrap()
-            .contains("including %")
+            .contains("Use ask_or_tell_agent for ordinary agent work")
     );
     assert_eq!(send["annotations"]["readOnlyHint"], false);
     assert_eq!(send["annotations"]["destructiveHint"], false);
@@ -380,13 +443,13 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         get_agent_result["description"]
             .as_str()
             .unwrap()
-            .contains("latest request submitted through ask_agent")
+            .contains("including creation or startup failures")
     );
     assert!(
         get_agent_result["description"]
             .as_str()
             .unwrap()
-            .contains("not a live-pane inventory")
+            .contains("old unrelated result is never substituted")
     );
     assert!(
         get_agent_result["inputSchema"]["properties"]
@@ -480,11 +543,13 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     let expected_annotations = [
         ("get_status", true, false, true),
         ("get_work_overview", true, false, true),
+        ("start_new_agent", false, false, false),
+        ("message_existing_agent", false, false, false),
         ("list_panes", true, false, true),
         ("create_pane", false, false, false),
         ("fork_pane", false, false, false),
         ("kill_pane", false, true, true),
-        ("ask_agent", false, false, false),
+        ("ask_or_tell_agent", false, false, false),
         ("get_agent_result", true, false, true),
         ("send_prompt", false, false, false),
         ("wait_for_reply", true, false, true),
@@ -534,6 +599,169 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(missing["error"]["data"]["code"], "unknown_pane_id");
     assert_eq!(missing["error"]["data"]["retry_with"]["tool"], "list_panes");
     assert!(missing["error"]["data"]["valid_panes"].is_array());
+}
+
+#[tokio::test]
+async fn natural_surface_separates_new_and_existing_agents() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (initialized, session) = initialize_at(&client, addr, None, "/mcp").await;
+    let instructions = initialized["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("start_new_agent"), "{initialized}");
+    assert!(
+        instructions.contains("message_existing_agent"),
+        "{initialized}"
+    );
+
+    let listed = read_rpc_message(
+        rpc_at(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list" }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        tool_names(&listed),
+        vec![
+            "get_work_overview",
+            "start_new_agent",
+            "message_existing_agent",
+            "get_agent_result",
+        ]
+    );
+    for name in ["start_new_agent", "message_existing_agent"] {
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("Translate the user's task to English"),
+            "{tool}"
+        );
+        assert!(
+            tool["inputSchema"]["properties"]["prompt"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Translate the user's task to English"),
+            "{tool}"
+        );
+    }
+
+    let hidden = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        11,
+        "send_prompt",
+        json!({ "pane_id": "%2", "prompt": "MUST_NOT_SEND" }),
+    )
+    .await;
+    assert_eq!(hidden["error"]["code"], -32602, "{hidden}");
+
+    let missing = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        12,
+        "message_existing_agent",
+        json!({
+            "backend": "codex",
+            "prompt": "MUST_NOT_CREATE",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let missing = tool_payload(&missing);
+    assert_eq!(missing["status"], "failed", "{missing}");
+    assert!(missing["pane_id"].is_null(), "{missing}");
+    assert!(
+        missing["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no new agent was created")),
+        "{missing}"
+    );
+
+    let started = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        13,
+        "start_new_agent",
+        json!({
+            "backend": "codex",
+            "prompt": "NEW_INTENT_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let started = tool_payload(&started);
+    assert_eq!(started["status"], "completed", "{started}");
+    assert!(
+        started["reply"]
+            .as_str()
+            .is_some_and(|reply| reply.contains("NEW_INTENT_CANARY")),
+        "{started}"
+    );
+    let pane_id = started["pane_id"].as_str().unwrap().to_string();
+
+    let messaged = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        14,
+        "message_existing_agent",
+        json!({
+            "prompt": "EXISTING_INTENT_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let messaged = tool_payload(&messaged);
+    assert_eq!(messaged["status"], "completed", "{messaged}");
+    assert_eq!(messaged["pane_id"], pane_id, "{messaged}");
+    assert!(
+        messaged["reply"]
+            .as_str()
+            .is_some_and(|reply| reply.contains("EXISTING_INTENT_CANARY")),
+        "{messaged}"
+    );
+
+    let overview = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        15,
+        "get_work_overview",
+        json!({}),
+    )
+    .await;
+    let overview = tool_payload(&overview);
+    assert_eq!(overview["count"], 1, "{overview}");
+    assert_eq!(overview["panes"][0]["pane_id"], pane_id, "{overview}");
 }
 
 #[tokio::test]
@@ -972,7 +1200,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
 }
 
 #[tokio::test]
-async fn cached_run_alias_creates_and_prompts_a_pane() {
+async fn cached_run_alias_creates_idle_panes_and_rejects_prompts() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {
         eprintln!("skipping: tmux is unavailable");
         return;
@@ -982,7 +1210,7 @@ async fn cached_run_alias_creates_and_prompts_a_pane() {
     let (_, session) = initialize(&client, addr, None).await;
     let session = session.as_deref();
 
-    let created = call_tool(
+    let rejected = call_tool(
         &client,
         addr,
         None,
@@ -996,36 +1224,28 @@ async fn cached_run_alias_creates_and_prompts_a_pane() {
         }),
     )
     .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("use one ask_or_tell_agent call")),
+        "{rejected}"
+    );
+
+    let created = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        71,
+        "run",
+        json!({ "backend": "claude", "ready_timeout": 20 }),
+    )
+    .await;
     let created = tool_payload(&created);
     let pane_id = created["pane_id"].as_str().unwrap().to_string();
     assert_eq!(created["ready"], true, "{created}");
-    assert_eq!(created["prompt_sent"], true, "{created}");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let transcript = call_tool(
-            &client,
-            addr,
-            None,
-            session,
-            71,
-            "transcript",
-            json!({ "pane_id": pane_id, "limit": 50 }),
-        )
-        .await;
-        let transcript = tool_payload(&transcript);
-        if transcript["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|record| record["text"].as_str())
-            .any(|text| text.contains("CACHED_RUN_CANARY"))
-        {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "{transcript}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    assert!(created.get("prompt_sent").is_none(), "{created}");
 
     let killed = call_tool(
         &client,
@@ -1069,7 +1289,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         ),
         ("kill_pane", json!({ "pane_id": malformed })),
         (
-            "ask_agent",
+            "ask_or_tell_agent",
             json!({ "pane_id": malformed, "prompt": "must not be sent" }),
         ),
         ("get_work_overview", json!({ "pane_id": malformed })),
@@ -1216,13 +1436,37 @@ async fn implicit_mutations_create_owned_panes_instead_of_using_untagged_matches
     .await;
     assert_eq!(tool_payload(&removed)["pane_id"], unowned);
 
+    let (_, simple_session) = initialize_at(&client, addr, None, "/mcp").await;
+    let explicitly_messaged = call_tool_at(
+        &client,
+        addr,
+        None,
+        simple_session.as_deref(),
+        "/mcp",
+        74,
+        "message_existing_agent",
+        json!({
+            "pane_id": unowned,
+            "prompt": "EXPLICIT_UNOWNED_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let explicitly_messaged = tool_payload(&explicitly_messaged);
+    assert_eq!(explicitly_messaged["pane_id"], unowned);
+    assert_eq!(explicitly_messaged["status"], "completed");
+    assert_eq!(
+        explicitly_messaged["reply"],
+        "mock response: EXPLICIT_UNOWNED_CANARY"
+    );
+
     let asked = call_tool(
         &client,
         addr,
         None,
         session.as_deref(),
         75,
-        "ask_agent",
+        "ask_or_tell_agent",
         json!({
             "account": "codex",
             "backend": "codex",
@@ -1281,6 +1525,117 @@ async fn implicit_mutations_create_owned_panes_instead_of_using_untagged_matches
 }
 
 #[tokio::test]
+async fn failed_agent_start_is_current_deduplicated_and_not_silently_replaced() {
+    let Some((env, _daemon, _codex_home)) = spawn_failing_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize(&client, addr, None).await;
+    let first_arguments = json!({
+        "account": "broken",
+        "backend": "codex",
+        "prompt": "START_FAILURE_CANARY",
+        "new_agent": true,
+        "wait_seconds": 10
+    });
+
+    let first = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        200,
+        "ask_or_tell_agent",
+        first_arguments.clone(),
+    )
+    .await;
+    let first = tool_payload(&first);
+    assert_eq!(first["status"], "failed", "{first}");
+    assert_eq!(first["finished"], true, "{first}");
+    assert_eq!(first["request_reused"], false, "{first}");
+    assert!(
+        first["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("died before ready")),
+        "{first}"
+    );
+    let first_request = first["request_id"].as_str().unwrap().to_string();
+    let first_pane = first["pane_id"].as_str().unwrap().to_string();
+
+    let duplicate = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        201,
+        "ask_or_tell_agent",
+        first_arguments,
+    )
+    .await;
+    let duplicate = tool_payload(&duplicate);
+    assert_eq!(duplicate["request_id"], first_request, "{duplicate}");
+    assert_eq!(duplicate["pane_id"], first_pane, "{duplicate}");
+    assert_eq!(duplicate["request_reused"], true, "{duplicate}");
+
+    let follow_up = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        202,
+        "ask_or_tell_agent",
+        json!({
+            "account": "broken",
+            "backend": "codex",
+            "prompt": "FOLLOW_UP_CANARY",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let follow_up = tool_payload(&follow_up);
+    assert_eq!(follow_up["status"], "failed", "{follow_up}");
+    assert_eq!(follow_up["pane_id"], first_pane, "{follow_up}");
+    assert_ne!(follow_up["request_id"], first_request, "{follow_up}");
+    assert!(
+        follow_up["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("no new pane was created")),
+        "{follow_up}"
+    );
+
+    let latest = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        203,
+        "get_agent_result",
+        json!({}),
+    )
+    .await;
+    let latest = tool_payload(&latest);
+    assert_eq!(latest["request_id"], follow_up["request_id"], "{latest}");
+    assert_eq!(latest["prompt"], "FOLLOW_UP_CANARY", "{latest}");
+    assert_eq!(latest["pane_id"], first_pane, "{latest}");
+
+    let dead = call_tool(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        204,
+        "list_dead_panes",
+        json!({}),
+    )
+    .await;
+    let dead = tool_payload(&dead);
+    assert_eq!(dead["count"], 1, "{dead}");
+    assert_eq!(dead["entries"][0]["pane_id"], first_pane, "{dead}");
+}
+
+#[tokio::test]
 async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
         eprintln!("skipping: tmux is unavailable");
@@ -1304,7 +1659,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     )
     .await;
     let names = tool_names(&listed);
-    assert!(names.iter().any(|name| name == "ask_agent"));
+    assert!(names.iter().any(|name| name == "ask_or_tell_agent"));
     assert!(names.iter().any(|name| name == "get_agent_result"));
     assert!(names.iter().any(|name| name == "wait_for_reply"));
     assert!(!names.iter().any(|name| name == "collect_events"));
@@ -1328,13 +1683,28 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "ask_agent")
+        .find(|tool| tool["name"] == "ask_or_tell_agent")
         .unwrap();
     assert_eq!(ask_tool["inputSchema"]["required"], json!(["prompt"]));
     assert!(
         ask_tool["inputSchema"]["properties"]
             .get("backend")
             .is_some()
+    );
+    assert_eq!(
+        ask_tool["inputSchema"]["properties"]["new_agent"]["default"],
+        false
+    );
+    let create_tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "create_pane")
+        .unwrap();
+    assert!(
+        create_tool["inputSchema"]["properties"]
+            .get("prompt")
+            .is_none()
     );
 
     let hidden = call_tool(
@@ -1402,7 +1772,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         None,
         control_session.as_deref(),
         89,
-        "ask_agent",
+        "ask_or_tell_agent",
         json!({
             "backend": "codex",
             "prompt": "MAILBOX_SYNC_CANARY",
@@ -1448,17 +1818,25 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
             .any(|record| { record["text"] == "I am still working after the helper runs." })
     );
 
-    let overview = call_tool(
-        &client,
-        addr,
-        None,
-        control_session.as_deref(),
-        96,
-        "get_work_overview",
-        json!({ "pane_id": pane_id.clone() }),
-    )
-    .await;
-    let overview = tool_payload(&overview);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let overview = loop {
+        let overview = call_tool(
+            &client,
+            addr,
+            None,
+            control_session.as_deref(),
+            96,
+            "get_work_overview",
+            json!({ "pane_id": pane_id.clone() }),
+        )
+        .await;
+        let overview = tool_payload(&overview);
+        if overview["state_counts"]["ready"] == 1 {
+            break overview;
+        }
+        assert!(std::time::Instant::now() < deadline, "{overview}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(overview["count"], 1, "{overview}");
     assert_eq!(overview["state_counts"]["ready"], 1, "{overview}");
     assert_eq!(overview["panes"][0]["backend"], "codex", "{overview}");
@@ -1521,7 +1899,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
         None,
         control_session.as_deref(),
         90,
-        "ask_agent",
+        "ask_or_tell_agent",
         json!({
             "pane_id": pane_id.clone(),
             "prompt": "::mock active",
@@ -1534,7 +1912,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert_eq!(pending["finished"], false);
     assert_eq!(
         pending["answer"],
-        "The agent is still running and has not replied yet."
+        "The agent is still running. Do not submit this request again; use get_agent_result later."
     );
     let pending_id = pending["request_id"].as_str().unwrap().to_string();
 
