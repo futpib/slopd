@@ -302,6 +302,14 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         instructions.contains("Never combine an overview with get_agent_result"),
         "{initialized}"
     );
+    assert!(
+        instructions.contains("Write prompts sent to agents in English"),
+        "{initialized}"
+    );
+    assert!(
+        instructions.contains("Preserve the language of agent replies"),
+        "{initialized}"
+    );
 
     let listed = rpc_json(
         &client,
@@ -396,6 +404,12 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         get_agent_result["outputSchema"]["properties"]["answer"]["type"],
         "string"
+    );
+    assert!(
+        get_agent_result["outputSchema"]["properties"]["reply"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("original language")
     );
     let overview = listed["result"]["tools"]
         .as_array()
@@ -1547,10 +1561,7 @@ async fn simple_mode_hides_events_and_waits_for_the_final_reply() {
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["finished"], true);
     assert_eq!(completed["reply"], "steered: MAILBOX_ASYNC_FINISH");
-    assert_eq!(
-        completed["answer"],
-        "The agent finished successfully. Reply: steered: MAILBOX_ASYNC_FINISH"
-    );
+    assert_eq!(completed["answer"], "steered: MAILBOX_ASYNC_FINISH");
 
     let killed = call_tool(
         &client,

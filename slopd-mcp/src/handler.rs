@@ -117,9 +117,9 @@ impl MailboxEntry {
             MailboxState::Completed(reply) => (
                 "completed",
                 true,
-                json!(reply),
+                json!(reply.clone()),
                 Value::Null,
-                json!(format!("The agent finished successfully. Reply: {reply}")),
+                json!(reply),
             ),
             MailboxState::Failed(error) => (
                 "failed",
@@ -1057,7 +1057,7 @@ impl ServerHandler for SlopdMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
+                "Supervisor for slopd-managed agent panes. Translate ordinary human requests into tools; never require the user to name MCP, a tool, or a pane ID. Write prompts sent to agents in English unless the user explicitly requests another language. Preserve the language of agent replies and transcript excerpts; never translate them unless the user asks, and present agent work in that same language. For read-only questions about what is happening in slopd, which agents are running or doing work, or where work left off across panes, call get_work_overview with no arguments and use its authoritative answer. If the user says 'slopd-mcp agent' or 'MCP agent', call get_work_overview with tag=slopd-mcp. Never combine an overview with get_agent_result or a mutating tool such as send_prompt. The backend field is the agent type; title is only a label. For a new request such as 'ask my Codex agent', call ask_agent with backend=codex. Only if the user asks whether the latest ask_agent request finished or for that request's result, call get_agent_result with no arguments; it is not evidence that its pane is still live. Without an explicit pane_id, mutating tools use only slopd-mcp-tagged panes and create one when needed. Fast replies return inline and slow replies remain available through get_agent_result across new MCP sessions. Never resend a pending request.",
             )
     }
 

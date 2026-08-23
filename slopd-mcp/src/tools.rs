@@ -12,7 +12,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_work_overview",
-            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. It already reads compact recent conversation excerpts; do not also call get_agent_result, send a prompt, or inspect dead panes. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
+            "Read-only overview of what is happening in slopd and where work left off. Use this when the user asks which agents are running, what they are doing, or for a summary across one or many panes. Call with no arguments for every live pane. If the user says 'slopd-mcp agent' or 'MCP agent', call with tag=slopd-mcp. It already reads compact recent conversation excerpts; do not also call get_agent_result, send a prompt, or inspect dead panes. Preserve the language of every agent excerpt and never translate it unless the user asks. reply_complete describes the full reply, not whether its excerpt was shortened. The backend field is the agent type; title is only a user-facing label.",
             overview_schema(),
         ),
         tool(
@@ -37,7 +37,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_agent",
-            "Preferred way to ask one agent and get its completed reply. Identify it with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay available through get_agent_result.",
+            "Preferred way to ask one agent and get its completed reply. Write the prompt in English unless the user explicitly requests another language. Identify the agent with pane_id or ordinary selectors such as backend=codex. Without pane_id, only slopd-mcp-tagged agents are eligible; the most recently used match is reused, or a matching agent is created and tagged automatically. Never ask the user for a pane ID just to make this work. Fast replies return inline; slow replies stay available through get_agent_result. Preserve the reply's language and do not translate it unless asked.",
             json!({
                 "type": "object",
                 "properties": {
@@ -55,7 +55,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the latest request submitted through ask_agent, its completion status, and reply. Use this when the user asks whether that request finished or for its result. This is not a live-pane inventory or general conversation history; use get_work_overview when asked what agents are doing or where work left off. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
+            "Get the latest request submitted through ask_agent, its completion status, and reply. Use this when the user asks whether that request finished or for its result. This is not a live-pane inventory or general conversation history; use get_work_overview when asked what agents are doing or where work left off. Call with no arguments first; no request or pane ID is needed. The top-level answer is authoritative and preserves the agent's language; do not translate it unless asked. Optional filters select one request or pane; wait_seconds can briefly wait for a pending reply.",
             json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +68,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "send_prompt",
-            "Submit a prompt and wait only until slopd accepts it. Without pane_id, only slopd-mcp-tagged agents are eligible and one is created if needed. An explicit pane_id may target any managed pane; copy it exactly, including %. Then call wait_for_reply once with the returned pane_id. Do not resend while the agent is working.",
+            "Submit a prompt in English unless the user explicitly requests another language, then wait only until slopd accepts it. Without pane_id, only slopd-mcp-tagged agents are eligible and one is created if needed. An explicit pane_id may target any managed pane; copy it exactly, including %. Then call wait_for_reply once with the returned pane_id. Preserve the reply's language and do not translate it unless asked. Do not resend while the agent is working.",
             json!({
                 "type": "object",
                 "properties": {
@@ -215,7 +215,7 @@ fn output_schema(name: &str) -> Value {
                 "additionalProperties": false
             },
             "panes": { "type": "array", "items": overview_pane_schema() },
-            "answer": { "type": "string", "description": "Authoritative summary grounded in live pane state and recent useful conversation text." }
+            "answer": { "type": "string", "description": "Authoritative English status summary with agent excerpts preserved in their original language." }
         }),
         "list_panes" => json!({
             "count": { "type": "integer" },
@@ -252,16 +252,16 @@ fn output_schema(name: &str) -> Value {
             "created_at_unix_ms": { "type": ["integer", "null"] },
             "status": { "type": "string", "enum": ["not_found", "pending", "completed", "failed"] },
             "finished": { "type": ["boolean", "null"], "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
-            "reply": { "type": ["string", "null"] },
+            "reply": { "type": ["string", "null"], "description": "Verbatim agent reply in its original language." },
             "error": { "type": ["string", "null"] },
-            "answer": { "type": "string", "description": "Authoritative natural-language answer to give the user." }
+            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." }
         }),
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
         }),
         "wait_for_reply" => json!({
             "pane_id": pane_id_schema(),
-            "reply": { "type": "string" }
+            "reply": { "type": "string", "description": "Verbatim agent reply in its original language; do not translate unless asked." }
         }),
         "collect_events" => json!({
             "records": { "type": "array", "items": { "type": "object" } },
@@ -308,9 +308,9 @@ fn mailbox_entry_schema() -> Value {
             "created_at_unix_ms": { "type": "integer" },
             "status": { "type": "string", "enum": ["pending", "completed", "failed"] },
             "finished": { "type": "boolean", "description": "True means the request is no longer running. With status completed, answer yes when asked whether the agent finished." },
-            "reply": { "type": ["string", "null"] },
+            "reply": { "type": ["string", "null"], "description": "Verbatim agent reply in its original language." },
             "error": { "type": ["string", "null"] },
-            "answer": { "type": "string", "description": "Authoritative natural-language answer to give the user." }
+            "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." }
         },
         "required": ["request_id", "pane_id", "prompt", "created_at_unix_ms", "status", "finished", "reply", "error", "answer"],
         "additionalProperties": false
@@ -352,8 +352,8 @@ fn overview_pane_schema() -> Value {
             "tags": { "type": "array", "items": { "type": "string" } },
             "title": { "type": ["string", "null"], "description": "User-facing label, not the agent type." },
             "working_dir": { "type": ["string", "null"] },
-            "last_request_excerpt": { "type": ["string", "null"] },
-            "latest_reply_excerpt": { "type": ["string", "null"] },
+            "last_request_excerpt": { "type": ["string", "null"], "description": "Verbatim excerpt in its original language." },
+            "latest_reply_excerpt": { "type": ["string", "null"], "description": "Verbatim agent excerpt in its original language; do not translate unless asked." },
             "reply_complete": { "type": "boolean" },
             "transcript_error": { "type": ["string", "null"] }
         },
