@@ -804,118 +804,141 @@ impl Adapter {
             Err(error) => return reject(sender, id, error).await,
         };
 
-        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-        let creation = self.session_creation.lock().await;
         if !self.sessions.lock().await.contains_key(&params.session_id) {
             return reject(sender, id, "session/prompt: unknown session".into()).await;
         }
-        if let Err(error) = self.ensure_session_resident(&params.session_id).await {
-            return server_error(sender, id, format!("session/prompt: {error}")).await;
-        }
-        let lease = {
-            let mut sessions = self.sessions.lock().await;
-            let Some(session) = sessions.get_mut(&params.session_id) else {
-                return reject(sender, id, "session/prompt: unknown session".into()).await;
+        let mut recovered_stale_pane = false;
+        loop {
+            let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+            let creation = self.session_creation.lock().await;
+            if let Err(error) = self.ensure_session_resident(&params.session_id).await {
+                return server_error(sender, id, format!("session/prompt: {error}")).await;
+            }
+            let lease = {
+                let mut sessions = self.sessions.lock().await;
+                let Some(session) = sessions.get_mut(&params.session_id) else {
+                    return reject(sender, id, "session/prompt: unknown session".into()).await;
+                };
+                if session.active_turn.is_some() {
+                    return reject(
+                        sender,
+                        id,
+                        "session/prompt: prompt already in flight".into(),
+                    )
+                    .await;
+                }
+                let pane_id = session
+                    .pane_id
+                    .clone()
+                    .expect("resident session must have a pane");
+                let backend = session
+                    .backend
+                    .expect("resident session must have a backend");
+
+                let system_prompt = (!session.system_prompt_delivered)
+                    .then_some(session.system_prompt.as_deref())
+                    .flatten();
+                let prompt = frame_first_prompt(system_prompt, &user_prompt);
+                let discard_replayed_history = std::mem::take(&mut session.pending_resume_history);
+                let cancel = CancellationToken::new();
+                let steering = Arc::new(Semaphore::new(1));
+                let done = CancellationToken::new();
+                session.active_turn = Some(ActiveTurn {
+                    id: turn_id,
+                    cancel: cancel.clone(),
+                    steering: Arc::clone(&steering),
+                    done: done.clone(),
+                });
+                session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+                TurnLease {
+                    turn_id,
+                    pane_id,
+                    backend,
+                    native_session_id: session.native_session_id.clone(),
+                    prompt,
+                    system_prompt_included: system_prompt.is_some(),
+                    discard_replayed_history,
+                    cancel,
+                    steering,
+                    done,
+                }
             };
-            if session.active_turn.is_some() {
-                return reject(
-                    sender,
-                    id,
-                    "session/prompt: prompt already in flight".into(),
-                )
-                .await;
-            }
-            let pane_id = session
-                .pane_id
-                .clone()
-                .expect("resident session must have a pane");
-            let backend = session
-                .backend
-                .expect("resident session must have a backend");
+            drop(creation);
 
-            let system_prompt = (!session.system_prompt_delivered)
-                .then_some(session.system_prompt.as_deref())
-                .flatten();
-            let prompt = frame_first_prompt(system_prompt, &user_prompt);
-            let discard_replayed_history = std::mem::take(&mut session.pending_resume_history);
-            let cancel = CancellationToken::new();
-            let steering = Arc::new(Semaphore::new(1));
-            let done = CancellationToken::new();
-            session.active_turn = Some(ActiveTurn {
-                id: turn_id,
-                cancel: cancel.clone(),
-                steering: Arc::clone(&steering),
-                done: done.clone(),
-            });
-            session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
-            TurnLease {
-                turn_id,
-                pane_id,
-                backend,
-                native_session_id: session.native_session_id.clone(),
-                prompt,
-                system_prompt_included: system_prompt.is_some(),
-                discard_replayed_history,
-                cancel,
-                steering,
-                done,
-            }
-        };
-        drop(creation);
-
-        let accepted = Arc::new(AtomicBool::new(false));
-        let run = self.run_turn(&params.session_id, &lease, Arc::clone(&accepted), sender);
-        let result = match tokio::time::timeout(self.config.turn_timeout, run).await {
-            Ok(result) => result,
-            Err(_) => {
-                if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
-                    tracing::warn!("failed to interrupt timed-out pane: {error}");
+            let accepted = Arc::new(AtomicBool::new(false));
+            let run = self.run_turn(&params.session_id, &lease, Arc::clone(&accepted), sender);
+            let result = match tokio::time::timeout(self.config.turn_timeout, run).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
+                        tracing::warn!("failed to interrupt timed-out pane: {error}");
+                    }
+                    Err(format!(
+                        "turn timed out after {} seconds",
+                        self.config.turn_timeout.as_secs()
+                    ))
                 }
-                Err(format!(
-                    "turn timed out after {} seconds",
-                    self.config.turn_timeout.as_secs()
-                ))
-            }
-        };
+            };
 
-        lease.done.cancel();
-        let _steering = lease
-            .steering
-            .acquire()
-            .await
-            .expect("turn semaphore is never closed");
+            lease.done.cancel();
+            let _steering = lease
+                .steering
+                .acquire()
+                .await
+                .expect("turn semaphore is never closed");
+            let was_accepted = result
+                .as_ref()
+                .map(|result| result.accepted)
+                .unwrap_or_else(|_| accepted.load(Ordering::Acquire));
 
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&params.session_id)
-                && session
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|active| active.id == lease.turn_id)
             {
-                session.active_turn = None;
-                let was_accepted = result
-                    .as_ref()
-                    .map(|result| result.accepted)
-                    .unwrap_or_else(|_| accepted.load(Ordering::Acquire));
-                if lease.system_prompt_included && was_accepted {
-                    session.system_prompt_delivered = true;
-                }
-                if lease.discard_replayed_history && !was_accepted {
-                    session.pending_resume_history = true;
+                let mut sessions = self.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&params.session_id)
+                    && session
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|active| active.id == lease.turn_id)
+                {
+                    session.active_turn = None;
+                    if lease.system_prompt_included && was_accepted {
+                        session.system_prompt_delivered = true;
+                    }
+                    if lease.discard_replayed_history && !was_accepted {
+                        session.pending_resume_history = true;
+                    }
                 }
             }
-        }
 
-        match result {
-            Ok(result) => {
-                wire::send(
-                    sender,
-                    wire::ok(id, json!({ "stopReason": result.stop_reason })),
-                )
-                .await;
+            if !recovered_stale_pane
+                && !was_accepted
+                && result
+                    .as_ref()
+                    .is_err_and(|error| stale_pane_prompt_error(error))
+            {
+                tracing::warn!(
+                    session_id = params.session_id,
+                    pane_id = lease.pane_id,
+                    "prompt found a stale ACP pane; restoring and retrying once"
+                );
+                let _ = self.kill_pane(&lease.pane_id).await;
+                self.mark_pane_gone(&params.session_id, &lease.pane_id, None)
+                    .await;
+                self.capture_latest_grave(&params.session_id).await;
+                recovered_stale_pane = true;
+                continue;
             }
-            Err(error) => server_error(sender, id, error).await,
+
+            match result {
+                Ok(result) => {
+                    wire::send(
+                        sender,
+                        wire::ok(id, json!({ "stopReason": result.stop_reason })),
+                    )
+                    .await;
+                }
+                Err(error) => server_error(sender, id, error).await,
+            }
+            return;
         }
     }
 
@@ -1421,6 +1444,17 @@ impl Adapter {
     }
 
     async fn ensure_session_resident(&self, session_id: &str) -> Result<(), String> {
+        let resident = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|session| session.pane_id.clone());
+        if resident.is_some() {
+            let mut client = self.config.transport.connect().await?;
+            let panes = client.ps().await.map_err(|error| error.to_string())?;
+            self.reconcile_live_sessions(&panes).await;
+        }
         let (start_directory, cwd, native_session_id, grave_id) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
@@ -1845,6 +1879,10 @@ impl Adapter {
             cancel.cancel();
         }
     }
+}
+
+fn stale_pane_prompt_error(error: &str) -> bool {
+    error.contains("is not managed by slopd") || error.contains("tmux send-keys failed")
 }
 
 fn state_ready_completes(backend: libslop::Backend, saw_busy: bool, saw_answer: bool) -> bool {
@@ -2992,6 +3030,17 @@ mod tests {
                 .unwrap_err()
                 .contains("unsupported")
         );
+    }
+
+    #[test]
+    fn stale_pane_send_failures_are_recoverable_before_acceptance() {
+        assert!(stale_pane_prompt_error(
+            "server error: pane %46 is not managed by slopd"
+        ));
+        assert!(stale_pane_prompt_error(
+            "server error: tmux send-keys failed for pane %53"
+        ));
+        assert!(!stale_pane_prompt_error("transport connection refused"));
     }
 
     #[test]

@@ -859,6 +859,55 @@ fn dead_panes_are_pruned_before_limit_eviction() {
 }
 
 #[test]
+fn prompt_restores_a_dead_resident_pane_without_client_retry() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let (first, _) = prompt(&mut harness, 3, &session_id, "FIRST_TURN");
+    assert_eq!(first["result"]["stopReason"], "end_turn");
+    let dead_pane = session_pane_id(&env, &session_id);
+    let killed = env.slopctl(&["kill", &dead_pane]);
+    assert!(
+        killed.status.success(),
+        "failed to kill test pane: {killed:?}"
+    );
+
+    let started = Instant::now();
+    let (restored, notifications) = prompt(&mut harness, 4, &session_id, "RESTORED_TURN");
+
+    assert_eq!(restored["result"]["stopReason"], "end_turn");
+    assert!(
+        streamed_text(&notifications).contains("RESTORED_TURN"),
+        "restored turn was not streamed: {notifications:?}"
+    );
+    assert_ne!(session_pane_id(&env, &session_id), dead_pane);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stale-pane recovery took too long: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn graceful_adapter_eof_detaches_panes_for_a_replacement_to_resume() {
     build_bin("slopd");
     build_bin("slopctl");
