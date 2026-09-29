@@ -281,6 +281,11 @@ impl LifecycleJournal {
         action: &str,
     ) -> Result<(), String> {
         let mut current = self.current.lock().unwrap();
+        // Restoring a live generation's own checkpoint does not consume its
+        // reboot backup. The generation can continue recording new checkpoints.
+        if *source == current.generation {
+            return Ok(());
+        }
         append_event(
             &mut current.file,
             &JournalEvent::RestoreResolved {
@@ -642,7 +647,11 @@ fn read_generation(path: &Path) -> Result<GenerationState, String> {
             ..
         } => state.revivals.push((grave_id, at, pane_id)),
         JournalEvent::RestoreResolved { source, .. } => {
-            state.resolved_sources.insert(source);
+            // Older daemons also marked same-generation manual restores as
+            // resolved, hiding every later checkpoint after a reboot.
+            if state.key.as_ref() != Some(&source) {
+                state.resolved_sources.insert(source);
+            }
         }
     })
     .map_err(|e| format!("failed to read lifecycle journal {}: {e}", path.display()))?;
@@ -943,6 +952,74 @@ mod tests {
 
         let reopened = open(dir.path(), &config, second, 2);
         assert!(reopened.pending_restore().unwrap().is_none());
+    }
+
+    #[test]
+    fn current_generation_restore_preserves_reboot_checkpoint() {
+        for update_checkpoint in [false, true] {
+            let dir = libsloptest::tempfile::tempdir().unwrap();
+            let config = config(dir.path(), "slopd");
+            let first = GenerationKey {
+                tmux_boot_id: "boot-a".into(),
+                tmux_session_id: "$0".into(),
+            };
+            let journal = open(dir.path(), &config, first.clone(), 1);
+            let mut expected = vec![pane("%4", "session")];
+            journal.checkpoint(expected.clone()).unwrap();
+            journal.resolve_restore(&first, "manual_restore").unwrap();
+            if update_checkpoint {
+                expected.push(pane("%5", "later-session"));
+                journal.checkpoint(expected.clone()).unwrap();
+            }
+            drop(journal);
+
+            let second = GenerationKey {
+                tmux_boot_id: "boot-b".into(),
+                tmux_session_id: "$0".into(),
+            };
+            let reopened = open(dir.path(), &config, second, 2);
+            assert_eq!(
+                reopened.pending_restore().unwrap(),
+                Some((first, expected)),
+                "a manual restore within the live generation must not consume its reboot backup"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_self_resolution_does_not_consume_reboot_checkpoint() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let first = GenerationKey {
+            tmux_boot_id: "boot-a".into(),
+            tmux_session_id: "$0".into(),
+        };
+        let journal = open(dir.path(), &config, first.clone(), 1);
+        let expected = vec![pane("%4", "session")];
+        journal.checkpoint(expected.clone()).unwrap();
+        // Older daemons wrote a resolution naming their own still-live
+        // generation, even when restore skipped every already-running pane.
+        append_event(
+            &mut journal.current.lock().unwrap().file,
+            &JournalEvent::RestoreResolved {
+                at: now(),
+                source: first.clone(),
+                action: "manual_restore".into(),
+            },
+        )
+        .unwrap();
+        drop(journal);
+
+        let second = GenerationKey {
+            tmux_boot_id: "boot-b".into(),
+            tmux_session_id: "$0".into(),
+        };
+        let reopened = open(dir.path(), &config, second, 2);
+        assert_eq!(
+            reopened.pending_restore().unwrap(),
+            Some((first, expected)),
+            "existing self-resolution records must not hide a recovery checkpoint"
+        );
     }
 
     #[test]

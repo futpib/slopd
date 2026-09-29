@@ -482,6 +482,10 @@ that is already running or that it has already restored in the same pass. It is
 otherwise best-effort — a pane whose session can no longer be resumed simply
 fails without preventing the other panes from being restored.
 
+A manual restore within the current tmux generation keeps that generation's
+checkpoint eligible for recovery after the next reboot. Only restoring or
+explicitly replacing an older generation's checkpoint consumes its restore point.
+
 Because restore continues the same backend session, a restored pane keeps its
 conversation identity and its checkpoints stay useful across repeated reboots.
 The default (`auto_backup = true`, `auto_restore = false`) keeps a current backup

@@ -4478,6 +4478,11 @@ fn hook_belongs_to_bound_session(
     event: &str,
     payload: &serde_json::Value,
 ) -> bool {
+    // OpenCode's API owns its session identity and lifecycle. CLI hooks from
+    // inherited or colliding pane IDs must not overwrite its recovery state.
+    if !backend.uses_injected_hooks() {
+        return false;
+    }
     if backend != libslop::Backend::Codex {
         return true;
     }

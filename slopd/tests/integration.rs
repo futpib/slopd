@@ -12955,6 +12955,49 @@ fn manual_restore_skips_already_running_session() {
     kill_slopd(slopd);
 }
 
+// A manual restore against the live generation must not consume the checkpoints
+// that automatic restore will need after the next reboot.
+#[test]
+fn manual_restore_preserves_next_reboot_recovery() {
+    let Some((env, _home)) = backup_env("[backup]\nauto_restore = true") else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+
+    let slopd1 = env.spawn_slopd();
+    let pane = run_and_wait(&env);
+    assert!(env.slopctl(&["backup"]).status.success());
+    let restored = env.slopctl(&["restore"]);
+    assert!(restored.status.success(), "restore failed: {restored:?}");
+    assert!(String::from_utf8_lossy(&restored.stdout).contains("restored 0"));
+    assert!(
+        env.slopctl(&["tag", &pane, "after-restore"])
+            .status
+            .success()
+    );
+    sigint_child(slopd1);
+    reboot_tmux(&env);
+
+    let slopd2 = env.spawn_slopd();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while count_panes_with_session(&env, MOCK_SID) == 0 {
+        if Instant::now() > deadline {
+            kill_slopd(slopd2);
+            panic!("manual restore suppressed the next reboot's recovery");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let restored = panes
+        .iter()
+        .find(|pane| pane.session_id.as_deref() == Some(MOCK_SID))
+        .unwrap();
+    assert!(restored.tags.contains(&"after-restore".to_string()));
+    assert_eq!(count_panes_with_session(&env, MOCK_SID), 1);
+    kill_slopd(slopd2);
+}
+
 // Repeated reboots must not accumulate duplicates: a session restored once stays
 // a single pane across a second reboot+restore.
 #[test]
@@ -16286,6 +16329,53 @@ fn fork_claude_pane_mints_new_forked_session() {
         "source pane session must be untouched by the fork"
     );
 
+    kill_slopd(slopd);
+}
+
+#[test]
+fn opencode_ignores_foreign_cli_hooks() {
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock_opencode = cargo_bin("mock_opencode");
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\n",
+        mock_opencode.to_str().unwrap(),
+    ));
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "oc"]);
+    assert!(run.status.success(), "run failed: {run:?}");
+    let pane_id = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    let before: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let before = before.iter().find(|pane| pane.pane_id == pane_id).unwrap();
+    assert_eq!(before.session_id.as_deref(), Some("ses_mock"));
+
+    // A nested CLI can inherit TMUX_PANE; a different tmux server can also
+    // reuse the same pane ID. Neither may replace the API-owned identity.
+    let payload = serde_json::json!({
+        "session_id": "foreign-codex-session",
+        "transcript_path": env.config_dir.path().join("foreign.jsonl"),
+    })
+    .to_string();
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        assert!(
+            fire_hook(&env, event, &payload, Some(&pane_id))
+                .status
+                .success()
+        );
+    }
+    let after: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let after = after.iter().find(|pane| pane.pane_id == pane_id).unwrap();
+    assert_eq!(after.session_id, before.session_id);
+    assert_eq!(after.transcript_path, before.transcript_path);
+    assert_eq!(after.detailed_state, before.detailed_state);
+    assert!(env.slopctl(&["backup"]).status.success());
+    let checkpoint = checkpoint_from_journal(&latest_lifecycle_journal(&env));
+    assert_eq!(checkpoint.len(), 1);
+    assert_eq!(checkpoint[0].session_id, before.session_id);
+    assert_eq!(checkpoint[0].transcript_path, before.transcript_path);
     kill_slopd(slopd);
 }
 
