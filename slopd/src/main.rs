@@ -4496,6 +4496,51 @@ fn hook_belongs_to_bound_session(
         || (event == "SessionStart" && hook_transcript_path(backend, event, payload).is_some())
 }
 
+/// `$TMUX` is socket,server-pid,session-index. Split from the right because a
+/// socket path can contain commas. The session index is not an ownership key:
+/// panes can move between sessions on the same server.
+fn hook_tmux_server(tmux: &str) -> Option<(&str, u32)> {
+    let (server, session) = tmux.rsplit_once(',')?;
+    session.parse::<u32>().ok()?;
+    let (socket, pid) = server.rsplit_once(',')?;
+    let pid = pid.parse::<u32>().ok()?;
+    (!socket.is_empty() && pid != 0).then_some((socket, pid))
+}
+
+async fn hook_belongs_to_tmux_server(config: &libslop::SlopdConfig, origin: Option<&str>) -> bool {
+    let Some((origin_socket, origin_pid)) = origin.and_then(hook_tmux_server) else {
+        return false;
+    };
+    // Resolve the daemon's configured target, never the caller's socket. This
+    // also works with the default socket, aliases, and a restarted tmux server.
+    let Ok(output) = tmux(config)
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &config.tmux.session(),
+            "#{socket_path},#{pid},0",
+        ])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let identity = String::from_utf8_lossy(&output.stdout);
+    let Some((socket, pid)) = hook_tmux_server(identity.trim()) else {
+        return false;
+    };
+    origin_pid == pid
+        && (origin_socket == socket
+            || std::fs::canonicalize(origin_socket)
+                .ok()
+                .zip(std::fs::canonicalize(socket).ok())
+                .is_some_and(|(origin, target)| origin == target))
+}
+
 /// Re-spawn the panes recorded in a checkpoint after a reboot, each via
 /// `claude --resume <session_id>` in its original working dir and account.
 ///
@@ -4949,11 +4994,19 @@ async fn handle_request(
             event,
             payload,
             pane_id,
+            tmux: origin,
         } => {
             let Some(pane) = pane_id.as_deref() else {
                 debug!("hook: {} ignored (no pane_id)", event);
                 return libslop::ResponseBody::Hooked;
             };
+            if !hook_belongs_to_tmux_server(config, origin.as_deref()).await {
+                debug!(
+                    "ignoring {} hook for pane {} from a foreign or unidentified tmux server: {:?}",
+                    event, pane, origin,
+                );
+                return libslop::ResponseBody::Hooked;
+            }
             debug!("hook: {} pane={} payload={}", event, pane, payload);
 
             // Ignore hooks from panes that were not spawned by slopd. This can happen

@@ -108,6 +108,7 @@ async fn main() {
             }
         };
         let pane_id = std::env::var("TMUX_PANE").ok();
+        let tmux = std::env::var("TMUX").ok();
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s) => s,
             Err(e) => {
@@ -121,7 +122,7 @@ async fn main() {
         };
         let (reader, writer) = stream.into_split();
         let mut client = libslopctl::Client::new(reader, writer);
-        match client.hook(event, payload, pane_id).await {
+        match client.hook(event, payload, pane_id, tmux).await {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("slopctl hook: {}", e);

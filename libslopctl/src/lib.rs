@@ -1052,12 +1052,14 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         event: String,
         payload: serde_json::Value,
         pane_id: Option<String>,
+        tmux: Option<String>,
     ) -> Result<(), Error> {
         match self
             .request(libslop::RequestBody::Hook {
                 event,
                 payload,
                 pane_id,
+                tmux,
             })
             .await?
         {

@@ -788,6 +788,14 @@ are not retained in graveyard records.
 Forward a Claude Code, Codex, or Grok lifecycle hook event to slopd. Reads the JSON
 payload from stdin. This is normally called by injected hooks.
 
+The client includes `$TMUX_PANE` and `$TMUX` from the calling process. Before
+accepting an agent hook, the daemon checks the tmux socket and server PID against
+its own configured server, then checks that it manages the pane. Pane numbers
+can repeat across servers; a hook from another instance must not change local
+session identity, state, transcripts, or recovery records. Hooks with missing,
+malformed, or foreign tmux identity are acknowledged and ignored. Upgrade
+`slopctl` together with `slopd`: older hook clients do not send this identity.
+
 ```bash
 echo '{"session_id":"abc"}' | slopctl hook SessionStart
 ```

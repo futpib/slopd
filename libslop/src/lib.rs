@@ -3079,6 +3079,11 @@ pub enum RequestBody {
         event: String,
         payload: serde_json::Value,
         pane_id: Option<String>,
+        /// Caller's `$TMUX` (socket path, server PID, session index). Pane IDs
+        /// are only unique within a server. Missing provenance is ignored by
+        /// the daemon, including requests from older hook clients.
+        #[serde(default)]
+        tmux: Option<String>,
     },
     /// Notification from a tmux hook (called by slopctl tmux-hook).
     TmuxHook {

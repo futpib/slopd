@@ -14,14 +14,40 @@ fn fire_hook(
     payload: &str,
     pane_id: Option<&str>,
 ) -> std::process::Output {
+    fire_hook_with_tmux(env, event, payload, pane_id, Some(&tmux_env(env)))
+}
+
+fn tmux_env(env: &TestEnv) -> String {
+    let output = env
+        .tmux
+        .tmux()
+        .args(["display-message", "-p", "#{socket_path},#{pid},0"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "tmux identity: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn fire_hook_with_tmux(
+    env: &TestEnv,
+    event: &str,
+    payload: &str,
+    pane_id: Option<&str>,
+    tmux: Option<&str>,
+) -> std::process::Output {
     let mut cmd = Command::new(cargo_bin("slopctl"));
     cmd.args(["hook", event])
         .env("XDG_RUNTIME_DIR", env.runtime_dir.path())
+        .env_remove("TMUX_PANE")
+        .env_remove("TMUX")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(pane) = pane_id {
         cmd.env("TMUX_PANE", pane);
+    }
+    if let Some(tmux) = tmux {
+        cmd.env("TMUX", tmux);
     }
     let mut child = cmd.spawn().expect("failed to spawn slopctl hook");
     use std::io::Write;
@@ -32,6 +58,213 @@ fn fire_hook(
         .write_all(payload.as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn hooks_from_another_tmux_server_cannot_change_a_colliding_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let local = TestEnv::new(Some(&["sh", "-c", "exec sleep 600"])).expect("tmux required");
+    let foreign = TestEnv::new(Some(&["sh", "-c", "exec sleep 600"])).expect("tmux required");
+    let daemons = [local.spawn_slopd(), foreign.spawn_slopd()];
+    let mut pane_ids = Vec::new();
+    for env in [&local, &foreign] {
+        let run = env.slopctl(&["run", "--backend", "codex"]);
+        assert!(run.status.success(), "run: {run:?}");
+        pane_ids.push(String::from_utf8(run.stdout).unwrap().trim().to_string());
+    }
+    assert_eq!(pane_ids[0], pane_ids[1], "test needs colliding pane IDs");
+    let pane = &pane_ids[0];
+    let local_transcript = local.config_dir.path().join("local.jsonl");
+    let local_payload = serde_json::json!({
+        "session_id": "local-session",
+        "transcript_path": local_transcript,
+        "cwd": local.config_dir.path(),
+    })
+    .to_string();
+    let foreign_payload = serde_json::json!({
+        "session_id": "foreign-session",
+        "transcript_path": foreign.config_dir.path().join("foreign.jsonl"),
+        "cwd": foreign.config_dir.path(),
+    })
+    .to_string();
+    assert!(
+        fire_hook(&local, "SessionStart", &local_payload, Some(pane))
+            .status
+            .success()
+    );
+    assert!(
+        fire_hook(&foreign, "SessionStart", &foreign_payload, Some(pane))
+            .status
+            .success()
+    );
+
+    // A shared hook file can deliver the same hook to both control sockets.
+    // The foreign server's pane number is deliberately valid in the local one.
+    for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+        assert!(
+            fire_hook_with_tmux(
+                &local,
+                event,
+                &foreign_payload,
+                Some(pane),
+                Some(&tmux_env(&foreign)),
+            )
+            .status
+            .success()
+        );
+    }
+    // Matching backend session IDs must not bypass server ownership either.
+    assert!(
+        fire_hook_with_tmux(
+            &local,
+            "UserPromptSubmit",
+            &local_payload,
+            Some(pane),
+            Some(&tmux_env(&foreign)),
+        )
+        .status
+        .success()
+    );
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&local.slopctl(&["ps", "--json"]).stdout).unwrap();
+    let local_pane = panes.iter().find(|p| p.pane_id == *pane).unwrap().clone();
+    assert!(local.slopctl(&["backup"]).status.success());
+    let checkpoint = checkpoint_from_journal(&latest_lifecycle_journal(&local));
+    assert!(local.slopctl(&["kill", pane]).status.success());
+    let graves: Vec<libslop::GraveEntry> =
+        serde_json::from_slice(&local.slopctl(&["graveyard", "--json"]).stdout).unwrap();
+    for daemon in daemons {
+        kill_slopd(daemon);
+    }
+    for saved in [&local_pane, &checkpoint[0], &graves[0].pane] {
+        assert_eq!(saved.session_id.as_deref(), Some("local-session"));
+        assert_eq!(saved.transcript_path.as_deref(), local_transcript.to_str());
+    }
+    assert_eq!(local_pane.state, libslop::PaneState::Ready);
+}
+
+#[test]
+fn hooks_require_server_identity_but_allow_aliases_and_session_changes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let env = TestEnv::new(Some(&["sh", "-c", "exec sleep 600"])).expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl(&["run", "--backend", "codex"]);
+    assert!(run.status.success(), "run: {run:?}");
+    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    let payload = serde_json::json!({
+        "session_id": "owned-session",
+        "transcript_path": env.config_dir.path().join("owned.jsonl"),
+    });
+    let identity = tmux_env(&env);
+    let (server, _) = identity.rsplit_once(',').unwrap();
+    let (socket, pid) = server.rsplit_once(',').unwrap();
+    let stale = format!("{socket},{},0", pid.parse::<u32>().unwrap() + 1);
+    let wrong_socket = format!("/nonexistent/tmux.sock,{pid},0");
+    let mut unbound = Vec::new();
+    for origin in [
+        None,
+        Some(""),
+        Some("invalid"),
+        Some(stale.as_str()),
+        Some(wrong_socket.as_str()),
+    ] {
+        assert!(
+            fire_hook_with_tmux(
+                &env,
+                "SessionStart",
+                &payload.to_string(),
+                Some(&pane),
+                origin,
+            )
+            .status
+            .success()
+        );
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        unbound.push(panes.into_iter().find(|p| p.pane_id == pane).unwrap());
+    }
+
+    // Older wire clients omit the field entirely; decoding must succeed while
+    // the unidentifiable hook remains unable to bind the pane.
+    let mut stream = std::os::unix::net::UnixStream::connect(env.socket_path()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    use std::io::Write;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id": 1,
+            "body": {"type": "Hook", "event": "SessionStart", "payload": payload, "pane_id": pane},
+        })
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut reply)
+        .unwrap();
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    unbound.push(panes.into_iter().find(|p| p.pane_id == pane).unwrap());
+
+    // A socket alias with spaces and commas still identifies the same server.
+    let alias = env.config_dir.path().join("tmux socket,alias");
+    std::os::unix::fs::symlink(socket, &alias).unwrap();
+    let aliased_identity = format!("{},{pid},0", alias.display());
+    assert!(
+        fire_hook_with_tmux(
+            &env,
+            "SessionStart",
+            &payload.to_string(),
+            Some(&pane),
+            Some(&aliased_identity),
+        )
+        .status
+        .success()
+    );
+    let mut snapshots = Vec::new();
+    let mut resumed = payload.clone();
+    resumed["session_id"] = serde_json::json!("resumed-session");
+    for (event, payload) in [
+        ("UserPromptSubmit", payload),
+        ("SessionStart", resumed.clone()),
+        ("SessionStart", {
+            resumed["source"] = serde_json::json!("compact");
+            resumed.clone()
+        }),
+        ("UserPromptSubmit", resumed.clone()),
+        ("Stop", resumed),
+    ] {
+        assert!(
+            fire_hook(&env, event, &payload.to_string(), Some(&pane))
+                .status
+                .success()
+        );
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        snapshots.push(panes.into_iter().find(|p| p.pane_id == pane).unwrap());
+    }
+    kill_slopd(slopd);
+
+    assert_eq!(reply["body"]["type"], "Hooked");
+    for pane in unbound {
+        assert_eq!(pane.session_id, None);
+        assert_eq!(pane.transcript_path, None);
+        assert_eq!(pane.state, libslop::PaneState::Ready);
+    }
+    assert_eq!(snapshots[0].session_id.as_deref(), Some("owned-session"));
+    assert_eq!(snapshots[0].state, libslop::PaneState::Busy);
+    for pane in &snapshots[1..] {
+        assert_eq!(pane.session_id.as_deref(), Some("resumed-session"));
+    }
+    assert_eq!(snapshots[1].state, libslop::PaneState::Ready);
+    assert_eq!(snapshots[2].state, libslop::PaneState::Ready);
+    assert_eq!(snapshots[3].state, libslop::PaneState::Busy);
+    assert_eq!(snapshots[4].state, libslop::PaneState::Ready);
 }
 
 fn tmux_available() -> bool {
@@ -7478,6 +7711,7 @@ fn multiplexed_subscribe_then_request() {
                 "UserPromptSubmit".to_string(),
                 payload,
                 Some(pane_id.clone()),
+                Some(tmux_env(&env)),
             )
             .await
             .unwrap();
@@ -7628,7 +7862,7 @@ fn multiplexed_multiple_subscriptions() {
             "transcript_path": "/dev/null",
             "cwd": "/tmp"
         });
-        hook_client.hook("SessionStart".to_string(), payload, Some(pane_id.clone())).await.unwrap();
+        hook_client.hook("SessionStart".to_string(), payload, Some(pane_id.clone()), Some(tmux_env(&env))).await.unwrap();
 
         // hook_sub should receive the hook event.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
