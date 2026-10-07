@@ -927,11 +927,33 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         boot: Option<i32>,
         limit: usize,
     ) -> Result<Vec<libslop::GraveEntry>, Error> {
+        let (entries, _) = self
+            .graveyard_page(boot, limit, libslop::GraveyardFilter::default(), None)
+            .await?;
+        Ok(entries)
+    }
+
+    /// Read one filtered page of durable pane-death records, newest first.
+    pub async fn graveyard_page(
+        &mut self,
+        boot: Option<i32>,
+        limit: usize,
+        filter: libslop::GraveyardFilter,
+        cursor: Option<String>,
+    ) -> Result<(Vec<libslop::GraveEntry>, Option<String>), Error> {
         match self
-            .request(libslop::RequestBody::Graveyard { boot, limit })
+            .request(libslop::RequestBody::Graveyard {
+                boot,
+                limit,
+                filter,
+                cursor,
+            })
             .await?
         {
-            libslop::ResponseBody::Graveyard { entries } => Ok(entries),
+            libslop::ResponseBody::Graveyard {
+                entries,
+                next_cursor,
+            } => Ok((entries, next_cursor)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -1109,6 +1131,72 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
     pub async fn tags(&mut self, pane_id: String) -> Result<Vec<String>, Error> {
         match self.request(libslop::RequestBody::Tags { pane_id }).await? {
             libslop::ResponseBody::Tags { pane_id: _, tags } => Ok(tags),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    pub async fn acquire_lease(
+        &mut self,
+        scope: String,
+        ttl_secs: u64,
+        grace_secs: u64,
+        expiry_policy: libslop::LeaseExpiryPolicy,
+    ) -> Result<libslop::LeaseGrant, Error> {
+        match self
+            .request(libslop::RequestBody::LeaseAcquire {
+                scope,
+                ttl_secs,
+                grace_secs,
+                expiry_policy,
+            })
+            .await?
+        {
+            libslop::ResponseBody::LeaseGranted { lease } => Ok(lease),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    pub async fn renew_lease(&mut self, lease_id: String, generation: u64) -> Result<u64, Error> {
+        match self
+            .request(libslop::RequestBody::LeaseRenew {
+                lease_id,
+                generation,
+            })
+            .await?
+        {
+            libslop::ResponseBody::LeaseRenewed { expires_at } => Ok(expires_at),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    pub async fn release_lease(&mut self, lease_id: String, generation: u64) -> Result<(), Error> {
+        match self
+            .request(libslop::RequestBody::LeaseRelease {
+                lease_id,
+                generation,
+            })
+            .await?
+        {
+            libslop::ResponseBody::LeaseReleased => Ok(()),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    pub async fn attach_lease(
+        &mut self,
+        pane_id: String,
+        lease_id: String,
+        generation: u64,
+    ) -> Result<String, Error> {
+        match self
+            .request(libslop::RequestBody::LeaseAttach {
+                pane_id,
+                lease_id,
+                generation,
+            })
+            .await?
+        {
+            libslop::ResponseBody::LeaseAttached { pane_id } => Ok(pane_id),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }

@@ -662,6 +662,8 @@ impl DeathCause {
 enum DeathDetectedBy {
     /// The Kill RPC handler (`slopctl kill`).
     KillRpc,
+    /// The generic external-owner lease expired after its handoff grace.
+    LeaseExpiry,
     /// The reconcile loop's DEAD-pane (remain-on-exit husk) path.
     ReconcileDeadPane,
     /// The reconcile loop's vanished-pane path.
@@ -672,10 +674,65 @@ impl DeathDetectedBy {
     fn as_str(self) -> &'static str {
         match self {
             DeathDetectedBy::KillRpc => "kill_rpc",
+            DeathDetectedBy::LeaseExpiry => "lease_expiry",
             DeathDetectedBy::ReconcileDeadPane => "reconcile_dead_pane",
             DeathDetectedBy::ReconcileVanished => "reconcile_vanished",
         }
     }
+}
+
+#[derive(Clone)]
+struct LeaseState {
+    grant: libslop::LeaseGrant,
+    released: bool,
+}
+
+type LeaseRegistry = Arc<std::sync::Mutex<std::collections::HashMap<String, LeaseState>>>;
+
+const LEASE_SCOPE_TAG_PREFIX: &str = "slop-lease-scope-";
+const LEASE_ID_TAG_PREFIX: &str = "slop-lease-id-";
+const LEASE_GENERATION_TAG_PREFIX: &str = "slop-lease-generation-";
+const LEASE_EXPIRES_TAG_PREFIX: &str = "slop-lease-expires-";
+const LEASE_GRACE_TAG_PREFIX: &str = "slop-lease-grace-";
+const LEASE_POLICY_TAG_PREFIX: &str = "slop-lease-policy-";
+
+fn lease_tag_prefixes() -> [&'static str; 6] {
+    [
+        LEASE_SCOPE_TAG_PREFIX,
+        LEASE_ID_TAG_PREFIX,
+        LEASE_GENERATION_TAG_PREFIX,
+        LEASE_EXPIRES_TAG_PREFIX,
+        LEASE_GRACE_TAG_PREFIX,
+        LEASE_POLICY_TAG_PREFIX,
+    ]
+}
+
+fn lease_tags(grant: &libslop::LeaseGrant) -> Vec<String> {
+    let policy = match grant.expiry_policy {
+        libslop::LeaseExpiryPolicy::Preserve => "preserve",
+        libslop::LeaseExpiryPolicy::Kill => "kill",
+    };
+    vec![
+        format!(
+            "{LEASE_SCOPE_TAG_PREFIX}{}",
+            hex_bytes(grant.scope.as_bytes())
+        ),
+        format!("{LEASE_ID_TAG_PREFIX}{}", grant.lease_id),
+        format!("{LEASE_GENERATION_TAG_PREFIX}{}", grant.generation),
+        format!("{LEASE_EXPIRES_TAG_PREFIX}{}", grant.expires_at),
+        format!("{LEASE_GRACE_TAG_PREFIX}{}", grant.grace_secs),
+        format!("{LEASE_POLICY_TAG_PREFIX}{policy}"),
+    ]
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    encoded
 }
 
 /// A durable snapshot of a pane's identity, kept in memory so a death can be
@@ -1891,6 +1948,11 @@ impl PaneMap {
     /// shard guard is released before this returns.
     fn remove(&self, pane_id: &str) -> Option<Arc<PaneState>> {
         self.inner.remove(pane_id).map(|(_, v)| v)
+    }
+
+    /// Snapshot the currently tracked pane IDs without retaining shard guards.
+    fn snapshot(&self) -> Vec<String> {
+        self.inner.iter().map(|entry| entry.key().clone()).collect()
     }
 }
 
@@ -3169,6 +3231,7 @@ async fn main() {
 
     let panes = PaneMap::new();
     let managed_panes = ManagedPanes::new();
+    let leases: LeaseRegistry = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pane_registered: PaneRegistered = Arc::new(tokio::sync::Notify::new());
     // Tracks the most recent tmux lifecycle hooks so a vanished pane can be
     // attributed to an external kill vs a closed window (see [`HookLog`]).
@@ -3203,6 +3266,19 @@ async fn main() {
         ),
     );
     info!("lifecycle journal: {}", lifecycle.root().display());
+    let grave_max_age_secs = config.lifecycle.grave_max_age_secs;
+    let grave_max_entries =
+        (config.lifecycle.grave_max_entries != 0).then_some(config.lifecycle.grave_max_entries);
+    let lifecycle_retention_enabled = grave_max_age_secs.is_some() || grave_max_entries.is_some();
+    if lifecycle_retention_enabled {
+        match lifecycle.compact(grave_max_age_secs, grave_max_entries) {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "compacted expired lifecycle grave records")
+            }
+            Ok(_) => {}
+            Err(error) => warn!("lifecycle journal compaction failed: {error}"),
+        }
+    }
 
     // Recover managed pane IDs from the tmux session so panes that existed
     // before a slopd restart are still recognized. This must happen before
@@ -3349,6 +3425,14 @@ async fn main() {
                 &reconcile_lifecycle,
             )
             .await;
+            expire_external_owner_leases(
+                &config_snapshot,
+                &reconcile_panes_map,
+                &reconcile_managed,
+                &reconcile_tx,
+                &reconcile_lifecycle,
+            )
+            .await;
         }
     });
 
@@ -3356,6 +3440,9 @@ async fn main() {
     // so it cannot race the shutdown checkpoint.
     let mut backup_interval = tokio::time::interval(std::time::Duration::from_secs(
         config.backup.interval_secs.max(1),
+    ));
+    let mut lifecycle_compact_interval = tokio::time::interval(std::time::Duration::from_secs(
+        config.lifecycle.compact_interval_secs.max(1),
     ));
 
     loop {
@@ -3371,11 +3458,20 @@ async fn main() {
                     }
                 }
             }
+            _ = lifecycle_compact_interval.tick(), if lifecycle_retention_enabled => {
+                match lifecycle.compact(grave_max_age_secs, grave_max_entries) {
+                    Ok(removed) if removed > 0 => {
+                        info!(removed, "compacted expired lifecycle grave records")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!("lifecycle journal compaction failed: {error}"),
+                }
+            }
             result = listener.accept() => {
                 let (stream, _addr) = result.unwrap();
                 debug!("accepted connection");
                 let config_snapshot = config_rx.borrow().clone();
-                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone(), hook_log.clone(), lifecycle.clone()));
+                tokio::spawn(handle_connection(stream, start_time, config_snapshot, panes.clone(), managed_panes.clone(), event_tx.clone(), pane_registered.clone(), session_lock.clone(), config_generation.clone(), pending_restore.clone(), hook_log.clone(), lifecycle.clone(), leases.clone()));
             }
             _ = sigterm.recv() => {
                 info!("received SIGTERM, shutting down");
@@ -3529,6 +3625,7 @@ async fn handle_connection(
     pending_restore: PendingRestore,
     hook_log: HookLog,
     lifecycle: LifecycleJournal,
+    leases: LeaseRegistry,
 ) {
     let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
@@ -3722,6 +3819,7 @@ async fn handle_connection(
                     &pending_restore,
                     &hook_log,
                     &lifecycle,
+                    &leases,
                 )
                 .await;
                 if write_response(&writer, req.id, body).await.is_err() {
@@ -4863,6 +4961,183 @@ fn merge_spawn_env(
 /// Escape window and any real terminal's ~25-50ms.
 const INTERRUPT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
+async fn replace_lease_tags(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    pane_id: &str,
+    grant: &libslop::LeaseGrant,
+) -> Result<(), String> {
+    let Some(state) = panes.get(pane_id) else {
+        return Err(format!("pane {pane_id} is not managed by slopd"));
+    };
+    let old_tags = state.identity.lock().unwrap().tags.clone();
+    for tag in old_tags.iter().filter(|tag| {
+        lease_tag_prefixes()
+            .iter()
+            .any(|prefix| tag.starts_with(prefix))
+    }) {
+        let option = libslop::tag_option_name(tag)?;
+        let output = tmux(config)
+            .args(["set-option", "-t", pane_id, "-p", "-u", &option])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+    }
+    let new_tags = lease_tags(grant);
+    for tag in &new_tags {
+        let option = libslop::tag_option_name(tag)?;
+        let status = tmux_set_pane_option(config, pane_id, &option, "1")
+            .await
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("tmux exited with {status}"));
+        }
+    }
+    let mut identity = state.identity.lock().unwrap();
+    identity.tags.retain(|tag| {
+        !lease_tag_prefixes()
+            .iter()
+            .any(|prefix| tag.starts_with(prefix))
+    });
+    identity.tags.extend(new_tags);
+    Ok(())
+}
+
+fn attached_lease_id(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix(LEASE_ID_TAG_PREFIX))
+}
+
+async fn refresh_attached_lease_tags(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    grant: &libslop::LeaseGrant,
+) {
+    let pane_ids = panes
+        .snapshot()
+        .into_iter()
+        .filter(|pane_id| {
+            panes.get(pane_id).is_some_and(|state| {
+                let identity = state.identity.lock().unwrap();
+                attached_lease_id(&identity.tags) == Some(grant.lease_id.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    for pane_id in pane_ids {
+        if let Err(error) = replace_lease_tags(config, panes, &pane_id, grant).await {
+            warn!(
+                pane_id,
+                "failed to refresh external-owner lease tags: {error}"
+            );
+        }
+    }
+}
+
+async fn kill_managed_pane(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    managed_panes: &ManagedPanes,
+    event_tx: &EventTx,
+    lifecycle: &LifecycleJournal,
+    pane_id: &str,
+    detected_by: DeathDetectedBy,
+) -> Result<(), String> {
+    if !managed_panes.contains(pane_id) {
+        return Err(format!("pane {pane_id} is not managed by slopd"));
+    }
+    reparent_children_of(config, managed_panes, pane_id).await;
+    managed_panes.remove(pane_id);
+    let output = tmux(config)
+        .args(["kill-pane", "-t", pane_id])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        warn!(
+            pane_id,
+            "tmux kill-pane failed (already dead?): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let state = panes.remove(pane_id);
+    if let Some(ref state) = state {
+        state.cancel_drivers();
+    }
+    record_pane_death(
+        event_tx,
+        lifecycle,
+        pane_id,
+        DeathCause::DeliberateKill,
+        detected_by,
+        state.as_ref(),
+        None,
+        None,
+        None,
+    );
+    Ok(())
+}
+
+fn lease_tag_value<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
+    tags.iter().find_map(|tag| tag.strip_prefix(prefix))
+}
+
+async fn expire_external_owner_leases(
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+    managed_panes: &ManagedPanes,
+    event_tx: &EventTx,
+    lifecycle: &LifecycleJournal,
+) {
+    let Ok(live) = list_panes(config, managed_panes).await else {
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for pane in live {
+        if pane.state != libslop::PaneState::Ready
+            || lease_tag_value(&pane.tags, LEASE_POLICY_TAG_PREFIX) != Some("kill")
+        {
+            continue;
+        }
+        let Some(expires_at) = lease_tag_value(&pane.tags, LEASE_EXPIRES_TAG_PREFIX)
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let grace_secs = lease_tag_value(&pane.tags, LEASE_GRACE_TAG_PREFIX)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if now <= expires_at.saturating_add(grace_secs) {
+            continue;
+        }
+        info!(
+            pane_id = pane.pane_id,
+            expires_at, grace_secs, "reclaiming pane after external-owner lease expiry"
+        );
+        if let Err(error) = kill_managed_pane(
+            config,
+            panes,
+            managed_panes,
+            event_tx,
+            lifecycle,
+            &pane.pane_id,
+            DeathDetectedBy::LeaseExpiry,
+        )
+        .await
+        {
+            warn!(
+                pane_id = pane.pane_id,
+                "failed to reclaim expired leased pane: {error}"
+            );
+        }
+    }
+}
+
 async fn send_interrupt_keys(
     config: &libslop::SlopdConfig,
     pane_id: &str,
@@ -4891,6 +5166,7 @@ async fn handle_request(
     pending_restore: &PendingRestore,
     hook_log: &HookLog,
     lifecycle: &LifecycleJournal,
+    leases: &LeaseRegistry,
 ) -> libslop::ResponseBody {
     match body {
         libslop::RequestBody::Status => {
@@ -4913,63 +5189,20 @@ async fn handle_request(
         }
 
         libslop::RequestBody::Kill { pane_id } => {
-            if !managed_panes.contains(&pane_id) {
-                return libslop::ResponseBody::Error {
-                    message: format!("pane {} is not managed by slopd", pane_id),
-                };
-            }
-            // Reparent children before killing: for every managed pane whose ancestor
-            // list contains the dying pane, remove it from their ancestor chain.
-            reparent_children_of(config, managed_panes, &pane_id).await;
-            // Disown the pane BEFORE tmux kill-pane. kill-pane fires the
-            // `after-kill-pane`/`window-unlinked` hooks, which trigger a reconcile
-            // in a concurrent connection task; if the pane were still in
-            // managed_panes when that reconcile ran, it would race us and record a
-            // spurious `vanished` death for a pane we are deliberately killing.
-            // Removing it first makes this Kill the sole, authoritative recorder.
-            managed_panes.remove(&pane_id);
-            let output = tmux(config)
-                .args(["kill-pane", "-t", &pane_id])
-                .output()
-                .await;
-            // Clean up internal state regardless of whether tmux kill-pane
-            // succeeded (the pane may already be dead from process exit).
-            match &output {
-                Err(e) => {
-                    return libslop::ResponseBody::Error {
-                        message: e.to_string(),
-                    };
-                }
-                Ok(out) if !out.status.success() => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    warn!(
-                        "tmux kill-pane failed for pane {} (already dead?): {}",
-                        pane_id,
-                        stderr.trim()
-                    );
-                }
-                _ => {}
-            }
-            let state = panes.remove(&pane_id);
-            if let Some(ref state) = state {
-                state.cancel_drivers();
-            }
-            // managed_panes was already cleared above (before kill-pane).
-            // An explicit `slopctl kill` — the one unambiguous death. Recording it
-            // is what lets a later post-mortem say "slopd killed it" instead of
-            // guessing, as the %119 investigation had to.
-            record_pane_death(
+            match kill_managed_pane(
+                config,
+                panes,
+                managed_panes,
                 event_tx,
                 lifecycle,
                 &pane_id,
-                DeathCause::DeliberateKill,
                 DeathDetectedBy::KillRpc,
-                state.as_ref(),
-                None,
-                None,
-                None,
-            );
-            libslop::ResponseBody::Kill { pane_id }
+            )
+            .await
+            {
+                Ok(()) => libslop::ResponseBody::Kill { pane_id },
+                Err(message) => libslop::ResponseBody::Error { message },
+            }
         }
 
         libslop::RequestBody::TmuxHook { event, pane_id } => {
@@ -5500,6 +5733,7 @@ async fn handle_request(
                 pending_restore,
                 hook_log,
                 lifecycle,
+                leases,
             ))
             .await
             {
@@ -6627,6 +6861,144 @@ async fn handle_request(
             }
         }
 
+        libslop::RequestBody::LeaseAcquire {
+            scope,
+            ttl_secs,
+            grace_secs,
+            expiry_policy,
+        } => {
+            if scope.is_empty() || scope.len() > 256 {
+                return libslop::ResponseBody::Error {
+                    message: "lease scope must contain 1 to 256 bytes".into(),
+                };
+            }
+            if ttl_secs == 0 || ttl_secs > 86_400 {
+                return libslop::ResponseBody::Error {
+                    message: "lease TTL must be between 1 and 86400 seconds".into(),
+                };
+            }
+            if grace_secs > 604_800 {
+                return libslop::ResponseBody::Error {
+                    message: "lease grace must not exceed 604800 seconds".into(),
+                };
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut registry = leases.lock().unwrap();
+            let generation = registry
+                .get(&scope)
+                .map_or(1, |lease| lease.grant.generation.saturating_add(1));
+            let lease = libslop::LeaseGrant {
+                lease_id: uuid::Uuid::new_v4().to_string(),
+                scope: scope.clone(),
+                generation,
+                ttl_secs,
+                expires_at: now.saturating_add(ttl_secs),
+                grace_secs,
+                expiry_policy,
+            };
+            registry.insert(
+                scope,
+                LeaseState {
+                    grant: lease.clone(),
+                    released: false,
+                },
+            );
+            drop(registry);
+            libslop::ResponseBody::LeaseGranted { lease }
+        }
+
+        libslop::RequestBody::LeaseRenew {
+            lease_id,
+            generation,
+        } => {
+            let grant = {
+                let mut registry = leases.lock().unwrap();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let Some(lease) = registry.values_mut().find(|lease| {
+                    !lease.released
+                        && lease.grant.expires_at >= now
+                        && lease.grant.lease_id == lease_id
+                        && lease.grant.generation == generation
+                }) else {
+                    return libslop::ResponseBody::Error {
+                        message: "lease expired, was released, or was superseded".into(),
+                    };
+                };
+                lease.grant.expires_at = now.saturating_add(lease.grant.ttl_secs);
+                lease.grant.clone()
+            };
+            refresh_attached_lease_tags(config, panes, &grant).await;
+            libslop::ResponseBody::LeaseRenewed {
+                expires_at: grant.expires_at,
+            }
+        }
+
+        libslop::RequestBody::LeaseRelease {
+            lease_id,
+            generation,
+        } => {
+            let grant = {
+                let mut registry = leases.lock().unwrap();
+                let Some(lease) = registry.values_mut().find(|lease| {
+                    !lease.released
+                        && lease.grant.lease_id == lease_id
+                        && lease.grant.generation == generation
+                }) else {
+                    return libslop::ResponseBody::Error {
+                        message: "lease was released, superseded, or does not exist".into(),
+                    };
+                };
+                lease.released = true;
+                lease.grant.expires_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                lease.grant.clone()
+            };
+            refresh_attached_lease_tags(config, panes, &grant).await;
+            libslop::ResponseBody::LeaseReleased
+        }
+
+        libslop::RequestBody::LeaseAttach {
+            pane_id,
+            lease_id,
+            generation,
+        } => {
+            if !managed_panes.contains(&pane_id) {
+                return libslop::ResponseBody::Error {
+                    message: format!("pane {pane_id} is not managed by slopd"),
+                };
+            }
+            let grant = {
+                let registry = leases.lock().unwrap();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let Some(lease) = registry.values().find(|lease| {
+                    !lease.released
+                        && lease.grant.expires_at >= now
+                        && lease.grant.lease_id == lease_id
+                        && lease.grant.generation == generation
+                }) else {
+                    return libslop::ResponseBody::Error {
+                        message: "lease expired, was released, or was superseded".into(),
+                    };
+                };
+                lease.grant.clone()
+            };
+            match replace_lease_tags(config, panes, &pane_id, &grant).await {
+                Ok(()) => libslop::ResponseBody::LeaseAttached { pane_id },
+                Err(message) => libslop::ResponseBody::Error { message },
+            }
+        }
+
         libslop::RequestBody::Ps => {
             match list_panes(config, managed_panes).await {
                 Ok(pane_infos) => {
@@ -6708,8 +7080,16 @@ async fn handle_request(
             libslop::ResponseBody::Restored { restored }
         }
 
-        libslop::RequestBody::Graveyard { boot, limit } => match lifecycle.graveyard(boot, limit) {
-            Ok(entries) => libslop::ResponseBody::Graveyard { entries },
+        libslop::RequestBody::Graveyard {
+            boot,
+            limit,
+            filter,
+            cursor,
+        } => match lifecycle.graveyard_page(boot, limit, &filter, cursor.as_deref()) {
+            Ok((entries, next_cursor)) => libslop::ResponseBody::Graveyard {
+                entries,
+                next_cursor,
+            },
             Err(message) => libslop::ResponseBody::Error { message },
         },
 

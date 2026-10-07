@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
+use std::io::BufRead;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 pub const PARSE_ERROR: i32 = -32700;
@@ -83,13 +84,13 @@ pub async fn send(sender: &Sender, message: Value) {
     let _ = sender.send(message).await;
 }
 
-pub async fn read_bounded_line<R>(reader: &mut R, maximum: usize) -> std::io::Result<Option<String>>
+pub fn read_bounded_line_sync<R>(reader: &mut R, maximum: usize) -> std::io::Result<Option<String>>
 where
-    R: AsyncBufRead + Unpin,
+    R: BufRead,
 {
     let mut line = Vec::new();
     loop {
-        let available = reader.fill_buf().await?;
+        let available = reader.fill_buf()?;
         if available.is_empty() {
             return if line.is_empty() {
                 Ok(None)
@@ -170,5 +171,35 @@ mod tests {
             classify(&notification),
             Inbound::Notification { method, .. } if method == "session/cancel"
         ));
+    }
+
+    #[test]
+    fn bounded_sync_reader_handles_eof_and_limits() {
+        let mut input = std::io::BufReader::new(&b"one\r\ntwo\n"[..]);
+        assert_eq!(
+            read_bounded_line_sync(&mut input, 8).unwrap(),
+            Some("one".into())
+        );
+        assert_eq!(
+            read_bounded_line_sync(&mut input, 8).unwrap(),
+            Some("two".into())
+        );
+        assert_eq!(read_bounded_line_sync(&mut input, 8).unwrap(), None);
+
+        let mut oversized = std::io::BufReader::new(&b"12345\n"[..]);
+        assert_eq!(
+            read_bounded_line_sync(&mut oversized, 4)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut unterminated = std::io::BufReader::new(&b"partial"[..]);
+        assert_eq!(
+            read_bounded_line_sync(&mut unterminated, 16)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 }

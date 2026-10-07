@@ -327,6 +327,13 @@ session named `slopd`.
 # How often (seconds) to auto-back-up while running (default: 30). A backup is
 # also taken on clean shutdown regardless of this interval.
 # interval_secs = 30
+
+# [lifecycle]
+# Grave records default to the newest 4096 entries. Compaction preserves pane
+# checkpoints and pending restore state. Set the count to 0 to disable it.
+# grave_max_age_secs = 7776000 # 90 days
+# grave_max_entries = 4096
+# compact_interval_secs = 3600
 ```
 
 #### Multiple accounts
@@ -455,8 +462,11 @@ instances under one Unix user cannot consume each other's restore points. Each
 target is then split into generations identified by a tmux-server UUID plus
 tmux's `#{session_id}`. The server UUID distinguishes pane IDs reused after a
 tmux restart; the session ID distinguishes a managed session killed and
-recreated inside the same server. Generation files are append-only JSONL and
-are retained without a time or count limit. The old single
+recreated inside the same server. Generation files are append-only JSONL.
+Grave records retain the newest 4096 entries by default;
+`[lifecycle] grave_max_age_secs` and `grave_max_entries` configure periodic
+atomic compaction without removing pane checkpoints or pending restore state
+(`grave_max_entries = 0` disables the count limit). The old single
 `$XDG_STATE_HOME/slopd/panes.json` is imported once for the default target.
 
 **Restore.** With `auto_restore` on, slopd restores when it has to create its
@@ -1347,9 +1357,19 @@ runtime-directory fallback described under [Requirements](#requirements). Use
 Useful adapter-wide launch options include:
 
 - `--account NAME` and `--backend claude|opencode|codex|grok`;
+- `--session-scope ID` for a stable adapter identity that remains valid when
+  its account or backend selection changes;
 - repeatable `--env KEY=VALUE` and `--agent-arg ARG`;
 - `--working-directory PATH` to override every ACP-provided cwd;
 - `--ready-timeout`, `--send-timeout`, and `--turn-timeout`;
+- `--idle-timeout SECS` and `--reconcile-interval SECS` for periodic inactive
+  pane reclamation and restored-pane discovery;
+- `--lease-ttl SECS`, `--handoff-grace SECS`, and
+  `--orphan-policy preserve|kill` for crash-safe external ownership;
+- `--session-retention SECS` to bound closed sessions loaded from the
+  graveyard;
+- `--shutdown-policy preserve|close`; `SIGUSR1` always performs a draining
+  close, while EOF, SIGTERM, and SIGINT use the configured policy;
 - repeatable `--inherit-env NAME` to copy selected variables from the adapter's
   environment into panes (off by default, especially important over iroh).
 
@@ -1374,12 +1394,18 @@ ACP turn remains in flight, instead of opening a second session.
 Every adapter-created pane receives durable `acp` session and cwd tags. ACP
 session IDs have the form `slopd:<uuid>` and do not depend on tmux pane IDs. At
 startup, the adapter reconstructs its session catalog from tagged live panes
-and the slopd graveyard, then reattaches to resumable panes. This works after
-both orderly stdin shutdown and abrupt adapter termination; orderly shutdown
-interrupts active turns but deliberately leaves their panes available to a
-replacement adapter. A pane that never reached its first accepted prompt is
-not considered resumable because its pending ACP system prompt existed only in
-the original adapter process.
+and filtered, paginated slopd graveyard queries, then reattaches to resumable
+panes. It also reconciles periodically, so panes restored after adapter startup
+are adopted without waiting for another ACP request. This works after both
+orderly stdin shutdown and abrupt adapter termination. Orderly shutdown
+interrupts active turns and, by default, leaves their panes available to a
+replacement adapter. A renewable slopd ownership lease fences stale renewal
+and pane attachment and gives crashed adapters a bounded handoff window; after
+the lease and grace period, slopd applies the configured orphan policy even if
+no new adapter ever starts. These lease operations are internal to slopd and
+do not extend ACP or alter the adapter's advertised ACP capabilities. A pane that
+never reached its first accepted prompt is not considered resumable because
+its pending ACP system prompt existed only in the original adapter process.
 
 The adapter advertises ACP `resume`, `list`, `close`, and `delete` session
 capabilities. It continues to advertise `loadSession: false`: resuming preserves
@@ -1394,6 +1420,12 @@ resumes the captured backend-native session ID when available. Startup applies
 the same bound to panes left by an older adapter. Active turns are never
 selected for eviction; if every live pane is active, the new session or prompt
 fails instead of disrupting one.
+
+`--idle-timeout` applies the same inactive-only eviction rule on the periodic
+reconciliation pass. It is disabled by default. `--session-retention` bounds
+how long closed logical sessions are reconstructed; it does not delete backend
+conversation data. Set `[lifecycle]` limits separately to bound the daemon's
+durable grave records on disk.
 
 ### ACP limitations
 

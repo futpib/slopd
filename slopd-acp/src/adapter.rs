@@ -19,8 +19,9 @@ const ACP_RESUMABLE_TAG: &str = "acp-resumable";
 const ACP_DELETED_TAG: &str = "acp-deleted";
 const ACP_SESSION_TAG_PREFIX: &str = "acp-session-";
 const ACP_CWD_TAG_PREFIX: &str = "acp-cwd-";
+const ACP_SCOPE_TAG_PREFIX: &str = "acp-scope-";
 const ACP_OWNER_TAG_PREFIX: &str = "acp-owner-";
-const GRAVEYARD_RECOVERY_LIMIT: usize = 4096;
+const GRAVEYARD_PAGE_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum SystemPromptMode {
@@ -46,11 +47,19 @@ pub struct Config {
     pub send_timeout_secs: u64,
     pub turn_timeout: Duration,
     pub max_sessions: usize,
+    pub session_scope: String,
+    pub idle_timeout: Option<Duration>,
+    pub lease_ttl_secs: u64,
+    pub handoff_grace_secs: u64,
+    pub orphan_policy: libslop::LeaseExpiryPolicy,
+    pub session_retention_secs: Option<u64>,
 }
 
 pub struct Adapter {
     config: Config,
     owner_tag: String,
+    scope_tag: String,
+    lease: Mutex<Option<libslop::LeaseGrant>>,
     sessions: Mutex<HashMap<String, Session>>,
     session_creation: Mutex<()>,
     next_activity_id: AtomicU64,
@@ -71,6 +80,7 @@ struct Session {
     pending_resume_history: bool,
     active_turn: Option<ActiveTurn>,
     last_used: u64,
+    last_touched_at: u64,
     title: Option<String>,
 }
 
@@ -161,14 +171,53 @@ struct SteerParams {
 
 impl Adapter {
     pub fn new(config: Config) -> Arc<Self> {
+        let scope_tag = format!(
+            "{ACP_SCOPE_TAG_PREFIX}{}",
+            hex_encode(config.session_scope.as_bytes())
+        );
         Arc::new(Self {
             config,
             owner_tag: format!("{ACP_OWNER_TAG_PREFIX}{}", uuid::Uuid::new_v4()),
+            scope_tag,
+            lease: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             session_creation: Mutex::new(()),
             next_activity_id: AtomicU64::new(1),
             next_turn_id: AtomicU64::new(1),
         })
+    }
+
+    pub async fn acquire_lease(&self) -> Result<(), String> {
+        let mut client = self.config.transport.connect().await?;
+        let lease = client
+            .acquire_lease(
+                format!("slopd-acp:{}", self.config.session_scope),
+                self.config.lease_ttl_secs,
+                self.config.handoff_grace_secs,
+                self.config.orphan_policy,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        *self.lease.lock().await = Some(lease);
+        Ok(())
+    }
+
+    async fn lease_grant(&self) -> Result<libslop::LeaseGrant, String> {
+        self.lease
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "ownership lease is not active".to_string())
+    }
+
+    async fn attach_lease(&self, pane_id: &str) -> Result<(), String> {
+        let lease = self.lease_grant().await?;
+        let mut client = self.config.transport.connect().await?;
+        client
+            .attach_lease(pane_id.to_string(), lease.lease_id, lease.generation)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Rebuild the logical ACP session catalog from live pane tags and slopd's
@@ -177,12 +226,16 @@ impl Adapter {
     /// backend-native session; an unprompted pane cannot be recovered safely
     /// because its pending ACP system prompt lived only in the old process.
     pub async fn recover_sessions(&self) -> Result<(), String> {
+        tracing::debug!("loading live panes for ACP recovery");
         let mut client = self.config.transport.connect().await?;
         let live_panes = client.ps().await.map_err(|error| error.to_string())?;
-        let graves = client
-            .graveyard(None, GRAVEYARD_RECOVERY_LIMIT)
-            .await
-            .map_err(|error| error.to_string())?;
+        drop(client);
+        tracing::debug!("loading graveyard pages for ACP recovery");
+        let graves = self.scoped_graves().await?;
+        tracing::debug!(
+            graves = graves.len(),
+            "loaded graveyard pages for ACP recovery"
+        );
 
         let mut recovered = HashMap::new();
         let mut seen_grave_sessions = HashSet::new();
@@ -226,6 +279,7 @@ impl Adapter {
                 pending_resume_history: false,
                 active_turn: None,
                 last_used: grave.destroyed_at.max(grave.pane.last_active),
+                last_touched_at: grave.destroyed_at.max(grave.pane.last_active),
                 title: grave.pane.pane_title,
             });
         }
@@ -275,6 +329,7 @@ impl Adapter {
                     pending_resume_history: false,
                     active_turn: None,
                     last_used: pane.last_active.max(pane.created_at),
+                    last_touched_at: pane.last_active.max(pane.created_at),
                     title: pane.pane_title,
                 },
             );
@@ -321,7 +376,190 @@ impl Adapter {
         Ok(())
     }
 
+    async fn scoped_graves(&self) -> Result<Vec<libslop::GraveEntry>, String> {
+        let destroyed_after = self
+            .config
+            .session_retention_secs
+            .map(|retention| unix_now().saturating_sub(retention));
+        let filter = libslop::GraveyardFilter {
+            tags_all: vec![ACP_TAG.to_string()],
+            unrevived_only: true,
+            destroyed_after,
+            ..Default::default()
+        };
+        let mut client = self.config.transport.connect().await?;
+        let mut cursor = None;
+        let mut graves = Vec::new();
+        loop {
+            let (page, next_cursor) = client
+                .graveyard_page(None, GRAVEYARD_PAGE_SIZE, filter.clone(), cursor)
+                .await
+                .map_err(|error| error.to_string())?;
+            graves.extend(
+                page.into_iter()
+                    .filter(|grave| self.pane_is_in_scope(&grave.pane)),
+            );
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(graves)
+    }
+
+    pub async fn renew_lease(&self) -> Result<(), String> {
+        let lease = self.lease_grant().await?;
+        let mut client = self.config.transport.connect().await?;
+        let expires_at = client
+            .renew_lease(lease.lease_id.clone(), lease.generation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut current = self.lease.lock().await;
+        if let Some(current) = current.as_mut()
+            && current.lease_id == lease.lease_id
+            && current.generation == lease.generation
+        {
+            current.expires_at = expires_at;
+        }
+        Ok(())
+    }
+
+    async fn release_lease(&self) {
+        let Some(lease) = self.lease.lock().await.take() else {
+            return;
+        };
+        let Ok(mut client) = self.config.transport.connect().await else {
+            return;
+        };
+        if let Err(error) = client.release_lease(lease.lease_id, lease.generation).await {
+            tracing::warn!("failed to release ownership lease: {error}");
+        }
+    }
+
+    pub async fn reconcile_sessions(&self) -> Result<(), String> {
+        let _creation = self.session_creation.lock().await;
+        let mut client = self.config.transport.connect().await?;
+        let panes = client.ps().await.map_err(|error| error.to_string())?;
+        drop(client);
+        self.reconcile_live_sessions(&panes).await;
+
+        let known_panes = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter_map(|session| session.pane_id.clone())
+            .collect::<HashSet<_>>();
+        for pane in panes.iter().filter(|pane| self.pane_is_in_scope(pane)) {
+            if known_panes.contains(&pane.pane_id) {
+                continue;
+            }
+            let Some(session_id) = tagged_session_id(&pane.tags) else {
+                tracing::warn!(pane_id = pane.pane_id, "discarding unidentifiable ACP pane");
+                let _ = self.kill_pane(&pane.pane_id).await;
+                continue;
+            };
+            if !pane.tags.iter().any(|tag| tag == ACP_RESUMABLE_TAG) || pane.session_id.is_none() {
+                tracing::warn!(pane_id = pane.pane_id, "discarding incomplete ACP pane");
+                self.remove_session_tags(&pane.pane_id, &pane.tags).await;
+                let _ = self.kill_pane(&pane.pane_id).await;
+                continue;
+            }
+            let existing_pane = self
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|session| session.pane_id.clone());
+            if existing_pane.is_some() {
+                tracing::warn!(
+                    pane_id = pane.pane_id,
+                    session_id,
+                    "discarding duplicate restored ACP pane"
+                );
+                let _ = self.kill_pane(&pane.pane_id).await;
+                continue;
+            }
+            let cwd = tagged_cwd(&pane.tags)
+                .or_else(|| pane.working_dir.as_deref().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let start_directory = self
+                .config
+                .working_directory
+                .clone()
+                .unwrap_or_else(|| cwd.clone());
+            let touched = pane.last_active.max(pane.created_at);
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .entry(session_id.clone())
+                .and_modify(|session| {
+                    session.pane_id = Some(pane.pane_id.clone());
+                    session.grave_id = None;
+                    session.backend = Some(pane.backend);
+                    session.native_session_id = pane.session_id.clone();
+                    session.last_touched_at = touched;
+                    session.last_used = touched;
+                })
+                .or_insert_with(|| Session {
+                    pane_id: Some(pane.pane_id.clone()),
+                    grave_id: None,
+                    backend: Some(pane.backend),
+                    native_session_id: pane.session_id.clone(),
+                    cwd: cwd.clone(),
+                    start_directory,
+                    system_prompt: None,
+                    system_prompt_delivered: true,
+                    pending_resume_history: false,
+                    active_turn: None,
+                    last_used: touched,
+                    last_touched_at: touched,
+                    title: pane.pane_title.clone(),
+                });
+            drop(sessions);
+            self.tag_session_pane(&pane.pane_id, &session_id, &cwd.to_string_lossy(), true)
+                .await?;
+        }
+
+        if let Some(timeout) = self.config.idle_timeout {
+            let cutoff = unix_now().saturating_sub(timeout.as_secs());
+            let expired = self
+                .sessions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, session)| {
+                    session.pane_id.is_some()
+                        && session.active_turn.is_none()
+                        && session.last_touched_at <= cutoff
+                })
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            for session_id in expired {
+                self.evict_session(&session_id).await?;
+            }
+        }
+        if let Some(retention) = self.config.session_retention_secs {
+            let cutoff = unix_now().saturating_sub(retention);
+            self.sessions.lock().await.retain(|_, session| {
+                session.pane_id.is_some()
+                    || session.active_turn.is_some()
+                    || session.last_touched_at >= cutoff
+            });
+        }
+        self.trim_recovered_panes().await
+    }
+
     fn pane_is_in_scope(&self, pane: &libslop::PaneInfo) -> bool {
+        if !pane.tags.iter().any(|tag| tag == ACP_TAG) {
+            return false;
+        }
+        if let Some(scope_tag) = pane
+            .tags
+            .iter()
+            .find(|tag| tag.starts_with(ACP_SCOPE_TAG_PREFIX))
+        {
+            return scope_tag == &self.scope_tag;
+        }
         let account = self
             .config
             .account
@@ -332,7 +570,6 @@ impl Adapter {
                 .config
                 .backend
                 .is_none_or(|backend| pane.backend == backend)
-            && pane.tags.iter().any(|tag| tag == ACP_TAG)
     }
 
     pub async fn dispatch(self: &Arc<Self>, message: Value, sender: &Sender) {
@@ -570,6 +807,7 @@ impl Adapter {
                 pending_resume_history: false,
                 active_turn: None,
                 last_used: self.next_activity_id.fetch_add(1, Ordering::Relaxed),
+                last_touched_at: unix_now(),
                 title: None,
             },
         );
@@ -619,6 +857,7 @@ impl Adapter {
         }
         if let Some(session) = self.sessions.lock().await.get_mut(&params.session_id) {
             session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+            session.last_touched_at = unix_now();
         }
         wire::send(sender, wire::ok(id, json!({}))).await;
     }
@@ -850,6 +1089,7 @@ impl Adapter {
                     done: done.clone(),
                 });
                 session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+                session.last_touched_at = unix_now();
                 TurnLease {
                     turn_id,
                     pane_id,
@@ -1317,6 +1557,7 @@ impl Adapter {
         }
         for tag in [
             ACP_TAG.to_string(),
+            self.scope_tag.clone(),
             session_tag(session_id),
             cwd_tag(cwd),
             self.owner_tag.clone(),
@@ -1337,6 +1578,8 @@ impl Adapter {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        drop(client);
+        self.attach_lease(pane_id).await?;
         Ok(())
     }
 
@@ -1349,6 +1592,7 @@ impl Adapter {
                 || *tag == ACP_RESUMABLE_TAG
                 || tag.starts_with(ACP_SESSION_TAG_PREFIX)
                 || tag.starts_with(ACP_CWD_TAG_PREFIX)
+                || tag.starts_with(ACP_SCOPE_TAG_PREFIX)
                 || tag.starts_with(ACP_OWNER_TAG_PREFIX)
         }) {
             if let Err(error) = client.untag(pane_id.to_string(), tag.clone()).await {
@@ -1407,17 +1651,7 @@ impl Adapter {
     }
 
     async fn capture_latest_grave(&self, session_id: &str) {
-        let mut client = match self.config.transport.connect().await {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::warn!(
-                    session_id,
-                    "could not find closed session in graveyard: {error}"
-                );
-                return;
-            }
-        };
-        let graves = match client.graveyard(None, GRAVEYARD_RECOVERY_LIMIT).await {
+        let graves = match self.scoped_graves().await {
             Ok(graves) => graves,
             Err(error) => {
                 tracing::warn!(
@@ -1440,6 +1674,7 @@ impl Adapter {
             }
             session.title = grave.pane.pane_title;
             session.last_used = session.last_used.max(grave.destroyed_at);
+            session.last_touched_at = session.last_touched_at.max(grave.destroyed_at);
         }
     }
 
@@ -1572,8 +1807,8 @@ impl Adapter {
     }
 
     async fn evict_lru_inactive(&self) -> Result<(), String> {
-        let victim = {
-            let mut sessions = self.sessions.lock().await;
+        let victim_id = {
+            let sessions = self.sessions.lock().await;
             let Some(victim_id) = sessions
                 .iter()
                 .filter(|(_, session)| session.pane_id.is_some() && session.active_turn.is_none())
@@ -1585,16 +1820,27 @@ impl Adapter {
                     self.config.max_sessions
                 ));
             };
+            victim_id
+        };
+        self.evict_session(&victim_id).await
+    }
+
+    async fn evict_session(&self, victim_id: &str) -> Result<(), String> {
+        let victim = {
+            let mut sessions = self.sessions.lock().await;
             let victim = sessions
-                .get_mut(&victim_id)
+                .get_mut(victim_id)
                 .expect("selected eviction victim must still exist");
+            if victim.active_turn.is_some() {
+                return Err("cannot evict a session with an active turn".into());
+            }
             let pane_id = victim
                 .pane_id
                 .take()
                 .expect("selected eviction victim must have a pane");
             let backend = victim.backend.take();
             (
-                victim_id,
+                victim_id.to_string(),
                 pane_id,
                 backend,
                 victim.native_session_id.clone(),
@@ -1713,6 +1959,7 @@ impl Adapter {
                 let done = active_turn.done.clone();
                 let pane_id = session.pane_id.clone()?;
                 session.last_used = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
+                session.last_touched_at = unix_now();
                 Some((pane_id, done, steering))
             })
         };
@@ -1791,7 +2038,7 @@ impl Adapter {
         }
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self, close_panes: bool) {
         let _creation = self.session_creation.lock().await;
         let panes = {
             let mut sessions = self.sessions.lock().await;
@@ -1817,6 +2064,12 @@ impl Adapter {
                     "failed to interrupt ACP pane during shutdown: {error}"
                 );
             }
+            if close_panes {
+                if let Err(error) = self.kill_pane(&pane_id).await {
+                    tracing::warn!(pane_id, "failed to close ACP pane during shutdown: {error}");
+                }
+                continue;
+            }
             let Ok(mut client) = self.config.transport.connect().await else {
                 continue;
             };
@@ -1827,6 +2080,7 @@ impl Adapter {
                 );
             }
         }
+        self.release_lease().await;
     }
 
     async fn interrupt_pane(&self, pane_id: &str) -> Result<(), String> {
@@ -2261,6 +2515,13 @@ fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
             Some((high << 4) | low)
         })
         .collect()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn launch_args(base: &[String], native_session_id: Option<&str>) -> Vec<String> {

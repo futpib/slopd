@@ -7746,6 +7746,84 @@ fn multiplexed_subscribe_then_request() {
     kill_slopd(slopd);
 }
 
+#[test]
+fn ownership_leases_fence_superseded_and_released_holders() {
+    build_bin("slopd");
+
+    let Some(env) = TestEnv::new(Some(&["sleep", "infinity"])) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    let slopd = env.spawn_slopd();
+    let pane_id = String::from_utf8(env.slopctl(&["run"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let socket_path = env.socket_path();
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        async fn connect(
+            socket: &std::path::Path,
+        ) -> libslopctl::Client<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>
+        {
+            let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+            let (reader, writer) = stream.into_split();
+            libslopctl::Client::new(reader, writer)
+        }
+
+        let mut first = connect(&socket_path).await;
+        let old = first
+            .acquire_lease(
+                "integration-scope".into(),
+                30,
+                30,
+                libslop::LeaseExpiryPolicy::Kill,
+            )
+            .await
+            .unwrap();
+        first
+            .attach_lease(pane_id.clone(), old.lease_id.clone(), old.generation)
+            .await
+            .unwrap();
+
+        let mut second = connect(&socket_path).await;
+        let current = second
+            .acquire_lease(
+                "integration-scope".into(),
+                30,
+                30,
+                libslop::LeaseExpiryPolicy::Kill,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.generation, old.generation + 1);
+        assert!(
+            first
+                .renew_lease(old.lease_id, old.generation)
+                .await
+                .is_err(),
+            "a superseded lease must not renew"
+        );
+        second
+            .attach_lease(pane_id, current.lease_id.clone(), current.generation)
+            .await
+            .unwrap();
+        second
+            .release_lease(current.lease_id.clone(), current.generation)
+            .await
+            .unwrap();
+        assert!(
+            second
+                .renew_lease(current.lease_id, current.generation)
+                .await
+                .is_err(),
+            "a released lease must not renew"
+        );
+    });
+
+    kill_slopd(slopd);
+}
+
 /// Unsubscribe stops the subscription stream.
 #[test]
 fn multiplexed_unsubscribe_stops_stream() {

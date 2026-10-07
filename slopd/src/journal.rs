@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -362,6 +364,17 @@ impl LifecycleJournal {
         boot: Option<i32>,
         limit: usize,
     ) -> Result<Vec<libslop::GraveEntry>, String> {
+        self.graveyard_page(boot, limit, &libslop::GraveyardFilter::default(), None)
+            .map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn graveyard_page(
+        &self,
+        boot: Option<i32>,
+        limit: usize,
+        filter: &libslop::GraveyardFilter,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<libslop::GraveEntry>, Option<String>), String> {
         if boot.is_some_and(|boot| boot > 0) {
             return Err("--boot must be 0 (current) or a negative generation offset".into());
         }
@@ -389,8 +402,37 @@ impl LifecycleJournal {
                 .cmp(&a.destroyed_at)
                 .then_with(|| b.grave_id.cmp(&a.grave_id))
         });
+        entries.retain(|entry| {
+            filter
+                .account
+                .as_deref()
+                .is_none_or(|account| entry.pane.account == account)
+                && filter
+                    .backend
+                    .is_none_or(|backend| entry.pane.backend == backend)
+                && filter
+                    .tags_all
+                    .iter()
+                    .all(|tag| entry.pane.tags.contains(tag))
+                && (!filter.unrevived_only || entry.revived_at.is_none())
+                && filter
+                    .destroyed_after
+                    .is_none_or(|after| entry.destroyed_at >= after)
+        });
+        if let Some(cursor) = cursor {
+            let (destroyed_at, grave_id) = decode_graveyard_cursor(cursor)?;
+            entries.retain(|entry| {
+                entry.destroyed_at < destroyed_at
+                    || (entry.destroyed_at == destroyed_at && entry.grave_id.as_str() < grave_id)
+            });
+        }
+        let has_more = entries.len() > limit;
         entries.truncate(limit);
-        Ok(entries)
+        let next_cursor = has_more
+            .then(|| entries.last())
+            .flatten()
+            .map(|entry| encode_graveyard_cursor(entry.destroyed_at, &entry.grave_id));
+        Ok((entries, next_cursor))
     }
 
     pub(crate) fn select_grave(
@@ -551,6 +593,157 @@ impl LifecycleJournal {
         });
         Ok(generations)
     }
+
+    /// Atomically rewrite generation journals with bounded grave history while
+    /// preserving every checkpoint and restore-resolution record.
+    pub(crate) fn compact(
+        &self,
+        max_age_secs: Option<u64>,
+        max_entries: Option<usize>,
+    ) -> Result<usize, String> {
+        if max_age_secs.is_none() && max_entries.is_none() {
+            return Ok(0);
+        }
+        let mut current = self.current.lock().unwrap();
+        current
+            .file
+            .sync_data()
+            .map_err(|error| format!("failed to sync lifecycle journal: {error}"))?;
+        let generations = self.read_generations()?;
+        let cutoff = max_age_secs.map(|age| now().saturating_sub(age));
+        let mut retained = generations
+            .iter()
+            .flat_map(|generation| generation.graves.iter())
+            .filter(|grave| cutoff.is_none_or(|cutoff| grave.destroyed_at >= cutoff))
+            .collect::<Vec<_>>();
+        retained.sort_by(|a, b| {
+            b.destroyed_at
+                .cmp(&a.destroyed_at)
+                .then_with(|| b.grave_id.cmp(&a.grave_id))
+        });
+        if let Some(limit) = max_entries {
+            retained.truncate(limit);
+        }
+        let retained_ids = retained
+            .iter()
+            .map(|grave| grave.grave_id.clone())
+            .collect::<HashSet<_>>();
+        drop(retained);
+        let before = generations
+            .iter()
+            .map(|generation| generation.graves.len())
+            .sum::<usize>();
+        if retained_ids.len() == before {
+            return Ok(0);
+        }
+        let dir = self.root.join("generations");
+        for generation in generations {
+            let Some(key) = generation.key.as_ref() else {
+                continue;
+            };
+            let path = dir.join(key.file_name());
+            let mut file = atomic_write_file::AtomicWriteFile::options()
+                .open(&path)
+                .map_err(|error| format!("failed to compact {}: {error}", path.display()))?;
+            write_compacted_event(
+                &mut file,
+                &JournalEvent::Generation {
+                    version: 1,
+                    started_at: generation.started_at,
+                    tmux_boot_id: key.tmux_boot_id.clone(),
+                    tmux_session_id: key.tmux_session_id.clone(),
+                },
+            )?;
+            if generation.has_checkpoint {
+                let at = now();
+                for pane in &generation.checkpoint {
+                    write_compacted_event(
+                        &mut file,
+                        &JournalEvent::Pane {
+                            at,
+                            pane: pane.clone(),
+                        },
+                    )?;
+                }
+                write_compacted_event(
+                    &mut file,
+                    &JournalEvent::Checkpoint {
+                        at,
+                        pane_ids: generation
+                            .checkpoint
+                            .iter()
+                            .map(|pane| pane.pane_id.clone())
+                            .collect(),
+                    },
+                )?;
+            }
+            for grave in generation
+                .graves
+                .into_iter()
+                .filter(|grave| retained_ids.contains(grave.grave_id.as_str()))
+            {
+                write_compacted_event(&mut file, &JournalEvent::Destroyed { entry: grave })?;
+            }
+            for (grave_id, at, pane_id) in generation
+                .revivals
+                .into_iter()
+                .filter(|(grave_id, _, _)| retained_ids.contains(grave_id.as_str()))
+            {
+                write_compacted_event(
+                    &mut file,
+                    &JournalEvent::Revived {
+                        at,
+                        grave_id,
+                        pane_id,
+                        tmux_boot_id: key.tmux_boot_id.clone(),
+                        tmux_session_id: key.tmux_session_id.clone(),
+                    },
+                )?;
+            }
+            for source in generation.resolved_sources {
+                write_compacted_event(
+                    &mut file,
+                    &JournalEvent::RestoreResolved {
+                        at: now(),
+                        source,
+                        action: "journal_compaction".into(),
+                    },
+                )?;
+            }
+            file.commit()
+                .map_err(|error| format!("failed to commit {}: {error}", path.display()))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("failed to protect {}: {error}", path.display()))?;
+        }
+        let current_path = dir.join(current.generation.file_name());
+        current.file = libslop::jsonl::open(&current_path)
+            .map_err(|error| format!("failed to reopen {}: {error}", current_path.display()))?;
+        Ok(before.saturating_sub(retained_ids.len()))
+    }
+}
+
+fn write_compacted_event(file: &mut impl Write, event: &JournalEvent) -> Result<(), String> {
+    serde_json::to_writer(&mut *file, event)
+        .map_err(|error| format!("failed to serialize compacted lifecycle event: {error}"))?;
+    file.write_all(b"\n")
+        .map_err(|error| format!("failed to write compacted lifecycle event: {error}"))
+}
+
+fn encode_graveyard_cursor(destroyed_at: u64, grave_id: &str) -> String {
+    format!("{destroyed_at}:{grave_id}")
+}
+
+fn decode_graveyard_cursor(cursor: &str) -> Result<(u64, &str), String> {
+    let Some((destroyed_at, grave_id)) = cursor.split_once(':') else {
+        return Err("invalid graveyard cursor".into());
+    };
+    let destroyed_at = destroyed_at
+        .parse()
+        .map_err(|_| "invalid graveyard cursor")?;
+    if grave_id.is_empty() {
+        return Err("invalid graveyard cursor".into());
+    }
+    Ok((destroyed_at, grave_id))
 }
 
 fn target_root(config: &libslop::SlopdConfig) -> PathBuf {
@@ -892,6 +1085,97 @@ mod tests {
         assert_eq!(
             journal.select_grave(Some("%7"), Some(-1)).unwrap().grave_id,
             "grave-a"
+        );
+    }
+
+    #[test]
+    fn graveyard_filters_before_paginating() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let key = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = open(dir.path(), &config, key, 1);
+        for index in 0..6 {
+            let mut pane = pane(&format!("%{index}"), &format!("session-{index}"));
+            if index % 2 == 0 {
+                pane.account = "selected".into();
+                pane.backend = libslop::Backend::Codex;
+                pane.tags.push("owned".into());
+            }
+            let generation = journal.current_generation();
+            journal
+                .record_destroyed(libslop::GraveEntry {
+                    grave_id: format!("grave-{index}"),
+                    tmux_boot_id: generation.tmux_boot_id,
+                    tmux_session_id: generation.tmux_session_id,
+                    destroyed_at: 10 + index,
+                    cause: "deliberate_kill".into(),
+                    detected_by: "kill_rpc".into(),
+                    pane,
+                    revived_at: None,
+                    revived_as: None,
+                })
+                .unwrap();
+        }
+        journal.record_revived("grave-2", "%20").unwrap();
+
+        let filter = libslop::GraveyardFilter {
+            account: Some("selected".into()),
+            backend: Some(libslop::Backend::Codex),
+            tags_all: vec!["owned".into()],
+            unrevived_only: true,
+            destroyed_after: Some(10),
+        };
+        let (first, cursor) = journal.graveyard_page(None, 1, &filter, None).unwrap();
+        assert_eq!(first[0].grave_id, "grave-4");
+        let (second, cursor) = journal
+            .graveyard_page(None, 1, &filter, cursor.as_deref())
+            .unwrap();
+        assert_eq!(second[0].grave_id, "grave-0");
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn compaction_bounds_graves_and_preserves_recovery_state() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let first = GenerationKey {
+            tmux_boot_id: "boot-a".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = open(dir.path(), &config, first.clone(), 1);
+        journal.checkpoint(vec![pane("%1", "recover-me")]).unwrap();
+        grave(&journal, "old", "%2", "old-session", 10);
+        grave(&journal, "middle", "%3", "middle-session", 20);
+
+        let second = GenerationKey {
+            tmux_boot_id: "boot-b".into(),
+            tmux_session_id: "$2".into(),
+        };
+        journal.switch_generation(second.clone(), 2).unwrap();
+        grave(&journal, "new", "%4", "new-session", 30);
+
+        assert_eq!(journal.compact(None, Some(2)).unwrap(), 1);
+        assert_eq!(
+            journal
+                .graveyard(None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.grave_id)
+                .collect::<Vec<_>>(),
+            vec!["new", "middle"]
+        );
+        assert_eq!(journal.pending_restore().unwrap().unwrap().0, first);
+
+        grave(&journal, "after", "%5", "after-session", 40);
+        drop(journal);
+        let reopened = open(dir.path(), &config, second, 2);
+        assert_eq!(reopened.graveyard(None, 10).unwrap()[0].grave_id, "after");
+        assert_eq!(
+            reopened.pending_restore().unwrap().unwrap().1[0].pane_id,
+            "%1"
         );
     }
 

@@ -2021,6 +2021,8 @@ pub struct SlopdConfig {
     pub run: SlopdRunConfig,
     #[serde(default)]
     pub backup: SlopdBackupConfig,
+    #[serde(default)]
+    pub lifecycle: SlopdLifecycleConfig,
     /// Agent config dir for the reserved [`DEFAULT_ACCOUNT`] (the account used
     /// when no account is selected). Exported as `CLAUDE_CONFIG_DIR` (Claude) or
     /// `OPENCODE_CONFIG_DIR` (OpenCode), `CODEX_HOME` (Codex), or `GROK_HOME`
@@ -2484,6 +2486,40 @@ impl Default for SlopdBackupConfig {
             auto_backup: default_auto_backup(),
             auto_restore: false,
             interval_secs: default_backup_interval_secs(),
+        }
+    }
+}
+
+/// Retention and compaction for the durable lifecycle journal.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlopdLifecycleConfig {
+    /// Drop grave records older than this many seconds during compaction.
+    #[serde(default)]
+    pub grave_max_age_secs: Option<u64>,
+    /// Retain at most this many newest grave records across all generations.
+    /// Zero disables the count limit.
+    #[serde(default = "default_grave_max_entries")]
+    pub grave_max_entries: usize,
+    /// How often to compact when either retention limit is configured.
+    #[serde(default = "default_lifecycle_compact_interval_secs")]
+    pub compact_interval_secs: u64,
+}
+
+fn default_lifecycle_compact_interval_secs() -> u64 {
+    3600
+}
+
+fn default_grave_max_entries() -> usize {
+    4096
+}
+
+impl Default for SlopdLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            grave_max_age_secs: None,
+            grave_max_entries: default_grave_max_entries(),
+            compact_interval_secs: default_lifecycle_compact_interval_secs(),
         }
     }
 }
@@ -3126,6 +3162,31 @@ pub enum RequestBody {
     Tags {
         pane_id: String,
     },
+    /// Acquire exclusive, renewable ownership of a generic external scope.
+    /// A newer acquisition fences the previous lease for the same scope.
+    LeaseAcquire {
+        scope: String,
+        ttl_secs: u64,
+        grace_secs: u64,
+        expiry_policy: LeaseExpiryPolicy,
+    },
+    LeaseRenew {
+        lease_id: String,
+        generation: u64,
+    },
+    /// Release into the configured handoff grace period. Attached panes remain
+    /// available for a replacement until that period expires.
+    LeaseRelease {
+        lease_id: String,
+        generation: u64,
+    },
+    /// Associate a managed pane with a lease. The daemon persists enough lease
+    /// metadata on the pane to enforce expiry across daemon restarts.
+    LeaseAttach {
+        pane_id: String,
+        lease_id: String,
+        generation: u64,
+    },
     /// List all panes in the slopd session.
     Ps,
     /// Write a lifecycle-journal checkpoint now (manual `slopctl backup`),
@@ -3144,6 +3205,13 @@ pub enum RequestBody {
         boot: Option<i32>,
         #[serde(default = "default_graveyard_limit")]
         limit: usize,
+        /// Apply server-side before `limit`, so a noisy unrelated scope cannot
+        /// hide matching records beyond the requested page.
+        #[serde(default)]
+        filter: GraveyardFilter,
+        /// Opaque cursor returned by the previous graveyard page.
+        #[serde(default)]
+        cursor: Option<String>,
     },
     /// Resume a pane from the lifecycle graveyard. `target` is a grave id
     /// (full or unique prefix) or an old tmux pane id such as `%21`; omitted
@@ -3218,6 +3286,16 @@ pub enum ResponseBody {
         pane_id: String,
         tags: Vec<String>,
     },
+    LeaseGranted {
+        lease: LeaseGrant,
+    },
+    LeaseRenewed {
+        expires_at: u64,
+    },
+    LeaseReleased,
+    LeaseAttached {
+        pane_id: String,
+    },
     Ps {
         panes: Vec<PaneInfo>,
     },
@@ -3233,6 +3311,8 @@ pub enum ResponseBody {
     /// Durable pane-death records, newest first.
     Graveyard {
         entries: Vec<GraveEntry>,
+        #[serde(default)]
+        next_cursor: Option<String>,
     },
     /// The newly spawned pane (or an already-running pane bound to the same
     /// backend session) produced by `revive`.
@@ -3405,6 +3485,41 @@ pub struct GraveEntry {
     pub revived_at: Option<u64>,
     #[serde(default)]
     pub revived_as: Option<String>,
+}
+
+/// Server-side graveyard selection. Every field is optional and filters are
+/// combined with AND semantics before pagination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraveyardFilter {
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub backend: Option<Backend>,
+    #[serde(default)]
+    pub tags_all: Vec<String>,
+    #[serde(default)]
+    pub unrevived_only: bool,
+    #[serde(default)]
+    pub destroyed_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseExpiryPolicy {
+    #[default]
+    Preserve,
+    Kill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseGrant {
+    pub lease_id: String,
+    pub scope: String,
+    pub generation: u64,
+    pub ttl_secs: u64,
+    pub expires_at: u64,
+    pub grace_secs: u64,
+    pub expiry_policy: LeaseExpiryPolicy,
 }
 
 fn default_graveyard_limit() -> usize {

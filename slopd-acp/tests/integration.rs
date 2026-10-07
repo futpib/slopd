@@ -96,6 +96,13 @@ impl Harness {
             }
         }
     }
+
+    fn kill_hard(mut self) {
+        drop(self.stdin.take());
+        let mut child = self.child.take().expect("adapter child");
+        child.kill().expect("SIGKILL slopd-acp");
+        child.wait().expect("wait for killed slopd-acp");
+    }
 }
 
 impl Drop for Harness {
@@ -288,6 +295,21 @@ fn session_pane_id(env: &TestEnv, session_id: &str) -> String {
 
 fn panes(env: &TestEnv) -> Vec<libslop::PaneInfo> {
     serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap()
+}
+
+fn wait_for_pane_count(env: &TestEnv, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = panes(env).len();
+        if count == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} pane(s); found {count}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -997,9 +1019,9 @@ fn replacement_recovers_a_session_after_abrupt_adapter_exit() {
     assert_eq!(completed["result"]["stopReason"], "end_turn");
     let pane_id = session_pane_id(&env, &session_id);
 
-    // Harness::drop terminates the adapter without closing stdin, reproducing
-    // the service-level signal race that originally orphaned panes.
-    drop(original);
+    // Bypass the adapter's signal cleanup so the pane is protected only by its
+    // durable lease metadata, reproducing a crash or SIGKILL.
+    original.kill_hard();
     assert_eq!(panes(&env).len(), 1);
 
     let mut replacement = Harness::spawn(&env.socket_path(), &["--account", "acp-codex"]);
@@ -1022,6 +1044,144 @@ fn replacement_recovers_a_session_after_abrupt_adapter_exit() {
     );
     assert_eq!(continued["result"]["stopReason"], "end_turn");
     assert!(streamed_text(&notifications).contains("AFTER_ADAPTER_RESTART_CANARY"));
+}
+
+#[test]
+fn expired_adapter_lease_reclaims_an_unclaimed_ready_pane() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &[
+            "--account",
+            "acp-codex",
+            "--lease-ttl",
+            "1",
+            "--handoff-grace",
+            "1",
+        ],
+    );
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut harness, 3, &session_id, "LEASE_EXPIRY_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    assert_eq!(panes(&env).len(), 1);
+
+    harness.kill_hard();
+    wait_for_pane_count(&env, 0, Duration::from_secs(8));
+}
+
+#[test]
+fn idle_timeout_evicts_the_pane_but_keeps_the_logical_session() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(
+        &env.socket_path(),
+        &[
+            "--account",
+            "acp-codex",
+            "--idle-timeout",
+            "1",
+            "--reconcile-interval",
+            "1",
+        ],
+    );
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut harness, 3, &session_id, "IDLE_TIMEOUT_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+
+    wait_for_pane_count(&env, 0, Duration::from_secs(6));
+    assert!(
+        list_sessions(&mut harness, 4)
+            .iter()
+            .any(|session| session["sessionId"].as_str() == Some(session_id.as_str())),
+        "idle eviction must preserve the resumable logical session"
+    );
+}
+
+#[test]
+fn explicit_scope_survives_account_changes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.old]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n\
+         \n[accounts.new]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut original = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "old", "--session-scope", "stable-bridge"],
+    );
+    initialize(&mut original);
+    let session_id = new_session(&mut original, env.config_dir.path(), "");
+    let (completed, _) = prompt(&mut original, 3, &session_id, "STABLE_SCOPE_CANARY");
+    assert_eq!(completed["result"]["stopReason"], "end_turn");
+    let pane_id = session_pane_id(&env, &session_id);
+    drop(original);
+
+    let mut replacement = Harness::spawn(
+        &env.socket_path(),
+        &["--account", "new", "--session-scope", "stable-bridge"],
+    );
+    initialize(&mut replacement);
+    assert!(
+        list_sessions(&mut replacement, 4)
+            .iter()
+            .any(|session| session["sessionId"].as_str() == Some(session_id.as_str()))
+    );
+    let resumed = resume_session(&mut replacement, 5, &session_id, env.config_dir.path());
+    assert!(resumed.get("error").is_none(), "resume failed: {resumed}");
+    assert_eq!(session_pane_id(&env, &session_id), pane_id);
 }
 
 #[test]

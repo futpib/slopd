@@ -20,6 +20,27 @@ enum Backend {
     Grok,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OrphanPolicy {
+    Preserve,
+    Kill,
+}
+
+impl From<OrphanPolicy> for libslop::LeaseExpiryPolicy {
+    fn from(policy: OrphanPolicy) -> Self {
+        match policy {
+            OrphanPolicy::Preserve => libslop::LeaseExpiryPolicy::Preserve,
+            OrphanPolicy::Kill => libslop::LeaseExpiryPolicy::Kill,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ShutdownPolicy {
+    Preserve,
+    Close,
+}
+
 impl From<Backend> for libslop::Backend {
     fn from(backend: Backend) -> Self {
         match backend {
@@ -76,6 +97,11 @@ struct Cli {
     #[arg(long, value_enum)]
     backend: Option<Backend>,
 
+    /// Stable ownership scope for durable sessions. Keep this unchanged when
+    /// renaming an account or changing its backend.
+    #[arg(long, value_name = "ID")]
+    session_scope: Option<String>,
+
     /// Override ACP's cwd when starting the underlying pane. This is useful
     /// when iroh connects to a host with a different filesystem layout.
     #[arg(long, value_name = "REMOTE_PATH")]
@@ -115,6 +141,35 @@ struct Cli {
     /// evicted at the limit, then natively resumed when possible if reused.
     #[arg(long, default_value_t = 4)]
     max_sessions: usize,
+
+    /// Reclaim inactive live panes after this many seconds. Zero disables it.
+    #[arg(long, default_value_t = 0)]
+    idle_timeout: u64,
+
+    /// Seconds between live-pane reconciliation passes.
+    #[arg(long, default_value_t = 15)]
+    reconcile_interval: u64,
+
+    /// Seconds between the last heartbeat and lease expiry.
+    #[arg(long, default_value_t = 60)]
+    lease_ttl: u64,
+
+    /// Seconds an expired lease remains available for replacement handoff.
+    #[arg(long, default_value_t = 300)]
+    handoff_grace: u64,
+
+    /// What slopd does with ready panes after lease expiry and handoff grace.
+    #[arg(long, value_enum, default_value = "kill")]
+    orphan_policy: OrphanPolicy,
+
+    /// Stop listing closed logical sessions older than this many seconds.
+    /// Zero retains them indefinitely.
+    #[arg(long, default_value_t = 0)]
+    session_retention: u64,
+
+    /// What a normal EOF, SIGTERM, or SIGINT does with resident panes.
+    #[arg(long, value_enum, default_value = "preserve")]
+    shutdown_policy: ShutdownPolicy,
 }
 
 #[tokio::main]
@@ -144,6 +199,27 @@ async fn main() {
         eprintln!("slopd-acp: --max-sessions must be greater than zero");
         std::process::exit(2);
     }
+    if cli.reconcile_interval == 0 || cli.lease_ttl == 0 {
+        eprintln!("slopd-acp: --reconcile-interval and --lease-ttl must be greater than zero");
+        std::process::exit(2);
+    }
+    let session_scope = cli.session_scope.clone().unwrap_or_else(|| {
+        let account = cli.account.as_deref().unwrap_or(libslop::DEFAULT_ACCOUNT);
+        let backend = cli
+            .backend
+            .map(|backend| match backend {
+                Backend::Claude => "claude",
+                Backend::Opencode => "opencode",
+                Backend::Codex => "codex",
+                Backend::Grok => "grok",
+            })
+            .unwrap_or("auto");
+        format!("{account}:{backend}")
+    });
+    if session_scope.is_empty() || session_scope.len() > 128 {
+        eprintln!("slopd-acp: --session-scope must contain 1 to 128 bytes");
+        std::process::exit(2);
+    }
 
     let adapter = Adapter::new(adapter::Config {
         transport,
@@ -157,46 +233,138 @@ async fn main() {
         send_timeout_secs: cli.send_timeout,
         turn_timeout: Duration::from_secs(cli.turn_timeout),
         max_sessions: cli.max_sessions,
+        session_scope: session_scope.clone(),
+        idle_timeout: (cli.idle_timeout != 0).then(|| Duration::from_secs(cli.idle_timeout)),
+        lease_ttl_secs: cli.lease_ttl,
+        handoff_grace_secs: cli.handoff_grace,
+        orphan_policy: cli.orphan_policy.into(),
+        session_retention_secs: (cli.session_retention != 0).then_some(cli.session_retention),
     });
+    tracing::debug!(scope = %session_scope, "acquiring ownership lease");
+    if let Err(error) = adapter.acquire_lease().await {
+        eprintln!("slopd-acp: failed to acquire ownership lease: {error}");
+        std::process::exit(1);
+    }
+    tracing::debug!("acquired ownership lease");
     if let Err(error) = adapter.recover_sessions().await {
         eprintln!("slopd-acp: failed to recover durable ACP sessions: {error}");
         std::process::exit(1);
     }
 
+    let background_stop = tokio_util::sync::CancellationToken::new();
+    let lease_lost = tokio_util::sync::CancellationToken::new();
+    let heartbeat = {
+        let adapter = adapter.clone();
+        let stop = background_stop.clone();
+        let lost = lease_lost.clone();
+        let interval = Duration::from_secs((cli.lease_ttl / 3).max(1));
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(interval);
+            ticks.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = ticks.tick() => {
+                        if let Err(error) = adapter.renew_lease().await {
+                            tracing::error!("ownership lease was lost: {error}");
+                            lost.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+    let maintenance = {
+        let adapter = adapter.clone();
+        let stop = background_stop.clone();
+        let interval = Duration::from_secs(cli.reconcile_interval);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(interval);
+            ticks.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = ticks.tick() => {
+                        if let Err(error) = adapter.reconcile_sessions().await {
+                            tracing::warn!("ACP session reconciliation failed: {error}");
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let (sender, receiver) = tokio::sync::mpsc::channel(256);
     let writer = tokio::spawn(wire::writer_task(receiver));
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    loop {
-        let line = match wire::read_bounded_line(&mut stdin, MAX_FRAME_BYTES).await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(error) => {
-                tracing::error!("failed to read ACP frame: {error}");
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(16);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = std::io::BufReader::new(stdin.lock());
+        loop {
+            let line = wire::read_bounded_line_sync(&mut stdin, MAX_FRAME_BYTES);
+            let finished = !matches!(line, Ok(Some(_)));
+            if input_sender.blocking_send(line).is_err() || finished {
                 break;
             }
-        };
-        if line.trim().is_empty() {
-            continue;
         }
-        match serde_json::from_str::<serde_json::Value>(&line) {
-            Ok(message) => adapter.dispatch(message, &sender).await,
-            Err(error) => {
-                wire::send(
-                    &sender,
-                    wire::error(
-                        serde_json::Value::Null,
-                        wire::PARSE_ERROR,
-                        format!("jsonrpc: parse error: {error}"),
-                    ),
-                )
-                .await;
+    });
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .expect("install SIGUSR1 handler");
+    let mut close_panes = matches!(cli.shutdown_policy, ShutdownPolicy::Close);
+    loop {
+        tokio::select! {
+            line = input_receiver.recv() => {
+                let line = match line {
+                    Some(Ok(Some(line))) => line,
+                    Some(Ok(None)) | None => break,
+                    Some(Err(error)) => {
+                        tracing::error!("failed to read ACP frame: {error}");
+                        break;
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(message) => adapter.dispatch(message, &sender).await,
+                    Err(error) => {
+                        wire::send(
+                            &sender,
+                            wire::error(
+                                serde_json::Value::Null,
+                                wire::PARSE_ERROR,
+                                format!("jsonrpc: parse error: {error}"),
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+            _ = sigusr1.recv() => {
+                close_panes = true;
+                break;
+            }
+            _ = lease_lost.cancelled() => break,
         }
     }
 
-    adapter.shutdown().await;
+    background_stop.cancel();
+    tracing::debug!("stopping ACP background tasks");
+    let _ = heartbeat.await;
+    let _ = maintenance.await;
+    tracing::debug!("running ACP shutdown policy");
+    adapter.shutdown(close_panes).await;
+    tracing::debug!("waiting for ACP output writer");
     drop(sender);
     let _ = writer.await;
+    tracing::debug!("ACP adapter stopped");
 }
 
 async fn build_transport(cli: &Cli) -> Result<Transport, String> {
