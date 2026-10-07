@@ -16215,7 +16215,7 @@ fn codex_send_uses_bracketed_paste_and_waits_until_prompt_is_submitted() {
     let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
     let prompt = format!(
         "BRACKETED_PASTE_CANARY\n{}",
-        vec!["multiline Buzz payload"; 80].join("\n")
+        vec!["multiline ACP payload"; 80].join("\n")
     );
 
     let send = env.slopctl(&["send", &pane_id, &prompt]);

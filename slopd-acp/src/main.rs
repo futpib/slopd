@@ -85,10 +85,10 @@ struct Cli {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
-    /// Forward Buzz credentials from this adapter process into each managed
-    /// pane. This is opt-in because iroh may target a different machine.
-    #[arg(long)]
-    forward_buzz_env: bool,
+    /// Inherit a named environment variable into each managed pane (repeatable).
+    /// This is opt-in because iroh may target a different machine.
+    #[arg(long = "inherit-env", value_name = "NAME")]
+    inherit_env: Vec<String>,
 
     /// Extra argument passed to the underlying agent CLI (repeatable).
     #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
@@ -136,8 +136,9 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if cli.forward_buzz_env {
-        inherit_buzz_env(&mut env);
+    if let Err(error) = inherit_named_env(&mut env, &cli.inherit_env) {
+        eprintln!("slopd-acp: {error}");
+        std::process::exit(2);
     }
     if cli.max_sessions == 0 {
         eprintln!("slopd-acp: --max-sessions must be greater than zero");
@@ -243,31 +244,36 @@ fn parse_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {
             let (key, value) = entry
                 .split_once('=')
                 .ok_or_else(|| format!("invalid --env {entry:?}: expected KEY=VALUE"))?;
-            if key.is_empty()
-                || !key.chars().enumerate().all(|(index, character)| {
-                    character == '_'
-                        || character.is_ascii_alphabetic()
-                        || (index > 0 && character.is_ascii_digit())
-                })
-            {
-                return Err(format!("invalid environment variable name {key:?}"));
-            }
+            validate_env_name(key)?;
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
 }
 
-fn inherit_buzz_env(env: &mut Vec<(String, String)>) {
-    merge_buzz_env(env, |key| std::env::var(key).ok());
+fn validate_env_name(key: &str) -> Result<(), String> {
+    if key.is_empty()
+        || !key.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphabetic()
+                || (index > 0 && character.is_ascii_digit())
+        })
+    {
+        return Err(format!("invalid environment variable name {key:?}"));
+    }
+    Ok(())
 }
 
-fn merge_buzz_env(env: &mut Vec<(String, String)>, mut lookup: impl FnMut(&str) -> Option<String>) {
-    for key in [
-        "BUZZ_PRIVATE_KEY",
-        "BUZZ_RELAY_URL",
-        "BUZZ_AUTH_TAG",
-        "BUZZ_API_TOKEN",
-    ] {
+fn inherit_named_env(env: &mut Vec<(String, String)>, names: &[String]) -> Result<(), String> {
+    merge_inherited_env(env, names, |key| std::env::var(key).ok())
+}
+
+fn merge_inherited_env(
+    env: &mut Vec<(String, String)>,
+    names: &[String],
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<(), String> {
+    for key in names {
+        validate_env_name(key)?;
         if env.iter().any(|(existing, _)| existing == key) {
             continue;
         }
@@ -277,6 +283,7 @@ fn merge_buzz_env(env: &mut Vec<(String, String)>, mut lookup: impl FnMut(&str) 
             env.push((key.to_string(), value));
         }
     }
+    Ok(())
 }
 
 fn init_logging(verbose: u8) {
@@ -310,22 +317,42 @@ mod tests {
     }
 
     #[test]
-    fn buzz_env_forwarding_is_allowlisted_and_preserves_explicit_values() {
-        let mut env = vec![("BUZZ_PRIVATE_KEY".into(), "explicit-secret".into())];
-        merge_buzz_env(&mut env, |key| match key {
-            "BUZZ_PRIVATE_KEY" => Some("ambient-secret".into()),
-            "BUZZ_RELAY_URL" => Some("https://relay.example".into()),
-            "BUZZ_AUTH_TAG" => Some(String::new()),
-            "NOT_ALLOWLISTED" => Some("must-not-leak".into()),
-            _ => None,
-        });
+    fn named_env_inheritance_is_explicit_and_preserves_explicit_values() {
+        let mut env = vec![("SERVICE_TOKEN".into(), "explicit-secret".into())];
+        merge_inherited_env(
+            &mut env,
+            &[
+                "SERVICE_TOKEN".into(),
+                "SERVICE_URL".into(),
+                "EMPTY_VALUE".into(),
+            ],
+            |key| match key {
+                "SERVICE_TOKEN" => Some("ambient-secret".into()),
+                "SERVICE_URL" => Some("https://service.example".into()),
+                "EMPTY_VALUE" => Some(String::new()),
+                "UNREQUESTED_SECRET" => Some("must-not-leak".into()),
+                _ => None,
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             env,
             vec![
-                ("BUZZ_PRIVATE_KEY".into(), "explicit-secret".into()),
-                ("BUZZ_RELAY_URL".into(), "https://relay.example".into()),
+                ("SERVICE_TOKEN".into(), "explicit-secret".into()),
+                ("SERVICE_URL".into(), "https://service.example".into()),
             ]
         );
+    }
+
+    #[test]
+    fn named_env_inheritance_rejects_invalid_names() {
+        let mut env = Vec::new();
+        let error =
+            merge_inherited_env(&mut env, &["INVALID-NAME".into()], |_| Some("value".into()))
+                .unwrap_err();
+
+        assert_eq!(error, "invalid environment variable name \"INVALID-NAME\"");
+        assert!(env.is_empty());
     }
 }

@@ -1331,9 +1331,8 @@ these filters for you.
 ## ACP adapter
 
 `slopd-acp` is a stdio [Agent Client Protocol (ACP)](https://agentclientprotocol.com/)
-adapter. An ACP host such as [Buzz](https://github.com/block/buzz) launches it
-as an agent process; each `session/new` creates a dedicated slopd pane, and
-later ACP prompts are sent to that pane.
+adapter. An ACP host launches it as an agent process; each `session/new` creates
+a dedicated slopd pane, and later ACP prompts are sent to that pane.
 
 For a local daemon, configure the ACP host's custom agent executable as:
 
@@ -1351,9 +1350,8 @@ Useful adapter-wide launch options include:
 - repeatable `--env KEY=VALUE` and `--agent-arg ARG`;
 - `--working-directory PATH` to override every ACP-provided cwd;
 - `--ready-timeout`, `--send-timeout`, and `--turn-timeout`;
-- `--forward-buzz-env` to explicitly forward the adapter's allowlisted
-  [Buzz](https://github.com/block/buzz) credentials into panes (off by default,
-  especially important over iroh).
+- repeatable `--inherit-env NAME` to copy selected variables from the adapter's
+  environment into panes (off by default, especially important over iroh).
 
 The adapter maps ACP onto slopd as follows:
 
@@ -1369,10 +1367,9 @@ The adapter maps ACP onto slopd as follows:
 | prompt completion | the pane's busy-to-ready state transition |
 | `session/cancel` | `interrupt` |
 
-For ACP hosts such as [Buzz](https://github.com/block/buzz), the adapter
-advertises and implements the vendor-neutral `_session/steering` extension. It
-routes steering text into the existing pane while the original ACP turn remains
-in flight, instead of opening a second session.
+The adapter advertises and implements the vendor-neutral `_session/steering`
+extension. It routes steering text into the existing pane while the original
+ACP turn remains in flight, instead of opening a second session.
 
 Every adapter-created pane receives durable `acp` session and cwd tags. ACP
 session IDs have the form `slopd:<uuid>` and do not depend on tmux pane IDs. At
@@ -1460,16 +1457,16 @@ the shared `iroh-slopctl` default.
 `slopd-mcp` is a [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
 [MCP](https://modelcontextprotocol.io) server. It is a **supervisor**, not a
 second ACP host: MCP clients such as Grok Voice can use slopd's remote control
-surface without competing with `slopd-acp` / Buzz. Pane creation still happens
+surface without competing with `slopd-acp`. Pane creation still happens
 inside slopd; `slopd-mcp` only translates MCP tools to control-socket requests.
 The local event-ingestion commands `hook` and `tmux-hook` are not exposed.
 
 ```bash
 # Loopback is anonymous. Non-loopback binds require a token.
-slopd-mcp --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock"
+slopd-mcp --socket "$XDG_RUNTIME_DIR/slopd-agent/slopd.sock"
 
 slopd-mcp \
-  --socket "$XDG_RUNTIME_DIR/slopd-buzz-agent/slopd.sock" \
+  --socket "$XDG_RUNTIME_DIR/slopd-agent/slopd.sock" \
   --bind 10.77.77.2:8780 \
   --token-file ~/.config/slopd-mcp/token \
   --public-url https://178.18.254.153 \
@@ -1673,6 +1670,6 @@ iroh-slopctl ps
 | `libslopiroh` | Shared iroh client transport — ALPN, identity/config, endpoint resolution |
 | `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
 | `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
-| `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to hosts such as [Buzz](https://github.com/block/buzz) |
+| `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to ACP hosts |
 | `slopd-mcp` | Streamable HTTP MCP supervisor for remote slopctl operations |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |

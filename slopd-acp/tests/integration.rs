@@ -14,10 +14,19 @@ struct Harness {
 
 impl Harness {
     fn spawn(socket: &std::path::Path, adapter_args: &[&str]) -> Self {
+        Self::spawn_with_env(socket, adapter_args, &[])
+    }
+
+    fn spawn_with_env(
+        socket: &std::path::Path,
+        adapter_args: &[&str],
+        adapter_env: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(cargo_bin("slopd-acp"));
         command
             .args(["--socket", socket.to_str().unwrap()])
             .args(adapter_args)
+            .envs(adapter_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -117,7 +126,7 @@ fn initialize(harness: &mut Harness) {
             "protocolVersion": 2,
             "clientCapabilities": {},
             "clientInfo": {
-                "name": "buzz-acp",
+                "name": "acp-client",
                 "version": "test"
             }
         },
@@ -566,7 +575,7 @@ fn generic_steering_reuses_the_existing_codex_pane() {
         "method": "_session/steering",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": "BUZZ_STEER_CANARY" }],
+            "prompt": [{ "type": "text", "text": "STEER_CANARY" }],
         },
     }));
 
@@ -574,7 +583,7 @@ fn generic_steering_reuses_the_existing_codex_pane() {
     let steer_response = harness.response(4, &mut messages);
     assert!(
         steer_response.get("error").is_none(),
-        "Buzz would fall back to cancel-and-reprompt after this response: {steer_response}"
+        "an ACP client may fall back to cancel-and-reprompt after this response: {steer_response}"
     );
     assert_eq!(steer_response["result"]["outcome"], "injected");
     assert!(
@@ -587,7 +596,7 @@ fn generic_steering_reuses_the_existing_codex_pane() {
     assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
     let streamed = streamed_text(&messages);
     assert!(
-        streamed.contains("steered: BUZZ_STEER_CANARY"),
+        streamed.contains("steered: STEER_CANARY"),
         "steered Codex response was not streamed through the original ACP turn: {streamed}"
     );
 
@@ -658,7 +667,7 @@ fn session_limit_evicts_and_lazily_restores_lru_inactive_panes() {
         "the least-recently-used pane was not evicted: {resident:?}"
     );
 
-    // Buzz still holds the second logical ACP session ID. Reusing it must
+    // The client still holds the second logical ACP session ID. Reusing it must
     // restore a pane transparently instead of returning "unknown session".
     let (restored, notifications) = prompt(&mut harness, 11, &second, "RESTORED_SESSION_CANARY");
     assert_eq!(restored["result"]["stopReason"], "end_turn");
@@ -1152,7 +1161,7 @@ fn closed_session_with_environment_is_revived() {
             "--account",
             "acp-codex",
             "--env",
-            "BUZZ_PRIVATE_KEY=restored-credential",
+            "AGENT_CONTEXT_TOKEN=restored-credential",
         ],
     );
     initialize(&mut replacement);
@@ -1180,12 +1189,72 @@ fn closed_session_with_environment_is_revived() {
         &mut replacement,
         6,
         &session_id,
-        "::mock env BUZZ_PRIVATE_KEY",
+        "::mock env AGENT_CONTEXT_TOKEN",
     );
     assert_eq!(continued["result"]["stopReason"], "end_turn");
     assert!(
-        streamed_text(&notifications).contains("::mock env BUZZ_PRIVATE_KEY=restored-credential")
+        streamed_text(&notifications)
+            .contains("::mock env AGENT_CONTEXT_TOKEN=restored-credential")
     );
+}
+
+#[test]
+fn named_environment_is_inherited_by_managed_panes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn_with_env(
+        &env.socket_path(),
+        &[
+            "--account",
+            "acp-codex",
+            "--inherit-env",
+            "AGENT_CONTEXT_TOKEN",
+        ],
+        &[
+            ("AGENT_CONTEXT_TOKEN", "inherited-credential"),
+            ("UNREQUESTED_SECRET", "must-not-leak"),
+        ],
+    );
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+
+    let (inherited, notifications) = prompt(
+        &mut harness,
+        3,
+        &session_id,
+        "::mock env AGENT_CONTEXT_TOKEN",
+    );
+    assert_eq!(inherited["result"]["stopReason"], "end_turn");
+    assert!(
+        streamed_text(&notifications)
+            .contains("::mock env AGENT_CONTEXT_TOKEN=inherited-credential")
+    );
+
+    let (unrequested, notifications) = prompt(
+        &mut harness,
+        4,
+        &session_id,
+        "::mock env UNREQUESTED_SECRET",
+    );
+    assert_eq!(unrequested["result"]["stopReason"], "end_turn");
+    assert!(streamed_text(&notifications).contains("::mock env UNREQUESTED_SECRET=UNSET"));
 }
 
 #[test]
