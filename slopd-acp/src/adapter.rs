@@ -1201,6 +1201,7 @@ impl Adapter {
                 pane_event_filter(&lease.pane_id, "slopd", "DetailedStateChange"),
                 pane_event_filter(&lease.pane_id, "slopd", "PaneDestroyed"),
                 pane_event_filter(&lease.pane_id, "hook", "Stop"),
+                pane_event_filter(&lease.pane_id, "hook", "StopFailure"),
                 pane_event_filter(&lease.pane_id, "hook", "SessionEnd"),
             ]) => result.map_err(|error| error.to_string())?,
             _ = lease.cancel.cancelled() => {
@@ -1240,6 +1241,7 @@ impl Adapter {
             TurnTranscriptGate::new(lease.backend, &lease.prompt, lease.discard_replayed_history);
         let mut saw_busy = false;
         let mut saw_answer = false;
+        let mut retry_pending = false;
         loop {
             tokio::select! {
                 item = transcript.next() => {
@@ -1324,7 +1326,23 @@ impl Adapter {
                                 sender,
                             ).await;
                         }
-                        "Stop" | "SessionEnd" => {
+                        "StopFailure" if hook_matches_session(
+                            lease.backend,
+                            lease.native_session_id.as_deref(),
+                            &record.payload,
+                        ) => {
+                            if record
+                                .payload
+                                .get("retry_scheduled")
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                            {
+                                retry_pending = true;
+                            } else {
+                                return Err(turn_failure_message(&record.payload));
+                            }
+                        }
+                        "Stop" | "StopFailure" | "SessionEnd" => {
                             tracing::debug!(
                                 pane_id = lease.pane_id,
                                 expected_session_id = ?lease.native_session_id,
@@ -1335,9 +1353,12 @@ impl Adapter {
                         }
                         "StateChange" => {
                             match record.payload.get("state").and_then(Value::as_str) {
-                                Some("busy") => saw_busy = true,
+                                Some("busy") => {
+                                    saw_busy = true;
+                                    retry_pending = false;
+                                }
                                 Some("ready")
-                                    if state_ready_completes(
+                                    if !retry_pending && state_ready_completes(
                                         lease.backend,
                                         saw_busy,
                                         saw_answer,
@@ -1370,6 +1391,7 @@ impl Adapter {
                             match detailed_state {
                                 Some("busy_processing" | "busy_tool_use" | "busy_subagent" | "busy_compacting") => {
                                     saw_busy = true;
+                                    retry_pending = false;
                                 }
                                 Some("awaiting_input_permission") => {
                                     wire::send(
@@ -2137,6 +2159,18 @@ impl Adapter {
 
 fn stale_pane_prompt_error(error: &str) -> bool {
     error.contains("is not managed by slopd") || error.contains("tmux send-keys failed")
+}
+
+fn turn_failure_message(payload: &Value) -> String {
+    let code = payload
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("turn_failed");
+    let message = payload
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("the underlying agent turn failed");
+    format!("underlying agent turn failed ({code}): {message}")
 }
 
 fn state_ready_completes(backend: libslop::Backend, saw_busy: bool, saw_answer: bool) -> bool {
@@ -3363,6 +3397,17 @@ mod tests {
         assert!(!state_ready_completes(libslop::Backend::Codex, true, false));
         assert!(state_ready_completes(libslop::Backend::Codex, true, true));
         assert!(state_ready_completes(libslop::Backend::Claude, true, false));
+    }
+
+    #[test]
+    fn turn_failures_preserve_the_structured_code_and_message() {
+        assert_eq!(
+            turn_failure_message(&json!({
+                "error_code": "usage_limit_exceeded",
+                "error": {"message": "usage limit reached"},
+            })),
+            "underlying agent turn failed (usage_limit_exceeded): usage limit reached"
+        );
     }
 
     #[test]

@@ -448,6 +448,46 @@ fn codex_acp_session_streams_a_complete_turn() {
 }
 
 #[test]
+fn codex_acp_waits_for_transient_retry_and_reports_terminal_failure() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    build_bin("slopd-acp");
+
+    let mock = cargo_bin("mock_codex");
+    let slopctl = cargo_bin("slopctl");
+    let codex_home = libsloptest::tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_full(None, Some(slopctl.to_str().unwrap()), None) else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.acp-codex-failures]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let _daemon = Daemon(Some(env.spawn_slopd()));
+    let mut harness = Harness::spawn(&env.socket_path(), &["--account", "acp-codex-failures"]);
+    initialize(&mut harness);
+    let session_id = new_session(&mut harness, env.config_dir.path(), "");
+
+    let (completed, notifications) = prompt(&mut harness, 3, &session_id, "FAIL_CAPACITY_ONCE");
+    assert_eq!(completed["result"]["stopReason"], "end_turn", "{completed}");
+    assert_eq!(streamed_text(&notifications), "mock response: continue");
+
+    let (failed, notifications) = prompt(&mut harness, 4, &session_id, "FAIL_USAGE_LIMIT");
+    assert!(notifications.is_empty(), "{notifications:?}");
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("usage_limit_exceeded")
+                && message.contains("usage limit")),
+        "{failed}"
+    );
+}
+
+#[test]
 fn grok_acp_session_preserves_native_updates_for_a_complete_turn() {
     build_bin("slopd");
     build_bin("slopctl");

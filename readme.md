@@ -299,10 +299,9 @@ session named `slopd`.
 # CLI `--env` / `--env-file` override these.
 # env_files = ["~/.config/slopd/pane.env"]
 
-# Retry a failed Claude Code, OpenCode, or Grok turn after exponential backoff
-# so an unattended pane does not stall (default: true). Claude and Grok receive
-# "continue"; OpenCode re-submits the failed prompt. Codex does not currently
-# expose the failure event needed for this policy.
+# Retry a failed Claude Code, Codex, OpenCode, or Grok turn after exponential
+# backoff so an unattended pane does not stall (default: true). Claude, Codex,
+# and Grok receive "continue"; OpenCode re-submits the failed prompt.
 # auto_continue_on_failure = true
 # Give up after this many consecutive failed retries, then leave the pane idle
 # (default: 8 — with the defaults below, ~4m15s of retrying).
@@ -1167,15 +1166,37 @@ immediately because it is terminal and Claude gives that hook a short deadline.
 When Claude Code or Grok emits `StopFailure`, slopd sends `continue` through
 that backend's normal confirmed transport after an exponential backoff.
 OpenCode's corresponding `session.error` path re-submits the last accepted
-non-command prompt. All retry until the turn succeeds or the attempt cap is
-reached. Codex does not currently expose an equivalent failure event to this
-policy.
+non-command prompt. Codex failures arrive in the rollout's structured
+`task_complete.error`; slopd normalizes them to the same `StopFailure` event and
+sends `continue` for transient failures. All retry until the turn succeeds or
+the attempt cap is reached.
+
+Codex retry classification uses `codex_error_info`, not the displayed English
+message. Capacity/overload, throttling, connection, timeout, service, and
+internal-server failures are transient. Usage limits, policy refusals,
+authentication, invalid requests, context limits, sandbox failures, version
+mismatches, and unknown codes are surfaced but not retried. The older
+`other`-coded "stream disconnected before completion" condition remains
+retryable for compatibility.
+
+A failed turn leaves the pane in `ready`: the state describes whether the pane
+can accept input, not whether its previous turn succeeded. Outcome is carried
+without adding state variants:
+
+- live clients receive `source: "hook"`, `event_type: "StopFailure"`;
+- Codex transcript readers receive a durable `turn_failed` record;
+- `error_code`, `error`, and `retryable` describe the failure;
+- `retry_scheduled` says whether slopd actually scheduled another attempt, with
+  `retry_attempt` and `retry_in_ms` when it did.
+
+ACP and MCP consumers wait across a scheduled retry, and return a terminal
+error instead of treating commentary followed by `ready` as a completed reply.
 
 Retry is **edge-triggered** by the backend's failure event, not a periodic
 timer, so a long-running retry does not provoke another submission while it is
 still active. Retrying stops as soon as any of these happens:
 
-- the turn succeeds (`Stop` / `session.idle`) — the counter resets;
+- the turn succeeds (`Stop`, Codex `task_complete`, or `session.idle`) — the counter resets;
 - `max_retry_attempts` consecutive failures are reached — slopd gives up and leaves the pane idle;
 - you submit a prompt yourself — taking over cancels any pending retry.
 
@@ -1200,12 +1221,14 @@ Clients can subscribe to the live event stream with `slopctl listen`. Events are
 
 `event_type` uses the Claude-style lifecycle vocabulary (for example,
 `SessionStart`, `Stop`, or `PreToolUse`) across all backends. Claude Code and
-Codex payloads come from their hooks. Grok hook payloads are normalized from
-camel case while retaining the original envelope under `_grok_raw`; its ACP
-permission, question, and plan-approval requests are also surfaced as
-`PermissionRequest` or `Elicitation` without slopd answering them. OpenCode has
-no hook file; slopd maps its SSE events onto the same names and includes the
-original OpenCode event data under `properties`.
+Codex lifecycle payloads normally come from their hooks; Codex `StopFailure` is
+synthesized from its rollout's structured task error because Codex does not
+emit that hook. Grok hook payloads are normalized from camel case while
+retaining the original envelope under `_grok_raw`; its ACP permission,
+question, and plan-approval requests are also surfaced as `PermissionRequest`
+or `Elicitation` without slopd answering them. OpenCode has no hook file; slopd
+maps its SSE events onto the same names and includes the original OpenCode event
+data under `properties`.
 
 ### `source:slopd` — daemon state events
 

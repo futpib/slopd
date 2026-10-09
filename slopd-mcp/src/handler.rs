@@ -965,6 +965,7 @@ impl SlopdMcp {
         let result = client.subscribe(reply_event_filters(&pane_id)).await;
         let mut subscription = self.slopd_result(result).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+        let mut retry_pending = false;
 
         loop {
             let result = client.read_transcript(pane_id.clone(), None, 500).await;
@@ -976,7 +977,15 @@ impl SlopdMcp {
                 .iter()
                 .find(|pane| pane.pane_id == pane_id)
                 .ok_or_else(|| invalid_argument(format!("pane {pane_id} no longer exists")))?;
-            if let Some(reply) = snapshot.reply
+            if let Some(failure) = snapshot.failure.as_ref() {
+                if failure_retry_scheduled(failure) == Some(false) || !failure_retryable(failure) {
+                    return tool_error(reply_failure_message(failure));
+                }
+                if failure_retry_scheduled(failure) == Some(true) {
+                    retry_pending = true;
+                }
+            } else if let Some(reply) = snapshot.reply
+                && !retry_pending
                 && (snapshot.explicit_complete || pane.state == libslop::PaneState::Ready)
             {
                 return ok_json(json!({ "pane_id": pane_id, "reply": reply }));
@@ -994,7 +1003,20 @@ impl SlopdMcp {
                 {
                     return tool_error(format!("pane {pane_id} exited before replying"));
                 }
-                Ok(Ok(Some(_))) => {}
+                Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
+                    if record.source == "hook" && record.event_type == "StopFailure" =>
+                {
+                    if failure_retry_scheduled(&record.payload) != Some(true) {
+                        return tool_error(reply_failure_message(&record.payload));
+                    }
+                    retry_pending = true;
+                }
+                Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record)))) => {
+                    if event_starts_retry(&record) {
+                        retry_pending = false;
+                    }
+                }
+                Ok(Ok(Some(libslopctl::SubscriptionItem::Subscribed))) => {}
                 Ok(Ok(None)) | Ok(Err(_)) => {
                     return Err(internal_failure("reply subscription closed"));
                 }
@@ -1471,6 +1493,7 @@ async fn wait_for_mailbox_reply(
     after_cursor: u64,
 ) -> Result<String, String> {
     let deadline = tokio::time::Instant::now() + MAILBOX_WORKER_TIMEOUT;
+    let mut retry_pending = false;
     loop {
         let records = client
             .read_transcript(pane_id.to_string(), None, 500)
@@ -1482,7 +1505,15 @@ async fn wait_for_mailbox_reply(
             .iter()
             .find(|pane| pane.pane_id == pane_id)
             .ok_or_else(|| format!("pane {pane_id} no longer exists"))?;
-        if let Some(reply) = snapshot.reply
+        if let Some(failure) = snapshot.failure.as_ref() {
+            if failure_retry_scheduled(failure) == Some(false) || !failure_retryable(failure) {
+                return Err(reply_failure_message(failure));
+            }
+            if failure_retry_scheduled(failure) == Some(true) {
+                retry_pending = true;
+            }
+        } else if let Some(reply) = snapshot.reply
+            && !retry_pending
             && (snapshot.explicit_complete || pane.state == libslop::PaneState::Ready)
         {
             return Ok(reply);
@@ -1498,7 +1529,20 @@ async fn wait_for_mailbox_reply(
             {
                 return Err(format!("pane {pane_id} exited before replying"));
             }
-            Ok(Ok(Some(_))) => {}
+            Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
+                if record.source == "hook" && record.event_type == "StopFailure" =>
+            {
+                if failure_retry_scheduled(&record.payload) != Some(true) {
+                    return Err(reply_failure_message(&record.payload));
+                }
+                retry_pending = true;
+            }
+            Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record)))) => {
+                if event_starts_retry(&record) {
+                    retry_pending = false;
+                }
+            }
+            Ok(Ok(Some(libslopctl::SubscriptionItem::Subscribed))) => {}
             Ok(Ok(None)) | Ok(Err(_)) => return Err("reply subscription closed".into()),
             Err(_) => return Err(format!("pane {pane_id} did not reply within 24 hours")),
         }
@@ -1803,8 +1847,9 @@ fn overview_pane(
     };
     let reply = reply_snapshot(records);
     let latest_reply = reply.reply.as_deref().map(brief);
-    let reply_complete = reply.explicit_complete
-        || (latest_reply.is_some() && pane.state == libslop::PaneState::Ready);
+    let reply_complete = reply.failure.is_none()
+        && (reply.explicit_complete
+            || (latest_reply.is_some() && pane.state == libslop::PaneState::Ready));
     json!({
         "pane_id": pane.pane_id,
         "backend": pane.backend,
@@ -1820,6 +1865,7 @@ fn overview_pane(
         "latest_tool_name": latest_tool_name,
         "latest_reply_excerpt": latest_reply,
         "reply_complete": reply_complete,
+        "turn_failure": reply.failure,
         "context_before": before,
         "context_after": after,
         "more_before": more_before,
@@ -2018,6 +2064,7 @@ fn compact_grave(entry: &libslop::GraveEntry) -> Value {
 struct ReplySnapshot {
     reply: Option<String>,
     explicit_complete: bool,
+    failure: Option<Value>,
 }
 
 fn reply_event_filters(pane_id: &str) -> Vec<libslop::EventFilter> {
@@ -2039,6 +2086,12 @@ fn reply_event_filters(pane_id: &str) -> Vec<libslop::EventFilter> {
             pane_id: Some(pane_id.into()),
             ..Default::default()
         },
+        libslop::EventFilter {
+            source: Some("hook".into()),
+            event_type: Some("StopFailure".into()),
+            pane_id: Some(pane_id.into()),
+            ..Default::default()
+        },
     ]
 }
 
@@ -2051,6 +2104,7 @@ fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
         return ReplySnapshot {
             reply: None,
             explicit_complete: false,
+            failure: None,
         };
     };
     reply_snapshot_from(records, last_user)
@@ -2070,6 +2124,7 @@ fn request_reply_snapshot(
         return ReplySnapshot {
             reply: None,
             explicit_complete: false,
+            failure: None,
         };
     };
     reply_snapshot_from(records, matching_user)
@@ -2079,13 +2134,30 @@ fn reply_snapshot_from(records: &[libslop::Record], user_index: usize) -> ReplyS
     let mut reply = None;
     let mut chunks = String::new();
     let mut explicit_complete = false;
+    let mut failure = None;
     for record in records.iter().skip(user_index + 1) {
+        if record.event_type == "turn_failed" {
+            failure = Some(record.payload.clone());
+            explicit_complete = false;
+            continue;
+        }
         if record.event_type == "turn_completed" {
+            failure = None;
             explicit_complete = true;
             break;
         }
-        if conversation_role(record) == Some("user") && reply.is_some() {
-            break;
+        if conversation_role(record) == Some("user") {
+            let retry_continuation = failure.is_some()
+                && transcript_text(&record.payload)
+                    .is_some_and(|text| text.trim().eq_ignore_ascii_case("continue"));
+            if retry_continuation {
+                failure = None;
+                explicit_complete = false;
+                continue;
+            }
+            if reply.is_some() || failure.is_some() {
+                break;
+            }
         }
         if conversation_role(record) != Some("assistant") || progress_record(record) {
             continue;
@@ -2100,6 +2172,7 @@ fn reply_snapshot_from(records: &[libslop::Record], user_index: usize) -> ReplyS
             reply = Some(text);
         }
         if record.payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+            failure = None;
             explicit_complete = true;
             break;
         }
@@ -2107,7 +2180,45 @@ fn reply_snapshot_from(records: &[libslop::Record], user_index: usize) -> ReplyS
     ReplySnapshot {
         reply,
         explicit_complete,
+        failure,
     }
+}
+
+fn failure_retry_scheduled(payload: &Value) -> Option<bool> {
+    payload.get("retry_scheduled").and_then(Value::as_bool)
+}
+
+fn failure_retryable(payload: &Value) -> bool {
+    payload
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn reply_failure_message(payload: &Value) -> String {
+    let code = payload
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("turn_failed");
+    let message = payload
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("the underlying agent turn failed");
+    format!("underlying agent turn failed ({code}): {message}")
+}
+
+fn event_starts_retry(record: &libslop::Record) -> bool {
+    if record.source == "slopd" && record.event_type == "DetailedStateChange" {
+        return record
+            .payload
+            .get("detailed_state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.starts_with("busy_"));
+    }
+    record.source == "transcript"
+        && conversation_role(record) == Some("user")
+        && transcript_text(&record.payload)
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case("continue"))
 }
 
 fn simple_record(record: &libslop::Record) -> Option<Value> {
@@ -2463,9 +2574,9 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        brief, canonical_tool_name, expand_wait_transcripts, latest_user_request, overview_pane,
-        parse_backend, preferred_mcp_pane_id, reply_snapshot, simple_record, transcript_text,
-        valid_pane_id,
+        brief, canonical_tool_name, expand_wait_transcripts, failure_retry_scheduled,
+        latest_user_request, overview_pane, parse_backend, preferred_mcp_pane_id,
+        reply_failure_message, reply_snapshot, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
 
@@ -2737,6 +2848,7 @@ mod tests {
         ]);
         assert_eq!(codex.reply.as_deref(), Some("answer"));
         assert!(codex.explicit_complete);
+        assert!(codex.failure.is_none());
 
         let grok = reply_snapshot(&[
             record(
@@ -2755,5 +2867,81 @@ mod tests {
         ]);
         assert_eq!(grok.reply.as_deref(), Some("answer"));
         assert!(grok.explicit_complete);
+        assert!(grok.failure.is_none());
+    }
+
+    #[test]
+    fn reply_snapshot_does_not_complete_failed_commentary_as_an_answer() {
+        let record = |event_type: &str, payload: Value| libslop::Record {
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%1".into()),
+            payload,
+            cursor: Some(1),
+        };
+        let failed = reply_snapshot(&[
+            record("userMessage", json!({ "text": "question" })),
+            record(
+                "agentMessage",
+                json!({ "text": "working", "phase": "commentary" }),
+            ),
+            record(
+                "turn_failed",
+                json!({
+                    "error": {"message": "at capacity"},
+                    "error_code": "server_overloaded",
+                    "retryable": true,
+                    "retry_scheduled": true,
+                }),
+            ),
+        ]);
+        assert!(failed.reply.is_none());
+        assert!(!failed.explicit_complete);
+        assert_eq!(
+            failed.failure.as_ref().and_then(failure_retry_scheduled),
+            Some(true)
+        );
+
+        let recovered = reply_snapshot(&[
+            record("userMessage", json!({ "text": "question" })),
+            record(
+                "agentMessage",
+                json!({ "text": "working", "phase": "commentary" }),
+            ),
+            record(
+                "turn_failed",
+                json!({
+                    "error": {"message": "at capacity"},
+                    "error_code": "server_overloaded",
+                    "retryable": true,
+                    "retry_scheduled": true,
+                }),
+            ),
+            record("userMessage", json!({ "text": "continue" })),
+            record(
+                "agentMessage",
+                json!({ "text": "answer", "phase": "final_answer" }),
+            ),
+        ]);
+        assert_eq!(recovered.reply.as_deref(), Some("answer"));
+        assert!(recovered.explicit_complete);
+        assert!(recovered.failure.is_none());
+
+        let terminal = reply_snapshot(&[
+            record("userMessage", json!({ "text": "question" })),
+            record(
+                "turn_failed",
+                json!({
+                    "error": {"message": "usage limit"},
+                    "error_code": "usage_limit_exceeded",
+                    "retryable": false,
+                    "retry_scheduled": false,
+                }),
+            ),
+        ]);
+        assert_eq!(
+            terminal.failure.as_ref().map(reply_failure_message),
+            Some("underlying agent turn failed (usage_limit_exceeded): usage limit".to_string())
+        );
     }
 }

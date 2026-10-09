@@ -1686,7 +1686,7 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
         .await
     };
     let (waited, sent) = tokio::join!(wait, send);
-    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id]));
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id.clone()]));
     let waited = tool_payload(&waited);
     assert_eq!(waited["record"]["event_type"], "agentMessage", "{waited}");
     assert!(
@@ -1694,6 +1694,158 @@ async fn wait_assistant_alias_catches_a_codex_reply() {
             .as_str()
             .is_some_and(|text| text.contains("MCP_WAIT_CANARY")),
         "{waited}"
+    );
+}
+
+#[tokio::test]
+async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, control_session) = initialize(&client, addr, None).await;
+    let created = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        170,
+        "create_pane",
+        json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+    )
+    .await;
+    let pane_id = tool_payload(&created)["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (_, wait_session) = initialize(&client, addr, None).await;
+    let (_, send_session) = initialize(&client, addr, None).await;
+    let wait = call_tool(
+        &client,
+        addr,
+        None,
+        wait_session.as_deref(),
+        171,
+        "wait_for_reply",
+        json!({ "pane_id": pane_id.clone(), "timeout": 10 }),
+    );
+    let send = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call_tool(
+            &client,
+            addr,
+            None,
+            send_session.as_deref(),
+            172,
+            "send_prompt",
+            json!({ "pane_id": pane_id.clone(), "prompt": "FAIL_CAPACITY_ONCE" }),
+        )
+        .await
+    };
+    let (waited, sent) = tokio::join!(wait, send);
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([pane_id.clone()]));
+    assert_eq!(
+        tool_payload(&waited)["reply"],
+        "mock response: continue",
+        "{waited}"
+    );
+
+    let created = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        173,
+        "create_pane",
+        json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
+    )
+    .await;
+    let usage_pane_id = tool_payload(&created)["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, wait_session) = initialize(&client, addr, None).await;
+    let (_, send_session) = initialize(&client, addr, None).await;
+    let wait = call_tool(
+        &client,
+        addr,
+        None,
+        wait_session.as_deref(),
+        174,
+        "wait_for_reply",
+        json!({ "pane_id": usage_pane_id.clone(), "timeout": 10 }),
+    );
+    let send = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call_tool(
+            &client,
+            addr,
+            None,
+            send_session.as_deref(),
+            175,
+            "send_prompt",
+            json!({ "pane_id": usage_pane_id.clone(), "prompt": "FAIL_USAGE_LIMIT" }),
+        )
+        .await
+    };
+    let (failed, sent) = tokio::join!(wait, send);
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([usage_pane_id]));
+    assert_eq!(failed["result"]["isError"], true, "{failed}");
+    let failure = tool_payload(&failed);
+    assert!(
+        failure["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("usage_limit_exceeded")
+                && message.contains("usage limit")),
+        "{failure}"
+    );
+
+    let recovered = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        176,
+        "ask_or_tell_agent",
+        json!({
+            "account": "codex",
+            "backend": "codex",
+            "prompt": "FAIL_CAPACITY_ONCE",
+            "new_agent": true,
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let recovered = tool_payload(&recovered);
+    assert_eq!(recovered["status"], "completed", "{recovered}");
+    assert_eq!(recovered["reply"], "mock response: continue", "{recovered}");
+
+    let terminal = call_tool(
+        &client,
+        addr,
+        None,
+        control_session.as_deref(),
+        177,
+        "ask_or_tell_agent",
+        json!({
+            "account": "codex",
+            "backend": "codex",
+            "prompt": "FAIL_USAGE_LIMIT",
+            "new_agent": true,
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let terminal = tool_payload(&terminal);
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert!(
+        terminal["error"].as_str().is_some_and(
+            |error| error.contains("usage_limit_exceeded") && error.contains("usage limit")
+        ),
+        "{terminal}"
     );
 }
 

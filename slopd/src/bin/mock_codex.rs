@@ -248,6 +248,7 @@ fn main() {
     let mut bracket_sequence = Vec::new();
     let mut in_bracketed_paste = false;
     let mut saw_bracketed_paste = false;
+    let mut capacity_failed_once = false;
     loop {
         match stdin.read(&mut byte) {
             Ok(0) | Err(_) => break,
@@ -378,6 +379,51 @@ fn main() {
                     json!({"type":"event_msg","payload":{"type":"task_started"}}),
                 );
                 response_message(&transcript, "user", &prompt);
+
+                if prompt == "FAIL_CAPACITY_ONCE" && !capacity_failed_once {
+                    capacity_failed_once = true;
+                    response_message_with_phase(
+                        &transcript,
+                        "assistant",
+                        "working before capacity failure",
+                        Some("commentary"),
+                    );
+                    write_record(
+                        &transcript,
+                        json!({
+                            "type":"event_msg",
+                            "payload":{
+                                "type":"task_complete",
+                                "turn_id":"mock-capacity-turn",
+                                "last_agent_message":null,
+                                "error":{
+                                    "message":"Selected model is at capacity. Please try a different model.",
+                                    "codex_error_info":"server_overloaded"
+                                }
+                            }
+                        }),
+                    );
+                    continue;
+                }
+
+                if prompt == "FAIL_USAGE_LIMIT" {
+                    write_record(
+                        &transcript,
+                        json!({
+                            "type":"event_msg",
+                            "payload":{
+                                "type":"task_complete",
+                                "turn_id":"mock-usage-limit-turn",
+                                "last_agent_message":null,
+                                "error":{
+                                    "message":"You've hit your usage limit.",
+                                    "codex_error_info":"usage_limit_exceeded"
+                                }
+                            }
+                        }),
+                    );
+                    continue;
+                }
 
                 if prompt == "FOREIGN_HELPER_CANARY" {
                     response_message_with_phase(

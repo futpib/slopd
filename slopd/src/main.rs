@@ -586,6 +586,18 @@ struct RetryState {
     next_send_at: tokio::time::Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetrySchedule {
+    attempt: u32,
+    delay_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CodexFailureState {
+    cursor: u64,
+    retry_schedule: Option<RetrySchedule>,
+}
+
 impl RetryState {
     /// Given the previous retry state (if any) and the backoff policy, compute
     /// the next retry to schedule — or `None` once the attempt cap is exceeded.
@@ -612,6 +624,109 @@ impl RetryState {
     /// scheduled retry was superseded and bail out.
     fn matches(&self, attempt: u32, at: tokio::time::Instant) -> bool {
         self.attempt_count == attempt && self.next_send_at == at
+    }
+}
+
+fn schedule_auto_continue(
+    pane_id: &str,
+    reason: &'static str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+) -> Option<RetrySchedule> {
+    if !config.run.auto_continue_on_failure {
+        return None;
+    }
+    let pane_state = panes.get_or_insert(pane_id);
+    let policy = BackoffPolicy::from_config(&config.run);
+    let now = tokio::time::Instant::now();
+    let next = {
+        let mut retry_guard = pane_state.retry_state.lock().unwrap();
+        match RetryState::next(retry_guard.as_ref(), &policy, now) {
+            Some(next) => {
+                *retry_guard = Some(next.clone());
+                next
+            }
+            None => {
+                *retry_guard = None;
+                debug!(
+                    "{}: pane {} exceeded max attempts ({}), giving up",
+                    reason, pane_id, config.run.max_retry_attempts
+                );
+                return None;
+            }
+        }
+    };
+    let attempt = next.attempt_count;
+    let next_send_instant = next.next_send_at;
+    let delay = next_send_instant.saturating_duration_since(now);
+    let schedule = RetrySchedule {
+        attempt,
+        delay_ms: delay.as_millis().min(u128::from(u64::MAX)) as u64,
+    };
+    let pane_id = pane_id.to_string();
+    let config = config.clone();
+    let panes = panes.clone();
+
+    tokio::spawn(async move {
+        let delay = next_send_instant.saturating_duration_since(tokio::time::Instant::now());
+        if !delay.is_zero() {
+            debug!(
+                "{}: pane {} will auto-continue in {:?}",
+                reason, pane_id, delay
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        let should_send = panes
+            .get(&pane_id)
+            .map(|state| {
+                state
+                    .retry_state
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|retry| retry.matches(attempt, next_send_instant))
+            })
+            .unwrap_or(false);
+        if !should_send {
+            debug!(
+                "{}: pane {} retry state changed, cancelling auto-continue",
+                reason, pane_id
+            );
+            return;
+        }
+
+        debug!("{}: sending auto-continue to pane {}", reason, pane_id);
+        if let Some(pane) = panes.get(&pane_id) {
+            pane.expecting_auto_continue
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if submit_auto_continue(&config, &panes, &pane_id).await {
+            debug!("{}: auto-continue submitted to pane {}", reason, pane_id);
+        } else {
+            if let Some(pane) = panes.get(&pane_id) {
+                pane.expecting_auto_continue
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                *pane.retry_state.lock().unwrap() = None;
+            }
+            warn!(
+                "{}: auto-continue was not accepted by pane {}",
+                reason, pane_id
+            );
+        }
+    });
+
+    Some(schedule)
+}
+
+fn annotate_retry(payload: &mut serde_json::Value, schedule: Option<RetrySchedule>) {
+    let Some(payload) = payload.as_object_mut() else {
+        return;
+    };
+    payload.insert("retry_scheduled".to_string(), schedule.is_some().into());
+    if let Some(schedule) = schedule {
+        payload.insert("retry_attempt".to_string(), schedule.attempt.into());
+        payload.insert("retry_in_ms".to_string(), schedule.delay_ms.into());
     }
 }
 
@@ -773,6 +888,9 @@ struct PaneState {
     transcript_path: std::sync::Mutex<Option<String>>,
     /// Auto-continue retry state (when a turn fails with StopFailure).
     retry_state: std::sync::Mutex<Option<RetryState>>,
+    /// Retry disposition for the latest Codex failure. This enriches the
+    /// durable normalized transcript without modifying Codex's rollout file.
+    codex_failure: std::sync::Mutex<Option<CodexFailureState>>,
     /// Grok prompt currently owning the pane's state. Native transcript updates
     /// can lag hooks, so terminal records must be correlated before they are
     /// allowed to mark a newer turn ready.
@@ -815,6 +933,7 @@ impl PaneState {
             transcript_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             transcript_path: std::sync::Mutex::new(None),
             retry_state: std::sync::Mutex::new(None),
+            codex_failure: std::sync::Mutex::new(None),
             grok_active_prompt_id: std::sync::Mutex::new(None),
             grok_unbound_prompt_active: std::sync::atomic::AtomicBool::new(false),
             grok_pending_prompt: std::sync::Mutex::new(None),
@@ -1260,6 +1379,64 @@ async fn read_opencode_sse(
                 });
             }
 
+            // Side effects apply to the main session only (a subagent's internal
+            // traffic isn't this pane's transcript/hooks). Emit terminal hooks
+            // before their ready state edge so completion consumers see the
+            // outcome first.
+            if is_main {
+                // A clean turn end (session.idle) resets the auto-continue retry budget.
+                if opencode::event_type(&event) == Some("session.idle") {
+                    let state = panes.get_or_insert(pane_id);
+                    *state.retry_state.lock().unwrap() = None;
+                    if let Some(oc) = state.opencode() {
+                        // A TUI-local command can finish without ever creating a
+                        // user message. Do not let its composer text leak into a
+                        // later prompt's retry bookkeeping.
+                        *oc.pending_prompt.lock().unwrap() = None;
+                    }
+                }
+                // Transcript record (live `listen --transcript`).
+                if let Some((rtype, payload)) = opencode::event_to_transcript(&event) {
+                    let _ = event_tx.send(libslop::Record {
+                        source: "transcript".to_string(),
+                        event_type: rtype,
+                        pane_id: Some(pane_id.to_string()),
+                        payload,
+                        cursor: None,
+                    });
+                }
+                let retry_schedule = if opencode::event_is_failure(&event) {
+                    if let Some(oc) = panes.get_or_insert(pane_id).opencode() {
+                        *oc.pending_prompt.lock().unwrap() = None;
+                    }
+                    schedule_opencode_auto_continue(pane_id, config, panes)
+                } else {
+                    None
+                };
+
+                // Synthesized hook event (unifies `listen --hook`/`wait --hook` across
+                // backends — opencode has no native hooks, so we emit hook-NAMED events
+                // derived from its bus).
+                if let Some((hook_name, mut payload)) = opencode::event_to_hook(&event) {
+                    if hook_name == "UserPromptSubmit"
+                        && let Some(oc) = panes.get_or_insert(pane_id).opencode()
+                        && let Some(prompt) = oc.pending_prompt.lock().unwrap().take()
+                    {
+                        *oc.last_prompt.lock().unwrap() = Some(prompt);
+                    }
+                    if hook_name == "StopFailure" {
+                        annotate_retry(&mut payload, retry_schedule);
+                    }
+                    let _ = event_tx.send(libslop::Record {
+                        source: "hook".to_string(),
+                        event_type: hook_name.to_string(),
+                        pane_id: Some(pane_id.to_string()),
+                        payload,
+                        cursor: None,
+                    });
+                }
+            }
+
             // STATE: an active child session (subagent) overrides → busy_subagent.
             let target = if !subagents.lock().unwrap().is_empty() {
                 Some(libslop::PaneDetailedState::BusySubagent)
@@ -1279,58 +1456,6 @@ async fn read_opencode_sse(
                     set_pane_detailed_state(config, pane_id, &new, Some(&current), event_tx, panes)
                         .await;
                 }
-            }
-
-            // Side effects apply to the main session only (a subagent's internal
-            // traffic isn't this pane's transcript/hooks).
-            if !is_main {
-                continue;
-            }
-            // A clean turn end (session.idle) resets the auto-continue retry budget.
-            if opencode::event_type(&event) == Some("session.idle") {
-                let state = panes.get_or_insert(pane_id);
-                *state.retry_state.lock().unwrap() = None;
-                if let Some(oc) = state.opencode() {
-                    // A TUI-local command can finish without ever creating a
-                    // user message. Do not let its composer text leak into a
-                    // later prompt's retry bookkeeping.
-                    *oc.pending_prompt.lock().unwrap() = None;
-                }
-            }
-            // Transcript record (live `listen --transcript`).
-            if let Some((rtype, payload)) = opencode::event_to_transcript(&event) {
-                let _ = event_tx.send(libslop::Record {
-                    source: "transcript".to_string(),
-                    event_type: rtype,
-                    pane_id: Some(pane_id.to_string()),
-                    payload,
-                    cursor: None,
-                });
-            }
-            // Synthesized hook event (unifies `listen --hook`/`wait --hook` across
-            // backends — opencode has no native hooks, so we emit hook-NAMED events
-            // derived from its bus).
-            if let Some((hook_name, payload)) = opencode::event_to_hook(&event) {
-                if hook_name == "UserPromptSubmit"
-                    && let Some(oc) = panes.get_or_insert(pane_id).opencode()
-                    && let Some(prompt) = oc.pending_prompt.lock().unwrap().take()
-                {
-                    *oc.last_prompt.lock().unwrap() = Some(prompt);
-                }
-                let _ = event_tx.send(libslop::Record {
-                    source: "hook".to_string(),
-                    event_type: hook_name.to_string(),
-                    pane_id: Some(pane_id.to_string()),
-                    payload,
-                    cursor: None,
-                });
-            }
-            // Auto-continue: a failed turn (session.error) re-sends the last prompt.
-            if opencode::event_is_failure(&event) {
-                if let Some(oc) = panes.get_or_insert(pane_id).opencode() {
-                    *oc.pending_prompt.lock().unwrap() = None;
-                }
-                schedule_opencode_auto_continue(pane_id, config, panes).await;
             }
         }
     }
@@ -1356,23 +1481,17 @@ fn extract_sse_data(block: &str) -> Option<String> {
 /// with exponential backoff, up to `[run] max_retry_attempts`. Mirrors the Claude
 /// retry path (`expecting_auto_continue` + `RetryState`) so a manual prompt or a
 /// later successful turn cancels a pending retry.
-async fn schedule_opencode_auto_continue(
+fn schedule_opencode_auto_continue(
     pane_id: &str,
     config: &Arc<libslop::SlopdConfig>,
     panes: &PaneMap,
-) {
+) -> Option<RetrySchedule> {
     if !config.run.auto_continue_on_failure {
-        return;
+        return None;
     }
     let pane_state = panes.get_or_insert(pane_id);
-    let oc = match pane_state.opencode() {
-        Some(oc) => oc,
-        None => return,
-    };
-    let prompt = match oc.last_prompt.lock().unwrap().clone() {
-        Some(p) => p,
-        None => return,
-    };
+    let oc = pane_state.opencode()?;
+    let prompt = oc.last_prompt.lock().unwrap().clone()?;
     let policy = BackoffPolicy::from_config(&config.run);
     let (attempt, send_at) = {
         let mut guard = pane_state.retry_state.lock().unwrap();
@@ -1389,7 +1508,7 @@ async fn schedule_opencode_auto_continue(
                     "opencode session.error: pane {} exceeded max retry attempts, giving up",
                     pane_id
                 );
-                return;
+                return None;
             }
         }
     };
@@ -1397,6 +1516,10 @@ async fn schedule_opencode_auto_continue(
         .expecting_auto_continue
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
+    let delay_ms = send_at
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
     let client = oc.client;
     let session_id = oc.session_id;
     let pid = pane_id.to_string();
@@ -1435,6 +1558,7 @@ async fn schedule_opencode_auto_continue(
             s.prompt_submitted.notify_waiters();
         }
     });
+    Some(RetrySchedule { attempt, delay_ms })
 }
 
 /// Tail a transcript .jsonl file, broadcasting each new JSON record as an event.
@@ -1464,6 +1588,15 @@ async fn tail_transcript(
         }
     };
 
+    // State recovery deliberately replays the existing file, but lifecycle
+    // side effects (notably retries) must apply only to records appended after
+    // this tailer attached. Otherwise a daemon restart would resubmit every
+    // historical failed turn it encountered while catching up.
+    let live_boundary = file
+        .metadata()
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut reader = tokio::io::BufReader::new(file);
     let mut line = String::new();
     let mut byte_pos: u64 = 0;
@@ -1577,6 +1710,54 @@ async fn tail_transcript(
                             pane_state.prompt_submitted.notify_waiters();
                         }
 
+                        let live_record = line_start >= live_boundary;
+                        if backend == libslop::Backend::Codex {
+                            if let Some(failure) = codex::task_failure(&record) {
+                                let schedule = if live_record && failure.retryable {
+                                    schedule_auto_continue(
+                                        &pane_id,
+                                        "Codex task failure",
+                                        &config,
+                                        &panes,
+                                    )
+                                } else {
+                                    None
+                                };
+                                *pane_state.codex_failure.lock().unwrap() =
+                                    Some(CodexFailureState {
+                                        cursor: line_start,
+                                        retry_schedule: schedule,
+                                    });
+                                if live_record && !failure.retryable {
+                                    *pane_state.retry_state.lock().unwrap() = None;
+                                }
+                                if live_record {
+                                    let session_id =
+                                        pane_state.identity.lock().unwrap().session_id.clone();
+                                    let mut payload = serde_json::json!({
+                                        "hook_event_name": "StopFailure",
+                                        "backend": "codex",
+                                        "session_id": session_id,
+                                        "turn_id": record.pointer("/payload/turn_id").cloned().unwrap_or(serde_json::Value::Null),
+                                        "error": failure.error,
+                                        "error_code": failure.code,
+                                        "retryable": failure.retryable,
+                                    });
+                                    annotate_retry(&mut payload, schedule);
+                                    let _ = event_tx.send(libslop::Record {
+                                        source: "hook".to_string(),
+                                        event_type: "StopFailure".to_string(),
+                                        pane_id: Some(pane_id.clone()),
+                                        payload,
+                                        cursor: None,
+                                    });
+                                }
+                            } else if codex::task_completed_successfully(&record) {
+                                *pane_state.codex_failure.lock().unwrap() = None;
+                                *pane_state.retry_state.lock().unwrap() = None;
+                            }
+                        }
+
                         // Check if this transcript record triggers a state transition.
                         {
                             let current = pane_state.detailed_state.lock().unwrap().clone();
@@ -1638,9 +1819,15 @@ async fn tail_transcript(
                                 .grok()
                                 .is_some_and(|runtime| runtime.acp_connected());
                         if !grok_acp_is_live
-                            && let Some((event_type, payload)) =
+                            && let Some((event_type, mut payload)) =
                                 decode_transcript_record(backend, &record)
                         {
+                            if event_type == "turn_failed"
+                                && let Some(failure) = *pane_state.codex_failure.lock().unwrap()
+                                && failure.cursor == line_start
+                            {
+                                annotate_retry(&mut payload, failure.retry_schedule);
+                            }
                             let _ = event_tx.send(libslop::Record {
                                 source: "transcript".to_string(),
                                 event_type,
@@ -5282,7 +5469,7 @@ async fn handle_request(
 
             let pane_state = panes.get_or_insert(pane);
             let hook_backend = pane_state.runtime().backend();
-            let payload = if hook_backend == libslop::Backend::Grok {
+            let mut payload = if hook_backend == libslop::Backend::Grok {
                 grok::normalize_hook_payload(payload)
             } else {
                 payload
@@ -5475,22 +5662,43 @@ async fn handle_request(
                 pane_state.prompt_submitted.notify_waiters();
             }
 
+            let stale_grok_terminal = hook_backend == libslop::Backend::Grok
+                && matches!(event.as_str(), "Stop" | "StopFailure" | "StopCancelled")
+                && payload
+                    .get("prompt_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|terminal| {
+                        panes
+                            .get_or_insert(pane)
+                            .grok_active_prompt_id
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .is_some_and(|active| active != terminal)
+                    });
+
+            // A pane is input-ready after a failed turn, so StopFailure still
+            // transitions it to Ready below. Publish the outcome (and the
+            // already-decided retry policy) first so consumers do not mistake
+            // that Ready edge for successful completion.
+            let mut failure_emitted = false;
+            if !stale_grok_terminal && event == "Stop" {
+                *panes.get_or_insert(pane).retry_state.lock().unwrap() = None;
+            } else if !stale_grok_terminal && event == "StopFailure" {
+                let schedule = schedule_auto_continue(pane, "StopFailure", config, panes);
+                annotate_retry(&mut payload, schedule);
+                let _ = event_tx.send(libslop::Record {
+                    source: "hook".to_string(),
+                    event_type: event.clone(),
+                    pane_id: pane_id.clone(),
+                    payload: payload.clone(),
+                    cursor: None,
+                });
+                failure_emitted = true;
+            }
+
             // Unified state transition via reducer.
             {
-                let stale_grok_terminal = hook_backend == libslop::Backend::Grok
-                    && matches!(event.as_str(), "Stop" | "StopFailure" | "StopCancelled")
-                    && payload
-                        .get("prompt_id")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|terminal| {
-                            panes
-                                .get_or_insert(pane)
-                                .grok_active_prompt_id
-                                .lock()
-                                .unwrap()
-                                .as_deref()
-                                .is_some_and(|active| active != terminal)
-                        });
                 if !stale_grok_terminal {
                     let current = panes
                         .get_or_insert(pane)
@@ -5534,105 +5742,15 @@ async fn handle_request(
                 }
             }
 
-            // Handle retry state: reset on clean Stop, schedule retry on StopFailure.
-            if event == "Stop" {
-                // Turn completed successfully — reset retry state.
-                *panes.get_or_insert(pane).retry_state.lock().unwrap() = None;
-            } else if event == "StopFailure" && config.run.auto_continue_on_failure {
-                // Turn failed — decide whether to auto-retry and when.
-                let pane_state = panes.get_or_insert(pane);
-                let mut retry_guard = pane_state.retry_state.lock().unwrap();
-
-                let policy = BackoffPolicy::from_config(&config.run);
-                let next =
-                    RetryState::next(retry_guard.as_ref(), &policy, tokio::time::Instant::now());
-
-                if let Some(next_state) = next {
-                    // Schedule auto-continue.
-                    let attempt = next_state.attempt_count;
-                    let next_send_instant = next_state.next_send_at;
-                    *retry_guard = Some(next_state);
-
-                    // Spawn a task to send "continue" after the backoff.
-                    let pane_id = pane.to_string();
-                    let config_clone = config.clone();
-                    let panes_clone = panes.clone();
-
-                    tokio::spawn(async move {
-                        let delay = next_send_instant
-                            .saturating_duration_since(tokio::time::Instant::now());
-                        if !delay.is_zero() {
-                            debug!(
-                                "StopFailure: pane {} will auto-continue in {:?}",
-                                pane_id, delay
-                            );
-                            tokio::time::sleep(delay).await;
-                        }
-
-                        // Check if retry state is still valid (may have been reset by manual prompt or Stop).
-                        let should_send = panes_clone
-                            .get(&pane_id)
-                            .map(|state| {
-                                let guard = state.retry_state.lock().unwrap();
-                                guard
-                                    .as_ref()
-                                    .is_some_and(|s| s.matches(attempt, next_send_instant))
-                            })
-                            .unwrap_or(false);
-
-                        if !should_send {
-                            debug!(
-                                "StopFailure: pane {} retry state changed, cancelling auto-continue",
-                                pane_id
-                            );
-                            return;
-                        }
-
-                        debug!("StopFailure: sending auto-continue to pane {}", pane_id);
-
-                        // Mark the upcoming UserPromptSubmit as ours so its handler
-                        // doesn't reset the retry counter (which would defeat
-                        // max_retry_attempts for a persistently-failing turn).
-                        if let Some(pane_obj) = panes_clone.get(&pane_id) {
-                            pane_obj
-                                .expecting_auto_continue
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-
-                        if panes_clone.get(&pane_id).is_some() {
-                            if submit_auto_continue(&config_clone, &panes_clone, &pane_id).await {
-                                debug!("StopFailure: auto-continue submitted to pane {}", pane_id);
-                            } else {
-                                warn!(
-                                    "StopFailure: auto-continue was not accepted by pane {}",
-                                    pane_id
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "StopFailure: failed to send auto-continue to pane {} (pane disappeared)",
-                                pane_id
-                            );
-                        }
-                    });
-                } else {
-                    // Attempt cap exceeded — give up and clear retry state so a
-                    // later failure starts a fresh backoff sequence.
-                    *retry_guard = None;
-                    debug!(
-                        "StopFailure: pane {} exceeded max attempts ({}), giving up",
-                        pane, config.run.max_retry_attempts
-                    );
-                }
+            if !failure_emitted {
+                let _ = event_tx.send(libslop::Record {
+                    source: "hook".to_string(),
+                    event_type: event,
+                    pane_id,
+                    payload,
+                    cursor: None,
+                });
             }
-
-            let _ = event_tx.send(libslop::Record {
-                source: "hook".to_string(),
-                event_type: event,
-                pane_id,
-                payload,
-                cursor: None,
-            });
 
             libslop::ResponseBody::Hooked
         }
@@ -7210,14 +7328,25 @@ async fn handle_request(
                         .unwrap_or(libslop::Backend::Claude);
                     match read_transcript_before(&path, effective_before, limit, backend).await {
                         Ok((records, _at_beginning)) => {
+                            let codex_failure = panes
+                                .get(&pane_id)
+                                .and_then(|state| *state.codex_failure.lock().unwrap());
                             let records = records
                                 .into_iter()
-                                .map(|(cursor, event_type, payload)| libslop::Record {
-                                    cursor: Some(cursor),
-                                    source: "transcript".to_string(),
-                                    event_type,
-                                    pane_id: Some(pane_id.clone()),
-                                    payload,
+                                .map(|(cursor, event_type, mut payload)| {
+                                    if event_type == "turn_failed"
+                                        && let Some(failure) = codex_failure
+                                        && failure.cursor == cursor
+                                    {
+                                        annotate_retry(&mut payload, failure.retry_schedule);
+                                    }
+                                    libslop::Record {
+                                        cursor: Some(cursor),
+                                        source: "transcript".to_string(),
+                                        event_type,
+                                        pane_id: Some(pane_id.clone()),
+                                        payload,
+                                    }
                                 })
                                 .collect();
                             libslop::ResponseBody::TranscriptPage { records }

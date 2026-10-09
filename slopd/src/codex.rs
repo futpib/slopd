@@ -8,12 +8,30 @@ use serde_json::{Value, json};
 
 pub type TranscriptRecord = (String, Value);
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskFailure {
+    pub error: Value,
+    pub code: Option<String>,
+    pub retryable: bool,
+}
+
 /// Convert one Codex rollout JSONL entry into slopd's public transcript shape.
 ///
 /// `event_msg` user/agent messages duplicate `response_item` messages, so only
 /// the latter are emitted. Metadata and lifecycle entries remain available to
 /// the state backstop but are not exposed as transcript messages.
 pub fn transcript_record(record: &Value) -> Option<TranscriptRecord> {
+    if let Some(failure) = task_failure(record) {
+        return Some((
+            "turn_failed".to_string(),
+            json!({
+                "turn_id": record.pointer("/payload/turn_id").cloned().unwrap_or(Value::Null),
+                "error": failure.error,
+                "error_code": failure.code,
+                "retryable": failure.retryable,
+            }),
+        ));
+    }
     if record.get("type").and_then(Value::as_str) != Some("response_item") {
         return None;
     }
@@ -79,6 +97,75 @@ pub fn transcript_record(record: &Value) -> Option<TranscriptRecord> {
         )),
         _ => None,
     }
+}
+
+pub fn task_failure(record: &Value) -> Option<TaskFailure> {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg")
+        || record.pointer("/payload/type").and_then(Value::as_str) != Some("task_complete")
+    {
+        return None;
+    }
+    let error = record.pointer("/payload/error")?.clone();
+    if error.is_null() {
+        return None;
+    }
+    let code = error
+        .get("codex_error_info")
+        .and_then(error_info_code)
+        .or_else(|| {
+            error
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let retryable = code.as_deref().is_some_and(retryable_error_code)
+        || code.as_deref() == Some("other")
+            && error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    message.starts_with("stream disconnected before completion")
+                });
+    Some(TaskFailure {
+        error,
+        code,
+        retryable,
+    })
+}
+
+pub fn task_completed_successfully(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("event_msg")
+        && record.pointer("/payload/type").and_then(Value::as_str) == Some("task_complete")
+        && record.pointer("/payload/error").is_none_or(Value::is_null)
+}
+
+fn error_info_code(value: &Value) -> Option<String> {
+    match value {
+        Value::String(code) => Some(code.clone()),
+        Value::Object(info) if info.len() == 1 => info.keys().next().cloned(),
+        _ => None,
+    }
+}
+
+fn retryable_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "server_overloaded"
+            | "server_is_overloaded"
+            | "rate_limit_exceeded"
+            | "slow_down"
+            | "connection_failed"
+            | "http_connection_failed"
+            | "response_stream_connection_failed"
+            | "response_stream_disconnected"
+            | "response_too_many_failed_attempts"
+            | "server_error"
+            | "internal_server_error"
+            | "service_unavailable_error"
+            | "request_timeout"
+            | "internal_error"
+            | "flex_unavailable"
+    )
 }
 
 fn content_text(value: Option<&Value>) -> Option<String> {
@@ -203,5 +290,129 @@ mod tests {
             transcript_state(&started),
             Some(libslop::PaneDetailedState::BusyProcessing)
         );
+    }
+
+    #[test]
+    fn classifies_structured_task_failures_without_matching_display_text() {
+        for code in [
+            "server_overloaded",
+            "rate_limit_exceeded",
+            "connection_failed",
+            "response_stream_connection_failed",
+            "response_stream_disconnected",
+            "response_too_many_failed_attempts",
+            "server_error",
+            "internal_server_error",
+            "request_timeout",
+            "internal_error",
+            "flex_unavailable",
+        ] {
+            let record = json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"task_complete",
+                    "turn_id":"turn-1",
+                    "error":{"message":"localized text", "codex_error_info":code}
+                }
+            });
+            let failure = task_failure(&record).expect("task failure");
+            assert_eq!(failure.code.as_deref(), Some(code));
+            assert!(failure.retryable, "{code} should be retryable");
+        }
+
+        for code in [
+            "usage_limit_exceeded",
+            "session_budget_exceeded",
+            "cyber_policy",
+            "bio_policy",
+            "misalignment_policy_violation",
+            "too_many_denials",
+            "authentication_error",
+            "unauthorized",
+            "bad_request",
+            "invalid_prompt",
+            "invalid_request",
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "sandbox_error",
+            "active_turn_not_steerable",
+            "thread_rollback_failed",
+            "executor_version_incompatible",
+            "unrecognized_future_error",
+        ] {
+            let record = json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"task_complete",
+                    "error":{"message":"action required", "codex_error_info":code}
+                }
+            });
+            assert!(
+                !task_failure(&record).unwrap().retryable,
+                "{code} should not retry"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_object_error_info_and_legacy_disconnects() {
+        for code in [
+            "http_connection_failed",
+            "response_stream_connection_failed",
+            "response_stream_disconnected",
+            "response_too_many_failed_attempts",
+        ] {
+            let mut connection = json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"task_complete",
+                    "error":{
+                        "message":"connection failed",
+                        "codex_error_info":{}
+                    }
+                }
+            });
+            connection["payload"]["error"]["codex_error_info"][code] =
+                json!({"http_status_code":null});
+            let failure = task_failure(&connection).unwrap();
+            assert_eq!(failure.code.as_deref(), Some(code));
+            assert!(failure.retryable, "{code} should be retryable");
+        }
+
+        let legacy = json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"task_complete",
+                "error":{
+                    "message":"stream disconnected before completion: transport closed",
+                    "codex_error_info":"other"
+                }
+            }
+        });
+        assert!(task_failure(&legacy).unwrap().retryable);
+    }
+
+    #[test]
+    fn exposes_failed_turns_as_durable_transcript_records() {
+        let failed = json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"task_complete",
+                "turn_id":"turn-capacity",
+                "error":{
+                    "message":"Selected model is at capacity.",
+                    "codex_error_info":"server_overloaded"
+                }
+            }
+        });
+        let (kind, payload) = transcript_record(&failed).unwrap();
+        assert_eq!(kind, "turn_failed");
+        assert_eq!(payload["turn_id"], "turn-capacity");
+        assert_eq!(payload["error_code"], "server_overloaded");
+        assert_eq!(payload["retryable"], true);
+
+        let complete = json!({"type":"event_msg","payload":{"type":"task_complete"}});
+        assert!(task_completed_successfully(&complete));
+        assert!(transcript_record(&complete).is_none());
     }
 }

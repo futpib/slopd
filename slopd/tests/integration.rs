@@ -14592,6 +14592,122 @@ fn fork_opencode_pane_binds_new_pane_to_forked_session() {
 }
 
 #[test]
+fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let Some(env) = TestEnv::new_with_auto_continue(None, None, 2, 50, 100) else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    env.append_config(&format!(
+        "\n[accounts.codex-failures]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        mock_codex.to_str().unwrap(),
+        codex_home.path().to_str().unwrap(),
+    ));
+
+    let slopd = env.spawn_slopd();
+    let run_codex = || {
+        let output = env.slopctl_raw(&[
+            "run",
+            "--account",
+            "codex-failures",
+            "--ready-timeout",
+            "20",
+        ]);
+        assert!(
+            output.status.success(),
+            "Codex run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    let capacity_pane = run_codex();
+    let listener = spawn_hook_listener(&env, "StopFailure");
+    let send = env.slopctl(&["send", &capacity_pane, "FAIL_CAPACITY_ONCE"]);
+    assert!(
+        send.status.success(),
+        "capacity prompt was not accepted: {send:?}"
+    );
+    let capacity_id = capacity_pane.clone();
+    let event = wait_for_event(listener, move |event| {
+        event["pane_id"] == capacity_id && event["event_type"] == "StopFailure"
+    });
+    assert_eq!(event["payload"]["error_code"], "server_overloaded");
+    assert_eq!(event["payload"]["retryable"], true);
+    assert_eq!(event["payload"]["retry_scheduled"], true);
+    assert_eq!(event["payload"]["retry_attempt"], 1);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let capacity_records = loop {
+        let transcript = env.slopctl(&["transcript", &capacity_pane, "--limit", "50"]);
+        assert!(transcript.status.success());
+        let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+        let records = transcript["records"].as_array().unwrap();
+        if records.iter().any(|record| {
+            record["event_type"] == "agentMessage"
+                && record["payload"]["text"] == "mock response: continue"
+        }) {
+            break records.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Codex capacity failure was not auto-continued: {transcript}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(capacity_records.iter().any(|record| {
+        record["event_type"] == "turn_failed"
+            && record["payload"]["error_code"] == "server_overloaded"
+    }));
+    assert_eq!(
+        capacity_records
+            .iter()
+            .filter(|record| {
+                record["event_type"] == "userMessage" && record["payload"]["text"] == "continue"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(env.pane_state(&capacity_pane).0, libslop::PaneState::Ready);
+
+    let usage_pane = run_codex();
+    let listener = spawn_hook_listener(&env, "StopFailure");
+    let send = env.slopctl(&["send", &usage_pane, "FAIL_USAGE_LIMIT"]);
+    assert!(
+        send.status.success(),
+        "usage-limit prompt was not accepted: {send:?}"
+    );
+    let usage_id = usage_pane.clone();
+    let event = wait_for_event(listener, move |event| {
+        event["pane_id"] == usage_id && event["event_type"] == "StopFailure"
+    });
+    assert_eq!(event["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(event["payload"]["retryable"], false);
+    assert_eq!(event["payload"]["retry_scheduled"], false);
+
+    std::thread::sleep(Duration::from_millis(300));
+    let transcript = env.slopctl(&["transcript", &usage_pane, "--limit", "50"]);
+    assert!(transcript.status.success());
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let usage_records = transcript["records"].as_array().unwrap();
+    assert!(usage_records.iter().any(|record| {
+        record["event_type"] == "turn_failed"
+            && record["payload"]["error_code"] == "usage_limit_exceeded"
+            && record["payload"]["retry_scheduled"] == false
+    }));
+    assert!(!usage_records.iter().any(|record| {
+        record["event_type"] == "userMessage" && record["payload"]["text"] == "continue"
+    }));
+    assert_eq!(env.pane_state(&usage_pane).0, libslop::PaneState::Ready);
+
+    kill_slopd(slopd);
+}
+
+#[test]
 fn codex_mock_run_send_approval_transcript_fork_and_restart() {
     build_bin("slopd");
     build_bin("slopctl");
