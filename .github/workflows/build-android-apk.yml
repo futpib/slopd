@@ -1,0 +1,120 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-app
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          : "${KEYSTORE_BASE64:?Configure KEYSTORE_BASE64 before publishing}"
+          : "${KEYSTORE_PASSWORD:?Configure KEYSTORE_PASSWORD before publishing}"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/slopd-release.jks"
+
+      - name: Analyze and test
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter analyze
+          flutter test
+
+      - name: Set version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
+          python3 - <<'PY'
+          import datetime
+          import os
+          import re
+          from pathlib import Path
+          tags = Path(os.environ['RUNNER_TEMP'], 'release-tags').read_text().splitlines()
+          codes = [int(match[1]) for tag in tags if (match := re.fullmatch(r'android-.+\+([0-9]+)', tag))]
+          code = max([1, *codes]) + 1
+          if code > 999999999:
+              raise SystemExit('Android version code exhausted')
+          name = datetime.datetime.now(datetime.timezone.utc).strftime('%y.%m.%d.%H.%M')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'name={name}\ncode={code}\ntag=android-{name}+{code}\n')
+          PY
+
+      - name: Build signed APKs
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/slopd-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: bash scripts/build-release.sh "$VERSION_NAME" "$VERSION_CODE" "$RUNNER_TEMP/release-apks"
+
+      - name: Publish Android release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Android ${{ steps.version.outputs.name }}+${{ steps.version.outputs.code }}
+          make_latest: true
+          body: |
+            Install **app-release.apk** if unsure; it contains ARM64 and x86-64.
+            Smaller standalone APKs are available for each architecture.
+
+            In Obtainium, add https://github.com/${{ github.repository }} and select the APK you want.
+            For updates, keep the same APK filename. These are independently installable APKs, not split APK bundles.
+
+            Built from ${{ github.sha }}. SHA256SUMS covers all three APKs.
+          fail_on_unmatched_files: true
+          files: |
+            ${{ runner.temp }}/release-apks/*.apk
+            ${{ runner.temp }}/release-apks/SHA256SUMS
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/slopd-release.jks"

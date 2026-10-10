@@ -71,24 +71,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
 
-    /// Connect through iroh. Implied by --endpoint or --addr-file.
-    #[arg(long)]
-    iroh: bool,
-
-    /// Iroh endpoint alias or raw EndpointId. Uses the default from the shared
-    /// iroh-slopctl config when omitted.
-    #[arg(long, value_name = "NAME_OR_ID")]
-    endpoint: Option<String>,
-
-    /// Read the remote iroh EndpointAddr from this JSON file.
-    #[arg(long, value_name = "PATH")]
-    addr_file: Option<PathBuf>,
-
-    /// Iroh client config. Defaults to the same config used by iroh-slopctl, so
-    /// both programs have the same client EndpointId and server authorization.
-    #[arg(long, value_name = "PATH")]
-    iroh_config: Option<PathBuf>,
-
     /// Named slopd account used for newly-created panes.
     #[arg(short, long, value_name = "NAME")]
     account: Option<String>,
@@ -102,8 +84,7 @@ struct Cli {
     #[arg(long, value_name = "ID")]
     session_scope: Option<String>,
 
-    /// Override ACP's cwd when starting the underlying pane. This is useful
-    /// when iroh connects to a host with a different filesystem layout.
+    /// Override ACP's cwd when starting the underlying pane.
     #[arg(long, value_name = "REMOTE_PATH")]
     working_directory: Option<PathBuf>,
 
@@ -112,7 +93,6 @@ struct Cli {
     env: Vec<String>,
 
     /// Inherit a named environment variable into each managed pane (repeatable).
-    /// This is opt-in because iroh may target a different machine.
     #[arg(long = "inherit-env", value_name = "NAME")]
     inherit_env: Vec<String>,
 
@@ -177,13 +157,12 @@ async fn main() {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
-    let transport = match build_transport(&cli).await {
-        Ok(transport) => transport,
-        Err(error) => {
-            eprintln!("slopd-acp: {error}");
-            std::process::exit(1);
-        }
-    };
+    let socket = cli
+        .socket
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(libslop::socket_path);
+    let transport = Transport::local(socket);
     let mut env = match parse_env(&cli.env) {
         Ok(env) => env,
         Err(error) => {
@@ -365,45 +344,6 @@ async fn main() {
     drop(sender);
     let _ = writer.await;
     tracing::debug!("ACP adapter stopped");
-}
-
-async fn build_transport(cli: &Cli) -> Result<Transport, String> {
-    let remote = cli.iroh || cli.endpoint.is_some() || cli.addr_file.is_some();
-    if remote && cli.socket.is_some() {
-        return Err("--socket cannot be combined with iroh transport options".into());
-    }
-    if !remote && cli.iroh_config.is_some() {
-        return Err("--iroh-config requires --iroh, --endpoint, or --addr-file".into());
-    }
-    if !remote {
-        let socket = cli
-            .socket
-            .as_deref()
-            .map(libslop::expand_path)
-            .unwrap_or_else(libslop::socket_path);
-        return Ok(Transport::Local(socket));
-    }
-
-    let config_path = cli
-        .iroh_config
-        .as_deref()
-        .map(libslop::expand_path)
-        .unwrap_or_else(libslopiroh::default_client_config_path);
-    let mut config = libslopiroh::ClientConfig::load(config_path);
-    let secret_key = config.secret_key().map_err(|error| error.to_string())?;
-    let remote = if let Some(addr_file) = cli.addr_file.as_deref() {
-        let path = libslop::expand_path(addr_file);
-        libslopiroh::read_addr_file(&path).map_err(|error| error.to_string())?
-    } else {
-        config
-            .resolve_endpoint(cli.endpoint.as_deref())
-            .map_err(|error| error.to_string())?
-    };
-    let connector = libslopiroh::Connector::bind(secret_key, remote)
-        .await
-        .map_err(|error| error.to_string())?;
-    tracing::info!("iroh client EndpointId: {}", connector.client_id());
-    Ok(Transport::Iroh(connector))
 }
 
 fn parse_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {

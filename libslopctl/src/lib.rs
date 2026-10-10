@@ -79,7 +79,7 @@ pub enum CommonCommand {
     Run {
         /// Working directory for the new pane. A relative path (e.g. `.`) is
         /// resolved against slopctl's current directory (local slopctl only; over
-        /// a remote iroh connection a relative path is rejected, since the
+        /// a remote connection a relative path is rejected, since the
         /// client's cwd has no meaning on the server). Supports ~ and $VAR /
         /// ${VAR} expansion (applied by slopd, so a quoted ~ works and resolves
         /// against the daemon's home). Overrides [run] start_directory from
@@ -343,22 +343,22 @@ pub enum CommonCommand {
     },
 }
 
-/// Context that differs between slopctl (local) and iroh-slopctl (remote).
+/// Context that differs between local and remote clients.
 pub struct CommandContext {
-    /// For `Run`: the parent pane ID. slopctl sets this to $TMUX_PANE, iroh sets None.
+    /// For `Run`: the parent pane ID. A local client can set this to $TMUX_PANE.
     /// The daemon also uses it to inherit the parent pane's account when `--account`
     /// is not given.
     pub parent_pane_id: Option<String>,
     /// For commands with an optional pane ID: fallback pane ID. Local slopctl
-    /// sets this to $TMUX_PANE; iroh-slopctl sets None.
+    /// sets this to $TMUX_PANE; remote clients use None.
     pub fallback_pane_id: Option<String>,
     /// For `run --interactive`: how to launch the viewer command. `None` means
-    /// interactive run is unsupported here (remote iroh — can't attach to a
+    /// interactive run is unsupported here (remote clients cannot attach to a
     /// remote tmux). slopctl populates it from its config.
     pub interactive: Option<InteractiveRun>,
     /// Whether slopd is reached over a local Unix socket (same filesystem). When
     /// true, client-relative paths like `--start-directory` are resolved here;
-    /// when false (remote iroh), the client's cwd is meaningless on the server,
+    /// when false (remote client), the client's cwd is meaningless on the server,
     /// so a relative path is rejected rather than silently misinterpreted.
     pub local: bool,
 }
@@ -1943,7 +1943,7 @@ fn resolve_local_start_directory(path: PathBuf) -> PathBuf {
     }
 }
 
-/// Validate a `--start-directory` for a *remote* (iroh) connection, where the
+/// Validate a `--start-directory` for a remote connection, where the
 /// client's cwd is meaningless on the server. `~`/`$VAR` and absolute paths defer
 /// to the remote (resolved there); a relative path is ambiguous and rejected so
 /// it can't silently resolve against the wrong machine's filesystem.
@@ -2370,7 +2370,7 @@ where
             };
             // Resolve / validate --start-directory before the value leaves this
             // process. Over a local socket a relative path resolves against
-            // slopctl's cwd; over a remote (iroh) connection the client's cwd is
+            // slopctl's cwd; over a remote connection the client's cwd is
             // meaningless on the server, so a relative path is rejected instead.
             let start_directory = if ctx.local {
                 start_directory.map(resolve_local_start_directory)
@@ -2747,7 +2747,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_command_rejects_relative_start_directory_over_remote() {
-        // A remote (iroh) connection: ctx.local == false. A relative
+        // A remote connection: ctx.local == false. A relative
         // --start-directory is rejected *before* any request is sent, so the
         // dummy empty/sink client is never actually driven.
         let mut client = Client::new(tokio::io::empty(), tokio::io::sink());

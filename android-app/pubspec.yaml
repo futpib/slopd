@@ -1,0 +1,33 @@
+name: slopd_control
+description: "SSH and Iroh management client for slopd."
+publish_to: 'none'
+
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  dartssh2:
+    path: vendor/dartssh2
+  flutter_secure_storage: ^11.2.0
+  ffi: ^2.2.0
+  file_picker: ^13.1.0
+  pinenacl: ^0.6.0
+  crypto: ^3.0.7
+  flutter_zxing: ^2.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+  integration_test:
+    sdk: flutter
+
+flutter:
+
+  uses-material-design: true

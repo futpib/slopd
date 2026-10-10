@@ -4,13 +4,11 @@ members = [
     "slopctl",
     "libslop",
     "libslopctl",
-    "libslopiroh",
     "libsloptest",
-    "iroh-slopd",
-    "iroh-slopctl",
     "slopd-acp",
     "slopd-mcp",
 ]
+exclude = ["android-app/native"]
 resolver = "2"
 
 [workspace.lints.rust]

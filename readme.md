@@ -28,9 +28,7 @@ subscribers.
 - [Event system](#event-system)
 - [ACP adapter](#acp-adapter)
 - [MCP supervisor](#mcp-supervisor)
-- [Remote access (iroh)](#remote-access-iroh)
-  - [iroh-slopd](#iroh-slopd)
-  - [iroh-slopctl](#iroh-slopctl)
+- [Android client](#android-client)
 - [Workspace layout](#workspace-layout)
 
 ---
@@ -86,9 +84,8 @@ package from the AUR:
 yay -S slopd-git
 ```
 
-The package installs `slopd`, `slopctl`, `iroh-slopd`, `iroh-slopctl`, and the
-systemd user service. Install from source if you also need `slopd-acp` or
-`slopd-mcp`.
+The package installs `slopd`, `slopctl`, and the systemd user service. Install
+from source if you also need `slopd-acp` or `slopd-mcp`.
 
 To install from source:
 
@@ -99,9 +96,6 @@ cargo install --path slopctl
 cargo install --path slopd-acp
 # Optional: Streamable HTTP MCP supervisor for Grok Voice / MCP clients
 cargo install --path slopd-mcp
-# Optional: remote access via iroh
-cargo install --path iroh-slopd
-cargo install --path iroh-slopctl
 ```
 
 Or build without installing:
@@ -159,9 +153,7 @@ slopd --config /path/to/other.toml
 The path supports `~` and `$VAR` expansion. `slopctl --config <path>` reads the
 same file for the slopd settings it needs (the control socket and the `[tmux]`
 socket/session used by `run --interactive`), so a single file can configure
-both. SIGHUP reloads from the `--config` path too. `slopd`, `slopctl`,
-`iroh-slopd`, and `iroh-slopctl` all accept a `--config` override for their
-respective config.
+both. SIGHUP reloads from the `--config` path too.
 
 #### Running a second instance
 
@@ -186,8 +178,7 @@ slopctl --config ~/.config/slopd/b.toml ps
 
 `--socket PATH` remains available on slopd and its local clients as a
 higher-precedence one-off override. The daemon automatically includes the
-effective control socket in injected hook commands. `iroh-slopd` can likewise
-read `[control] socket` from its own config or override it with `--socket`.
+effective control socket in injected hook commands.
 
 ### Reloading config
 
@@ -598,9 +589,7 @@ PANE=$(slopctl run -c ~/code/other-project)
 PANE=$(slopctl run --start-directory ~/code/other-project)
 ```
 
-For local `slopctl`, relative paths are resolved against the client's current
-directory. A remote `iroh-slopctl` requires an absolute path because its local
-cwd has no meaning on the daemon host.
+Relative paths are resolved against `slopctl`'s current directory.
 
 Use `-e` / `--env KEY=VALUE` (repeatable) to add environment variables to the new pane. Values support `$VAR` / `${VAR}` expansion against slopctl's environment; a missing variable is an error:
 
@@ -628,16 +617,14 @@ interactive_command = ["kitty", "tmux", "attach", "-t", "{{session}}"]
 interactive_type = "forking"
 ```
 
-`--interactive` is a local-slopctl feature (it attaches to slopd's tmux); `iroh-slopctl run --interactive` errors.
+`--interactive` attaches the local terminal to slopd's tmux session.
 
 ### `slopctl fork [PANE_ID] [--no-wait] [-i] [--ready-timeout SECS] [-c DIR] [-e KEY=VALUE]... [--env-file PATH]... [-- EXTRA_ARGS...]`
 
 Open a new pane whose agent session **starts as a copy** of `PANE_ID`'s conversation and then diverges independently. The source pane keeps running, untouched — the two share history up to the fork point and nothing after it. The fork inherits the source's account, backend, and (by default) working directory. Prints the new pane id, and — like `run` — waits for it to become ready unless `--no-wait` is given.
 
-For local `slopctl`, `PANE_ID` defaults to `$TMUX_PANE`, so it can be omitted
-when forking the pane you are currently using. Outside a tmux pane, the argument
-is required. `iroh-slopctl` always requires it because the client's local tmux
-pane has no meaning on the remote host.
+When `$TMUX_PANE` is available, `PANE_ID` defaults to the current pane. Outside
+a tmux pane, the argument is required.
 
 ```bash
 FORK=$(slopctl fork)             # branch the current pane's conversation
@@ -983,8 +970,8 @@ Named accounts do **not** inherit the top-level `backend` (mirroring `config_dir
 ### What works identically
 
 `run`, `fork`, `send`, `interrupt`, `listen`, `wait`, `transcript`, tagging,
-backup/restore, `ps`, and the iroh remote path are backend-aware behind the same
-CLI. A state such as `ready`, `busy_tool_use`, or `awaiting_input_permission`
+backup/restore, and `ps` are backend-aware behind the same CLI. A state such as
+`ready`, `busy_tool_use`, or `awaiting_input_permission`
 has the same meaning regardless of backend.
 
 ### OpenCode limitations
@@ -1006,8 +993,7 @@ binds the durable session ID. Consequently, `ps` can briefly show
 
 This keeps failure domains independent: a signal, crash, or disconnect affecting
 one Codex process does not take the other Codex panes down with a shared service.
-The panes may run on different hosts when paired with the normal slopd/iroh
-remote path; no Codex-specific shared server is required.
+Separate slopd hosts do not require a Codex-specific shared server.
 
 ```toml
 [accounts.codex]
@@ -1394,7 +1380,7 @@ Useful adapter-wide launch options include:
 - `--shutdown-policy preserve|close`; `SIGUSR1` always performs a draining
   close, while EOF, SIGTERM, and SIGINT use the configured policy;
 - repeatable `--inherit-env NAME` to copy selected variables from the adapter's
-  environment into panes (off by default, especially important over iroh).
+  environment into panes (off by default).
 
 The adapter maps ACP onto slopd as follows:
 
@@ -1478,32 +1464,6 @@ incremental text parts; Grok passes its native incremental ACP/xAI update
 envelopes through without projection; Claude and Codex may yield complete
 message blocks.
 
-### ACP over iroh
-
-Iroh changes only the transport below the adapter. `slopd-acp` shares the ALPN,
-client config, persisted secret key, endpoint aliases, address-file format, and
-authorization identity used by `iroh-slopctl`. If `iroh-slopctl info` is already
-authorized on the server, `slopd-acp` is already authorized too.
-
-```bash
-# Use the default endpoint in ~/.config/iroh-slopctl/config.toml
-slopd-acp --iroh --account work --backend codex
-
-# Or select an alias/raw EndpointId/full EndpointAddr file
-slopd-acp --endpoint my-server
-slopd-acp --addr-file /path/to/iroh-addr.json
-```
-
-ACP's cwd names a path on the machine running the ACP host. When the remote
-slopd host has a different filesystem layout, override it with a path meaningful
-to that host:
-
-```bash
-slopd-acp --iroh --working-directory /srv/agents/project
-```
-
-Use `--iroh-config PATH` to select a different client identity/config instead of
-the shared `iroh-slopctl` default.
 
 ---
 
@@ -1598,119 +1558,26 @@ must list the public hostname or IP clients send.
 
 ---
 
-## Remote access (iroh)
+## Android client
 
-`iroh-slopd` and `iroh-slopctl` provide remote access to a running slopd instance by exposing the Unix socket over the [iroh](https://github.com/n0-computer/iroh) peer-to-peer network. This lets you control slopd from another machine via an encrypted P2P connection with EndpointId allowlist authentication.
+The Flutter app in [`android-app`](android-app/) manages slopd through the remote
+host's ordinary SSH service. It supports direct SSH and SSH carried over
+[`iroh-ssh`](https://github.com/futpib/iroh-ssh):
 
 ```
- [remote machine]               [local machine]
- iroh-slopctl ──── iroh ────► iroh-slopd ──► slopd.sock ──► slopd
+Android app -> SSH exec -> slopctl -> slopd.sock -> slopd
+            \ Iroh tunnel /  (optional)
 ```
 
-`iroh-slopctl` exposes the same common command set as `slopctl`, plus `info`.
-Remote `run`/`fork` require an absolute `--start-directory`, `--interactive` is
-not available because the tmux server is remote, and `tags` requires an
-explicit pane ID.
+Install `slopctl` for the SSH user, add a normal key to
+`~/.ssh/authorized_keys`, and connect with `user@host` or an Iroh Endpoint ID.
+No forced command, scoped key, custom slopd transport, or separate endpoint
+allowlist is used. The app can start agents, send prompts and local commands, inspect
+transcripts, interrupt work, and kill panes, so its SSH credential should be
+treated as granting code execution as that user.
 
-### iroh-slopd
-
-`iroh-slopd` is a proxy that listens for iroh connections and forwards them to the local slopd Unix socket. Only clients whose EndpointId has been explicitly authorized are allowed to connect.
-
-**Config file:** `~/.config/iroh-slopd/config.toml`
-
-```toml
-# Auto-generated on first run; do not edit manually.
-secret_key = "..."
-
-# List of authorized client EndpointIds (z-base-32 public keys).
-authorized_clients = []
-
-# Optional local slopd instance to expose. `--socket PATH` overrides it.
-# [control]
-# socket = "/run/user/1000/slopd-b.sock"
-```
-
-**Subcommands:**
-
-| Command | Description |
-|---------|-------------|
-| `iroh-slopd` | Run the proxy server (default mode) |
-| `iroh-slopd info` | Print this server's EndpointId |
-| `iroh-slopd authorize <endpoint-id>` | Add a client EndpointId to the allowlist |
-| `iroh-slopd revoke <endpoint-id>` | Remove a client EndpointId from the allowlist |
-
-**Setup walkthrough:**
-
-```bash
-# 1. On the server — get the server's EndpointId
-iroh-slopd info
-# example output: abc123...
-
-# 2. On the client — get the client's EndpointId
-iroh-slopctl info
-# example output: xyz789...
-
-# 3. On the server — authorize the client
-iroh-slopd authorize xyz789...
-
-# 4. On the server — start the proxy
-iroh-slopd
-# iroh-slopd endpoint: abc123...
-# iroh-slopd addr: {"node_id":"...","info":{...}}
-```
-
-Use `--addr-file PATH` to write the full `EndpointAddr` JSON to a file on startup. This is useful in scripts or tests that need to pass the address to a client without relying on discovery:
-
-```bash
-iroh-slopd --addr-file /tmp/iroh-addr.json
-```
-
-Set `[control] socket` in iroh-slopd's config to bridge a non-default local
-slopd instance, or use `--socket PATH` as an override. `--config PATH` selects
-another iroh server identity/allowlist file. Verbosity can be increased with
-`-v` / `-vv` / `-vvv`.
-
-### iroh-slopctl
-
-`iroh-slopctl` is a remote slopctl that connects to `iroh-slopd` instead of a
-local Unix socket. It exposes the common daemon commands described under
-[slopctl commands](#slopctl-commands), but not the local-only `hook` and
-`tmux-hook` commands, and adds an `info` subcommand.
-
-**Config file:** `~/.config/iroh-slopctl/config.toml`
-
-```toml
-# Auto-generated on first run; do not edit manually.
-secret_key = "..."
-
-# Default named endpoint to connect to when --endpoint is not given.
-default = "my-server"
-
-[endpoints.my-server]
-endpoint_id = "abc123..."
-```
-
-**Connecting:**
-
-```bash
-# Connect by EndpointId (raw key)
-iroh-slopctl --endpoint abc123... ps
-
-# Connect by name defined in config
-iroh-slopctl --endpoint my-server ps
-
-# Connect using a full EndpointAddr JSON file (no discovery needed)
-iroh-slopctl --addr-file /tmp/iroh-addr.json ps --json
-
-# Use the default endpoint from config
-iroh-slopctl ps
-```
-
-**Additional subcommand:**
-
-| Command | Description |
-|---------|-------------|
-| `iroh-slopctl info` | Print this client's EndpointId (share with server for authorization) |
+See [android-app/README.md](android-app/README.md) for receiver setup, app
+architecture, and build instructions.
 
 ---
 
@@ -1722,9 +1589,7 @@ iroh-slopctl ps
 | `slopctl` | CLI client binary — all user-facing subcommands |
 | `libslop` | Shared library — protocol types, config, hook injection, path helpers |
 | `libslopctl` | Transport-agnostic client library — JSON-RPC protocol, typed methods, streaming |
-| `libslopiroh` | Shared iroh client transport — ALPN, identity/config, endpoint resolution |
-| `iroh-slopd` | iroh proxy binary — exposes slopd over iroh with EndpointId allowlist auth |
-| `iroh-slopctl` | iroh remote CLI binary — connects to iroh-slopd instead of a Unix socket |
 | `slopd-acp` | ACP stdio adapter — exposes slopd-managed panes to ACP hosts |
 | `slopd-mcp` | Streamable HTTP MCP supervisor for remote slopctl operations |
 | `libsloptest` | Test helpers — isolated tmux environments for integration tests |
+| `android-app` | Flutter client — ordinary SSH or SSH over Iroh, invoking remote `slopctl` |
