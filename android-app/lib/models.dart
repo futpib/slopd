@@ -1,4 +1,4 @@
-import 'dart:convert';
+import 'package:yaml_writer/yaml_writer.dart';
 
 class PaneInfo {
   const PaneInfo({
@@ -80,6 +80,8 @@ class TranscriptEntry {
   final dynamic payload;
   final int? cursor;
 
+  static final _yamlWriter = YamlWriter(allowUnquotedStrings: true);
+
   factory TranscriptEntry.fromJson(Map<String, dynamic> value) =>
       TranscriptEntry(
         type: value['event_type'] as String? ?? 'record',
@@ -88,7 +90,7 @@ class TranscriptEntry {
         cursor: (value['cursor'] as num?)?.toInt(),
       );
 
-  String get text => messageText ?? _readable(payload) ?? _pretty(payload);
+  String get text => messageText ?? _readable(payload) ?? _yaml(payload);
 
   TranscriptKind get kind {
     final normalized = type.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
@@ -309,9 +311,9 @@ class TranscriptEntry {
     return null;
   }
 
-  static String _pretty(dynamic value) {
+  static String _yaml(dynamic value) {
     try {
-      return const JsonEncoder.withIndent('  ').convert(value);
+      return _yamlWriter.write(value).trimRight();
     } catch (_) {
       return '$value';
     }

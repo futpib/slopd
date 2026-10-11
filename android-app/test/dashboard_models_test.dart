@@ -80,6 +80,9 @@ void main() {
     expect(assistant.kind, TranscriptKind.assistant);
     expect(tool.kind, TranscriptKind.activity);
     expect(tool.activityLabel, 'Using exec command');
+    expect(tool.activityDetail, contains('name: exec_command'));
+    expect(tool.activityDetail, contains('cmd: cargo test'));
+    expect(tool.activityDetail, isNot(contains('{')));
   });
 
   test('OpenCode text and tool parts become chat and activity', () {

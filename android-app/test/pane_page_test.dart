@@ -41,14 +41,17 @@ void main() {
     expect(find.text('Agent'), findsOneWidget);
     expect(find.text('Make this feel like chat.'), findsOneWidget);
     expect(find.text('It now reads like a conversation.'), findsOneWidget);
-    expect(find.text('2 steps'), findsOneWidget);
+    expect(find.text('3 steps'), findsOneWidget);
     expect(find.text('command output'), findsNothing);
     expect(find.textContaining('{"text"'), findsNothing);
     expect(find.widgetWithText(TextField, 'Message agent'), findsOneWidget);
 
-    await tester.tap(find.text('2 steps'));
+    await tester.tap(find.text('3 steps'));
     await tester.pumpAndSettle();
     expect(find.text('command output'), findsOneWidget);
+    expect(find.textContaining('name: exec_command'), findsOneWidget);
+    expect(find.textContaining('cmd: flutter test'), findsOneWidget);
+    expect(find.textContaining('{"name"'), findsNothing);
 
     await tester.enterText(
       find.widgetWithText(TextField, 'Message agent'),
@@ -94,11 +97,19 @@ class _FakeControlApi implements ControlApi {
             },
             {
               'cursor': 3,
+              'event_type': 'toolCall',
+              'payload': {
+                'name': 'exec_command',
+                'arguments': {'cmd': 'flutter test'},
+              },
+            },
+            {
+              'cursor': 4,
               'event_type': 'toolResult',
               'payload': {'output': 'command output'},
             },
             {
-              'cursor': 4,
+              'cursor': 5,
               'event_type': 'agentMessage',
               'payload': {'text': 'It now reads like a conversation.'},
             },

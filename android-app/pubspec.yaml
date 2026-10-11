@@ -19,6 +19,7 @@ dependencies:
   pinenacl: ^0.6.0
   crypto: ^3.0.7
   flutter_zxing: ^2.2.1
+  yaml_writer: ^2.1.0
 
 dev_dependencies:
   flutter_test:
