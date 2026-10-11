@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:slopd_control/control.dart';
 
-class TestControl implements ControlApi {
+class TestControl extends ControlApi {
   bool lost = false;
   int closes = 0;
   final calls = <List<String>>[];

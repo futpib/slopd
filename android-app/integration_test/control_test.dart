@@ -34,12 +34,32 @@ void main() {
         return Future.value(true);
       });
       try {
-        final status = await api.command(['status']);
-        expect(status.stdout, contains('uptime:'));
+        final status =
+            jsonDecode((await api.command(['status', '--json'])).stdout)
+                as Map<String, dynamic>;
+        expect(status['uptime_secs'], isA<num>());
+        expect(status['config_generation'], isA<num>());
+        final info =
+            jsonDecode((await api.command(['info', '--json'])).stdout)
+                as Map<String, dynamic>;
+        expect(info['version'], isA<String>());
+        expect(info['capabilities'], contains('listen'));
         expect(
           jsonDecode((await api.command(['ps', '--json'])).stdout),
           isList,
         );
+        final events = await api.openStream(['listen']);
+        try {
+          expect(
+            jsonDecode(
+              await events.lines.first.timeout(const Duration(seconds: 10)),
+            ),
+            containsPair('subscribed', true),
+          );
+        } finally {
+          events.close();
+          await events.done;
+        }
         expect(hostKey, isNotEmpty);
       } finally {
         await api.close();
@@ -92,13 +112,13 @@ void main() {
       await tester.tap(find.text('Trust'));
       for (
         var i = 0;
-        i < 200 && find.text('Agents · 0').evaluate().isEmpty;
+        i < 200 && find.text('Agents · 0/0').evaluate().isEmpty;
         i++
       ) {
         await tester.pump(const Duration(milliseconds: 100));
       }
-      expect(find.text('Agents · 0'), findsOneWidget);
-      expect(find.textContaining('uptime:'), findsOneWidget);
+      expect(find.text('Agents · 0/0'), findsOneWidget);
+      expect(find.text('slopd service online'), findsOneWidget);
       await tester.pageBack();
       await tester.pump(const Duration(seconds: 1));
     } finally {

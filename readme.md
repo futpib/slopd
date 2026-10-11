@@ -496,13 +496,20 @@ automatic restore.
 
 ## slopctl commands
 
-All commands communicate with the running daemon over its Unix socket. Global
+Commands that operate on daemon state communicate over its Unix socket. Global
 `--config PATH` selects the control socket and local client settings from a
 specific slopd config; `--socket PATH` overrides its socket for one invocation.
 
-### `slopctl status`
+### `slopctl info [--json]`
 
-Print daemon uptime and state.
+Print the slopctl version and commit, selected slopd config and control-socket
+paths, and the command capabilities supported by this client. `--json` provides
+a stable machine-readable object and does not require a running daemon.
+
+### `slopctl status [--json]`
+
+Print daemon uptime and state. `--json` returns the structured daemon-state
+object used by management clients.
 
 ```
 uptime: 5025s

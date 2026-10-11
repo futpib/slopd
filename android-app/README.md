@@ -4,10 +4,14 @@ The Android app manages slopd agent panes through an ordinary SSH login. It can
 connect to a normal SSH address or use `iroh-ssh` to reach that SSH service by
 Iroh Endpoint ID.
 
-The app lists managed panes, starts agents, reads transcripts, sends prompts and
-local commands, interrupts work, and terminates panes. The SSH account therefore
-has the same effective authority as a local `slopctl` user. Use a normal SSH key
-in `authorized_keys`; no forced command or slopd-specific key option is required.
+The app lists, searches, filters, and sorts managed panes; starts and forks
+agents with readiness, environment, and argument controls; tails and paginates
+transcripts; sends to one or filtered groups; manages tags; listens or waits for
+events; and exposes backup, restore, graveyard, and revive operations. Structured
+service information shows the daemon state, selected remote config/socket,
+slopctl version, and supported capabilities. The SSH account therefore has the
+same effective authority as a local `slopctl` user. Use a normal SSH key in
+`authorized_keys`; no forced command or slopd-specific key option is required.
 
 ## Receiver
 
@@ -38,6 +42,9 @@ adapter calls the pinned `futpib/iroh-ssh` bridge and returns a loopback TCP por
 the same SSH client then connects through that tunnel.
 
 Each app operation invokes the installed `slopctl` over an SSH exec channel.
+Long-lived transcript and event subscriptions keep one exec channel open and
+consume the command's JSON-lines output. Polling and subscriptions stop while
+their page is backgrounded and reconnect explicitly after transport loss.
 There is no custom slopd transport, endpoint allowlist, alternate remote CLI, or
 additional network protocol. SSH authentication and host-key checks are shared
 across those exec channels.

@@ -26,6 +26,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show client, configuration, and supported-command information.
+    Info {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Forward an agent lifecycle hook event to slopd (called by Claude/Codex hooks).
     Hook {
         /// Hook event name (e.g. UserPromptSubmit).
@@ -91,6 +97,53 @@ async fn main() {
         .map(libslop::expand_path)
         .unwrap_or_else(|| slopd_config.control_socket_path());
     debug!("connecting to {}", socket_path.display());
+
+    if let Command::Info { json } = &cli.command {
+        let config_path = config_override
+            .clone()
+            .unwrap_or_else(libslop::SlopdConfig::config_path);
+        let capabilities = [
+            "info",
+            "status",
+            "status_json",
+            "pane_list",
+            "run",
+            "fork",
+            "send",
+            "interrupt",
+            "kill",
+            "listen",
+            "wait",
+            "transcript_pagination",
+            "tags",
+            "backup",
+            "restore",
+            "graveyard",
+            "revive",
+        ];
+        if *json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "commit": env!("GIT_COMMIT"),
+                    "config_path": config_path.to_string_lossy(),
+                    "socket_path": socket_path.to_string_lossy(),
+                    "capabilities": capabilities,
+                })
+            );
+        } else {
+            println!(
+                "slopctl {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_COMMIT")
+            );
+            println!("config: {}", config_path.display());
+            println!("socket: {}", socket_path.display());
+            println!("capabilities: {}", capabilities.join(", "));
+        }
+        return;
+    }
 
     // Hook must never exit 2 — that would block the Claude action.
     // Exit 1 on errors (so failures are visible), but never 2.

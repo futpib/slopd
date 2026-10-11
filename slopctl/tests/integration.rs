@@ -437,8 +437,6 @@ fn status_with_slopd_running() {
 
     let output = env.slopctl(&["status"]);
 
-    kill_slopd(slopd);
-
     assert!(
         output.status.success(),
         "slopctl exited with failure: {:?}",
@@ -446,6 +444,44 @@ fn status_with_slopd_running() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("uptime:"), "unexpected output: {}", stdout);
+
+    let json_output = env.slopctl(&["status", "--json"]);
+    assert!(
+        json_output.status.success(),
+        "slopctl status --json failed: {:?}",
+        json_output
+    );
+    let state: serde_json::Value = serde_json::from_slice(&json_output.stdout)
+        .unwrap_or_else(|e| panic!("status output is not JSON: {e}"));
+    assert!(state["uptime_secs"].is_number());
+    assert!(state["subscriber_count"].is_number());
+    assert!(state["config_generation"].is_number());
+
+    kill_slopd(slopd);
+}
+
+#[test]
+fn info_json_does_not_require_a_running_daemon() {
+    build_bin("slopctl");
+    let runtime_dir = tempfile::tempdir().unwrap();
+    let output = Command::new(cargo_bin("slopctl"))
+        .args(["info", "--json"])
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .output()
+        .expect("failed to run slopctl info");
+    assert!(output.status.success(), "slopctl info failed: {:?}", output);
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("info output is not JSON: {e}"));
+    assert!(info["version"].is_string());
+    assert!(info["commit"].is_string());
+    assert!(info["config_path"].is_string());
+    assert!(info["socket_path"].is_string());
+    assert!(
+        info["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("listen"))
+    );
 }
 
 #[test]

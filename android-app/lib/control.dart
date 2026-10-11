@@ -127,6 +127,9 @@ abstract class ControlApi {
     List<String> arguments, {
     Duration timeout = const Duration(seconds: 45),
   });
+  Future<CommandStream> openStream(List<String> arguments) => Future.error(
+    UnsupportedError('This control transport does not support streams'),
+  );
   Future<void> close();
 }
 
@@ -134,6 +137,19 @@ class CommandResult {
   const CommandResult(this.stdout, this.stderr, this.exitCode);
   final String stdout, stderr;
   final int exitCode;
+}
+
+class CommandStream {
+  const CommandStream({
+    required this.lines,
+    required this.errors,
+    required this.done,
+    required this.close,
+  });
+
+  final Stream<String> lines, errors;
+  final Future<int> done;
+  final void Function() close;
 }
 
 class ConnectionLost implements Exception {
@@ -203,6 +219,42 @@ class ControlConnection extends ChangeNotifier implements ControlApi {
       }
     }();
     return done.future;
+  }
+
+  @override
+  Future<CommandStream> openStream(List<String> arguments) async {
+    final api = _api;
+    if (_closed || disconnected || reconnecting || api == null) {
+      throw const ConnectionLost();
+    }
+    try {
+      final stream = await api.openStream(arguments);
+      if (_closed || api != _api) {
+        stream.close();
+        throw const ConnectionLost();
+      }
+      return CommandStream(
+        lines: stream.lines,
+        errors: stream.errors,
+        done: stream.done.catchError((Object error, StackTrace stack) {
+          if (error is ConnectionLost &&
+              !_closed &&
+              api == _api &&
+              !disconnected) {
+            disconnected = true;
+            notifyListeners();
+          }
+          Error.throwWithStackTrace(error, stack);
+        }),
+        close: stream.close,
+      );
+    } on ConnectionLost {
+      if (!_closed && api == _api && !disconnected) {
+        disconnected = true;
+        notifyListeners();
+      }
+      rethrow;
+    }
   }
 
   @override
@@ -446,6 +498,82 @@ class SshControl implements ControlApi {
     } finally {
       session.close();
     }
+  }
+
+  @override
+  Future<CommandStream> openStream(List<String> arguments) async {
+    if (_closed || _ssh.isClosed) throw const ConnectionLost();
+    late final SSHSession session;
+    try {
+      session = await _ssh
+          .execute(commandLine(arguments))
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      _ssh.close();
+      throw const ConnectionLost();
+    } catch (_) {
+      if (_ssh.isClosed) throw const ConnectionLost();
+      rethrow;
+    }
+
+    final lines = StreamController<String>();
+    final errors = StreamController<String>();
+    final stderr = StringBuffer();
+    var cancelled = false;
+
+    Future<void> pump(
+      Stream<Uint8List> input,
+      StreamController<String> output, {
+      StringBuffer? copy,
+    }) async {
+      await for (final line
+          in input
+              .cast<List<int>>()
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())) {
+        copy?.writeln(line);
+        if (!output.isClosed) output.add(line);
+      }
+    }
+
+    final done = () async {
+      try {
+        await Future.wait([
+          pump(session.stdout, lines),
+          pump(session.stderr, errors, copy: stderr),
+          session.done,
+        ]);
+        if (cancelled) return 0;
+        if (_ssh.isClosed) throw const ConnectionLost();
+        final exitCode = session.exitCode ?? 255;
+        if (exitCode != 0) {
+          final detail = stderr.toString().trim();
+          throw StateError(
+            detail.isEmpty
+                ? 'slopctl exited $exitCode'
+                : 'slopctl exited $exitCode: $detail',
+          );
+        }
+        return exitCode;
+      } catch (_) {
+        if (_ssh.isClosed) throw const ConnectionLost();
+        rethrow;
+      } finally {
+        await lines.close();
+        await errors.close();
+        session.close();
+      }
+    }();
+
+    return CommandStream(
+      lines: lines.stream,
+      errors: errors.stream,
+      done: done,
+      close: () {
+        cancelled = true;
+        session.close();
+      },
+    );
   }
 
   @override
