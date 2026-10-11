@@ -59,6 +59,88 @@ void main() {
     expect(entry.text, 'first\nsecond');
   });
 
+  test('transcript entries classify Codex messages and tool activity', () {
+    final user = TranscriptEntry.fromJson({
+      'event_type': 'userMessage',
+      'payload': {'text': 'Please fix the tests.'},
+    });
+    final assistant = TranscriptEntry.fromJson({
+      'event_type': 'agentMessage',
+      'payload': {'text': 'The tests now pass.'},
+    });
+    final tool = TranscriptEntry.fromJson({
+      'event_type': 'toolCall',
+      'payload': {
+        'name': 'exec_command',
+        'arguments': {'cmd': 'cargo test'},
+      },
+    });
+
+    expect(user.kind, TranscriptKind.user);
+    expect(assistant.kind, TranscriptKind.assistant);
+    expect(tool.kind, TranscriptKind.activity);
+    expect(tool.activityLabel, 'Using exec command');
+  });
+
+  test('OpenCode text and tool parts become chat and activity', () {
+    final message = TranscriptEntry.fromJson({
+      'event_type': 'assistant',
+      'payload': {
+        'info': {
+          'time': {'created': 1791676800000},
+        },
+        'parts': [
+          {'type': 'text', 'text': 'I found the issue.'},
+        ],
+      },
+    });
+    final tool = TranscriptEntry.fromJson({
+      'event_type': 'assistant',
+      'payload': {
+        'parts': [
+          {
+            'type': 'tool',
+            'tool': 'bash',
+            'state': {'title': 'Run tests', 'output': 'All tests passed'},
+          },
+        ],
+      },
+    });
+
+    expect(message.kind, TranscriptKind.assistant);
+    expect(message.messageText, 'I found the issue.');
+    expect(message.timestamp, isNotEmpty);
+    expect(tool.kind, TranscriptKind.activity);
+    expect(tool.toolName, 'bash');
+    expect(tool.activityDetail, contains('All tests passed'));
+  });
+
+  test('Grok streamed text is shown as a message', () {
+    final entry = TranscriptEntry.fromJson({
+      'event_type': 'agent_message_chunk',
+      'payload': {
+        'params': {
+          'update': {
+            'content': {'type': 'text', 'text': 'Working on it'},
+          },
+        },
+      },
+    });
+
+    expect(entry.kind, TranscriptKind.assistant);
+    expect(entry.messageText, 'Working on it');
+  });
+
+  test('failed transcript records are presented as errors', () {
+    final entry = TranscriptEntry.fromJson({
+      'event_type': 'tool_error',
+      'payload': {'error': 'permission denied'},
+    });
+
+    expect(entry.kind, TranscriptKind.error);
+    expect(entry.activityLabel, 'Agent error');
+  });
+
   test('structured daemon and client status retain management metadata', () {
     final status = DaemonStatus.fromJson({
       'uptime_secs': 90,

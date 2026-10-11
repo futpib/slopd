@@ -19,6 +19,8 @@ class PanePage extends StatefulWidget {
 }
 
 class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
+  static const transcriptPageSize = 300;
+
   final prompt = TextEditingController();
   final scroll = ScrollController();
   late PaneInfo pane = widget.pane;
@@ -43,6 +45,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     widget.api.addListener(_connectionChanged);
+    prompt.addListener(_promptChanged);
     _resume();
   }
 
@@ -53,9 +56,14 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     timer?.cancel();
     widget.api.removeListener(_connectionChanged);
     WidgetsBinding.instance.removeObserver(this);
+    prompt.removeListener(_promptChanged);
     prompt.dispose();
     scroll.dispose();
     super.dispose();
+  }
+
+  void _promptChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -108,7 +116,12 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     if (!quiet && mounted) setState(() => loading = true);
     try {
       final results = await Future.wait([
-        widget.api.command(['transcript', pane.id, '--limit', '100']),
+        widget.api.command([
+          'transcript',
+          pane.id,
+          '--limit',
+          '$transcriptPageSize',
+        ]),
         widget.api.command(['ps', '--json']),
       ]);
       final value = jsonDecode(results[0].stdout) as Map<String, dynamic>;
@@ -126,7 +139,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           records = _merge(next, records);
-          hasEarlier = next.length >= 100;
+          hasEarlier = next.length >= transcriptPageSize;
           if (updated != null) pane = updated;
           error = updated == null ? 'This pane is no longer managed.' : '';
         });
@@ -466,214 +479,469 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     if (value != null && mounted) setState(() => sendTimeout = value);
   }
 
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: Text(pane.id),
-      actions: [
-        IconButton(
-          tooltip: 'Refresh',
-          onPressed: loading
-              ? null
-              : () {
-                  refresh();
-                  _startLive();
-                },
-          icon: const Icon(Icons.refresh),
-        ),
-        PopupMenuButton<String>(
-          onSelected: (value) => switch (value) {
-            'fork' => forkPane(),
-            'tags' => manageTags(),
-            'interrupt' => interrupt(),
-            'kill' => kill(),
-            _ => Future<void>.value(),
-          },
-          itemBuilder: (_) => const [
-            PopupMenuItem(value: 'fork', child: Text('Fork')),
-            PopupMenuItem(value: 'tags', child: Text('Manage tags')),
-            PopupMenuItem(value: 'interrupt', child: Text('Interrupt')),
-            PopupMenuItem(value: 'kill', child: Text('Kill')),
+  Future<void> showPaneDetails() => showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    showDragHandle: true,
+    builder: (context) => SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(pane.title, style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                Chip(label: Text(_words(pane.detailedState))),
+                Chip(label: Text('${pane.backend}/${pane.account}')),
+                for (final tag in pane.tags) Chip(label: Text(tag)),
+              ],
+            ),
+            const SizedBox(height: 20),
+            _Detail('Working directory', pane.directory),
+            _Detail(
+              'Session',
+              pane.sessionId.isEmpty ? 'Unknown' : pane.sessionId,
+            ),
+            _Detail(
+              'Parent pane',
+              pane.parentPaneId.isEmpty ? 'None' : pane.parentPaneId,
+            ),
+            _Detail('Created', formatAge(pane.createdAt)),
+            _Detail('Last active', formatAge(pane.lastActive)),
+            _Detail(
+              'Transcript',
+              pane.transcriptPath.isEmpty ? 'Unknown' : pane.transcriptPath,
+            ),
           ],
         ),
-      ],
+      ),
     ),
-    body: Column(
-      children: [
-        if (widget.api.disconnected || widget.api.reconnecting)
-          MaterialBanner(
-            content: Text(
-              widget.api.reconnecting ? 'Reconnecting…' : 'Connection lost',
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _conversationItems(records);
+    final disconnected = widget.api.disconnected || widget.api.reconnecting;
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 4,
+        title: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: showPaneDetails,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  pane.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                Text(
+                  '${pane.id} · ${_words(pane.detailedState)}',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
-            actions: [
-              if (!widget.api.reconnecting)
-                TextButton(
-                  onPressed: reconnect,
-                  child: const Text('Reconnect'),
-                ),
-            ],
-          ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(pane.title, style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 4),
-              Text(
-                '${pane.backend}/${pane.account} · ${pane.detailedState}\n${pane.directory}',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              if (pane.tags.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Wrap(
-                    spacing: 6,
-                    runSpacing: 4,
-                    children: [
-                      for (final tag in pane.tags) Chip(label: Text(tag)),
-                    ],
-                  ),
-                ),
-              ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: const Text('Pane details'),
-                childrenPadding: const EdgeInsets.only(bottom: 8),
-                expandedCrossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SelectableText(
-                    'Session: ${pane.sessionId.isEmpty ? 'unknown' : pane.sessionId}\n'
-                    'Parent: ${pane.parentPaneId.isEmpty ? 'none' : pane.parentPaneId}\n'
-                    'Created: ${formatAge(pane.createdAt)}\n'
-                    'Last active: ${formatAge(pane.lastActive)}\n'
-                    'Transcript: ${pane.transcriptPath.isEmpty ? 'unknown' : pane.transcriptPath}',
-                    style: mono.copyWith(fontSize: 11),
-                  ),
-                ],
-              ),
-              if (error.isNotEmpty) ErrorBox(error),
-            ],
           ),
         ),
-        Expanded(
-          child: loading && records.isEmpty
-              ? const Center(child: CircularProgressIndicator())
-              : records.isEmpty
-              ? const EmptyState(
-                  Icons.notes,
-                  'No transcript records',
-                  'Records appear after the agent receives input.',
-                )
-              : ListView.builder(
-                  controller: scroll,
-                  padding: const EdgeInsets.all(16),
-                  itemCount: records.length + (hasEarlier ? 1 : 0),
-                  itemBuilder: (context, index) {
-                    if (hasEarlier && index == 0) {
-                      return Center(
-                        child: TextButton.icon(
-                          onPressed: loadingEarlier ? null : loadEarlier,
-                          icon: loadingEarlier
+        actions: [
+          IconButton(
+            tooltip: 'Refresh chat',
+            onPressed: loading
+                ? null
+                : () {
+                    refresh();
+                    _startLive();
+                  },
+            icon: const Icon(Icons.refresh),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) => switch (value) {
+              'details' => showPaneDetails(),
+              'fork' => forkPane(),
+              'tags' => manageTags(),
+              'interrupt' => interrupt(),
+              'kill' => kill(),
+              _ => Future<void>.value(),
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'details', child: Text('Agent details')),
+              PopupMenuItem(value: 'fork', child: Text('Fork')),
+              PopupMenuItem(value: 'tags', child: Text('Manage tags')),
+              PopupMenuItem(value: 'interrupt', child: Text('Interrupt')),
+              PopupMenuItem(value: 'kill', child: Text('Kill')),
+            ],
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (disconnected)
+            MaterialBanner(
+              content: Text(
+                widget.api.reconnecting ? 'Reconnecting…' : 'Connection lost',
+              ),
+              actions: [
+                if (!widget.api.reconnecting)
+                  TextButton(
+                    onPressed: reconnect,
+                    child: const Text('Reconnect'),
+                  ),
+              ],
+            ),
+          if (error.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: ErrorBox(error),
+            ),
+          Expanded(
+            child: loading && records.isEmpty
+                ? const Center(child: CircularProgressIndicator())
+                : records.isEmpty
+                ? const EmptyState(
+                    Icons.chat_bubble_outline,
+                    'No messages yet',
+                    'Send a message to start this conversation.',
+                  )
+                : ListView.builder(
+                    controller: scroll,
+                    padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
+                    itemCount: items.length + (hasEarlier ? 1 : 0),
+                    itemBuilder: (context, index) {
+                      if (hasEarlier && index == 0) {
+                        return Center(
+                          child: TextButton.icon(
+                            onPressed: loadingEarlier ? null : loadEarlier,
+                            icon: loadingEarlier
+                                ? const SizedBox.square(
+                                    dimension: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.history),
+                            label: const Text('Earlier messages'),
+                          ),
+                        );
+                      }
+                      final item = items[index - (hasEarlier ? 1 : 0)];
+                      return _ConversationItemView(item: item);
+                    },
+                  ),
+          ),
+          SafeArea(
+            top: false,
+            child: Material(
+              color: Theme.of(context).colorScheme.surfaceContainer,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: prompt,
+                            minLines: 1,
+                            maxLines: 6,
+                            enabled: !sending && !widget.api.disconnected,
+                            textCapitalization: TextCapitalization.sentences,
+                            decoration: const InputDecoration(
+                              hintText: 'Message agent',
+                              filled: true,
+                            ),
+                          ),
+                        ),
+                        PopupMenuButton<String>(
+                          tooltip: 'Message options',
+                          enabled: !sending,
+                          icon: const Icon(Icons.tune),
+                          onSelected: (value) {
+                            if (value == 'interrupt') {
+                              setState(() => interruptFirst = !interruptFirst);
+                            } else if (value == 'timeout') {
+                              setSendTimeout();
+                            }
+                          },
+                          itemBuilder: (_) => [
+                            CheckedPopupMenuItem(
+                              value: 'interrupt',
+                              checked: interruptFirst,
+                              child: const Text('Interrupt before sending'),
+                            ),
+                            PopupMenuItem(
+                              value: 'timeout',
+                              child: Text('Send timeout · ${sendTimeout}s'),
+                            ),
+                          ],
+                        ),
+                        IconButton.filled(
+                          tooltip: 'Send message',
+                          onPressed:
+                              sending ||
+                                  widget.api.disconnected ||
+                                  prompt.text.trim().isEmpty
+                              ? null
+                              : send,
+                          icon: sending
                               ? const SizedBox.square(
-                                  dimension: 16,
+                                  dimension: 20,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2,
                                   ),
                                 )
-                              : const Icon(Icons.expand_less),
-                          label: const Text('Load earlier'),
+                              : const Icon(Icons.arrow_upward),
                         ),
-                      );
-                    }
-                    final record = records[index - (hasEarlier ? 1 : 0)];
-                    return Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '${record.type}${record.cursor == null ? '' : ' · ${record.cursor}'}',
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                            if (record.timestamp.isNotEmpty)
-                              Text(
-                                record.timestamp,
-                                style: Theme.of(context).textTheme.labelSmall,
-                              ),
-                            const SizedBox(height: 8),
-                            SelectableText(record.text, style: mono),
-                          ],
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.only(left: 12, top: 4),
+                      child: Text(
+                        'Local commands start with ! · ${sendTimeout}s'
+                        '${interruptFirst ? ' · interrupt first' : ''}',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-        SafeArea(
-          top: false,
-          child: Material(
-            color: Theme.of(context).colorScheme.surfaceContainer,
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: prompt,
-                      minLines: 1,
-                      maxLines: 5,
-                      enabled: !sending && !widget.api.disconnected,
-                      decoration: InputDecoration(
-                        labelText: 'Prompt or local command',
-                        hintText: 'Continue, or ! command',
-                        helperText: 'Timeout: ${sendTimeout}s',
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        tooltip: 'Set send timeout',
-                        onPressed: sending ? null : setSendTimeout,
-                        icon: const Icon(Icons.timer_outlined),
-                      ),
-                      Tooltip(
-                        message: 'Interrupt before sending',
-                        child: Checkbox(
-                          value: interruptFirst,
-                          onChanged: sending
-                              ? null
-                              : (value) => setState(
-                                  () => interruptFirst = value ?? false,
-                                ),
-                        ),
-                      ),
-                      IconButton.filled(
-                        tooltip: 'Send',
-                        onPressed: sending || widget.api.disconnected
-                            ? null
-                            : send,
-                        icon: sending
-                            ? const SizedBox.square(
-                                dimension: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.send),
-                      ),
-                    ],
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
-        ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Detail extends StatelessWidget {
+  const _Detail(this.label, this.value);
+
+  final String label, value;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 16),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: Theme.of(context).textTheme.labelMedium),
+        const SizedBox(height: 4),
+        SelectableText(value.isEmpty ? 'Unknown' : value),
       ],
     ),
   );
 }
+
+class _ConversationItem {
+  _ConversationItem(this.kind, TranscriptEntry record) : records = [record];
+
+  final TranscriptKind kind;
+  final List<TranscriptEntry> records;
+
+  bool get chunks =>
+      records.every((record) => record.type.toLowerCase().contains('chunk'));
+
+  String get message => records
+      .map((record) => record.messageText ?? record.text)
+      .join(chunks ? '' : '\n\n');
+}
+
+List<_ConversationItem> _conversationItems(List<TranscriptEntry> records) {
+  final items = <_ConversationItem>[];
+  for (final record in records) {
+    final kind = record.kind;
+    final previous = items.lastOrNull;
+    final combineActivity =
+        kind == TranscriptKind.activity &&
+        previous?.kind == TranscriptKind.activity;
+    final combineChunks =
+        (kind == TranscriptKind.user || kind == TranscriptKind.assistant) &&
+        previous?.kind == kind &&
+        previous!.chunks &&
+        record.type.toLowerCase().contains('chunk');
+    if (combineActivity || combineChunks) {
+      previous!.records.add(record);
+    } else {
+      items.add(_ConversationItem(kind, record));
+    }
+  }
+  return items;
+}
+
+class _ConversationItemView extends StatelessWidget {
+  const _ConversationItemView({required this.item});
+
+  final _ConversationItem item;
+
+  @override
+  Widget build(BuildContext context) => switch (item.kind) {
+    TranscriptKind.user => _MessageBubble(item: item, user: true),
+    TranscriptKind.assistant => _MessageBubble(item: item, user: false),
+    TranscriptKind.error => _FailureCard(item.records.first),
+    TranscriptKind.activity => _ActivityCard(item.records),
+  };
+}
+
+class _MessageBubble extends StatelessWidget {
+  const _MessageBubble({required this.item, required this.user});
+
+  final _ConversationItem item;
+  final bool user;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final timestamp = _shortTimestamp(item.records.last.timestamp);
+    return Align(
+      alignment: user ? Alignment.centerRight : Alignment.centerLeft,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.sizeOf(context).width * 0.86,
+        ),
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
+          decoration: BoxDecoration(
+            color: user ? colors.primaryContainer : colors.surfaceContainerHigh,
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(18),
+              topRight: const Radius.circular(18),
+              bottomLeft: Radius.circular(user ? 18 : 4),
+              bottomRight: Radius.circular(user ? 4 : 18),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    user ? Icons.person_outline : Icons.smart_toy_outlined,
+                    size: 16,
+                    color: colors.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    user ? 'You' : 'Agent',
+                    style: Theme.of(context).textTheme.labelMedium,
+                  ),
+                  if (timestamp.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    Text(
+                      timestamp,
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: colors.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 6),
+              SelectableText(item.message),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ActivityCard extends StatelessWidget {
+  const _ActivityCard(this.records);
+
+  final List<TranscriptEntry> records;
+
+  @override
+  Widget build(BuildContext context) {
+    final labels = records.map((record) => record.activityLabel).toList();
+    final distinct = labels.toSet().take(3).join(' · ');
+    return Card(
+      color: Theme.of(context).colorScheme.surfaceContainerLow,
+      margin: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+      child: ExpansionTile(
+        dense: true,
+        leading: const Icon(Icons.auto_awesome_outlined, size: 20),
+        title: Text(
+          records.length == 1 ? labels.first : '${records.length} steps',
+        ),
+        subtitle: records.length == 1 ? null : Text(distinct),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        children: [
+          for (final record in records)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    record.activityLabel,
+                    style: Theme.of(context).textTheme.labelMedium,
+                  ),
+                  const SizedBox(height: 4),
+                  SelectableText(
+                    _limited(record.activityDetail),
+                    style: mono.copyWith(fontSize: 11),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FailureCard extends StatelessWidget {
+  const _FailureCard(this.record);
+
+  final TranscriptEntry record;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    color: Theme.of(context).colorScheme.errorContainer,
+    margin: const EdgeInsets.only(bottom: 12),
+    child: ListTile(
+      leading: const Icon(Icons.error_outline),
+      title: const Text('Agent error'),
+      subtitle: SelectableText(_limited(record.text, limit: 2000)),
+    ),
+  );
+}
+
+String _limited(String value, {int limit = 4000}) {
+  final text = value.trim();
+  if (text.length <= limit) return text;
+  return '${text.substring(0, limit)}\n… ${text.length - limit} more characters';
+}
+
+String _shortTimestamp(String value) {
+  if (value.isEmpty) return '';
+  final parsed = DateTime.tryParse(value)?.toLocal();
+  if (parsed == null) return value;
+  final hour = '${parsed.hour}'.padLeft(2, '0');
+  final minute = '${parsed.minute}'.padLeft(2, '0');
+  return '$hour:$minute';
+}
+
+String _words(String value) => value
+    .replaceAllMapped(
+      RegExp(r'([a-z0-9])([A-Z])'),
+      (match) => '${match.group(1)} ${match.group(2)}',
+    )
+    .replaceAll('_', ' ')
+    .trim();

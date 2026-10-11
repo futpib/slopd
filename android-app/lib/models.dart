@@ -66,6 +66,8 @@ class PaneInfo {
   }
 }
 
+enum TranscriptKind { user, assistant, activity, error }
+
 class TranscriptEntry {
   const TranscriptEntry({
     required this.type,
@@ -86,7 +88,119 @@ class TranscriptEntry {
         cursor: (value['cursor'] as num?)?.toInt(),
       );
 
-  String get text => _readable(payload) ?? _pretty(payload);
+  String get text => messageText ?? _readable(payload) ?? _pretty(payload);
+
+  TranscriptKind get kind {
+    final normalized = type.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+    if (normalized.contains('fail') || normalized.contains('error')) {
+      return TranscriptKind.error;
+    }
+    if ({'user', 'usermessage', 'usermessagechunk'}.contains(normalized)) {
+      return TranscriptKind.user;
+    }
+    if ({
+      'assistant',
+      'agentmessage',
+      'agentmessagechunk',
+    }.contains(normalized)) {
+      return messageText == null
+          ? TranscriptKind.activity
+          : TranscriptKind.assistant;
+    }
+    return TranscriptKind.activity;
+  }
+
+  String? get messageText {
+    final value = payload;
+    if (value is String && value.trim().isNotEmpty) return value;
+    if (value is! Map) return null;
+
+    final direct = _textContent(value['text']);
+    if (direct != null) return direct;
+    final message = value['message'];
+    if (message is Map) {
+      final text =
+          _textContent(message['content']) ?? _textContent(message['text']);
+      if (text != null) return text;
+    }
+    final parts = _textContent(value['parts']);
+    if (parts != null) return parts;
+
+    final update =
+        _mapAt(value, const ['params', 'update']) ??
+        _mapAt(value, const ['update']);
+    return update == null ? null : _textContent(update['content']);
+  }
+
+  String get activityLabel {
+    final normalized = type.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+    if (kind == TranscriptKind.error) return 'Agent error';
+    if (normalized == 'reasoning' || normalized.contains('thought')) {
+      return 'Thinking';
+    }
+    if (normalized == 'commandexecution') return 'Running command';
+    if (normalized == 'filechange') return 'Editing files';
+    if (normalized == 'websearch') return 'Searching the web';
+    if (normalized == 'plan') return 'Updating plan';
+    if (normalized.contains('toolresult')) return 'Tool finished';
+    if (normalized.contains('tool') || normalized == 'mcptoolcall') {
+      final name = toolName;
+      return name == null ? 'Using a tool' : 'Using ${_words(name)}';
+    }
+    if (type.isEmpty || type == 'record') return 'Agent activity';
+    return _words(type);
+  }
+
+  String? get toolName {
+    final value = payload;
+    if (value is! Map) return null;
+    final direct = value['name'];
+    if (direct is String && direct.trim().isNotEmpty) return direct;
+    final parts = value['parts'];
+    if (parts is List) {
+      for (final part in parts) {
+        if (part is Map && part['type'] == 'tool') {
+          final tool = part['tool'];
+          if (tool is String && tool.trim().isNotEmpty) return tool;
+        }
+      }
+    }
+    final update =
+        _mapAt(value, const ['params', 'update']) ??
+        _mapAt(value, const ['update']);
+    final title = update?['title'];
+    return title is String && title.trim().isNotEmpty ? title : null;
+  }
+
+  String get activityDetail {
+    final value = payload;
+    if (value is Map) {
+      final parts = value['parts'];
+      if (parts is List) {
+        final details = <String>[];
+        for (final part in parts) {
+          if (part is! Map || part['type'] != 'tool') continue;
+          final name = part['tool'];
+          final state = part['state'];
+          final title = state is Map ? state['title'] : null;
+          final output = state is Map ? state['output'] : null;
+          details.add(
+            [
+              if (name is String) name,
+              if (title is String && title != name) title,
+              if (output is String && output.trim().isNotEmpty) output,
+            ].join('\n'),
+          );
+        }
+        if (details.isNotEmpty) return details.join('\n\n');
+      }
+      for (final key in const ['arguments', 'output', 'result', 'error']) {
+        final detail = _readable(value[key]);
+        if (detail != null && detail.trim().isNotEmpty) return detail;
+      }
+    }
+    return text;
+  }
 
   String get timestamp {
     final value = payload;
@@ -103,8 +217,75 @@ class TranscriptEntry {
         ).toLocal().toIso8601String();
       }
     }
+    for (final path in const [
+      ['info', 'time', 'created'],
+      ['info', 'time', 'completed'],
+      ['params', 'update', 'timestamp'],
+      ['update', 'timestamp'],
+    ]) {
+      final candidate = _at(value, path);
+      if (candidate is String && candidate.isNotEmpty) return candidate;
+      if (candidate is num) {
+        final milliseconds = candidate > 100000000000
+            ? candidate.toInt()
+            : candidate.toInt() * 1000;
+        return DateTime.fromMillisecondsSinceEpoch(
+          milliseconds,
+        ).toLocal().toIso8601String();
+      }
+    }
     return '';
   }
+
+  static String? _textContent(dynamic value) {
+    if (value is String && value.trim().isNotEmpty) return value;
+    if (value is Map) {
+      final type = value['type'];
+      if (type == 'text' || type == 'input_text' || type == 'output_text') {
+        final text =
+            value['text'] ?? value['input_text'] ?? value['output_text'];
+        if (text is String && text.isNotEmpty) return text;
+      }
+      return null;
+    }
+    if (value is! List) return null;
+    final parts = <String>[];
+    for (final part in value) {
+      if (part is String && part.isNotEmpty) {
+        parts.add(part);
+      } else if (part is Map) {
+        final type = part['type'];
+        if (type == 'text' || type == 'input_text' || type == 'output_text') {
+          final text =
+              part['text'] ?? part['input_text'] ?? part['output_text'];
+          if (text is String && text.isNotEmpty) parts.add(text);
+        }
+      }
+    }
+    return parts.isEmpty ? null : parts.join('\n');
+  }
+
+  static dynamic _at(Map value, List<String> path) {
+    dynamic current = value;
+    for (final part in path) {
+      if (current is! Map) return null;
+      current = current[part];
+    }
+    return current;
+  }
+
+  static Map? _mapAt(Map value, List<String> path) {
+    final result = _at(value, path);
+    return result is Map ? result : null;
+  }
+
+  static String _words(String value) => value
+      .replaceAllMapped(
+        RegExp(r'([a-z0-9])([A-Z])'),
+        (match) => '${match.group(1)} ${match.group(2)}',
+      )
+      .replaceAll('_', ' ')
+      .trim();
 
   static String? _readable(dynamic value) {
     if (value is String && value.isNotEmpty) return value;
