@@ -2,19 +2,47 @@
 
 [![Coverage Status](https://coveralls.io/repos/github/futpib/slopd/badge.svg?branch=master)](https://coveralls.io/github/futpib/slopd?branch=master)
 
-**slopd** is an agent session manager daemon for Claude Code, OpenCode, Codex,
-and Grok Build. It runs interactive sessions inside
-[tmux](https://github.com/tmux/tmux) panes, exposes a Unix socket RPC API for
-controlling them, and streams normalized lifecycle and transcript events to
-subscribers.
+Run several AI agents on your machine, keep their conversations around,
+and pick up their work from a terminal, another agent, or a connected app.
 
-`slopctl` is the companion CLI for talking to the daemon.
+**slopd** manages Claude Code, Codex, OpenCode, and Grok Build in
+[tmux](https://github.com/tmux/tmux). Each session remains an interactive
+terminal you can attach to, while `slopctl` and the ACP and MCP adapters let
+you inspect and control it programmatically. The Android app provides remote
+control over SSH, optionally carried over
+[`iroh-ssh`](https://github.com/futpib/iroh-ssh).
+
+## What you can do
+
+- **Work on several tasks at once.** Keep separate agents for coding,
+  research, and ongoing automation. List their titles, working directories,
+  accounts, and activity to find the session you need.
+- **Branch a conversation into parallel work.** Fork a session with its
+  existing history, then give the new agent a separate investigation or
+  implementation task. The original session keeps running independently.
+- **Let agents supervise other agents.** Give a supervisor or script access
+  to session status, transcripts, and lifecycle events. It can inspect
+  progress, wait for a worker to become ready, and send follow-up instructions.
+  Your supervisor or script decides what to do next.
+- **Come back to the same work.** Agent processes survive daemon restarts
+  in tmux. Backups let you resume recorded conversations after a reboot;
+  the graveyard lets you find and revive individual closed sessions.
+  Automatic backups are enabled by default; automatic restore is opt-in.
+- **Use the interface that fits the moment.** Work directly in the agent's
+  terminal, connect an ACP client, expose supervision tools through MCP,
+  or manage sessions from Android. Agents execute on the host where slopd
+  runs. Voice interaction is provided by a connected MCP client.
+- **Spend less time restarting stalled work.** Configurable retries handle
+  supported transient failures with backoff. Status and transcript events
+  give your own automation the information it needs to respond.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [What you can do](#what-you-can-do)
+- [Start, inspect, fork, and resume](#start-inspect-fork-and-resume)
+- [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Running the daemon](#running-the-daemon)
@@ -33,7 +61,69 @@ subscribers.
 
 ---
 
-## Overview
+## Start, inspect, fork, and resume
+
+After [installing slopd](#installation) and [starting the daemon](#running-the-daemon),
+run these commands on the host where the agents will work. Replace
+`~/code/my-project` with an existing project directory. This example uses
+Codex; the same commands work with the other supported backends.
+
+Start an agent and give it a task:
+
+```bash
+agent_pane=$(slopctl run --backend codex -c ~/code/my-project)
+slopctl send "$agent_pane" "Inspect this project and suggest a focused improvement."
+```
+
+See what is running, wait for the agent to become ready, and read its transcript:
+
+```bash
+slopctl ps
+slopctl wait --pane-id "$agent_pane" --event DetailedStateChange \
+  --until detailed_state=ready --timeout 0
+slopctl transcript "$agent_pane" --limit 10
+```
+
+`send` confirms prompt submission; `wait` observes readiness. Read the transcript
+to check the result. You can also attach to the agent's terminal with
+`tmux attach -t slopd` when using the default tmux configuration.
+
+Fork the conversation to investigate another angle with the same starting context:
+
+```bash
+fork_pane=$(slopctl fork "$agent_pane")
+slopctl send "$fork_pane" "Review that suggestion for risks and missing tests."
+```
+
+Both agents now have independent conversations. Forking copies the conversation;
+both panes still use the same project directory unless you arrange separate
+checkouts.
+
+Checkpoint the running sessions before maintenance:
+
+```bash
+slopctl backup
+```
+
+After a reboot, resume the recorded conversations:
+
+```bash
+slopctl restore
+slopctl ps
+```
+
+To recover an individual closed session, run `slopctl graveyard`, then pass its
+`GRAVE_ID` to `slopctl revive GRAVE_ID`. Recovery uses the backend's saved
+conversation and native resume support. See [Backup and restore](#backup-and-restore)
+for recovery settings and limitations.
+
+---
+
+## How it works
+
+slopd runs the agent processes in tmux and exposes a common control and event
+interface across the supported backends. `slopctl` is its command-line client;
+`slopd-acp` and `slopd-mcp` connect other applications to managed sessions.
 
 ```
 ┌───────────────────────────────────────────────────────────┐
