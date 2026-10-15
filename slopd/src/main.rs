@@ -160,12 +160,43 @@ async fn tmux_send_keys(
     pane_id: &str,
     keys: &str,
 ) -> std::io::Result<std::process::ExitStatus> {
-    tmux(config)
+    let result = tmux(config)
         .args(["send-keys", "-t", pane_id, keys])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    let (kind, detail, size_hint) = match result {
+        Ok(output) if output.status.success() => return Ok(output.status),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // tmux can report either error for an oversized command, depending
+            // on whether it overflows before or after adding the protocol header.
+            let size_hint = stderr == "command too long" || stderr == "failed to send command";
+            let detail = if stderr.is_empty() {
+                output.status.to_string()
+            } else {
+                stderr
+            };
+            (std::io::ErrorKind::Other, detail, size_hint)
+        }
+        Err(error) => (
+            error.kind(),
+            error.to_string(),
+            error.raw_os_error() == Some(libc::E2BIG),
+        ),
+    };
+    let mut message = format!(
+        "tmux send-keys failed for pane {pane_id} (input: {} bytes): {detail}",
+        keys.len()
+    );
+    if size_hint {
+        message.push_str(
+            "; tmux's command limit is approximately 16 KiB including overhead; \
+             shorten the input or send a path to a file the agent can read",
+        );
+    }
+    Err(std::io::Error::new(kind, message))
 }
 
 async fn tmux_paste_text(

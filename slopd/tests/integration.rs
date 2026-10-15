@@ -1650,6 +1650,67 @@ fn send_delivers_prompt_to_pane() {
 }
 
 #[test]
+fn send_reports_oversized_input_with_tmux_error_and_byte_count() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let claude_config_dir = home_dir.path().join(".claude");
+    let slopctl_path = cargo_bin("slopctl").to_str().unwrap().to_string();
+    let mock_claude_path = cargo_bin("mock_claude").to_str().unwrap().to_string();
+    let env = TestEnv::new_full(
+        Some(&[&mock_claude_path]),
+        Some(&slopctl_path),
+        Some(&claude_config_dir),
+    )
+    .expect("tmux required");
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--ready-timeout", "15"]);
+    assert!(run.status.success(), "run failed: {run:?}");
+    let pane_id = String::from_utf8(run.stdout).unwrap().trim().to_string();
+
+    // Exercise tmux's command packing and protocol-header overflow errors,
+    // including UTF-8 input whose byte count differs from its character count.
+    let prompts = ["x".repeat(20_000), "x".repeat(16_350), "é".repeat(10_000)];
+    let failures: Vec<_> = prompts
+        .iter()
+        .map(|prompt| env.slopctl(&["send", &pane_id, prompt, "--timeout", "5"]))
+        .collect();
+    let recovery = env.slopctl(&[
+        "send",
+        &pane_id,
+        "hello after oversized input",
+        "--timeout",
+        "5",
+    ]);
+    kill_slopd(slopd);
+
+    for (prompt, output) in prompts.iter().zip(failures) {
+        assert!(!output.status.success(), "oversized send succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&pane_id), "missing pane: {stderr}");
+        assert!(
+            stderr.contains(&format!("input: {} bytes", prompt.len())),
+            "missing input byte count: {stderr}"
+        );
+        assert!(stderr.contains("16 KiB"), "missing tmux limit: {stderr}");
+        assert!(
+            stderr.contains("command too long") || stderr.contains("failed to send command"),
+            "missing underlying tmux error: {stderr}"
+        );
+        assert!(
+            stderr.contains("shorten the input"),
+            "missing actionable guidance: {stderr}"
+        );
+    }
+    assert!(
+        recovery.status.success(),
+        "subsequent send failed: {recovery:?}"
+    );
+}
+
+#[test]
 fn send_concurrent_all_delivered() {
     build_bin("slopd");
     build_bin("slopctl");
