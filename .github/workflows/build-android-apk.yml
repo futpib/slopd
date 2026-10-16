@@ -51,10 +51,8 @@ jobs:
       - name: Prepare signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
           : "${KEYSTORE_BASE64:?Configure KEYSTORE_BASE64 before publishing}"
-          : "${KEYSTORE_PASSWORD:?Configure KEYSTORE_PASSWORD before publishing}"
           umask 077
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/slopd-release.jks"
 
@@ -88,9 +86,7 @@ jobs:
       - name: Build signed APKs
         env:
           KEYSTORE_PATH: ${{ runner.temp }}/slopd-release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PASSWORD: android
           VERSION_NAME: ${{ steps.version.outputs.name }}
           VERSION_CODE: ${{ steps.version.outputs.code }}
         run: bash scripts/build-release.sh "$VERSION_NAME" "$VERSION_CODE" "$RUNNER_TEMP/release-apks"

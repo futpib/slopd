@@ -68,3 +68,8 @@ Gradle builds the native adapter automatically. `scripts/build-native.sh` builds
 it separately. Release builds require a persistent signing key through
 `KEYSTORE_PATH` and `KEYSTORE_PASSWORD`; `scripts/build-release.sh` creates a
 universal APK, per-architecture APKs, and `SHA256SUMS`.
+
+The manually triggered **Build Android APK** workflow requires the GitHub
+Actions secret `KEYSTORE_BASE64`. It uses the `release` alias and `android`
+passwords of the existing `iroh-ssh-android` release keystore. Keep this
+keystore for future releases so installed APKs can be updated.
