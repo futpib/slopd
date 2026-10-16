@@ -14688,6 +14688,7 @@ fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
 
     let capacity_pane = run_codex();
     let listener = spawn_hook_listener(&env, "StopFailure");
+    let stop_listener = spawn_hook_listener(&env, "Stop");
     let send = env.slopctl(&["send", &capacity_pane, "FAIL_CAPACITY_ONCE"]);
     assert!(
         send.status.success(),
@@ -14733,7 +14734,26 @@ fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
             .count(),
         1
     );
-    assert_eq!(env.pane_state(&capacity_pane).0, libslop::PaneState::Ready);
+    // The response appears in the transcript before the mock finishes the turn.
+    let capacity_id = capacity_pane.clone();
+    wait_for_event(stop_listener, move |event| {
+        event["pane_id"] == capacity_id && event["event_type"] == "Stop"
+    });
+    let wait_for_ready = |pane_id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = env.pane_state(pane_id).0;
+            if state == libslop::PaneState::Ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane {pane_id} stayed {state:?} after its turn ended"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    wait_for_ready(&capacity_pane);
 
     let usage_pane = run_codex();
     let listener = spawn_hook_listener(&env, "StopFailure");
@@ -14763,7 +14783,7 @@ fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
     assert!(!usage_records.iter().any(|record| {
         record["event_type"] == "userMessage" && record["payload"]["text"] == "continue"
     }));
-    assert_eq!(env.pane_state(&usage_pane).0, libslop::PaneState::Ready);
+    wait_for_ready(&usage_pane);
 
     kill_slopd(slopd);
 }

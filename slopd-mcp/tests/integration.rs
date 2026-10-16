@@ -781,6 +781,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
         13,
         "start_new_agent",
         json!({
+            "account": "codex",
             "backend": "codex",
             "prompt": "NEW_INTENT_CANARY",
             "wait_seconds": 10
@@ -806,6 +807,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
         14,
         "message_existing_agent",
         json!({
+            "account": "codex",
             "prompt": "EXISTING_INTENT_CANARY",
             "wait_seconds": 10
         }),
