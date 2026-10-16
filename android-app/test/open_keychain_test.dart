@@ -8,7 +8,7 @@ import 'package:slopd_control/open_keychain.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  const channel = MethodChannel('slopd/openkeychain');
+  const channel = MethodChannel(openKeychainChannelName);
 
   tearDown(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

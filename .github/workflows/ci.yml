@@ -5,6 +5,31 @@ on:
   pull_request:
 
 jobs:
+  android-flutter:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: android-app
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          cache: true
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - run: flutter pub get --enforce-lockfile
+      - run: dart format --output=none --set-exit-if-changed lib test integration_test
+      - run: flutter analyze
+      - run: flutter test
+      - run: ./gradlew :app:compileDebugKotlin -x :app:compileFlutterBuildDebug
+        working-directory: android-app/android
+
   test:
     runs-on: ubuntu-24.04
     steps:

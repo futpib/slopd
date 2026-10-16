@@ -11,8 +11,12 @@ dependencies:
   flutter:
     sdk: flutter
 
-  dartssh2:
-    path: vendor/dartssh2
+  dartssh2: ^4.1.0
+  openkeychain_ssh:
+    git:
+      url: https://github.com/futpib/iroh-ssh-android.git
+      ref: fa6e0cf0a6be499e778f93cf77483c6c7ee1fcef
+      path: packages/openkeychain_ssh
   flutter_secure_storage: ^11.2.0
   ffi: ^2.2.0
   file_picker: ^13.1.0

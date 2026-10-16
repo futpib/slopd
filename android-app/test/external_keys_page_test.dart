@@ -5,10 +5,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:slopd_control/control.dart';
 import 'package:slopd_control/identities.dart';
 import 'package:slopd_control/keys_page.dart';
+import 'package:slopd_control/open_keychain.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
-  const channel = MethodChannel('slopd/openkeychain');
+  const channel = MethodChannel(openKeychainChannelName);
   final messenger =
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
   setUp(() => FlutterSecureStorage.setMockInitialValues({}));

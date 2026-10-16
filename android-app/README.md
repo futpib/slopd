@@ -36,10 +36,11 @@ separately before it is passed to the remote shell.
 
 ## Architecture
 
-Flutter provides the UI and the vendored `dartssh2` package provides normal SSH
+Flutter provides the UI and published `dartssh2` provides normal SSH
 authentication and exec channels. For Iroh connections, a small Rust native
 adapter calls the pinned `futpib/iroh-ssh` bridge and returns a loopback TCP port;
 the same SSH client then connects through that tunnel.
+The shared `openkeychain_ssh` Flutter plugin handles Android key providers.
 
 Each app operation invokes the installed `slopctl` over an SSH exec channel.
 Long-lived transcript and event subscriptions keep one exec channel open and

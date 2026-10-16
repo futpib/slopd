@@ -148,9 +148,10 @@ packages:
   dartssh2:
     dependency: "direct main"
     description:
-      path: "vendor/dartssh2"
-      relative: true
-    source: path
+      name: dartssh2
+      sha256: "39359aceafcf5940b868249e3c9c6d86e4e0f989eec7417d033c943157c84c51"
+      url: "https://pub.dev"
+    source: hosted
     version: "4.1.0"
   dbus:
     dependency: transitive
@@ -566,6 +567,15 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "9.5.0"
+  openkeychain_ssh:
+    dependency: "direct main"
+    description:
+      path: "packages/openkeychain_ssh"
+      ref: fa6e0cf0a6be499e778f93cf77483c6c7ee1fcef
+      resolved-ref: fa6e0cf0a6be499e778f93cf77483c6c7ee1fcef
+      url: "https://github.com/futpib/iroh-ssh-android.git"
+    source: git
+    version: "0.1.0"
   package_config:
     dependency: transitive
     description:

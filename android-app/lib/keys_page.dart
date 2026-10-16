@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:file_picker/file_picker.dart';
@@ -21,6 +22,13 @@ class _KeysPageState extends State<KeysPage> {
   List<Identity> keys = [];
   String? error;
   bool importingExternal = false;
+  OpenKeychainOperation? importOperation;
+  @override
+  void dispose() {
+    unawaited(importOperation?.cancel());
+    super.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -45,13 +53,17 @@ class _KeysPageState extends State<KeysPage> {
   }
 
   Future<void> addExternal() async {
+    if (importingExternal) return;
+    final operation = OpenKeychainOperation();
+    importOperation = operation;
+    DialogRoute<OpenKeychainProvider>? providerRoute;
     setState(() {
       importingExternal = true;
       error = null;
     });
     try {
       final client = OpenKeychainClient.instance;
-      final providers = await client.listProviders();
+      final providers = await client.listProviders(operation: operation);
       if (!mounted) return;
       if (providers.isEmpty) {
         throw StateError(
@@ -60,25 +72,39 @@ class _KeysPageState extends State<KeysPage> {
       }
       final provider = providers.length == 1
           ? providers.single
-          : await showDialog<OpenKeychainProvider>(
-              context: context,
-              builder: (context) => SimpleDialog(
-                title: const Text('Choose key provider'),
-                children: [
-                  for (final provider in providers)
-                    SimpleDialogOption(
-                      onPressed: () => Navigator.pop(context, provider),
-                      child: Text(provider.label),
-                    ),
-                ],
+          : await operation.run(
+              () => Navigator.of(context).push(
+                providerRoute = DialogRoute<OpenKeychainProvider>(
+                  context: context,
+                  builder: (context) => SimpleDialog(
+                    title: const Text('Choose key provider'),
+                    children: [
+                      for (final provider in providers)
+                        SimpleDialogOption(
+                          onPressed: () => Navigator.pop(context, provider),
+                          child: Text(provider.label),
+                        ),
+                    ],
+                  ),
+                ),
               ),
             );
       if (provider == null) return;
-      final selection = await client.selectKey(provider.packageName);
+      final selection = await client.selectKey(
+        provider.packageName,
+        operation: operation,
+      );
       final publicKeyString = await client.getSshPublicKey(
+        operation: operation,
         providerPackage: provider.packageName,
         keyId: selection.keyId,
       );
+      // The last provider response may race cancellation/disposal.
+      await operation.run(() async {});
+      if (!mounted) return;
+      // Persistence has begun; this is no longer a provider wait.
+      operation.dispose();
+      setState(() => importOperation = null);
       final key = await store.importExternal(
         OpenKeychainKey(
           providerPackage: provider.packageName,
@@ -97,7 +123,16 @@ class _KeysPageState extends State<KeysPage> {
     } catch (e) {
       if (mounted) setState(() => error = '$e');
     } finally {
-      if (mounted) setState(() => importingExternal = false);
+      operation.dispose();
+      if (providerRoute?.isActive == true) {
+        providerRoute!.navigator?.removeRoute(providerRoute!);
+      }
+      if (mounted) {
+        setState(() {
+          importingExternal = false;
+          importOperation = null;
+        });
+      }
     }
   }
 
@@ -220,6 +255,11 @@ class _KeysPageState extends State<KeysPage> {
             importingExternal ? 'Opening provider…' : 'Add from OpenKeychain',
           ),
         ),
+        if (importOperation != null)
+          TextButton(
+            onPressed: () => importOperation?.cancel(),
+            child: const Text('Cancel key import'),
+          ),
         if (error != null) ...[const SizedBox(height: 16), ErrorBox(error!)],
         SectionHeading('Identities · ${keys.length}'),
         if (keys.isEmpty)
