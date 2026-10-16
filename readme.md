@@ -12,6 +12,8 @@ you inspect and control it programmatically. The Android app provides remote
 control over SSH, optionally carried over
 [`iroh-ssh`](https://github.com/futpib/iroh-ssh).
 
+[<img src="https://raw.githubusercontent.com/ImranR98/Obtainium/main/assets/graphics/badge_obtainium.png" height="80" alt="Get it on Obtainium">](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/futpib/slopd)
+
 ## What you can do
 
 - **Work on several tasks at once.** Keep separate agents for coding,
@@ -36,11 +38,23 @@ control over SSH, optionally carried over
   supported transient failures with backoff. Status and transcript events
   give your own automation the information it needs to respond.
 
+## Screenshots
+
+The Android client connected to an isolated demo slopd instance:
+
+<table><tr>
+<td><img src="android-app/fastlane/metadata/android/en-US/images/phoneScreenshots/1.png" width="200" alt="Connection screen with Iroh and SSH options and a saved demo host"></td>
+<td><img src="android-app/fastlane/metadata/android/en-US/images/phoneScreenshots/2.png" width="200" alt="Dashboard showing two running demo agents with titles and tags"></td>
+<td><img src="android-app/fastlane/metadata/android/en-US/images/phoneScreenshots/3.png" width="200" alt="Demo agent conversation with sent prompts and sample replies"></td>
+<td><img src="android-app/fastlane/metadata/android/en-US/images/phoneScreenshots/4.png" width="200" alt="Graveyard listing closed demo agents available to revive"></td>
+</tr></table>
+
 ---
 
 ## Table of Contents
 
 - [What you can do](#what-you-can-do)
+- [Screenshots](#screenshots)
 - [Start, inspect, fork, and resume](#start-inspect-fork-and-resume)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
@@ -1675,6 +1689,10 @@ treated as granting code execution as that user.
 
 See [android-app/README.md](android-app/README.md) for receiver setup, app
 architecture, and build instructions.
+
+The Obtainium badge above adds this repository as an app source. Install the
+Android client from a [signed APK release](https://github.com/futpib/slopd/releases)
+when one is available.
 
 ---
 
