@@ -6,24 +6,24 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y tmux
-      - run: cargo install cargo-llvm-cov --locked
+      - run: cargo install cargo-llvm-cov --version 0.9.0 --locked
       - run: cargo llvm-cov --workspace --all-features --no-report -- --test-threads=1
       # Tests spawn the slopd daemon and kill it; a killed process cannot flush
       # its .profraw, leaving a corrupt file that aborts the whole profdata
       # merge. Drop those files before generating the report.
       - name: Remove corrupt profraw files
         run: |
-          llvm_profdata=$(find ~/.rustup/toolchains/stable-*/lib/rustlib/*/bin -name llvm-profdata | head -1)
-          if [ -z "$llvm_profdata" ]; then
-            echo "llvm-profdata not found" >&2
+          llvm_profdata="$(rustc --print sysroot)/lib/rustlib/$(rustc --print host-tuple)/bin/llvm-profdata"
+          if [ ! -x "$llvm_profdata" ]; then
+            echo "llvm-profdata not found: $llvm_profdata" >&2
             exit 1
           fi
           find target/llvm-cov-target -name '*.profraw' | while read -r f; do
@@ -38,10 +38,10 @@ jobs:
           file: lcov.info
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2

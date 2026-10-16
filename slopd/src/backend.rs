@@ -439,6 +439,8 @@ pub(super) struct RestoreContext<'a> {
     pub(super) extra_env: &'a [(String, String)],
 }
 
+// async_trait adds must_use to the boxed futures returned by these methods.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub(super) trait BackendLifecycle: Sync {
     async fn prepare_run(

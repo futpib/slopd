@@ -4385,7 +4385,9 @@ async fn list_panes(
         panes.push(libslop::PaneInfo {
             pane_id: raw.pane_id,
             created_at,
-            last_active: raw.last_active,
+            // tmux may report window activity from just before we record the
+            // pane's creation, so creation is the earliest known activity.
+            last_active: raw.last_active.max(created_at),
             session_id: raw.opts.session_id,
             parent_pane_id,
             tags: raw.opts.tags,

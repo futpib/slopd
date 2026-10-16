@@ -331,7 +331,7 @@ async fn authorize_get(
 ) -> Response {
     match validate_authorize(&auth, &headers, &query).await {
         Ok(()) => login_page(&query, None),
-        Err(error) => error,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -350,7 +350,7 @@ async fn authorize_post(
         resource: form.resource,
     };
     if let Err(error) = validate_authorize(&auth, &headers, &query).await {
-        return error;
+        return error.into_response();
     }
     let Some(expected) = auth.password.as_deref() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "oauth is not configured").into_response();
@@ -388,36 +388,33 @@ async fn validate_authorize(
     auth: &Auth,
     headers: &HeaderMap,
     query: &AuthorizeQuery,
-) -> Result<(), Response> {
+) -> Result<(), (StatusCode, &'static str)> {
     if query.response_type != "code" {
-        return Err((StatusCode::BAD_REQUEST, "response_type must be code").into_response());
+        return Err((StatusCode::BAD_REQUEST, "response_type must be code"));
     }
     if query.code_challenge_method != "S256" || query.code_challenge.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "PKCE S256 is required").into_response());
+        return Err((StatusCode::BAD_REQUEST, "PKCE S256 is required"));
     }
     if query.client_id.is_empty() || query.redirect_uri.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "client_id and redirect_uri are required",
-        )
-            .into_response());
+        ));
     }
     if !redirect_ok(&query.redirect_uri) {
         return Err((
             StatusCode::BAD_REQUEST,
             "redirect_uri must be https or loopback http",
-        )
-            .into_response());
+        ));
     }
     if !query.resource.is_empty() && query.resource != resource_url(auth, headers) {
         return Err((
             StatusCode::BAD_REQUEST,
             "resource does not match MCP server",
-        )
-            .into_response());
+        ));
     }
     let Some(client) = auth.oauth.client(&query.client_id).await else {
-        return Err((StatusCode::BAD_REQUEST, "unknown client_id").into_response());
+        return Err((StatusCode::BAD_REQUEST, "unknown client_id"));
     };
     if !client.redirect_uris.is_empty()
         && !client
@@ -425,7 +422,7 @@ async fn validate_authorize(
             .iter()
             .any(|uri| uri == &query.redirect_uri)
     {
-        return Err((StatusCode::BAD_REQUEST, "redirect_uri is not registered").into_response());
+        return Err((StatusCode::BAD_REQUEST, "redirect_uri is not registered"));
     }
     Ok(())
 }
