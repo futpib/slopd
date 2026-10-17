@@ -55,7 +55,7 @@ across those exec channels.
 
 ## Build
 
-Requirements: Flutter 3.44.1 or newer, Rust, Android SDK 36, JDK 17, Android NDK
+Requirements: Flutter 3.47.5, Rust, Android SDK 36, JDK 25, Android NDK
 28.2.13676358, and `cargo-ndk`.
 
 ```sh

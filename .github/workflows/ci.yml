@@ -15,10 +15,10 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '25'
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.1'
+          flutter-version: '3.47.5'
           cache: true
       - uses: actions/setup-python@v5
         with:
@@ -86,10 +86,10 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '25'
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.1'
+          flutter-version: '3.47.5'
           cache: true
       - uses: android-actions/setup-android@v3
         with:
