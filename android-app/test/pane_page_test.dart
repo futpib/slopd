@@ -36,7 +36,7 @@ void main() {
         home: PanePage(api: connection, pane: fake.pane),
       ),
     );
-    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpAndSettle();
 
     expect(find.text('You'), findsOneWidget);
     expect(find.text('Agent'), findsOneWidget);
@@ -62,6 +62,87 @@ void main() {
     await tester.tap(find.byTooltip('Send message'));
     await tester.pumpAndSettle();
     expect(fake.commands.last, ['send', '--timeout', '60', '%7', 'Follow up']);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('short chats keep the latest answer by the composer', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    fake.transcript.removeWhere((record) => (record['cursor'] as int) > 1);
+    fake.addRecord(2, 'agentMessage', 'A short answer');
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final answerBottom = tester.getBottomLeft(find.text('A short answer')).dy;
+    final composerTop = tester
+        .getTopLeft(find.widgetWithText(TextField, 'Message agent'))
+        .dy;
+    expect(composerTop - answerBottom, lessThan(100));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('new message cue counts a reply once and jumps to latest', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    final viewState = PaneViewState();
+    fake.transcript.clear();
+    for (var cursor = 1; cursor <= 40; cursor++) {
+      fake.transcript.add({
+        'cursor': cursor,
+        'event_type': 'userMessage',
+        'payload': {'text': 'Message $cursor'},
+      });
+    }
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('new message'), findsNothing);
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 500));
+    await tester.pumpAndSettle();
+    final scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    final readingOffset = scroll.offset;
+    fake.addRecord(41, 'agentMessageChunk', 'First part');
+    fake.addRecord(42, 'agentMessageChunk', 'Second part');
+    await tester.pumpAndSettle();
+    expect(scroll.offset, closeTo(readingOffset, 1));
+    expect(find.text('1 new message'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('1 new message'), findsOneWidget);
+
+    await tester.tap(find.text('1 new message'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('new message'), findsNothing);
+    final restored = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    expect(restored.offset, closeTo(restored.position.maxScrollExtent, 1));
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
@@ -291,7 +372,7 @@ void main() {
     final fake = _FakeControlApi(pane());
     final viewState = PaneViewState();
     fake.transcript.clear();
-    for (var cursor = 1; cursor <= 320; cursor++) {
+    for (var cursor = 1; cursor <= 420; cursor++) {
       fake.transcript.add({
         'cursor': cursor,
         'event_type': 'userMessage',
@@ -308,19 +389,26 @@ void main() {
     final scroll = tester
         .widget<CustomScrollView>(find.byType(CustomScrollView))
         .controller!;
+    expect(
+      fake.commands.where((command) => command.contains('--before')),
+      isEmpty,
+    );
     await tester.drag(find.byType(CustomScrollView), const Offset(0, 100000));
     await tester.pumpAndSettle();
-    expect(find.text('Message 21'), findsOneWidget);
-    final readingOffset = scroll.offset;
-
-    await tester.tap(find.text('Earlier messages'));
+    expect(find.text('Message 121'), findsOneWidget);
+    expect(
+      fake.commands.where((command) => command.contains('--before')).length,
+      1,
+    );
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 100000));
     await tester.pumpAndSettle();
     expect(
-      find.text('Message 21'),
-      findsOneWidget,
-      reason: 'offset ${scroll.offset}, max ${scroll.position.maxScrollExtent}',
+      fake.commands.where((command) => command.contains('--before')).length,
+      2,
     );
-    expect(scroll.offset, closeTo(readingOffset, 1));
+    expect(find.text('Message 21'), findsOneWidget);
+    final readingOffset = scroll.offset;
+    expect(find.text('Earlier messages'), findsNothing);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pumpWidget(
@@ -334,6 +422,46 @@ void main() {
         .controller!;
     expect(find.text('Message 21'), findsOneWidget);
     expect(restored.offset, closeTo(readingOffset, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('pulling down loads history when activity fits the screen', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    fake.transcript.clear();
+    for (var cursor = 1; cursor <= 400; cursor++) {
+      fake.transcript.add({
+        'cursor': cursor,
+        'event_type': 'reasoning',
+        'payload': {'text': 'Step $cursor'},
+      });
+    }
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    expect(scroll.position.maxScrollExtent, 0);
+    expect(
+      fake.commands.where((command) => command.contains('--before')),
+      isEmpty,
+    );
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 500));
+    await tester.pumpAndSettle();
+    expect(
+      fake.commands.where((command) => command.contains('--before')).length,
+      1,
+    );
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();

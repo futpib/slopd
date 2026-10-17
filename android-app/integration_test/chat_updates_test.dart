@@ -23,6 +23,11 @@ void main() {
       );
       await tester.pump(const Duration(milliseconds: 200));
       expect(find.text('First answer'), findsOneWidget);
+      final answerBottom = tester.getBottomLeft(find.text('First answer')).dy;
+      final composerTop = tester
+          .getTopLeft(find.widgetWithText(TextField, 'Message agent'))
+          .dy;
+      expect(composerTop - answerBottom, lessThan(100));
 
       fake.add(3, 'userMessage', 'Next question');
       await tester.pump(const Duration(milliseconds: 200));
@@ -76,6 +81,7 @@ void main() {
       ),
     );
     await tester.pump(const Duration(milliseconds: 200));
+    await tester.pumpAndSettle();
     var scroll = tester
         .widget<CustomScrollView>(find.byType(CustomScrollView))
         .controller!;
@@ -87,6 +93,7 @@ void main() {
     fake.add(51, 'agentMessage', 'Later answer');
     await tester.pump(const Duration(milliseconds: 200));
     expect(scroll.offset, closeTo(readingOffset, 1));
+    expect(find.text('1 new message'), findsOneWidget);
 
     await tester.drag(find.byType(CustomScrollView), const Offset(0, 10000));
     await tester.pump(const Duration(milliseconds: 200));
@@ -107,6 +114,51 @@ void main() {
         .controller!;
     expect(scroll.offset, closeTo(expandedOffset, 1));
     expect(find.text('command output'), findsOneWidget);
+    expect(find.text('1 new message'), findsOneWidget);
+
+    await tester.tap(find.text('1 new message'));
+    await tester.pumpAndSettle();
+    expect(find.text('1 new message'), findsNothing);
+    expect(scroll.offset, closeTo(scroll.position.maxScrollExtent, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('pulling to the top loads earlier messages on Android', (
+    tester,
+  ) async {
+    final fake = _ChatApi();
+    fake.records
+      ..clear()
+      ..addAll([
+        for (var cursor = 1; cursor <= 420; cursor++)
+          {
+            'cursor': cursor,
+            'event_type': 'userMessage',
+            'payload': {'text': 'Message $cursor'},
+          },
+      ]);
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      fake.commands.where((command) => command.contains('--before')),
+      isEmpty,
+    );
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 100000));
+    await tester.pumpAndSettle();
+    expect(
+      fake.commands.where((command) => command.contains('--before')).length,
+      1,
+    );
+    expect(find.text('Message 121'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
@@ -141,6 +193,7 @@ class _ChatApi implements ControlApi {
     },
   ];
   final streams = <StreamController<String>>[];
+  final commands = <List<String>>[];
   bool liveAvailable = true;
   int get liveStarts => streams.length;
 
@@ -200,27 +253,45 @@ class _ChatApi implements ControlApi {
   Future<CommandResult> command(
     List<String> arguments, {
     Duration timeout = const Duration(seconds: 45),
-  }) async => CommandResult(
-    arguments.first == 'transcript'
-        ? jsonEncode({'records': records})
-        : jsonEncode([
-            {
-              'pane_id': pane.id,
-              'pane_title': pane.title,
-              'state': pane.state,
-              'detailed_state': pane.detailedState,
-              'working_dir': pane.directory,
-              'account': pane.account,
-              'backend': pane.backend,
-              'session_id': pane.sessionId,
-              'tags': pane.tags,
-              'created_at': pane.createdAt,
-              'last_active': pane.lastActive,
-            },
-          ]),
-    '',
-    0,
-  );
+  }) async {
+    commands.add(arguments);
+    if (arguments.first == 'transcript') {
+      final beforeIndex = arguments.indexOf('--before');
+      final limitIndex = arguments.indexOf('--limit');
+      final before = beforeIndex < 0
+          ? null
+          : int.parse(arguments[beforeIndex + 1]);
+      final limit = int.parse(arguments[limitIndex + 1]);
+      final matching = records
+          .where(
+            (record) => before == null || (record['cursor'] as int) < before,
+          )
+          .toList();
+      final page = matching.length > limit
+          ? matching.sublist(matching.length - limit)
+          : matching;
+      return CommandResult(jsonEncode({'records': page}), '', 0);
+    }
+    return CommandResult(
+      jsonEncode([
+        {
+          'pane_id': pane.id,
+          'pane_title': pane.title,
+          'state': pane.state,
+          'detailed_state': pane.detailedState,
+          'working_dir': pane.directory,
+          'account': pane.account,
+          'backend': pane.backend,
+          'session_id': pane.sessionId,
+          'tags': pane.tags,
+          'created_at': pane.createdAt,
+          'last_active': pane.lastActive,
+        },
+      ]),
+      '',
+      0,
+    );
+  }
 
   @override
   Future<CommandStream> openStream(List<String> arguments) async {

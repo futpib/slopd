@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 import 'control.dart';
 import 'dialogs.dart';
@@ -27,6 +28,7 @@ class PanePage extends StatefulWidget {
 class PaneViewState {
   double? scrollOffset;
   bool followBottom = true;
+  int? seenThroughCursor;
   final expandedActivityCursors = <int>{};
   List<TranscriptEntry> records = const [];
   int? anchorCursor;
@@ -52,7 +54,11 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       sending = false,
       interruptFirst = false,
       active = true,
-      openingLive = false;
+      openingLive = false,
+      earlierLoadScheduled = false,
+      markSeenScheduled = false,
+      scrollingToBottom = false,
+      bottomScrollCancelled = false;
   int sendTimeout = 60;
   Timer? timer;
   CommandStream? live;
@@ -69,6 +75,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     hasEarlier = viewState.hasEarlier;
     loadedEarlier = viewState.loadedEarlier;
     viewState.anchorCursor ??= records.firstOrNull?.cursor;
+    viewState.seenThroughCursor ??= _latestCursor;
     scroll = ScrollController(initialScrollOffset: viewState.scrollOffset ?? 0)
       ..addListener(_scrollChanged);
     WidgetsBinding.instance.addObserver(this);
@@ -98,8 +105,59 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
 
   void _scrollChanged() {
     if (!scroll.hasClients) return;
+    if (scrollingToBottom &&
+        scroll.position.userScrollDirection == ScrollDirection.forward) {
+      bottomScrollCancelled = true;
+    }
     viewState.scrollOffset = scroll.offset;
     viewState.followBottom = _nearBottom;
+    if (_nearBottom &&
+        viewState.seenThroughCursor != _latestCursor &&
+        !markSeenScheduled) {
+      markSeenScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        markSeenScheduled = false;
+        if (mounted && _nearBottom) {
+          setState(() => viewState.seenThroughCursor = _latestCursor);
+        }
+      });
+    }
+    if (scroll.position.userScrollDirection == ScrollDirection.forward &&
+        scroll.offset - scroll.position.minScrollExtent < 220) {
+      _scheduleEarlierLoad();
+    }
+  }
+
+  void _scheduleEarlierLoad() {
+    if (!hasEarlier ||
+        loadingEarlier ||
+        earlierLoadScheduled ||
+        !active ||
+        widget.api.disconnected ||
+        widget.api.reconnecting) {
+      return;
+    }
+    earlierLoadScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      earlierLoadScheduled = false;
+      if (mounted && active && hasEarlier && !loadingEarlier) {
+        unawaited(loadEarlier());
+      }
+    });
+  }
+
+  int? get _latestCursor => records.reversed
+      .map((record) => record.cursor)
+      .whereType<int>()
+      .firstOrNull;
+
+  void _updateSeenCursor(bool followBottom) {
+    final latest = _latestCursor;
+    if (followBottom ||
+        viewState.seenThroughCursor == null ||
+        (latest != null && latest < viewState.seenThroughCursor!)) {
+      viewState.seenThroughCursor = latest;
+    }
   }
 
   @override
@@ -188,6 +246,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
             records = merged;
             viewState.records = merged;
             cachedOlderItems = cachedNewerItems = null;
+            _updateSeenCursor(shouldScroll);
           }
           viewState.anchorCursor ??= merged.firstOrNull?.cursor;
           if (!loadedEarlier) {
@@ -316,6 +375,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
           viewState.records = next;
           viewState.anchorCursor ??= next.firstOrNull?.cursor;
           cachedOlderItems = cachedNewerItems = null;
+          _updateSeenCursor(shouldScroll);
           error = '';
         });
         if (shouldScroll) _scrollToBottom();
@@ -401,20 +461,46 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     return first == second;
   }
 
-  bool get _nearBottom =>
-      !scroll.hasClients ||
-      scroll.position.maxScrollExtent - scroll.position.pixels < 160;
+  bool get _nearBottom => !scroll.hasClients
+      ? viewState.followBottom
+      : scroll.position.maxScrollExtent - scroll.position.pixels < 160;
+
+  void _jumpToLatest() {
+    if (_nearBottom) {
+      setState(() => viewState.seenThroughCursor = _latestCursor);
+    }
+    _scrollToBottom();
+  }
 
   void _scrollToBottom() {
+    if (scrollingToBottom) return;
+    scrollingToBottom = true;
+    bottomScrollCancelled = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && scroll.hasClients) {
-        scroll.animateTo(
+      unawaited(_settleAtBottom());
+    });
+  }
+
+  Future<void> _settleAtBottom() async {
+    try {
+      for (var attempt = 0; attempt < 12; attempt++) {
+        if (!mounted || !scroll.hasClients || bottomScrollCancelled) return;
+        await scroll.animateTo(
           scroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 180),
+          duration: Duration(milliseconds: attempt == 0 ? 180 : 60),
           curve: Curves.easeOut,
         );
+        if (!mounted || !scroll.hasClients || bottomScrollCancelled) return;
+        if (scroll.position.maxScrollExtent - scroll.position.pixels <= 1) {
+          if (viewState.seenThroughCursor != _latestCursor) {
+            setState(() => viewState.seenThroughCursor = _latestCursor);
+          }
+          return;
+        }
       }
-    });
+    } finally {
+      scrollingToBottom = false;
+    }
   }
 
   void _clearLive() {
@@ -673,17 +759,10 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
         },
       );
 
-  Widget _buildEarlierButton() => Center(
-    key: const ValueKey('earlier'),
-    child: TextButton.icon(
-      onPressed: loadingEarlier ? null : loadEarlier,
-      icon: loadingEarlier
-          ? const SizedBox.square(
-              dimension: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          : const Icon(Icons.history),
-      label: const Text('Earlier messages'),
+  Widget _buildHistoryProgress() => const Center(
+    child: Padding(
+      padding: EdgeInsets.all(16),
+      child: CircularProgressIndicator(strokeWidth: 2),
     ),
   );
 
@@ -694,12 +773,27 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       for (final record in records)
         if (anchor != null && record.cursor != null && record.cursor! < anchor)
           record,
-    ]);
+    ]).reversed.toList();
     final newerItems = cachedNewerItems ??= _conversationItems([
       for (final record in records)
         if (anchor == null || record.cursor == null || record.cursor! >= anchor)
           record,
     ]);
+    final seenThrough = viewState.seenThroughCursor;
+    final unseenCount = seenThrough == null
+        ? 0
+        : [...olderItems, ...newerItems]
+              .where(
+                (item) =>
+                    item.kind != TranscriptKind.activity &&
+                    item.records.any(
+                      (record) =>
+                          record.cursor != null && record.cursor! > seenThrough,
+                    ),
+              )
+              .length;
+    final bottomAlignShortChat =
+        !hasEarlier && olderItems.isEmpty && newerItems.length <= 12;
     final disconnected = widget.api.disconnected || widget.api.reconnecting;
     return Scaffold(
       appBar: AppBar(
@@ -779,46 +873,107 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
               child: ErrorBox(error),
             ),
           Expanded(
-            child: loading && records.isEmpty
-                ? const Center(child: CircularProgressIndicator())
-                : records.isEmpty
-                ? const EmptyState(
-                    Icons.chat_bubble_outline,
-                    'No messages yet',
-                    'Send a message to start this conversation.',
-                  )
-                : CustomScrollView(
-                    controller: scroll,
-                    center: const ValueKey('newer'),
-                    slivers: [
-                      if (hasEarlier || olderItems.isNotEmpty)
-                        SliverPadding(
-                          padding: const EdgeInsets.fromLTRB(12, 16, 12, 0),
-                          sliver: SliverList(
-                            delegate: SliverChildBuilderDelegate(
-                              (context, index) => hasEarlier && index == 0
-                                  ? _buildEarlierButton()
-                                  : _buildConversationItem(
-                                      olderItems[index - (hasEarlier ? 1 : 0)],
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: loading && records.isEmpty
+                      ? const Center(child: CircularProgressIndicator())
+                      : records.isEmpty
+                      ? const EmptyState(
+                          Icons.chat_bubble_outline,
+                          'No messages yet',
+                          'Send a message to start this conversation.',
+                        )
+                      : NotificationListener<ScrollNotification>(
+                          onNotification: (notification) {
+                            if (notification is ScrollStartNotification &&
+                                notification.dragDetails != null) {
+                              bottomScrollCancelled = true;
+                            }
+                            if (notification is OverscrollNotification &&
+                                notification.dragDetails != null &&
+                                notification.overscroll < 0) {
+                              _scheduleEarlierLoad();
+                            }
+                            return false;
+                          },
+                          child: CustomScrollView(
+                            controller: scroll,
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            center: const ValueKey('newer'),
+                            slivers: [
+                              if (loadingEarlier || olderItems.isNotEmpty)
+                                SliverPadding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    12,
+                                    16,
+                                    12,
+                                    0,
+                                  ),
+                                  sliver: SliverList(
+                                    delegate: SliverChildBuilderDelegate(
+                                      (context, index) =>
+                                          loadingEarlier &&
+                                              index == olderItems.length
+                                          ? _buildHistoryProgress()
+                                          : _buildConversationItem(
+                                              olderItems[index],
+                                            ),
+                                      childCount:
+                                          olderItems.length +
+                                          (loadingEarlier ? 1 : 0),
                                     ),
-                              childCount:
-                                  olderItems.length + (hasEarlier ? 1 : 0),
-                            ),
+                                  ),
+                                ),
+                              SliverPadding(
+                                key: const ValueKey('newer'),
+                                padding: const EdgeInsets.fromLTRB(
+                                  12,
+                                  16,
+                                  12,
+                                  12,
+                                ),
+                                sliver: bottomAlignShortChat
+                                    ? SliverFillRemaining(
+                                        hasScrollBody: false,
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.end,
+                                          children: [
+                                            for (final item in newerItems)
+                                              _buildConversationItem(item),
+                                          ],
+                                        ),
+                                      )
+                                    : SliverList(
+                                        delegate: SliverChildBuilderDelegate(
+                                          (context, index) =>
+                                              _buildConversationItem(
+                                                newerItems[index],
+                                              ),
+                                          childCount: newerItems.length,
+                                        ),
+                                      ),
+                              ),
+                            ],
                           ),
                         ),
-                      SliverPadding(
-                        key: const ValueKey('newer'),
-                        padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
-                        sliver: SliverList(
-                          delegate: SliverChildBuilderDelegate(
-                            (context, index) =>
-                                _buildConversationItem(newerItems[index]),
-                            childCount: newerItems.length,
-                          ),
-                        ),
+                ),
+                if (unseenCount > 0)
+                  Positioned(
+                    right: 16,
+                    bottom: 12,
+                    child: FilledButton.tonalIcon(
+                      onPressed: _jumpToLatest,
+                      icon: const Icon(Icons.arrow_downward),
+                      label: Text(
+                        '$unseenCount new ${unseenCount == 1 ? 'message' : 'messages'}',
                       ),
-                    ],
+                    ),
                   ),
+              ],
+            ),
           ),
           SafeArea(
             top: false,
