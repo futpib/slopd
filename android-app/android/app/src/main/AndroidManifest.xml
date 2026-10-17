@@ -4,9 +4,9 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application
         android:allowBackup="false"
-        android:label="slopd"
+        android:label="slop"
         android:name="${applicationName}"
-        android:icon="@drawable/ic_slopd">
+        android:icon="@drawable/ic_slop">
         <activity
             android:name=".MainActivity"
             android:exported="true"

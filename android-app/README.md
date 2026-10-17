@@ -1,6 +1,6 @@
-# slopd for Android
+# slop for Android
 
-The Android app manages slopd agent panes through an ordinary SSH login. It can
+slop manages slopd agent panes through an ordinary SSH login. It can
 connect to a normal SSH address or use `iroh-ssh` to reach that SSH service by
 Iroh Endpoint ID.
 
@@ -47,8 +47,10 @@ The shared `openkeychain_ssh` Flutter plugin handles Android key providers.
 
 Each app operation invokes the installed `slopctl` over an SSH exec channel.
 Long-lived transcript and event subscriptions keep one exec channel open and
-consume the command's JSON-lines output. Polling and subscriptions stop while
-their page is backgrounded and reconnect explicitly after transport loss.
+consume the command's JSON-lines output. The chat also polls its transcript to
+recover missed updates and retries a stopped subscription. Polling and
+subscriptions stop while their page is backgrounded and resume with a fresh
+snapshot. Transport loss requires an explicit reconnect.
 There is no custom slopd transport, endpoint allowlist, alternate remote CLI, or
 additional network protocol. SSH authentication and host-key checks are shared
 across those exec channels.

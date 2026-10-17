@@ -9,30 +9,31 @@ import 'package:slopd_control/pane_page.dart';
 import 'package:slopd_control/ui.dart';
 
 void main() {
+  PaneInfo pane() => PaneInfo.fromJson({
+    'pane_id': '%7',
+    'pane_title': 'Fix the Android client',
+    'state': 'idle',
+    'detailed_state': 'idle',
+    'working_dir': '/srv/slopd',
+    'account': 'default',
+    'backend': 'codex',
+    'session_id': 'session-7',
+    'tags': ['android'],
+    'created_at': 10,
+    'last_active': 12,
+    'transcript_path': '/tmp/session.jsonl',
+  });
+
   testWidgets('pane presents a conversation with collapsible agent work', (
     tester,
   ) async {
-    final pane = PaneInfo.fromJson({
-      'pane_id': '%7',
-      'pane_title': 'Fix the Android client',
-      'state': 'idle',
-      'detailed_state': 'idle',
-      'working_dir': '/srv/slopd',
-      'account': 'default',
-      'backend': 'codex',
-      'session_id': 'session-7',
-      'tags': ['android'],
-      'created_at': 10,
-      'last_active': 12,
-      'transcript_path': '/tmp/session.jsonl',
-    });
-    final fake = _FakeControlApi(pane);
+    final fake = _FakeControlApi(pane());
     final connection = ControlConnection(fake, () async => fake);
 
     await tester.pumpWidget(
       MaterialApp(
         theme: appTheme(Brightness.dark),
-        home: PanePage(api: connection, pane: pane),
+        home: PanePage(api: connection, pane: fake.pane),
       ),
     );
     await tester.pump(const Duration(milliseconds: 100));
@@ -66,6 +67,123 @@ void main() {
     await tester.pump();
     await connection.close();
   });
+
+  testWidgets('chat catches up after live loss, backgrounding, and reconnect', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(fake.liveStarts, 1);
+
+    fake.addRecord(6, 'agentMessage', 'Live answer');
+    await tester.pump();
+    expect(find.text('Live answer'), findsOneWidget);
+
+    fake.liveUnavailable = true;
+    await fake.endLive();
+    fake.transcript.removeWhere((record) => record['cursor'] == 5);
+    fake.addRecord(7, 'agentMessage', 'Missed while offline');
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
+    expect(fake.liveStarts, 1);
+    expect(find.text('Missed while offline'), findsOneWidget);
+    expect(find.text('Live answer'), findsOneWidget);
+    expect(find.text('It now reads like a conversation.'), findsNothing);
+    expect(find.textContaining('Live transcript failed'), findsNothing);
+
+    fake.liveUnavailable = false;
+    await tester.pump(const Duration(seconds: 3));
+    expect(fake.liveStarts, 2);
+
+    fake.transcript.removeWhere((record) => record['cursor'] == 7);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump();
+    expect(find.text('Missed while offline'), findsNothing);
+
+    for (final state in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    await tester.pump();
+    fake.addRecord(8, 'agentMessage', 'Arrived in background');
+    final startsWhilePaused = fake.liveStarts;
+    await tester.pump(const Duration(seconds: 3));
+    expect(fake.liveStarts, startsWhilePaused);
+    expect(find.text('Arrived in background'), findsNothing);
+
+    for (final state in [
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('Arrived in background'), findsOneWidget);
+
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Message agent'),
+      'Keep this draft',
+    );
+    await connection.reconnect();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(fake.liveStarts, greaterThan(startsWhilePaused));
+    expect(find.text('Keep this draft'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('new chat activity keeps the reader position until near bottom', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    fake.transcript.clear();
+    for (var i = 1; i <= 40; i++) {
+      fake.transcript.add({
+        'cursor': i,
+        'event_type': i.isOdd ? 'userMessage' : 'agentMessage',
+        'payload': {'text': 'Message $i'},
+      });
+    }
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scroll = tester.widget<ListView>(find.byType(ListView)).controller!;
+
+    await tester.drag(find.byType(ListView), const Offset(0, 500));
+    await tester.pumpAndSettle();
+    final readingOffset = scroll.offset;
+    expect(scroll.position.maxScrollExtent - readingOffset, greaterThan(160));
+
+    fake.addRecord(41, 'userMessage', 'Message 41');
+    await tester.pumpAndSettle();
+    expect(scroll.offset, closeTo(readingOffset, 1));
+
+    await tester.drag(find.byType(ListView), const Offset(0, -10000));
+    await tester.pumpAndSettle();
+    fake.addRecord(42, 'agentMessage', 'Message 42');
+    await tester.pumpAndSettle();
+    expect(scroll.offset, closeTo(scroll.position.maxScrollExtent, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
 }
 
 class _FakeControlApi implements ControlApi {
@@ -73,7 +191,54 @@ class _FakeControlApi implements ControlApi {
 
   final PaneInfo pane;
   final commands = <List<String>>[];
-  final _live = StreamController<String>();
+  final _streams = <StreamController<String>>[];
+  bool liveUnavailable = false;
+  final transcript = <Map<String, dynamic>>[
+    {
+      'cursor': 1,
+      'event_type': 'userMessage',
+      'payload': {'text': 'Make this feel like chat.'},
+    },
+    {
+      'cursor': 2,
+      'event_type': 'reasoning',
+      'payload': {'text': 'Reviewing the current screen'},
+    },
+    {
+      'cursor': 3,
+      'event_type': 'toolCall',
+      'payload': {
+        'name': 'exec_command',
+        'arguments': {'cmd': 'flutter test'},
+      },
+    },
+    {
+      'cursor': 4,
+      'event_type': 'toolResult',
+      'payload': {'output': 'command output'},
+    },
+    {
+      'cursor': 5,
+      'event_type': 'agentMessage',
+      'payload': {'text': 'It now reads like a conversation.'},
+    },
+  ];
+
+  int get liveStarts => _streams.length;
+
+  void addRecord(int cursor, String type, String text) {
+    final record = {
+      'cursor': cursor,
+      'event_type': type,
+      'payload': {'text': text},
+    };
+    transcript.add(record);
+    if (_streams.isNotEmpty && !_streams.last.isClosed) {
+      _streams.last.add(jsonEncode({...record, 'source': 'transcript'}));
+    }
+  }
+
+  Future<void> endLive() => _streams.last.close();
 
   @override
   Future<CommandResult> command(
@@ -82,42 +247,7 @@ class _FakeControlApi implements ControlApi {
   }) async {
     commands.add(arguments);
     if (arguments.first == 'transcript') {
-      return CommandResult(
-        jsonEncode({
-          'records': [
-            {
-              'cursor': 1,
-              'event_type': 'userMessage',
-              'payload': {'text': 'Make this feel like chat.'},
-            },
-            {
-              'cursor': 2,
-              'event_type': 'reasoning',
-              'payload': {'text': 'Reviewing the current screen'},
-            },
-            {
-              'cursor': 3,
-              'event_type': 'toolCall',
-              'payload': {
-                'name': 'exec_command',
-                'arguments': {'cmd': 'flutter test'},
-              },
-            },
-            {
-              'cursor': 4,
-              'event_type': 'toolResult',
-              'payload': {'output': 'command output'},
-            },
-            {
-              'cursor': 5,
-              'event_type': 'agentMessage',
-              'payload': {'text': 'It now reads like a conversation.'},
-            },
-          ],
-        }),
-        '',
-        0,
-      );
+      return CommandResult(jsonEncode({'records': transcript}), '', 0);
     }
     if (arguments.first == 'ps') {
       return CommandResult(jsonEncode([_paneJson(pane)]), '', 0);
@@ -126,17 +256,25 @@ class _FakeControlApi implements ControlApi {
   }
 
   @override
-  Future<CommandStream> openStream(List<String> arguments) async =>
-      CommandStream(
-        lines: _live.stream,
-        errors: const Stream.empty(),
-        done: _live.done.then((_) => 0),
-        close: () => _live.close(),
-      );
+  Future<CommandStream> openStream(List<String> arguments) async {
+    if (liveUnavailable) throw StateError('feed offline');
+    final live = StreamController<String>();
+    _streams.add(live);
+    return CommandStream(
+      lines: live.stream,
+      errors: const Stream.empty(),
+      done: live.done.then((_) => 0),
+      close: () {
+        if (!live.isClosed) live.close();
+      },
+    );
+  }
 
   @override
   Future<void> close() async {
-    if (!_live.isClosed) await _live.close();
+    for (final live in _streams) {
+      if (!live.isClosed) await live.close();
+    }
   }
 }
 

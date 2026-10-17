@@ -332,7 +332,7 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
-      title: const Text('slopd'),
+      title: const Text('slop'),
       actions: [
         IconButton(
           tooltip: 'SSH keys',

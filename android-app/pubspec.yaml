@@ -1,5 +1,5 @@
 name: slopd_control
-description: "SSH and Iroh management client for slopd."
+description: "slop Android client for managing slopd over SSH and Iroh."
 publish_to: 'none'
 
 version: 0.1.0+1

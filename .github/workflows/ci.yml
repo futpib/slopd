@@ -109,7 +109,7 @@ jobs:
       - run: cargo install cargo-ndk --version 4.1.2 --locked
       - run: flutter pub get --enforce-lockfile
         working-directory: android-app
-      - name: Test SSH identity selection on Android
+      - name: Test Android identity selection and chat updates
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -118,4 +118,7 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
-          script: cd android-app && flutter test integration_test/identity_selection_test.dart -d emulator-5554
+          script: |
+            cd android-app
+            flutter test integration_test/identity_selection_test.dart -d emulator-5554 &&
+              flutter test integration_test/chat_updates_test.dart -d emulator-5554

@@ -8,7 +8,7 @@ and pick up their work from a terminal, another agent, or a connected app.
 **slopd** manages Claude Code, Codex, OpenCode, and Grok Build in
 [tmux](https://github.com/tmux/tmux). Each session remains an interactive
 terminal you can attach to, while `slopctl` and the ACP and MCP adapters let
-you inspect and control it programmatically. The Android app provides remote
+you inspect and control it programmatically. The slop Android app provides remote
 control over SSH, optionally carried over
 [`iroh-ssh`](https://github.com/futpib/iroh-ssh).
 
@@ -1671,7 +1671,7 @@ must list the public hostname or IP clients send.
 
 ## Android client
 
-The Flutter app in [`android-app`](android-app/) manages slopd through the remote
+The slop Flutter app in [`android-app`](android-app/) manages slopd through the remote
 host's ordinary SSH service. It supports direct SSH and SSH carried over
 [`iroh-ssh`](https://github.com/futpib/iroh-ssh):
 

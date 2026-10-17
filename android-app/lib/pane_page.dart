@@ -25,10 +25,13 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   final scroll = ScrollController();
   late PaneInfo pane = widget.pane;
   List<TranscriptEntry> records = const [];
+  List<_ConversationItem>? cachedItems;
   String error = '';
   bool loading = false,
       refreshing = false,
+      refreshAfterCurrent = false,
       loadingEarlier = false,
+      loadedEarlier = false,
       hasEarlier = true,
       sending = false,
       interruptFirst = false,
@@ -39,6 +42,8 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   CommandStream? live;
   StreamSubscription<String>? liveLines, liveErrors;
   int liveGeneration = 0;
+  int liveSerial = 0;
+  final liveArrivals = <int, int>{};
 
   @override
   void initState() {
@@ -53,7 +58,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   void dispose() {
     active = false;
     _stopLive();
-    timer?.cancel();
+    _stopPolling();
     widget.api.removeListener(_connectionChanged);
     WidgetsBinding.instance.removeObserver(this);
     prompt.removeListener(_promptChanged);
@@ -72,8 +77,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     if (active) {
       _resume();
     } else {
-      timer?.cancel();
-      timer = null;
+      _stopPolling();
       _stopLive();
     }
   }
@@ -82,6 +86,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {});
     if (widget.api.disconnected || widget.api.reconnecting) {
+      _stopPolling();
       _stopLive();
     } else if (active) {
       _resume();
@@ -90,12 +95,17 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
 
   void _resume() {
     if (!active || widget.api.disconnected || widget.api.reconnecting) return;
-    timer ??= Timer.periodic(
-      const Duration(seconds: 3),
-      (_) => _refreshMetadata(quiet: true),
-    );
+    timer ??= Timer.periodic(const Duration(seconds: 3), (_) {
+      refresh(quiet: true);
+      _startLive();
+    });
     refresh(quiet: records.isNotEmpty);
     _startLive();
+  }
+
+  void _stopPolling() {
+    timer?.cancel();
+    timer = null;
   }
 
   Future<void> reconnect() async {
@@ -113,6 +123,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       return;
     }
     refreshing = true;
+    final serialAtStart = liveSerial;
     if (!quiet && mounted) setState(() => loading = true);
     try {
       final results = await Future.wait([
@@ -138,12 +149,18 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       final shouldScroll = records.isEmpty || _nearBottom;
       if (mounted) {
         setState(() {
-          records = _merge(next, records);
-          hasEarlier = next.length >= transcriptPageSize;
+          final merged = _reconcileSnapshot(next, serialAtStart);
+          final changed = !_sameRecords(records, merged);
+          if (changed) {
+            records = merged;
+            cachedItems = null;
+          }
+          if (!loadedEarlier) hasEarlier = next.length >= transcriptPageSize;
           if (updated != null) pane = updated;
           error = updated == null ? 'This pane is no longer managed.' : '';
+          if (changed && shouldScroll) _scrollToBottom();
         });
-        if (shouldScroll) _scrollToBottom();
+        liveArrivals.removeWhere((_, serial) => serial <= serialAtStart);
       }
     } on ConnectionLost {
       if (mounted) setState(() {});
@@ -152,10 +169,14 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     } finally {
       refreshing = false;
       if (!quiet && mounted) setState(() => loading = false);
+      if (refreshAfterCurrent) {
+        refreshAfterCurrent = false;
+        if (mounted && active) unawaited(refresh(quiet: true));
+      }
     }
   }
 
-  Future<void> _refreshMetadata({bool quiet = false}) async {
+  Future<void> _refreshMetadata() async {
     if (refreshing || widget.api.disconnected || widget.api.reconnecting) {
       return;
     }
@@ -212,22 +233,19 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
             .then<void>((_) {
               if (mounted && generation == liveGeneration) {
                 _clearLive();
-                setState(
-                  () =>
-                      error = 'Live transcript ended. Refresh to reconnect it.',
-                );
+                unawaited(refresh(quiet: true));
               }
             })
             .catchError((Object exception) {
               if (mounted && generation == liveGeneration) {
                 _clearLive();
-                setState(() => error = 'Live transcript stopped: $exception');
+                unawaited(refresh(quiet: true));
               }
             }),
       );
     } catch (exception) {
       if (mounted && generation == liveGeneration) {
-        setState(() => error = 'Live transcript failed: $exception');
+        unawaited(refresh(quiet: true));
       }
     } finally {
       openingLive = false;
@@ -235,20 +253,33 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   }
 
   void _receiveLive(String line) {
-    if (line.trim().isEmpty) return;
+    if (!mounted || !active || line.trim().isEmpty) return;
     try {
       final value = jsonDecode(line) as Map<String, dynamic>;
-      if (value['subscribed'] == true || value['event_type'] == 'ReplayEnd') {
+      if (value['subscribed'] == true) {
+        if (refreshing) {
+          refreshAfterCurrent = true;
+        } else {
+          unawaited(refresh(quiet: true));
+        }
+        return;
+      }
+      if (value['event_type'] == 'ReplayEnd') {
         return;
       }
       final record = TranscriptEntry.fromJson(value);
       if (record.source != 'transcript') return;
+      if (record.cursor != null) liveArrivals[record.cursor!] = ++liveSerial;
       final shouldScroll = _nearBottom;
-      setState(() {
-        records = _merge(records, [record]);
-        error = '';
-      });
-      if (shouldScroll) _scrollToBottom();
+      final next = _merge(records, [record]);
+      if (!_sameRecords(records, next)) {
+        setState(() {
+          records = next;
+          cachedItems = null;
+          error = '';
+        });
+        if (shouldScroll) _scrollToBottom();
+      }
     } catch (exception) {
       setState(() => error = 'Invalid live record: $exception');
     }
@@ -265,6 +296,69 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     }
     result.sort((a, b) => (a.cursor ?? 1 << 62).compareTo(b.cursor ?? 1 << 62));
     return result;
+  }
+
+  List<TranscriptEntry> _reconcileSnapshot(
+    List<TranscriptEntry> snapshot,
+    int serialAtStart,
+  ) {
+    if (snapshot.isEmpty) {
+      return [
+        for (final record in records)
+          if (record.cursor != null &&
+              (liveArrivals[record.cursor!] ?? 0) > serialAtStart)
+            record,
+      ];
+    }
+    final first = snapshot.first.cursor, last = snapshot.last.cursor;
+    if (first == null || last == null) return _merge(snapshot, records);
+    return _merge(
+      [
+        for (final record in records)
+          if (record.cursor != null && record.cursor! < first) record,
+        ...snapshot,
+      ],
+      [
+        for (final record in records)
+          if (record.cursor != null &&
+              record.cursor! > last &&
+              (liveArrivals[record.cursor!] ?? 0) > serialAtStart)
+            record,
+      ],
+    );
+  }
+
+  bool _sameRecords(List<TranscriptEntry> first, List<TranscriptEntry> second) {
+    if (first.length != second.length) return false;
+    for (var i = 0; i < first.length; i++) {
+      if (first[i].cursor != second[i].cursor ||
+          first[i].type != second[i].type ||
+          !_sameValue(first[i].payload, second[i].payload)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _sameValue(dynamic first, dynamic second) {
+    if (identical(first, second)) return true;
+    if (first is List && second is List) {
+      if (first.length != second.length) return false;
+      for (var i = 0; i < first.length; i++) {
+        if (!_sameValue(first[i], second[i])) return false;
+      }
+      return true;
+    }
+    if (first is Map && second is Map) {
+      if (first.length != second.length) return false;
+      for (final key in first.keys) {
+        if (!second.containsKey(key) || !_sameValue(first[key], second[key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return first == second;
   }
 
   bool get _nearBottom =>
@@ -326,6 +420,8 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           records = _merge(earlier, records);
+          cachedItems = null;
+          loadedEarlier = true;
           hasEarlier = earlier.length >= 100;
           error = '';
         });
@@ -524,7 +620,7 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final items = _conversationItems(records);
+    final items = cachedItems ??= _conversationItems(records);
     final disconnected = widget.api.disconnected || widget.api.reconnecting;
     return Scaffold(
       appBar: AppBar(

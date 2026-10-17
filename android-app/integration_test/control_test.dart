@@ -92,7 +92,7 @@ void main() {
       expect(migrated.privateKey, isEmpty);
       expect((await identities.get(migrated.keyId)).pem, direct.privateKey);
 
-      await tester.pumpWidget(const SlopdApp());
+      await tester.pumpWidget(const SlopApp());
       for (
         var i = 0;
         i < 100 && find.text(direct.name).evaluate().isEmpty;
