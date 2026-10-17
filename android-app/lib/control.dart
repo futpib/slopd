@@ -316,22 +316,37 @@ class SshControl implements ControlApi {
     AuthenticationRequest? onAuthenticationRequest,
     AuthenticationCancellation? cancellation,
   }) async {
-    for (var attempt = 0; ; attempt++) {
+    var promptForPassword =
+        profile.password.isNotEmpty || onAuthenticationRequest == null;
+    var retry = false;
+    var submittedFailures = 0;
+    while (true) {
       var submitted = false;
+      var interactiveRequested = false;
       try {
         return await _connect(
           profile,
           verify,
           onAuthenticationRequest: onAuthenticationRequest,
-          retry: attempt > 0,
+          retry: retry,
+          promptForPassword: promptForPassword,
           onSubmitted: () => submitted = true,
+          onInteractiveRequest: () => interactiveRequested = true,
           cancellation: cancellation,
         );
       } on SSHAuthFailError {
-        // dartssh2 tries each authentication method once per connection.
-        if (onAuthenticationRequest == null || !submitted || attempt >= 2) {
+        // dartssh2 requests a password before learning the server's methods.
+        if (!promptForPassword && !interactiveRequested && !submitted) {
+          promptForPassword = true;
+          continue;
+        }
+        if (onAuthenticationRequest == null ||
+            !submitted ||
+            submittedFailures >= 2) {
           rethrow;
         }
+        submittedFailures++;
+        retry = true;
       }
     }
   }
@@ -341,7 +356,9 @@ class SshControl implements ControlApi {
     Future<bool> Function(String type, String fingerprint) verify, {
     required AuthenticationRequest? onAuthenticationRequest,
     required bool retry,
+    required bool promptForPassword,
     required void Function() onSubmitted,
+    required void Function() onInteractiveRequest,
     AuthenticationCancellation? cancellation,
   }) async {
     int? tunnel;
@@ -389,22 +406,29 @@ class SshControl implements ControlApi {
         socket,
         username: profile.user,
         identities: identities,
-        onPasswordRequest: () async {
-          if (!active) return null;
-          if (!savedPasswordUsed && profile.password.isNotEmpty) {
-            savedPasswordUsed = true;
-            onSubmitted();
-            return profile.password;
-          }
-          if (onAuthenticationRequest == null) return null;
-          final responses = await ask(
-            SSHUserInfoRequest('SSH password', '', [
-              SSHUserInfoPrompt('Password', false),
-            ]),
-          );
-          return responses?.single;
-        },
-        onUserInfoRequest: onAuthenticationRequest == null ? null : ask,
+        onPasswordRequest: promptForPassword
+            ? () async {
+                if (!active) return null;
+                if (!savedPasswordUsed && profile.password.isNotEmpty) {
+                  savedPasswordUsed = true;
+                  onSubmitted();
+                  return profile.password;
+                }
+                if (onAuthenticationRequest == null) return null;
+                final responses = await ask(
+                  SSHUserInfoRequest('SSH password', '', [
+                    SSHUserInfoPrompt('Password', false),
+                  ]),
+                );
+                return responses?.single;
+              }
+            : null,
+        onUserInfoRequest: onAuthenticationRequest == null
+            ? null
+            : (request) {
+                onInteractiveRequest();
+                return ask(request);
+              },
         onChangePasswordRequest: (prompt) async {
           if (onAuthenticationRequest == null) return null;
           final responses = await ask(PasswordChangeRequest(prompt));
