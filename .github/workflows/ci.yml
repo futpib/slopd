@@ -71,3 +71,45 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  android-device:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          cache: true
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+      - name: Allow emulator acceleration
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android-app/native -> target
+      - run: cargo install cargo-ndk --version 4.1.2 --locked
+      - run: flutter pub get --enforce-lockfile
+        working-directory: android-app
+      - name: Test SSH identity selection on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: cd android-app && flutter test integration_test/identity_selection_test.dart -d emulator-5554
