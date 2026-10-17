@@ -173,7 +173,7 @@ class _KeysPageState extends State<KeysPage> {
     try {
       final profiles = await const ProfileStore().load();
       final users = profiles
-          .where((p) => p.keyId == key.id)
+          .where((p) => p.selectedKeyIds.contains(key.id))
           .map((p) => p.name)
           .toList();
       if (users.isNotEmpty) {

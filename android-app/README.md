@@ -29,6 +29,9 @@ The connection screen accepts:
 SSH host keys are verified and pinned separately for each destination. Private
 keys, passwords, and connection profiles use Android encrypted storage. Keys can
 also remain in an OpenKeychain-compatible provider.
+Quick connect selects a key automatically only when one is saved. With multiple
+keys, choose an identity for the destination. Connection options can save an
+ordered list of keys for servers that require more than one SSH identity.
 
 Advanced connection options select the remote `slopctl` executable, config file,
 control socket, and optional Iroh relay URLs. Each command argument is quoted

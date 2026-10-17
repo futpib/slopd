@@ -33,6 +33,23 @@ void main() {
     },
   );
 
+  testWidgets('multiple keys require a quick connection choice', (
+    tester,
+  ) async {
+    await IdentityStore().generate('First');
+    await IdentityStore().generate('Second');
+    await tester.pumpWidget(const MaterialApp(home: ConnectionsPage()));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<DropdownButtonFormField<String>>(
+            find.byType(DropdownButtonFormField<String>),
+          )
+          .initialValue,
+      '',
+    );
+  });
+
   testWidgets(
     'connection back preserves edits unless discarded, save bypasses prompt',
     (tester) async {
@@ -95,4 +112,48 @@ void main() {
       expect(find.text('Edit'), findsOneWidget);
     },
   );
+
+  testWidgets('saved connection can order two SSH identities', (tester) async {
+    final first = await IdentityStore().generate('First');
+    final second = await IdentityStore().generate('Second');
+    Profile? saved;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () async {
+                saved = await Navigator.of(context).push<Profile>(
+                  MaterialPageRoute(
+                    builder: (_) => ProfilePage(
+                      profile: Profile(
+                        name: 'Server',
+                        host: 'server',
+                        user: 'alice',
+                        keyId: first.id,
+                      ),
+                    ),
+                  ),
+                );
+              },
+              child: const Text('Edit'),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('Edit'));
+    await tester.pumpAndSettle();
+    final add = find.text('Add another key (optional)');
+    await tester.ensureVisible(add);
+    await tester.tap(add);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Second').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Move first key down'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Save connection'));
+    await tester.pumpAndSettle();
+    expect(saved?.selectedKeyIds, [second.id, first.id]);
+  });
 }

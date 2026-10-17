@@ -6,6 +6,24 @@ import 'package:slopd_control/identities.dart';
 import 'package:slopd_control/open_keychain.dart';
 
 void main() {
+  test('profile preserves explicit SSH key order', () {
+    final profile = Profile(
+      name: 'Server',
+      host: 'server',
+      user: 'alice',
+      keyId: 'primary',
+      additionalKeyIds: const ['second', 'third'],
+    );
+    final restored = Profile.fromJson(profile.toJson());
+    expect(restored.selectedKeyIds, ['primary', 'second', 'third']);
+    expect(
+      Profile.fromJson(
+        {...profile.toJson()}..remove('additionalKeyIds'),
+      ).selectedKeyIds,
+      ['primary'],
+    );
+  });
+
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => FlutterSecureStorage.setMockInitialValues({}));
 

@@ -122,7 +122,7 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
           profiles = saved;
           keys = identities;
           if (keyId == null) {
-            keyId = keys.firstOrNull?.id ?? '';
+            keyId = keys.length == 1 ? keys.single.id : '';
           } else if (keyId!.isNotEmpty && !keys.any((k) => k.id == keyId)) {
             keyId = '';
           }
@@ -520,12 +520,14 @@ class _ProfilePageState extends State<ProfilePage> {
   late bool iroh, password;
   List<Identity> keys = [];
   String? keyId, error;
+  List<String> additionalKeyIds = [];
   late String initial;
   bool leaving = false, confirming = false;
   String get snapshot => jsonEncode([
     iroh,
     password,
     password ? '' : keyId,
+    if (!password) ...additionalKeyIds,
     for (final f in fields.values) f.text,
   ]);
   bool get dirty => snapshot != initial;
@@ -570,6 +572,7 @@ class _ProfilePageState extends State<ProfilePage> {
         p.password.isNotEmpty ||
         (p.keyId.isEmpty && p.privateKey.isEmpty);
     keyId = p?.keyId.isNotEmpty == true ? p!.keyId : null;
+    additionalKeyIds = List.of(p?.additionalKeyIds ?? const []);
     fields = {
       for (final e in {
         'Name': p?.name ?? '',
@@ -597,7 +600,7 @@ class _ProfilePageState extends State<ProfilePage> {
           keys = result;
           if (keyId == null) {
             final pristine = !dirty;
-            keyId = keys.firstOrNull?.id;
+            keyId = keys.length == 1 ? keys.single.id : null;
             if (pristine) initial = snapshot;
           }
         });
@@ -663,6 +666,13 @@ class _ProfilePageState extends State<ProfilePage> {
       );
       return;
     }
+    if (!password &&
+        additionalKeyIds.any(
+          (id) => id == keyId || !keys.any((key) => key.id == id),
+        )) {
+      setState(() => error = 'Choose distinct available SSH keys.');
+      return;
+    }
     final t = Target.parse(value('Target'), iroh);
     final result = Profile(
       name: value('Name').trim().isEmpty ? t.host : value('Name').trim(),
@@ -671,6 +681,7 @@ class _ProfilePageState extends State<ProfilePage> {
       port: t.port,
       iroh: iroh,
       keyId: password ? '' : keyId!,
+      additionalKeyIds: password ? const [] : additionalKeyIds,
       password: password ? value('Password') : '',
       executable: value('Executable').trim(),
       socket: value('Socket').trim(),
@@ -766,7 +777,82 @@ class _ProfilePageState extends State<ProfilePage> {
                           ),
                         )
                         .toList(),
-                    onChanged: (v) => setState(() => keyId = v),
+                    onChanged: (v) => setState(() {
+                      keyId = v;
+                      additionalKeyIds.remove(v);
+                    }),
+                  ),
+                if (additionalKeyIds.isNotEmpty)
+                  Row(
+                    children: [
+                      const Expanded(child: Text('First key')),
+                      IconButton(
+                        tooltip: 'Move first key down',
+                        onPressed: () => setState(() {
+                          final first = keyId!;
+                          keyId = additionalKeyIds.first;
+                          additionalKeyIds[0] = first;
+                        }),
+                        icon: const Icon(Icons.arrow_downward),
+                      ),
+                    ],
+                  ),
+                for (var index = 0; index < additionalKeyIds.length; index++)
+                  Row(
+                    key: ValueKey(additionalKeyIds[index]),
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${index + 2}. ${keys.where((k) => k.id == additionalKeyIds[index]).firstOrNull?.label ?? 'Missing key'}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Move key up',
+                        onPressed: () => setState(() {
+                          final selected = [keyId!, ...additionalKeyIds];
+                          final item = selected.removeAt(index + 1);
+                          selected.insert(index, item);
+                          keyId = selected.first;
+                          additionalKeyIds = selected.skip(1).toList();
+                        }),
+                        icon: const Icon(Icons.arrow_upward),
+                      ),
+                      if (index < additionalKeyIds.length - 1)
+                        IconButton(
+                          tooltip: 'Move key down',
+                          onPressed: () => setState(() {
+                            final item = additionalKeyIds.removeAt(index);
+                            additionalKeyIds.insert(index + 1, item);
+                          }),
+                          icon: const Icon(Icons.arrow_downward),
+                        ),
+                      IconButton(
+                        tooltip: 'Remove key from connection',
+                        onPressed: () =>
+                            setState(() => additionalKeyIds.removeAt(index)),
+                        icon: const Icon(Icons.remove_circle_outline),
+                      ),
+                    ],
+                  ),
+                if (keys.any(
+                  (k) => k.id != keyId && !additionalKeyIds.contains(k.id),
+                ))
+                  DropdownButtonFormField<String>(
+                    key: ValueKey('add-${additionalKeyIds.join(',')}-$keyId'),
+                    decoration: const InputDecoration(
+                      labelText: 'Add another key (optional)',
+                    ),
+                    items: [
+                      for (final key in keys.where(
+                        (k) =>
+                            k.id != keyId && !additionalKeyIds.contains(k.id),
+                      ))
+                        DropdownMenuItem(value: key.id, child: Text(key.label)),
+                    ],
+                    onChanged: (id) {
+                      if (id != null) setState(() => additionalKeyIds.add(id));
+                    },
                   ),
                 Align(
                   alignment: Alignment.centerLeft,
