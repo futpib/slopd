@@ -30,6 +30,7 @@ class Dashboard extends StatefulWidget {
 
 class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
   final search = TextEditingController();
+  final paneViewStates = <String, PaneViewState>{};
   List<PaneInfo> panes = const [];
   DaemonStatus? status;
   ClientInfo? info;
@@ -628,7 +629,19 @@ class _DashboardState extends State<Dashboard> with WidgetsBindingObserver {
                         ),
                     ],
                   ),
-                  onTap: () => _open(PanePage(api: widget.api, pane: pane)),
+                  onTap: () {
+                    final key = '${pane.id}:${pane.sessionId}';
+                    _open(
+                      PanePage(
+                        api: widget.api,
+                        pane: pane,
+                        viewState: paneViewStates.putIfAbsent(
+                          key,
+                          PaneViewState.new,
+                        ),
+                      ),
+                    );
+                  },
                   trailing: PopupMenuButton<String>(
                     onSelected: (value) => switch (value) {
                       'fork' => forkPane(pane),

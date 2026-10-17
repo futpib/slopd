@@ -9,23 +9,39 @@ import 'models.dart';
 import 'ui.dart';
 
 class PanePage extends StatefulWidget {
-  const PanePage({super.key, required this.api, required this.pane});
+  const PanePage({
+    super.key,
+    required this.api,
+    required this.pane,
+    this.viewState,
+  });
 
   final ControlConnection api;
   final PaneInfo pane;
+  final PaneViewState? viewState;
 
   @override
   State<PanePage> createState() => _PanePageState();
+}
+
+class PaneViewState {
+  double? scrollOffset;
+  bool followBottom = true;
+  final expandedActivityCursors = <int>{};
+  List<TranscriptEntry> records = const [];
+  int? anchorCursor;
+  bool hasEarlier = true, loadedEarlier = false;
 }
 
 class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   static const transcriptPageSize = 300;
 
   final prompt = TextEditingController();
-  final scroll = ScrollController();
+  late final PaneViewState viewState;
+  late final ScrollController scroll;
   late PaneInfo pane = widget.pane;
   List<TranscriptEntry> records = const [];
-  List<_ConversationItem>? cachedItems;
+  List<_ConversationItem>? cachedOlderItems, cachedNewerItems;
   String error = '';
   bool loading = false,
       refreshing = false,
@@ -48,6 +64,13 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    viewState = widget.viewState ?? PaneViewState();
+    records = viewState.records;
+    hasEarlier = viewState.hasEarlier;
+    loadedEarlier = viewState.loadedEarlier;
+    viewState.anchorCursor ??= records.firstOrNull?.cursor;
+    scroll = ScrollController(initialScrollOffset: viewState.scrollOffset ?? 0)
+      ..addListener(_scrollChanged);
     WidgetsBinding.instance.addObserver(this);
     widget.api.addListener(_connectionChanged);
     prompt.addListener(_promptChanged);
@@ -63,12 +86,20 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     prompt.removeListener(_promptChanged);
     prompt.dispose();
+    if (scroll.hasClients) _scrollChanged();
+    scroll.removeListener(_scrollChanged);
     scroll.dispose();
     super.dispose();
   }
 
   void _promptChanged() {
     if (mounted) setState(() {});
+  }
+
+  void _scrollChanged() {
+    if (!scroll.hasClients) return;
+    viewState.scrollOffset = scroll.offset;
+    viewState.followBottom = _nearBottom;
   }
 
   @override
@@ -146,16 +177,23 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
         (value) => PaneInfo.fromJson(value as Map<String, dynamic>),
       );
       final updated = panes.where((value) => value.id == pane.id).firstOrNull;
-      final shouldScroll = records.isEmpty || _nearBottom;
+      final shouldScroll = records.isEmpty
+          ? viewState.followBottom
+          : _nearBottom;
       if (mounted) {
         setState(() {
           final merged = _reconcileSnapshot(next, serialAtStart);
           final changed = !_sameRecords(records, merged);
           if (changed) {
             records = merged;
-            cachedItems = null;
+            viewState.records = merged;
+            cachedOlderItems = cachedNewerItems = null;
           }
-          if (!loadedEarlier) hasEarlier = next.length >= transcriptPageSize;
+          viewState.anchorCursor ??= merged.firstOrNull?.cursor;
+          if (!loadedEarlier) {
+            hasEarlier = next.length >= transcriptPageSize;
+            viewState.hasEarlier = hasEarlier;
+          }
           if (updated != null) pane = updated;
           error = updated == null ? 'This pane is no longer managed.' : '';
           if (changed && shouldScroll) _scrollToBottom();
@@ -275,7 +313,9 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       if (!_sameRecords(records, next)) {
         setState(() {
           records = next;
-          cachedItems = null;
+          viewState.records = next;
+          viewState.anchorCursor ??= next.firstOrNull?.cursor;
+          cachedOlderItems = cachedNewerItems = null;
           error = '';
         });
         if (shouldScroll) _scrollToBottom();
@@ -399,8 +439,6 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
         .firstOrNull;
     if (cursor == null || loadingEarlier || !hasEarlier) return;
     setState(() => loadingEarlier = true);
-    final oldExtent = scroll.hasClients ? scroll.position.maxScrollExtent : 0.0;
-    final oldOffset = scroll.hasClients ? scroll.position.pixels : 0.0;
     try {
       final result = await widget.api.command([
         'transcript',
@@ -420,18 +458,13 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           records = _merge(earlier, records);
-          cachedItems = null;
+          viewState.records = records;
+          cachedOlderItems = cachedNewerItems = null;
           loadedEarlier = true;
+          viewState.loadedEarlier = true;
           hasEarlier = earlier.length >= 100;
+          viewState.hasEarlier = hasEarlier;
           error = '';
-        });
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && scroll.hasClients) {
-            final added = scroll.position.maxScrollExtent - oldExtent;
-            scroll.jumpTo(
-              (oldOffset + added).clamp(0, scroll.position.maxScrollExtent),
-            );
-          }
         });
       }
     } catch (exception) {
@@ -618,9 +651,55 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
     ),
   );
 
+  Widget _buildConversationItem(_ConversationItem item) =>
+      _ConversationItemView(
+        key: _itemKey(item),
+        item: item,
+        expanded: item.records.any(
+          (record) =>
+              record.cursor != null &&
+              viewState.expandedActivityCursors.contains(record.cursor),
+        ),
+        onExpansionChanged: (expanded) {
+          for (final record in item.records) {
+            final cursor = record.cursor;
+            if (cursor == null) continue;
+            if (expanded) {
+              viewState.expandedActivityCursors.add(cursor);
+            } else {
+              viewState.expandedActivityCursors.remove(cursor);
+            }
+          }
+        },
+      );
+
+  Widget _buildEarlierButton() => Center(
+    key: const ValueKey('earlier'),
+    child: TextButton.icon(
+      onPressed: loadingEarlier ? null : loadEarlier,
+      icon: loadingEarlier
+          ? const SizedBox.square(
+              dimension: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(Icons.history),
+      label: const Text('Earlier messages'),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
-    final items = cachedItems ??= _conversationItems(records);
+    final anchor = viewState.anchorCursor;
+    final olderItems = cachedOlderItems ??= _conversationItems([
+      for (final record in records)
+        if (anchor != null && record.cursor != null && record.cursor! < anchor)
+          record,
+    ]);
+    final newerItems = cachedNewerItems ??= _conversationItems([
+      for (final record in records)
+        if (anchor == null || record.cursor == null || record.cursor! >= anchor)
+          record,
+    ]);
     final disconnected = widget.api.disconnected || widget.api.reconnecting;
     return Scaffold(
       appBar: AppBar(
@@ -708,30 +787,37 @@ class _PanePageState extends State<PanePage> with WidgetsBindingObserver {
                     'No messages yet',
                     'Send a message to start this conversation.',
                   )
-                : ListView.builder(
+                : CustomScrollView(
                     controller: scroll,
-                    padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
-                    itemCount: items.length + (hasEarlier ? 1 : 0),
-                    itemBuilder: (context, index) {
-                      if (hasEarlier && index == 0) {
-                        return Center(
-                          child: TextButton.icon(
-                            onPressed: loadingEarlier ? null : loadEarlier,
-                            icon: loadingEarlier
-                                ? const SizedBox.square(
-                                    dimension: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
+                    center: const ValueKey('newer'),
+                    slivers: [
+                      if (hasEarlier || olderItems.isNotEmpty)
+                        SliverPadding(
+                          padding: const EdgeInsets.fromLTRB(12, 16, 12, 0),
+                          sliver: SliverList(
+                            delegate: SliverChildBuilderDelegate(
+                              (context, index) => hasEarlier && index == 0
+                                  ? _buildEarlierButton()
+                                  : _buildConversationItem(
+                                      olderItems[index - (hasEarlier ? 1 : 0)],
                                     ),
-                                  )
-                                : const Icon(Icons.history),
-                            label: const Text('Earlier messages'),
+                              childCount:
+                                  olderItems.length + (hasEarlier ? 1 : 0),
+                            ),
                           ),
-                        );
-                      }
-                      final item = items[index - (hasEarlier ? 1 : 0)];
-                      return _ConversationItemView(item: item);
-                    },
+                        ),
+                      SliverPadding(
+                        key: const ValueKey('newer'),
+                        padding: const EdgeInsets.fromLTRB(12, 16, 12, 12),
+                        sliver: SliverList(
+                          delegate: SliverChildBuilderDelegate(
+                            (context, index) =>
+                                _buildConversationItem(newerItems[index]),
+                            childCount: newerItems.length,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
           ),
           SafeArea(
@@ -856,6 +942,9 @@ class _ConversationItem {
       .join(chunks ? '' : '\n\n');
 }
 
+Key _itemKey(_ConversationItem item) =>
+    ValueKey<Object>(item.records.first.cursor ?? item.records.first);
+
 List<_ConversationItem> _conversationItems(List<TranscriptEntry> records) {
   final items = <_ConversationItem>[];
   for (final record in records) {
@@ -879,16 +968,27 @@ List<_ConversationItem> _conversationItems(List<TranscriptEntry> records) {
 }
 
 class _ConversationItemView extends StatelessWidget {
-  const _ConversationItemView({required this.item});
+  const _ConversationItemView({
+    super.key,
+    required this.item,
+    required this.expanded,
+    required this.onExpansionChanged,
+  });
 
   final _ConversationItem item;
+  final bool expanded;
+  final ValueChanged<bool> onExpansionChanged;
 
   @override
   Widget build(BuildContext context) => switch (item.kind) {
     TranscriptKind.user => _MessageBubble(item: item, user: true),
     TranscriptKind.assistant => _MessageBubble(item: item, user: false),
     TranscriptKind.error => _FailureCard(item.records.first),
-    TranscriptKind.activity => _ActivityCard(item.records),
+    TranscriptKind.activity => _ActivityCard(
+      item.records,
+      expanded: expanded,
+      onExpansionChanged: onExpansionChanged,
+    ),
   };
 }
 
@@ -958,9 +1058,15 @@ class _MessageBubble extends StatelessWidget {
 }
 
 class _ActivityCard extends StatelessWidget {
-  const _ActivityCard(this.records);
+  const _ActivityCard(
+    this.records, {
+    required this.expanded,
+    required this.onExpansionChanged,
+  });
 
   final List<TranscriptEntry> records;
+  final bool expanded;
+  final ValueChanged<bool> onExpansionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -971,6 +1077,8 @@ class _ActivityCard extends StatelessWidget {
       margin: const EdgeInsets.fromLTRB(20, 0, 20, 10),
       child: ExpansionTile(
         dense: true,
+        initiallyExpanded: expanded,
+        onExpansionChanged: onExpansionChanged,
         leading: const Icon(Icons.auto_awesome_outlined, size: 20),
         title: Text(
           records.length == 1 ? labels.first : '${records.length} steps',

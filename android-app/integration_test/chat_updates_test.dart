@@ -63,6 +63,55 @@ void main() {
       await connection.close();
     },
   );
+
+  testWidgets('reading place and expanded work survive reopening a chat', (
+    tester,
+  ) async {
+    final fake = _ChatApi()..seedHistory();
+    final connection = ControlConnection(fake, () async => fake);
+    final viewState = PaneViewState();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    var scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 500));
+    await tester.pump(const Duration(milliseconds: 200));
+    final readingOffset = scroll.offset;
+    expect(scroll.position.maxScrollExtent - readingOffset, greaterThan(160));
+    fake.add(51, 'agentMessage', 'Later answer');
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(scroll.offset, closeTo(readingOffset, 1));
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 10000));
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.tap(find.text('3 steps'));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('command output'), findsOneWidget);
+    final expandedOffset = scroll.offset;
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    expect(scroll.offset, closeTo(expandedOffset, 1));
+    expect(find.text('command output'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
 }
 
 class _ChatApi implements ControlApi {
@@ -94,6 +143,44 @@ class _ChatApi implements ControlApi {
   final streams = <StreamController<String>>[];
   bool liveAvailable = true;
   int get liveStarts => streams.length;
+
+  void seedHistory() {
+    records
+      ..clear()
+      ..addAll([
+        {
+          'cursor': 1,
+          'event_type': 'userMessage',
+          'payload': {'text': 'First question'},
+        },
+        {
+          'cursor': 2,
+          'event_type': 'reasoning',
+          'payload': {'text': 'Thinking'},
+        },
+        {
+          'cursor': 3,
+          'event_type': 'toolCall',
+          'payload': {'name': 'exec_command'},
+        },
+        {
+          'cursor': 4,
+          'event_type': 'toolResult',
+          'payload': {'output': 'command output'},
+        },
+        {
+          'cursor': 5,
+          'event_type': 'agentMessage',
+          'payload': {'text': 'First answer'},
+        },
+        for (var cursor = 6; cursor <= 50; cursor++)
+          {
+            'cursor': cursor,
+            'event_type': 'userMessage',
+            'payload': {'text': 'Question $cursor'},
+          },
+      ]);
+  }
 
   void add(int cursor, String type, String text) {
     final record = {

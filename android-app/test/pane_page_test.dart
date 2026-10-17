@@ -144,10 +144,80 @@ void main() {
     await connection.close();
   });
 
+  testWidgets(
+    'activity expansion stays with its records through chat updates',
+    (tester) async {
+      final fake = _FakeControlApi(pane());
+      final connection = ControlConnection(fake, () async => fake);
+      final viewState = PaneViewState();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PanePage(
+            api: connection,
+            pane: fake.pane,
+            viewState: viewState,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('3 steps'));
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsOneWidget);
+
+      fake.transcript.insert(0, {
+        'cursor': 0,
+        'event_type': 'userMessage',
+        'payload': {'text': 'Earlier question'},
+      });
+      await tester.tap(find.byTooltip('Refresh chat'));
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsOneWidget);
+
+      for (var cursor = 6; cursor <= 45; cursor++) {
+        fake.transcript.add({
+          'cursor': cursor,
+          'event_type': 'userMessage',
+          'payload': {'text': 'Later question $cursor'},
+        });
+      }
+      await tester.tap(find.byTooltip('Refresh chat'));
+      await tester.pumpAndSettle();
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, 10000));
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PanePage(
+            api: connection,
+            pane: fake.pane,
+            viewState: viewState,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsOneWidget);
+
+      await tester.tap(find.text('3 steps'));
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsNothing);
+      await connection.reconnect();
+      await tester.pumpAndSettle();
+      expect(find.text('command output'), findsNothing);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      await connection.close();
+    },
+  );
+
   testWidgets('new chat activity keeps the reader position until near bottom', (
     tester,
   ) async {
     final fake = _FakeControlApi(pane());
+    final viewState = PaneViewState();
     fake.transcript.clear();
     for (var i = 1; i <= 40; i++) {
       fake.transcript.add({
@@ -159,13 +229,15 @@ void main() {
     final connection = ControlConnection(fake, () async => fake);
     await tester.pumpWidget(
       MaterialApp(
-        home: PanePage(api: connection, pane: fake.pane),
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
       ),
     );
     await tester.pumpAndSettle();
-    final scroll = tester.widget<ListView>(find.byType(ListView)).controller!;
+    var scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
 
-    await tester.drag(find.byType(ListView), const Offset(0, 500));
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 500));
     await tester.pumpAndSettle();
     final readingOffset = scroll.offset;
     expect(scroll.position.maxScrollExtent - readingOffset, greaterThan(160));
@@ -174,11 +246,94 @@ void main() {
     await tester.pumpAndSettle();
     expect(scroll.offset, closeTo(readingOffset, 1));
 
-    await tester.drag(find.byType(ListView), const Offset(0, -10000));
+    for (final state in [
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+    }
+    await tester.pumpAndSettle();
+    expect(scroll.offset, closeTo(readingOffset, 1));
+    await connection.reconnect();
+    await tester.pumpAndSettle();
+    expect(scroll.offset, closeTo(readingOffset, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pumpAndSettle();
+    scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    expect(scroll.offset, closeTo(readingOffset, 1));
+
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, -10000));
     await tester.pumpAndSettle();
     fake.addRecord(42, 'agentMessage', 'Message 42');
     await tester.pumpAndSettle();
     expect(scroll.offset, closeTo(scroll.position.maxScrollExtent, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await connection.close();
+  });
+
+  testWidgets('loading earlier messages keeps the current reading place', (
+    tester,
+  ) async {
+    final fake = _FakeControlApi(pane());
+    final viewState = PaneViewState();
+    fake.transcript.clear();
+    for (var cursor = 1; cursor <= 320; cursor++) {
+      fake.transcript.add({
+        'cursor': cursor,
+        'event_type': 'userMessage',
+        'payload': {'text': 'Message $cursor'},
+      });
+    }
+    final connection = ControlConnection(fake, () async => fake);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final scroll = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    await tester.drag(find.byType(CustomScrollView), const Offset(0, 100000));
+    await tester.pumpAndSettle();
+    expect(find.text('Message 21'), findsOneWidget);
+    final readingOffset = scroll.offset;
+
+    await tester.tap(find.text('Earlier messages'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Message 21'),
+      findsOneWidget,
+      reason: 'offset ${scroll.offset}, max ${scroll.position.maxScrollExtent}',
+    );
+    expect(scroll.offset, closeTo(readingOffset, 1));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PanePage(api: connection, pane: fake.pane, viewState: viewState),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final restored = tester
+        .widget<CustomScrollView>(find.byType(CustomScrollView))
+        .controller!;
+    expect(find.text('Message 21'), findsOneWidget);
+    expect(restored.offset, closeTo(readingOffset, 1));
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
@@ -247,7 +402,27 @@ class _FakeControlApi implements ControlApi {
   }) async {
     commands.add(arguments);
     if (arguments.first == 'transcript') {
-      return CommandResult(jsonEncode({'records': transcript}), '', 0);
+      final beforeIndex = arguments.indexOf('--before');
+      final limitIndex = arguments.indexOf('--limit');
+      final before = beforeIndex < 0
+          ? null
+          : int.parse(arguments[beforeIndex + 1]);
+      final limit = int.parse(arguments[limitIndex + 1]);
+      final matching =
+          transcript
+              .where(
+                (record) =>
+                    before == null || (record['cursor'] as int) < before,
+              )
+              .toList()
+            ..sort(
+              (first, second) =>
+                  (first['cursor'] as int).compareTo(second['cursor'] as int),
+            );
+      final page = matching.length > limit
+          ? matching.sublist(matching.length - limit)
+          : matching;
+      return CommandResult(jsonEncode({'records': page}), '', 0);
     }
     if (arguments.first == 'ps') {
       return CommandResult(jsonEncode([_paneJson(pane)]), '', 0);
