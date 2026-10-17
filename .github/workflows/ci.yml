@@ -33,7 +33,7 @@ jobs:
       - run: flutter test
         env:
           SSH_AUTH_PYTHON: python
-      - run: ./gradlew :app:compileDebugKotlin -x :app:compileFlutterBuildDebug
+      - run: ./gradlew :app:compileDebugKotlin -x :app:compileFlutterBuildDebug -x :app:buildIrohTransport
         working-directory: android-app/android
 
   test:
