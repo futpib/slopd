@@ -16890,8 +16890,17 @@ fn opencode_ignores_foreign_cli_hooks() {
 
 #[test]
 fn opencode_follows_tui_session_switch() {
-    // When the human navigates the TUI to a different session, opencode emits a
-    // `tui.session.select` SSE event. slopd must follow it: re-point the session it
+    check_opencode_session_switch(false);
+}
+
+#[test]
+fn opencode_sse_reconnect_keeps_followed_session() {
+    check_opencode_session_switch(true);
+}
+
+fn check_opencode_session_switch(reconnect: bool) {
+    // An API-driven TUI selection emits `tui.session.select` (native navigation
+    // does not). slopd must follow it: re-point the session it
     // drives so `ps`/`send`/`transcript` describe the conversation the pane now
     // shows, instead of staying bound to the spawn-time session. Without the fix,
     // slopd kept driving the old session and the two views diverged.
@@ -16901,9 +16910,13 @@ fn opencode_follows_tui_session_switch() {
     let oc_config_dir = tempfile::tempdir().unwrap();
 
     let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    let mut executable = vec![mock_opencode.to_str().unwrap()];
+    if reconnect {
+        executable.push("--mock-disconnect-after-switch");
+    }
     env.append_config(&format!(
         "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = {:?}\nclaude_config_dir = {:?}\n",
-        mock_opencode.to_str().unwrap(),
+        executable,
         oc_config_dir.path().to_str().unwrap(),
     ));
 
@@ -16931,6 +16944,7 @@ fn opencode_follows_tui_session_switch() {
         "slopd should start bound to the spawn-time session"
     );
 
+    let listener = reconnect.then(|| spawn_transcript_listener(&env, "text"));
     // Drive the TUI to switch sessions: the mock's "::mock switch-session" prompt creates a second
     // top-level session and emits tui.session.select for it.
     let send = env.slopctl(&["send", &pane_id, "::mock switch-session"]);
@@ -16965,6 +16979,12 @@ fn opencode_follows_tui_session_switch() {
         "transcript should follow onto the second session, got: {}",
         out
     );
+
+    if let Some(listener) = listener {
+        wait_for_event(listener, |event| {
+            event["payload"]["part"]["text"] == "second session after reconnect"
+        });
+    }
 
     kill_slopd(slopd);
 }

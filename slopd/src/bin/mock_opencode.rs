@@ -89,6 +89,7 @@ struct MockState {
     /// API readiness is delayed. A premature POST /session hangs, matching the
     /// real OpenCode startup race.
     ready_at: Instant,
+    disconnect_after_switch: bool,
 }
 
 fn main() {
@@ -103,6 +104,7 @@ fn main() {
     let mut resume_id: Option<String> = None;
     let mut ghost = false;
     let mut startup_delay = Duration::ZERO;
+    let mut disconnect_after_switch = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -115,6 +117,7 @@ fn main() {
             // Test flag: list a garbage-collected "ghost" session in GET /session
             // that 404s on use — reproduces the ephemeral-boot-session bug.
             "--mock-ghost-session" => ghost = true,
+            "--mock-disconnect-after-switch" => disconnect_after_switch = true,
             "--mock-startup-delay" => {
                 let Some(value) = args.next() else {
                     eprintln!("mock_opencode: `--mock-startup-delay` requires a duration");
@@ -169,6 +172,7 @@ fn main() {
         child_status: None,
         main_retry: false,
         ready_at: Instant::now() + startup_delay,
+        disconnect_after_switch,
     }));
 
     let tui_state = state.clone();
@@ -359,21 +363,23 @@ fn stream_sse(state: Arc<Mutex<MockState>>, mut stream: std::net::TcpStream) {
     );
     loop {
         match rx.recv_timeout(Duration::from_millis(800)) {
+            Ok(json) if json == "disconnect" => break,
             Ok(json) => {
                 let msg = format!("data: {json}\n\n");
                 if stream.write_all(msg.as_bytes()).is_err() {
-                    return; // client gone
+                    break; // client gone
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Heartbeat comment keeps the connection alive.
                 if stream.write_all(b": heartbeat\n\n").is_err() {
-                    return;
+                    break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    state.lock().unwrap().event_rx = Some(rx);
 }
 
 fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> String {
@@ -441,9 +447,9 @@ fn route(state: Arc<Mutex<MockState>>, method: &str, path: &str, body: &str) -> 
             (200, format!(r#"{{"id":"{FORK_SID}","directory":"/mock","parentID":null,"title":"{src} (fork #1)","time":{{"created":300,"updated":300}}}}"#))
         }
 
-        // slopd imposes its session on the TUI at spawn (and the TUI reports the
-        // human's navigation via the tui.session.select SSE event). Record the
-        // selection so a test can assert slopd called it.
+        // slopd imposes its session on the TUI at spawn. Record the selection so
+        // a test can assert slopd called it. Native TUI navigation has no such
+        // event; the real-TUI test covers that separate path.
         ("POST", "/tui/select-session") => {
             let sid = extract_session_id(body);
             state.lock().unwrap().selected_session = sid;
@@ -551,6 +557,20 @@ fn submit_prompt(state: Arc<Mutex<MockState>>, text: String) {
                 })
                 .to_string(),
             );
+            if state.lock().unwrap().disconnect_after_switch {
+                emit(&state, "disconnect".to_string());
+                // Only the next SSE connection can consume this record.
+                emit(
+                    &state,
+                    serde_json::json!({
+                        "type": "message.part.updated",
+                        "properties": {"sessionID": SID_2, "part": {
+                            "type": "text", "text": "second session after reconnect"
+                        }}
+                    })
+                    .to_string(),
+                );
+            }
             return;
         }
         Some(MockCommand::FailOnce) => (Scenario::Normal, format!("echo: {text}")),

@@ -21,6 +21,8 @@ const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Session creation should normally be fast once discovery succeeds, but leave
 /// more headroom than a read-only probe to avoid retrying a committed request.
 const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Keep the status backstop responsive even if the embedded server stalls.
+const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection details for one opencode pane's embedded HTTP server.
 ///
@@ -182,21 +184,72 @@ impl OpencodeClient {
     /// `GET /session/status` → the status object for one session. `Ok(None)` if the
     /// session is absent from the map (e.g. not yet created).
     pub async fn session_status(&self, session_id: &str) -> Result<Option<Value>, String> {
-        let resp = self
-            .req(reqwest::Method::GET, "/session/status")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!(
-                "GET /session/status {}: {}",
-                status,
-                resp.text().await.unwrap_or_default()
-            ));
+        Ok(self.status_map().await?.get(session_id).cloned())
+    }
+
+    /// Resolve activity from this embedded server, never from the newest session
+    /// in the shared database. Native TUI navigation does not publish
+    /// `tui.session.select` (that event is an incoming command to the TUI).
+    /// Only adopt a single active top-level session when our binding is idle.
+    pub async fn active_session(
+        &self,
+        current: &str,
+        activity: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let statuses = self.status_map().await?;
+        for (sid, status) in &statuses {
+            if status_to_detailed(status).is_none() {
+                return Err(format!("unrecognized session status for {sid}"));
+            }
         }
-        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
-        Ok(v.get(session_id).cloned())
+        if statuses
+            .get(current)
+            .is_some_and(|status| status_to_detailed(status) != Some(PaneDetailedState::Ready))
+        {
+            return Ok(None);
+        }
+        let mut candidates: Vec<String> = statuses
+            .iter()
+            .filter(|(sid, status)| {
+                sid.as_str() != current
+                    && status_to_detailed(status) != Some(PaneDetailedState::Ready)
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        // A short turn can finish before the HTTP snapshot. Its busy/user event
+        // still identifies activity from this process, unlike a database listing.
+        if let Some(sid) = activity
+            && sid != current
+            && !candidates.iter().any(|id| id == sid)
+        {
+            candidates.push(sid.to_string());
+        }
+        let mut candidate = None;
+        for sid in candidates {
+            let resp = self
+                .req(reqwest::Method::GET, &format!("/session/{sid}"))
+                .timeout(STATUS_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| e.to_string())?;
+            let info = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+            if info.get("id").and_then(Value::as_str) != Some(sid.as_str()) {
+                return Err(format!(
+                    "GET /session/{sid} returned no matching session id"
+                ));
+            }
+            if info.get("parentID").is_some_and(|parent| !parent.is_null()) {
+                continue;
+            }
+            if candidate.is_some() {
+                return Err(format!(
+                    "session binding {current} is idle but multiple top-level sessions are active; cannot determine the TUI session"
+                ));
+            }
+            candidate = Some(sid);
+        }
+        Ok(candidate)
     }
 
     /// `GET /session/status` → the whole busy map (`{"<sid>":{"type":…}, …}`).
@@ -207,6 +260,7 @@ impl OpencodeClient {
     pub async fn status_map(&self) -> Result<serde_json::Map<String, Value>, String> {
         let resp = self
             .req(reqwest::Method::GET, "/session/status")
+            .timeout(STATUS_REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -219,7 +273,9 @@ impl OpencodeClient {
             ));
         }
         let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
-        Ok(v.as_object().cloned().unwrap_or_default())
+        v.as_object()
+            .cloned()
+            .ok_or_else(|| "GET /session/status returned a non-object".to_string())
     }
 
     /// Replace the OpenCode TUI's current composer contents with `text`.
@@ -484,9 +540,9 @@ pub fn session_created_parent(event: &Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-/// For a `tui.session.select` event, the session id the TUI navigated to
-/// (`properties.sessionID`). slopd follows this so the session it drives stays the
-/// one the human is actually looking at in the pane.
+/// For an API `tui.session.select` command, the requested session id
+/// (`properties.sessionID`). Native TUI navigation does not emit this event;
+/// the driver also reconciles session activity from the embedded server.
 pub fn tui_selected_session(event: &Value) -> Option<&str> {
     if event_type(event) != Some("tui.session.select") {
         return None;
@@ -660,6 +716,71 @@ pub fn event_is_failure(event: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_session_recovers_only_unambiguous_local_roots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A database can contain newer sessions from other panes. Only entries
+        // active in this server (or its observed events) are candidates.
+        for (statuses, activity, expected) in [
+            (json!({}), None, Ok(None)),
+            (json!({"root": {"type": "busy"}}), None, Ok(Some("root"))),
+            (json!({}), Some("root"), Ok(Some("root"))),
+            (
+                json!({"current": {"type": "busy"}, "root": {"type": "busy"}}),
+                Some("root"),
+                Ok(None),
+            ),
+            (
+                json!({"current": {"type": "retry"}, "root": {"type": "busy"}}),
+                None,
+                Ok(None),
+            ),
+            (json!({"child": {"type": "busy"}}), Some("child"), Ok(None)),
+            (
+                json!({"root": {"type": "busy"}, "child": {"type": "busy"}}),
+                None,
+                Ok(Some("root")),
+            ),
+            (
+                json!({"root": {"type": "busy"}, "other": {"type": "busy"}}),
+                None,
+                Err(()),
+            ),
+            (json!({"missing": {"type": "busy"}}), None, Err(())),
+            (json!({"root": {"type": "unknown-status"}}), None, Err(())),
+            (json!([]), None, Err(())),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = OpencodeClient::new(listener.local_addr().unwrap().port(), None);
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let (status, body) = match path {
+                        "/session/status" => (200, statuses.clone()),
+                        "/session/root" => (200, json!({"id": "root"})),
+                        "/session/other" => (200, json!({"id": "other", "parentID": null})),
+                        "/session/child" => (200, json!({"id": "child", "parentID": "current"})),
+                        _ => (404, json!({"error": "not found"})),
+                    };
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let result = client.active_session("current", activity).await;
+            server.abort();
+            assert_eq!(
+                result.as_ref().map(|sid| sid.as_deref()).map_err(|_| ()),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn alloc_port_returns_listening_port() {

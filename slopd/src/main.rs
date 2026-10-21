@@ -1015,17 +1015,6 @@ impl PaneState {
         }
     }
 
-    fn update_opencode_session(&self, session_id: String) -> Option<opencode::OpencodeClient> {
-        let mut runtime = self.runtime.lock().unwrap();
-        match &mut *runtime {
-            PaneRuntime::Opencode(runtime) => {
-                runtime.session_id = session_id;
-                Some(runtime.client.clone())
-            }
-            _ => None,
-        }
-    }
-
     /// Stop every background task attached to this pane. Called from every
     /// teardown path (explicit kill + both reconcile-driven reaps) so a pane that
     /// exits keeps nothing running behind it. For opencode panes this is what
@@ -1050,6 +1039,87 @@ type SubagentSet = Arc<std::sync::Mutex<std::collections::HashMap<String, std::t
 /// `/session/status` yet, so give it one poll cycle's worth of slack before
 /// treating "not working" as "finished".
 const SUBAGENT_PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Keep command routing, durable identity, and the SSE filter on the same
+/// session. The expected id fences an API result that raced another selection.
+async fn follow_opencode_session(
+    expected: &str,
+    selected: &str,
+    pane_id: &str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+    subagents: &SubagentSet,
+) -> bool {
+    let Some(state) = panes.get(pane_id) else {
+        return false;
+    };
+    {
+        let mut runtime = state.runtime.lock().unwrap();
+        let PaneRuntime::Opencode(oc) = &mut *runtime else {
+            return false;
+        };
+        if oc.session_id != expected || selected == expected {
+            return false;
+        }
+        oc.session_id = selected.to_string();
+        *oc.last_prompt.lock().unwrap() = None;
+        *state.retry_state.lock().unwrap() = None;
+        state.note_session_id(selected);
+        subagents.lock().unwrap().clear();
+    }
+    let _ = tmux_set_pane_option(
+        config,
+        pane_id,
+        libslop::TmuxOption::SlopdSessionId.as_str(),
+        selected,
+    )
+    .await;
+    true
+}
+
+async fn reconcile_opencode_session(
+    client: &opencode::OpencodeClient,
+    activity: Option<&str>,
+    pane_id: &str,
+    config: &Arc<libslop::SlopdConfig>,
+    panes: &PaneMap,
+    subagents: &SubagentSet,
+) {
+    let Some(oc) = panes.get(pane_id).and_then(|state| state.opencode()) else {
+        return;
+    };
+    match client.active_session(&oc.session_id, activity).await {
+        Ok(selected) => {
+            *oc.binding_warning.lock().unwrap() = None;
+            if let Some(selected) = selected
+                && follow_opencode_session(
+                    &oc.session_id,
+                    &selected,
+                    pane_id,
+                    config,
+                    panes,
+                    subagents,
+                )
+                .await
+            {
+                warn!(
+                    "opencode pane {}: recovered stale session binding {} -> {} from embedded-server activity",
+                    pane_id, oc.session_id, selected
+                );
+            }
+        }
+        Err(error) => {
+            let mut previous = oc.binding_warning.lock().unwrap();
+            if previous.as_ref() != Some(&error) {
+                warn!(
+                    "opencode pane {}: cannot verify session binding: {}",
+                    pane_id, error
+                );
+                *previous = Some(error);
+            }
+        }
+    }
+}
 
 /// OpenCode pane driver. Real-time state + transcript come from the server's SSE
 /// stream (`GET /event`); a slow `/session` + `/session/status` poll is a backstop
@@ -1103,6 +1173,7 @@ async fn run_opencode_driver(
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = interval.tick() => {
+                reconcile_opencode_session(&client, None, &pane_id, &config, &panes, &subagents).await;
                 // Read the live session id: the SSE reader re-points it when the
                 // human navigates the TUI, and this backstop must poll whatever
                 // session is currently being followed, not the spawn-time one.
@@ -1153,6 +1224,14 @@ async fn reconcile_opencode_status(
         Err(_) => None,
     };
     if let Some(new) = target {
+        // A selection may have completed while the HTTP request was in flight.
+        if panes
+            .get(pane_id)
+            .and_then(|s| s.opencode())
+            .is_some_and(|oc| oc.session_id != session_id)
+        {
+            return;
+        }
         let current = panes
             .get_or_insert(pane_id)
             .detailed_state
@@ -1244,8 +1323,12 @@ async fn run_opencode_sse(
         if cancel.is_cancelled() {
             return;
         }
-        match client.events().send().await {
-            Ok(resp) => {
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return,
+            response = tokio::time::timeout(std::time::Duration::from_secs(5), client.events().send()) => response,
+        };
+        match response {
+            Ok(Ok(resp)) if resp.status().is_success() => {
                 backoff = std::time::Duration::from_secs(1);
                 if let Err(e) = read_opencode_sse(
                     resp,
@@ -1259,10 +1342,19 @@ async fn run_opencode_sse(
                 )
                 .await
                 {
-                    debug!("opencode SSE stream for {} ended: {}", pane_id, e);
+                    warn!(
+                        "opencode SSE stream for {} ended: {}; reconnecting",
+                        pane_id, e
+                    );
                 }
             }
-            Err(e) => debug!("opencode SSE connect failed for {}: {}", pane_id, e),
+            Ok(Ok(resp)) => warn!(
+                "opencode SSE connect failed for {}: HTTP {}",
+                pane_id,
+                resp.status()
+            ),
+            Ok(Err(e)) => warn!("opencode SSE connect failed for {}: {}", pane_id, e),
+            Err(_) => warn!("opencode SSE connect timed out for {}", pane_id),
         }
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -1290,14 +1382,12 @@ async fn read_opencode_sse(
     // the child's terminal event, and pruned by the backstop if that event is
     // missed. Persists across SSE reconnects (the set is owned by the driver), so a
     // subagent that spans a reconnect stays tracked.
-    // The main session slopd currently tracks. Seeded from the spawn-time id but
-    // re-pointed when the human navigates the TUI to another session (see the
-    // `tui.session.select` handling below) — so `ps`/`send`/`transcript` follow
-    // whatever conversation the pane is actually showing.
-    let mut current_session = session_id.to_string();
     loop {
         let chunk = tokio::select! {
-            c = resp.chunk() => c.map_err(|e| e.to_string())?,
+            c = tokio::time::timeout(std::time::Duration::from_secs(90), resp.chunk()) => {
+                c.map_err(|_| "no SSE data or heartbeat for 90s".to_string())?
+                    .map_err(|e| e.to_string())?
+            },
             _ = cancel.cancelled() => return Ok(()),
         };
         let Some(chunk) = chunk else {
@@ -1314,7 +1404,40 @@ async fn read_opencode_sse(
                 continue;
             };
 
-            // The human switched the TUI to another session — follow it: re-point
+            // Poll recovery and a previous SSE connection may have rebound the
+            // runtime. Never reset this filter to the original spawn-time id.
+            let mut current_session = panes
+                .get(pane_id)
+                .and_then(|state| state.opencode().map(|oc| oc.session_id))
+                .unwrap_or_else(|| session_id.to_string());
+
+            // Native /new and session-list navigation do not emit a selection
+            // event. Resolve an unfamiliar session's activity before filtering
+            // its records, so even the first prompt/turn is observed.
+            if opencode::event_session_id(&event).is_some_and(|sid| sid != current_session)
+                && ((opencode::event_type(&event) == Some("session.status")
+                    && opencode::event_to_detailed(&event)
+                        .is_some_and(|state| state != libslop::PaneDetailedState::Ready))
+                    || (opencode::event_type(&event) == Some("message.updated")
+                        && event["properties"]["info"]["role"] == "user"))
+                && let Some(oc) = panes.get(pane_id).and_then(|state| state.opencode())
+            {
+                reconcile_opencode_session(
+                    &oc.client,
+                    opencode::event_session_id(&event),
+                    pane_id,
+                    config,
+                    panes,
+                    subagents,
+                )
+                .await;
+                current_session = panes
+                    .get(pane_id)
+                    .and_then(|state| state.opencode().map(|oc| oc.session_id))
+                    .unwrap_or(current_session);
+            }
+
+            // An API command selected another TUI session — follow it: re-point
             // the shared OpencodeState (so send/interrupt/transcript target it),
             // persist the new id on the pane, and forget the old session's
             // subagents. Skip no-op re-selects of the session we already track.
@@ -1324,27 +1447,21 @@ async fn read_opencode_sse(
                         "opencode pane {}: TUI selected session {} (was {})",
                         pane_id, selected, current_session
                     );
-                    current_session = selected.to_string();
-                    subagents.lock().unwrap().clear();
-                    // Re-point the shared state so send/interrupt/transcript target
-                    // the followed session; grab a client clone for the reconcile.
-                    let client = panes.get(pane_id).and_then(|state| {
-                        state.note_session_id(&current_session);
-                        state.update_opencode_session(current_session.clone())
-                    });
-                    let _ = tmux_set_pane_option(
-                        config,
-                        pane_id,
-                        libslop::TmuxOption::SlopdSessionId.as_str(),
+                    follow_opencode_session(
                         &current_session,
+                        selected,
+                        pane_id,
+                        config,
+                        panes,
+                        subagents,
                     )
                     .await;
                     // Re-reconcile so state reflects the newly-followed session (it
                     // may be idle, so no further events would arrive on their own).
-                    if let Some(client) = client {
+                    if let Some(oc) = panes.get(pane_id).and_then(|state| state.opencode()) {
                         reconcile_opencode_status(
-                            &client,
-                            &current_session,
+                            &oc.client,
+                            &oc.session_id,
                             pane_id,
                             config,
                             panes,
@@ -6241,8 +6358,8 @@ async fn handle_request(
                                 // its UI and subscribed — calling once at spawn races that
                                 // and the TUI lands on its own welcome screen instead. So
                                 // re-assert it a few times over the first couple seconds;
-                                // it's idempotent, and once the TUI honors it (and emits
-                                // tui.session.select) the SSE follow keeps the two in sync.
+                                // it's idempotent. Stop if activity recovery has already
+                                // followed a different session chosen in the TUI.
                                 // Shares the driver cancel token so it stops immediately if
                                 // the pane is killed mid-boot (rather than poking a dead
                                 // server for the rest of its 10 attempts).
@@ -6250,9 +6367,17 @@ async fn handle_request(
                                 let sid = session_id.clone();
                                 let pane = pane_id.clone();
                                 let cancel = driver_cancel.clone();
+                                let startup_panes = panes.clone();
                                 tokio::spawn(async move {
                                     for _ in 0..10 {
                                         if cancel.is_cancelled() {
+                                            return;
+                                        }
+                                        if startup_panes
+                                            .get(&pane)
+                                            .and_then(|state| state.opencode())
+                                            .is_some_and(|oc| oc.session_id != sid)
+                                        {
                                             return;
                                         }
                                         if let Err(e) = client.select_session(&sid).await {

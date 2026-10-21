@@ -1055,6 +1055,21 @@ placed in the visible composer through `/tui/clear-prompt` and
 /session/:id/message`. These signals are normalized onto the same state, hook,
 and transcript interfaces used by the other backends.
 
+Native OpenCode TUI navigation does not announce the selected session on SSE.
+When the tracked session is idle, slopd follows activity from a single top-level
+session in that pane's embedded server and persists the new binding. It excludes
+subagents and does not choose among multiple active top-level sessions. An idle
+session selected locally is discovered when it produces activity. Recovery and
+ambiguous bindings are logged; SSE reconnects retain the current binding.
+
+The real-TUI regression test uses an isolated tmux server and a local model
+fixture, without provider credentials:
+
+```sh
+OPENCODE_TEST_BINARY=/path/to/opencode cargo test -p slopd --all-features \
+  --test opencode_live -- --ignored --nocapture
+```
+
 > **No server password.** slopd deliberately does **not** set `OPENCODE_SERVER_PASSWORD`: the opencode TUI is itself a client of its embedded server, and its internal client does not authenticate — setting a password makes the TUI `401` against its own server and crash on startup (verified against real opencode 1.17.x). The embedded server is therefore open on `127.0.0.1`, which matches the local-only threat model slopd already assumes. (Headless `opencode serve` does support a password; slopd uses TUI mode.)
 
 ### Configuring an OpenCode account

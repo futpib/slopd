@@ -1,5 +1,53 @@
 # Bug: opencode panes on OpenCode 1.19.3 report `ready` in slopctl forever; no state/transcript events flow
 
+## Resolution
+
+The failure was a stale **session binding**, not renamed SSE events. A read-only
+capture from the affected pane's embedded server on OpenCode
+`1.19.3.r4380.ga1f604b` showed normal `session.status` and `message.*` events for
+`ses_ea0f97d82ffeq7ovytAfws2Gb4` (title `adb into TV`). slopd was filtering and
+fetching history for `ses_ea0faa8f7ffez3TjrqMUft5J8d`, an idle initial session
+with three messages. The HTTP API agreed with both observations.
+
+`tui.session.select` is an API command **to** the TUI, not a notification of
+native TUI navigation. Creating or selecting a session locally can therefore
+leave slopd bound to the previous session. Separately, reconnecting SSE reset
+its session filter to the original spawn-time ID even after a known selection.
+
+The backend now recovers an idle binding from a single active top-level session
+in that pane's embedded server, both on activity events and in the three-second
+poll. Session metadata excludes subagents; the shared database's newest session
+is never used as evidence. Recovery updates command routing, transcript reads,
+the durable tmux session ID, and the SSE filter. Old retry bookkeeping is cleared,
+and SSE reconnects consult the live binding. Recoveries, ambiguous bindings, API
+failures, and stalled SSE connections produce warnings; status requests and SSE
+connection/heartbeat waits are bounded.
+
+There is no API exposing the TUI's current route. Navigation to an idle session
+is detected when it produces activity. If the bound session is still active or
+multiple top-level sessions are active, automatic recovery does not guess a new
+binding. This fix does not add a new `unknown` state to the public state enum.
+
+Validation includes a real OpenCode TUI with a local deterministic model
+provider: native new-session navigation, busy/tool/live-transcript events, a
+daemon restart with deliberately stale metadata, a real bash tool running for
+over 30 seconds, and completion back to ready. All test resources use a private
+tmux server and isolated configuration/data directories; a command guard rejects
+tmux access outside the test socket. The same real-TUI test fails against the
+original commit at the stale-session check and passes with the fix. Run it with:
+
+```sh
+OPENCODE_TEST_BINARY=/usr/bin/opencode cargo test -p slopd --all-features \
+  --test opencode_live -- --ignored --nocapture
+```
+
+Mock integration coverage also forces an SSE reconnect after a session switch,
+and HTTP fixture tests cover child sessions, concurrent roots, short turns,
+missing metadata, retrying bound sessions, and malformed status responses.
+
+The original incident report follows. Its version-wide workaround and suspected
+event rename were hypotheses, superseded by the session-binding diagnosis above.
+
 ## Summary
 
 An opencode-backend pane running OpenCode `1.19.3.r4380.ga1f604b` (tmux fork build)
