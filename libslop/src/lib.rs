@@ -238,6 +238,8 @@ pub enum TmuxOption {
     SlopdOpencodePort,
     /// For opencode panes: the per-pane basic-auth token for that server.
     SlopdOpencodeToken,
+    /// OpenCode wire protocol version, retained across daemon restarts.
+    SlopdOpencodeVersion,
     /// For Grok panes: the private leader socket shared by the visible TUI and
     /// slopd's ACP sidecar.
     SlopdGrokLeaderSocket,
@@ -257,6 +259,7 @@ impl TmuxOption {
             TmuxOption::SlopdBackend => "@slopd_backend",
             TmuxOption::SlopdOpencodePort => "@slopd_opencode_port",
             TmuxOption::SlopdOpencodeToken => "@slopd_opencode_token",
+            TmuxOption::SlopdOpencodeVersion => "@slopd_opencode_version",
             TmuxOption::SlopdGrokLeaderSocket => "@slopd_grok_leader_socket",
         }
     }

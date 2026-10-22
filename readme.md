@@ -158,8 +158,8 @@ interface across the supported backends. `slopctl` is its command-line client;
 - **slopd** listens on a Unix domain socket and accepts JSON-RPC requests.
 - Each agent process runs in its own pane inside a dedicated `slopd` tmux session.
 - Claude Code, Codex, and Grok Build report lifecycle events through injected
-  hooks; OpenCode is observed and controlled through the local API embedded in
-  each TUI process. Grok additionally exposes a pane-private leader socket that
+  hooks; OpenCode is observed and controlled through each pane's local server
+  API. Grok additionally exposes a pane-private leader socket that
   slopd joins through ACP when its sandbox policy permits leader mode.
 - Clients see one normalized state, lifecycle, and transcript event stream across
   all four backends.
@@ -746,7 +746,7 @@ How the copy is made is backend-specific, using the agent's native fork rather
 than re-sending the conversation:
 
 - **Claude Code** — spawns `claude --resume <src> --fork-session` with a freshly minted `--session-id`, so the new pane is a distinct session whose transcript is copied from the source's.
-- **opencode** — calls the source pane's server `POST /session/:id/fork`, which creates a new top-level session copying the source's messages, then binds the new pane to it.
+- **opencode** — calls the source pane's fork API, which copies its history into an independent session, then binds the new pane to it. V1 forks are roots; v2 records their parent and fork boundary.
 - **Codex** — launches `codex fork <SESSION_ID>`; Codex creates the new rollout
   lazily when its first prompt is submitted, and the resulting `SessionStart`
   hook binds the new session ID.
@@ -779,7 +779,7 @@ Codex input uses bracketed paste to avoid treating the following Enter as a
 newline. Grok uses the ACP peer attached to its pane-private leader, including
 in-flight steering, and falls back to confirmed bracketed TUI input when a
 sandbox disables leader mode. OpenCode replaces the visible TUI composer
-through its local API and then sends a physical Enter, so slash commands retain
+through its local API (v1) or bracketed paste (v2) and then sends a physical Enter, so slash commands retain
 normal TUI semantics. The default timeout is 60 seconds.
 
 When the first positional argument contains `=`, it is treated as a filter instead of a pane ID.
@@ -1046,31 +1046,46 @@ pane's backend is selected by its account (default `claude`) or a one-off
 `slopctl run --backend` override. `slopctl ps` records both `BACKEND` and
 `ACCOUNT`, and either can be used as a filter.
 
-OpenCode runs its TUI as a client of an **embedded HTTP server**, so slopd
-spawns each pane with a pinned port on `127.0.0.1` and subscribes to `GET /event`
-SSE, with `/session` and `/session/status` polling as a backstop. User input is
-placed in the visible composer through `/tui/clear-prompt` and
-`/tui/append-prompt`, then submitted with a physical Enter. Interrupt uses
-`POST /session/:id/abort`, while transcripts come from `GET
-/session/:id/message`. These signals are normalized onto the same state, hook,
-and transcript interfaces used by the other backends.
+slopd detects **OpenCode v1 and v2** from the configured executable's version.
+V1 uses the TUI's embedded HTTP server on a pinned loopback port. V2 runs a
+private `opencode serve --stdio` process and attaches the TUI with `--server`
+and `--session`. Each v2 pane has its own authentication token and pipe lease:
+the server survives a daemon restart and stops when its pane owner exits,
+including after loss of the tmux server.
+
+Both versions use SSE plus status polling for lifecycle and transcript events.
+V2's `/api` routes, response envelopes, paginated messages, tool events, and
+interrupt endpoint are translated to the same interfaces as v1. Pending v2
+permissions, forms, and tools are also recovered through snapshots. Input goes
+through the visible composer and a physical Enter, preserving slash commands.
+V1 supplies composer-control endpoints; v2 uses bracketed paste and the default
+Shift+Home/Shift+End selection bindings to replace existing input.
 
 Native OpenCode TUI navigation does not announce the selected session on SSE.
 When the tracked session is idle, slopd follows activity from a single top-level
-session in that pane's embedded server and persists the new binding. It excludes
+session in that pane's server and persists the new binding. It excludes
 subagents and does not choose among multiple active top-level sessions. An idle
 session selected locally is discovered when it produces activity. Recovery and
 ambiguous bindings are logged; SSE reconnects retain the current binding.
 
 The real-TUI regression test uses an isolated tmux server and a local model
-fixture, without provider credentials:
+fixture, without provider credentials. It covers native session switching,
+daemon restart during a tool lasting over 30 seconds, fork independence, large
+multiline input, interruption, and restoration of both histories after losing
+the tmux server. V2 also checks permission polling and private-server cleanup:
 
 ```sh
 OPENCODE_TEST_BINARY=/path/to/opencode cargo test -p slopd --all-features \
   --test opencode_live -- --ignored --nocapture
 ```
 
-> **No server password.** slopd deliberately does **not** set `OPENCODE_SERVER_PASSWORD`: the opencode TUI is itself a client of its embedded server, and its internal client does not authenticate — setting a password makes the TUI `401` against its own server and crash on startup (verified against real opencode 1.17.x). The embedded server is therefore open on `127.0.0.1`, which matches the local-only threat model slopd already assumes. (Headless `opencode serve` does support a password; slopd uses TUI mode.)
+Set `OPENCODE_TEST_UPGRADE_BINARY=/path/to/opencode-v2` while testing a v1 binary
+to also verify restoring those histories through OpenCode's v1-to-v2 migration.
+Resuming a missing v2 session fails explicitly rather than creating an empty
+conversation with the saved ID.
+
+V2 uses a per-pane `OPENCODE_PASSWORD`. V1's embedded TUI client does not support
+server authentication, so its loopback server remains unauthenticated.
 
 ### Configuring an OpenCode account
 
@@ -1102,9 +1117,10 @@ has the same meaning regardless of backend.
 
 ### OpenCode limitations
 
-- **No server password (TUI mode)**: the opencode TUI is itself a client of its embedded server and can't authenticate to it, so slopd spawns the pane **without** `OPENCODE_SERVER_PASSWORD` (verified against real opencode 1.17.x). The server is therefore open on `127.0.0.1` — acceptable for the single-user local model slopd assumes, but it can't be locked down the way headless `opencode serve` can.
+- **V1 server authentication**: the embedded TUI server remains open on loopback. V2 uses authentication.
+- **V2 composer bindings**: replacing existing input requires the default Shift+Home/Shift+End selection bindings. slopd owns the server address; `--server` and `--standalone` overrides are rejected.
 - **Subagent transcript not surfaced**: opencode runs subagents as child sessions; slopd tracks the subagent *state* (`busy_subagent`) and emits `SubagentStart`/`SubagentStop` hooks, but the subagent's own messages are **not** folded into the pane's transcript (`slopctl transcript` / `listen --transcript` show the main session only).
-- **Rare events mapped per-doc**: the `permission.asked` and `session.compacted` mappings follow the opencode plugin docs but weren't individually triggered in a real-opencode smoke (auto-allowed bash; no compaction in short turns). The common path (idle/busy/tool/subagent/elicitation) is verified against real opencode 1.17.x.
+- **Rare events**: v2 form, subagent, and compaction mappings follow upstream schemas; these paths have not all been exercised with the real v2 TUI. The real regression exercises permission requests and the common prompt/tool lifecycle.
 
 ### Configuring a Codex account
 

@@ -2,8 +2,8 @@
 //!
 //! `opencode` runs its TUI as a client of an embedded HTTP server (see
 //! <https://opencode.ai/docs/server>). slopd spawns the TUI pane with a pinned
-//! `--port` on 127.0.0.1 and uses that API for lifecycle/state plus composer
-//! insertion. Submission itself is a real Enter key in the pane so OpenCode's
+//! `--port` on 127.0.0.1 (V1) or a leased private server (V2), and uses that API
+//! for lifecycle/state. Submission itself is a real Enter key in the pane so OpenCode's
 //! TUI—not slopd—interprets normal prompts, built-in slash commands, configured
 //! commands, and any future input forms. This module is the transport + mapping
 //! layer; the per-pane driver loop and RPC dispatch live in [`crate`]
@@ -33,6 +33,11 @@ pub struct OpencodeClient {
     base: String,
     token: Option<String>,
     client: reqwest::Client,
+    pub v2: bool,
+    v2_events: std::sync::Arc<std::sync::Mutex<crate::opencode_v2::Events>>,
+    /// V1 emits copied user messages while forking. Fence discovery against the
+    /// request and ignore those copies as evidence of native TUI navigation.
+    forks: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl OpencodeClient {
@@ -41,6 +46,9 @@ impl OpencodeClient {
         Self {
             base: format!("http://127.0.0.1:{}", port),
             token,
+            v2: false,
+            v2_events: Default::default(),
+            forks: Default::default(),
             client: reqwest::Client::builder()
                 // No per-request timeout: SSE / long polls would hit it. The
                 // driver's individual calls are short; send/transcript cap
@@ -51,12 +59,112 @@ impl OpencodeClient {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let path = if self.v2 {
+            match path {
+                "/session/status" => "/api/session/active".to_string(),
+                _ => format!("/api{path}")
+                    .replace("/prompt_async", "/prompt")
+                    .replace("/abort", "/interrupt"),
+            }
+        } else {
+            path.to_string()
+        };
         let url = format!("{}{}", self.base, path);
         let mut r = self.client.request(method, url);
         if let Some(t) = &self.token {
             r = r.basic_auth(AUTH_USER, Some(t));
         }
         r
+    }
+
+    fn data(&self, value: Value) -> Value {
+        if self.v2 {
+            value.get("data").cloned().unwrap_or(Value::Null)
+        } else {
+            value
+        }
+    }
+
+    /// V2 lists are paginated even when the caller wants the whole transcript.
+    async fn pages(&self, path: &str) -> Result<Vec<Value>, String> {
+        let mut result = Vec::new();
+        let mut cursor = None::<String>;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut request = self
+                .req(reqwest::Method::GET, path)
+                .timeout(STATUS_REQUEST_TIMEOUT);
+            request = if let Some(cursor) = &cursor {
+                request.query(&[("cursor", cursor.as_str())])
+            } else {
+                request.query(&[("order", "asc")])
+            };
+            let value = request
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| e.to_string())?
+                .json::<Value>()
+                .await
+                .map_err(|e| e.to_string())?;
+            result.extend(
+                value["data"]
+                    .as_array()
+                    .ok_or("V2 list returned no data array")?
+                    .iter()
+                    .cloned(),
+            );
+            cursor = value["cursor"]["next"].as_str().map(str::to_string);
+            match &cursor {
+                None => return Ok(result),
+                Some(cursor) if !seen.insert(cursor.clone()) => {
+                    return Err("V2 list repeated its pagination cursor".into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Wait for upstream's background V1 history migration before resuming.
+    pub async fn wait_v2_session(&self, id: &str) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if self.session_exists(id).await? { return Ok(()); }
+                let migration = self.req(reqwest::Method::GET, "/experimental/migration/v1")
+                    .timeout(STATUS_REQUEST_TIMEOUT).send().await
+                    .and_then(reqwest::Response::error_for_status).map_err(|e| e.to_string())?
+                    .json::<Value>().await.map_err(|e| e.to_string())?;
+                match migration["status"].as_str() {
+                    Some("required" | "running") => tokio::time::sleep(Duration::from_millis(200)).await,
+                    Some("completed") => return Err(format!("session {id} is not available in OpenCode 2; refusing to resume an empty conversation")),
+                    _ => return Err(format!("OpenCode history migration failed: {migration}")),
+                }
+            }
+        }).await.map_err(|_| "timed out waiting for OpenCode history migration".to_string())?
+    }
+
+    /// Create a fresh ID only after checking for an existing conversation.
+    pub async fn create_v2_session(&self, id: &str, directory: &str) -> Result<(), String> {
+        let response = self
+            .req(reqwest::Method::GET, &format!("/session/{id}"))
+            .timeout(CREATE_SESSION_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(format!("session lookup: {}", response.status()));
+        }
+        self.req(reqwest::Method::POST, "/session")
+            .timeout(CREATE_SESSION_TIMEOUT)
+            .json(&json!({"id": id, "location": {"directory": directory}}))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Create the session slopd will drive and return its id, via `POST /session`.
@@ -96,8 +204,8 @@ impl OpencodeClient {
     /// `session_id`'s history up to now (optionally truncated at `message_id`),
     /// diverging independently thereafter. The source session is untouched.
     /// Returns the new session's id (opencode assigns it and echoes the full
-    /// Session object; the fork is a top-level session — `parentID` is null, so
-    /// it is not confused with a subagent child). Because sessions live in the
+    /// Session object; V1 forks are roots, V2 forks have parent metadata).
+    /// Because sessions live in the
     /// shared on-disk store, a pane spawned later with `-s <new id>` will find
     /// it.
     pub async fn fork_session(
@@ -105,7 +213,9 @@ impl OpencodeClient {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<String, String> {
+        let mut forks = self.forks.lock().await;
         let body = match message_id {
+            Some(m) if self.v2 => json!({ "before": m }),
             Some(m) => json!({ "messageID": m }),
             None => json!({}),
         };
@@ -114,6 +224,7 @@ impl OpencodeClient {
                 reqwest::Method::POST,
                 &format!("/session/{}/fork", session_id),
             )
+            .timeout(Duration::from_secs(30))
             .json(&body)
             .send()
             .await
@@ -127,11 +238,14 @@ impl OpencodeClient {
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
-        v.get("id")
+        let v = self.data(resp.json::<Value>().await.map_err(|e| e.to_string())?);
+        let id = v
+            .get("id")
             .and_then(|i| i.as_str())
             .map(str::to_string)
-            .ok_or_else(|| format!("POST /session/{}/fork returned no id", session_id))
+            .ok_or_else(|| format!("POST /session/{}/fork returned no id", session_id))?;
+        forks.insert(id.clone());
+        Ok(id)
     }
 
     /// `POST /tui/select-session` — command the TUI to display `session_id`, so the
@@ -140,6 +254,10 @@ impl OpencodeClient {
     /// leaving `slopctl ps`/`send`/`transcript` describing a conversation the pane
     /// never shows. Best-effort: a failure is logged by the caller, not fatal.
     pub async fn select_session(&self, session_id: &str) -> Result<(), String> {
+        // V2 is launched with this exact session; it has no TUI-control HTTP API.
+        if self.v2 {
+            return Ok(());
+        }
         let resp = self
             .req(reqwest::Method::POST, "/tui/select-session")
             .json(&serde_json::json!({ "sessionID": session_id }))
@@ -160,6 +278,14 @@ impl OpencodeClient {
     /// `GET /session` → every session id (used to tell "idle but exists" from
     /// "still booting", since idle sessions are absent from `/session/status`).
     pub async fn session_ids(&self) -> Result<Vec<String>, String> {
+        if self.v2 {
+            return Ok(self
+                .pages("/session")
+                .await?
+                .iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .collect());
+        }
         let resp = self
             .req(reqwest::Method::GET, "/session")
             .timeout(DISCOVERY_REQUEST_TIMEOUT)
@@ -184,7 +310,64 @@ impl OpencodeClient {
     /// `GET /session/status` → the status object for one session. `Ok(None)` if the
     /// session is absent from the map (e.g. not yet created).
     pub async fn session_status(&self, session_id: &str) -> Result<Option<Value>, String> {
-        Ok(self.status_map().await?.get(session_id).cloned())
+        let status = self.status_map().await?.get(session_id).cloned();
+        if !self.v2 || status.is_none() {
+            return Ok(status);
+        }
+        // V2's active map only says "running". Recover pending interactions and
+        // tools from snapshots as well, including after a daemon/SSE restart.
+        let snapshot = async |suffix: &str| -> Result<Value, String> {
+            let value = self
+                .req(
+                    reqwest::Method::GET,
+                    &format!("/session/{session_id}/{suffix}"),
+                )
+                .timeout(STATUS_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| e.to_string())?
+                .json::<Value>()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(self.data(value))
+        };
+        let (permissions, forms, messages) = tokio::try_join!(
+            snapshot("permission"),
+            snapshot("form"),
+            snapshot("message?order=desc&limit=1&type=assistant"),
+        )?;
+        if permissions.as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(Some(json!({"type":"permission"})));
+        }
+        if forms.as_array().is_some_and(|a| !a.is_empty()) {
+            return Ok(Some(json!({"type":"question"})));
+        }
+        if messages[0]["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|p| p["type"] == "tool" && p["state"]["status"] == "running")
+        }) {
+            return Ok(Some(json!({"type":"tool"})));
+        }
+        Ok(status)
+    }
+
+    pub async fn session_exists(&self, session_id: &str) -> Result<bool, String> {
+        if !self.v2 {
+            return Ok(self.session_ids().await?.iter().any(|id| id == session_id));
+        }
+        let response = self
+            .req(reqwest::Method::GET, &format!("/session/{session_id}"))
+            .timeout(DISCOVERY_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        response.error_for_status().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// Resolve activity from this embedded server, never from the newest session
@@ -196,6 +379,7 @@ impl OpencodeClient {
         current: &str,
         activity: Option<&str>,
     ) -> Result<Option<String>, String> {
+        let forks = self.forks.lock().await;
         let statuses = self.status_map().await?;
         for (sid, status) in &statuses {
             if status_to_detailed(status).is_none() {
@@ -220,6 +404,7 @@ impl OpencodeClient {
         // still identifies activity from this process, unlike a database listing.
         if let Some(sid) = activity
             && sid != current
+            && !forks.contains(sid)
             && !candidates.iter().any(|id| id == sid)
         {
             candidates.push(sid.to_string());
@@ -233,13 +418,15 @@ impl OpencodeClient {
                 .await
                 .and_then(reqwest::Response::error_for_status)
                 .map_err(|e| e.to_string())?;
-            let info = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+            let info = self.data(resp.json::<Value>().await.map_err(|e| e.to_string())?);
             if info.get("id").and_then(Value::as_str) != Some(sid.as_str()) {
                 return Err(format!(
                     "GET /session/{sid} returned no matching session id"
                 ));
             }
-            if info.get("parentID").is_some_and(|parent| !parent.is_null()) {
+            if info.get("parentID").is_some_and(|parent| !parent.is_null())
+                && (!self.v2 || info.get("fork").is_none_or(Value::is_null))
+            {
                 continue;
             }
             if candidate.is_some() {
@@ -272,7 +459,7 @@ impl OpencodeClient {
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+        let v = self.data(resp.json::<Value>().await.map_err(|e| e.to_string())?);
         v.as_object()
             .cloned()
             .ok_or_else(|| "GET /session/status returned a non-object".to_string())
@@ -321,7 +508,11 @@ impl OpencodeClient {
     /// for internal automatic retries. User-supplied input always goes through
     /// [`Self::replace_prompt`] and the visible TUI.
     pub async fn send_message(&self, session_id: &str, text: &str) -> Result<(), String> {
-        let body = json!({ "parts": [{ "type": "text", "text": text }] });
+        let body = if self.v2 {
+            json!({"text": text})
+        } else {
+            json!({ "parts": [{ "type": "text", "text": text }] })
+        };
         let resp = self
             .req(
                 reqwest::Method::POST,
@@ -350,6 +541,7 @@ impl OpencodeClient {
                 reqwest::Method::POST,
                 &format!("/session/{}/abort", session_id),
             )
+            .json(&json!({}))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -367,6 +559,14 @@ impl OpencodeClient {
 
     /// `GET /session/:id/message` — full conversation as `{ info, parts }[]`.
     pub async fn messages(&self, session_id: &str) -> Result<Vec<Value>, String> {
+        if self.v2 {
+            return Ok(self
+                .pages(&format!("/session/{session_id}/message"))
+                .await?
+                .iter()
+                .map(crate::opencode_v2::message)
+                .collect());
+        }
         let resp = self
             .req(
                 reqwest::Method::GET,
@@ -391,6 +591,22 @@ impl OpencodeClient {
     pub fn events(&self) -> reqwest::RequestBuilder {
         self.req(reqwest::Method::GET, "/event")
             .header(reqwest::header::ACCEPT, "text/event-stream")
+    }
+
+    pub async fn parse_event(&self, payload: &str) -> Option<Value> {
+        let event = event_from_line(payload)?;
+        if self.v2 {
+            let missing = self.v2_events.lock().unwrap().missing_tool(&event);
+            if missing
+                && let Some(sid) = event["data"]["sessionID"].as_str()
+                && let Ok(messages) = self.messages(sid).await
+            {
+                self.v2_events.lock().unwrap().seed_tools(sid, &messages);
+            }
+            self.v2_events.lock().unwrap().normalize(event)
+        } else {
+            Some(event)
+        }
     }
 }
 
@@ -443,6 +659,9 @@ pub fn status_to_detailed(status: &Value) -> Option<PaneDetailedState> {
     }
     if s == "compacting" {
         return Some(PaneDetailedState::BusyCompacting);
+    }
+    if s == "question" {
+        return Some(PaneDetailedState::AwaitingInputElicitation);
     }
     // Boolean fallbacks.
     if status.get("busy").and_then(|v| v.as_bool()) == Some(true) {
@@ -724,6 +943,12 @@ mod tests {
         // active in this server (or its observed events) are candidates.
         for (statuses, activity, expected) in [
             (json!({}), None, Ok(None)),
+            (json!({}), Some("copied"), Ok(None)),
+            (
+                json!({"copied": {"type": "busy"}}),
+                Some("copied"),
+                Ok(Some("copied")),
+            ),
             (json!({"root": {"type": "busy"}}), None, Ok(Some("root"))),
             (json!({}), Some("root"), Ok(Some("root"))),
             (
@@ -753,6 +978,7 @@ mod tests {
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = OpencodeClient::new(listener.local_addr().unwrap().port(), None);
+            client.forks.lock().await.insert("copied".into());
             let server = tokio::spawn(async move {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
@@ -765,6 +991,7 @@ mod tests {
                     let (status, body) = match path {
                         "/session/status" => (200, statuses.clone()),
                         "/session/root" => (200, json!({"id": "root"})),
+                        "/session/copied" => (200, json!({"id": "copied"})),
                         "/session/other" => (200, json!({"id": "other", "parentID": null})),
                         "/session/child" => (200, json!({"id": "child", "parentID": "current"})),
                         _ => (404, json!({"error": "not found"})),
@@ -780,6 +1007,48 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn v2_transcript_follows_authenticated_pagination() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client =
+            OpencodeClient::new(listener.local_addr().unwrap().port(), Some("secret".into()));
+        client.v2 = true;
+        let server = tokio::spawn(async move {
+            for (path, body) in [
+                (
+                    "/api/session/ses_test/message?order=asc",
+                    json!({"data":[{"id":"msg_one","type":"user","text":"first"}], "cursor":{"next":"page+two"}}),
+                ),
+                (
+                    "/api/session/ses_test/message?cursor=page%2Btwo",
+                    json!({"data":[{"id":"msg_two","type":"assistant","content":[{"type":"text","text":"last"}]}], "cursor":{}}),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert_eq!(request.split_whitespace().nth(1), Some(path));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: basic b3blbmnvzgu6c2vjcmv0")
+                );
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let messages = client.messages("ses_test").await.unwrap();
+        server.await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["info"]["role"], "user");
+        assert_eq!(messages[0]["parts"][0]["text"], "first");
+        assert_eq!(messages[1]["parts"][0]["text"], "last");
     }
 
     #[test]

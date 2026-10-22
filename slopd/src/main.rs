@@ -11,7 +11,13 @@ mod codex;
 mod grok;
 mod journal;
 mod opencode;
+mod opencode_v2;
 use backend::*;
+
+// Capture before a package upgrade replaces the running binary. On Linux,
+// current_exe() would then append " (deleted)", which cannot launch a pane.
+static DAEMON_EXECUTABLE: std::sync::LazyLock<std::io::Result<std::path::PathBuf>> =
+    std::sync::LazyLock::new(std::env::current_exe);
 
 #[derive(Parser)]
 #[command(name = "slopd", about = "Agent session manager daemon", version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")"))]
@@ -45,6 +51,20 @@ struct Cli {
 enum CliCommand {
     /// Remove slopctl hook entries from Claude and Codex hook files.
     UninjectHooks,
+    /// Own a private OpenCode 2 server for the lifetime of its terminal client.
+    #[command(hide = true)]
+    OpencodeRun {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        create_session: bool,
+        #[arg(long, allow_hyphen_values = true)]
+        server_arg: Vec<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 fn tmux(config: &libslop::SlopdConfig) -> tokio::process::Command {
@@ -1214,11 +1234,9 @@ async fn reconcile_opencode_status(
 ) {
     let target = match client.session_status(session_id).await {
         Ok(Some(status)) => opencode::status_to_detailed(&status),
-        Ok(None) => match client.session_ids().await {
+        Ok(None) => match client.session_exists(session_id).await {
             // Idle sessions are absent from /session/status; confirm existence → Ready.
-            Ok(ids) if ids.iter().any(|id| id == session_id) => {
-                Some(libslop::PaneDetailedState::Ready)
-            }
+            Ok(true) => Some(libslop::PaneDetailedState::Ready),
             _ => None,
         },
         Err(_) => None,
@@ -1331,6 +1349,7 @@ async fn run_opencode_sse(
             Ok(Ok(resp)) if resp.status().is_success() => {
                 backoff = std::time::Duration::from_secs(1);
                 if let Err(e) = read_opencode_sse(
+                    &client,
                     resp,
                     &session_id,
                     &pane_id,
@@ -1367,6 +1386,7 @@ async fn run_opencode_sse(
 /// Read one SSE connection to completion, dispatching each session-scoped event.
 #[allow(clippy::too_many_arguments)] // wiring fn threading shared daemon state
 async fn read_opencode_sse(
+    client: &opencode::OpencodeClient,
     mut resp: reqwest::Response,
     session_id: &str,
     pane_id: &str,
@@ -1400,7 +1420,7 @@ async fn read_opencode_sse(
             let Some(payload) = extract_sse_data(&block) else {
                 continue;
             };
-            let Some(event) = opencode::event_from_line(&payload) else {
+            let Some(event) = client.parse_event(&payload).await else {
                 continue;
             };
 
@@ -2378,6 +2398,34 @@ async fn read_pane_opencode_port(config: &libslop::SlopdConfig, pane_id: &str) -
         return None;
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+async fn read_pane_option(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    option: libslop::TmuxOption,
+) -> Option<String> {
+    let out = tmux(config)
+        .args(["show-options", "-pqv", "-t", pane_id, option.as_str()])
+        .output()
+        .await
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+async fn pane_opencode_client(
+    config: &libslop::SlopdConfig,
+    pane_id: &str,
+    port: u16,
+) -> opencode::OpencodeClient {
+    let token = read_pane_option(config, pane_id, libslop::TmuxOption::SlopdOpencodeToken).await;
+    let mut client = opencode::OpencodeClient::new(port, token);
+    client.v2 = read_pane_option(config, pane_id, libslop::TmuxOption::SlopdOpencodeVersion)
+        .await
+        .as_deref()
+        == Some("2");
+    client
 }
 
 /// Scan the slopd session for managed panes and return the distinct
@@ -3386,7 +3434,24 @@ async fn pane_is_still_alive(config: &libslop::SlopdConfig, pane_id: &str) -> bo
 
 #[tokio::main]
 async fn main() {
+    std::sync::LazyLock::force(&DAEMON_EXECUTABLE);
     let cli = Cli::parse();
+    if let Some(CliCommand::OpencodeRun {
+        port,
+        session,
+        create_session,
+        server_arg,
+        command,
+    }) = &cli.command
+    {
+        match opencode_v2::run(*port, session, *create_session, server_arg, command).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("OpenCode 2: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Resolve the config file path once (CLI override or default) so the initial
     // load and every SIGHUP reload read the same file.
@@ -4674,6 +4739,32 @@ async fn spawn_pane(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let resolved = resolve_spawn_program(&spec.executable, &spec.extra_env, &lookup_cwd)?;
+    let v2 = spec.backend == libslop::Backend::Opencode
+        && opencode_v2::detect(
+            &resolved,
+            spec.executable.args(),
+            &spec.extra_env,
+            &lookup_cwd,
+        )
+        .await?;
+    let v2_launch = if v2 {
+        let args = spec
+            .executable
+            .args()
+            .iter()
+            .cloned()
+            .chain(spec.trailing_args.iter().cloned())
+            .collect::<Vec<_>>();
+        Some((
+            opencode_v2::launch_args(&args)?,
+            DAEMON_EXECUTABLE
+                .as_ref()
+                .map_err(|e| e.to_string())?
+                .clone(),
+        ))
+    } else {
+        None
+    };
 
     let xdg_runtime_dir = libslop::runtime_dir();
     let profile_file = std::env::var("LLVM_PROFILE_FILE").ok();
@@ -4687,7 +4778,15 @@ async fn spawn_pane(
         let session = c.tmux.session();
         // `-d`: create the window in the background so spawning a pane doesn't
         // yank clients already watching the session to it.
-        cmd.args(["new-window", "-d", "-t", &session, "-P", "-F", "#{pane_id}"]);
+        cmd.args([
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:"),
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ]);
         if let Some(ref dir) = spec.working_dir {
             cmd.args(["-c", dir]);
         }
@@ -4748,9 +4847,43 @@ async fn spawn_pane(
             }
             // Spawn the resolved absolute path, not the bare program name, so
             // the launch never depends on the pane's own PATH.
-            cmd.arg(&resolved)
-                .args(spec.executable.args())
-                .args(&spec.trailing_args);
+            if let Some(((port, session, args, create_session), launcher)) = &v2_launch {
+                let token = uuid::Uuid::new_v4().to_string();
+                for (key, value) in [
+                    (libslop::TmuxOption::SlopdOpencodeVersion, "2".to_string()),
+                    (libslop::TmuxOption::SlopdOpencodeToken, token.clone()),
+                    (libslop::TmuxOption::SlopdSessionId, session.clone()),
+                ] {
+                    let status = tmux_set_pane_option(config, &pane_id, key.as_str(), &value).await;
+                    if !status.is_ok_and(|status| status.success()) {
+                        let _ = tmux(config)
+                            .args(["kill-pane", "-t", &pane_id])
+                            .status()
+                            .await;
+                        return Err("failed to persist OpenCode 2 launch metadata".into());
+                    }
+                }
+                cmd.args(["-e", &format!("SLOPD_OPENCODE_TOKEN={token}")])
+                    .arg(launcher)
+                    .args([
+                        "opencode-run",
+                        "--port",
+                        &port.to_string(),
+                        "--session",
+                        session,
+                    ]);
+                for arg in spec.executable.args() {
+                    cmd.arg(format!("--server-arg={arg}"));
+                }
+                if *create_session {
+                    cmd.arg("--create-session");
+                }
+                cmd.arg("--").arg(&resolved).args(args);
+            } else {
+                cmd.arg(&resolved)
+                    .args(spec.executable.args())
+                    .args(&spec.trailing_args);
+            }
 
             match cmd.output().await {
                 Ok(out) if out.status.success() => Ok(pane_id),
@@ -5951,6 +6084,7 @@ async fn handle_request(
                     session_id: &src_session,
                     extra_args,
                     config,
+                    panes,
                 })
                 .await
             {
@@ -6277,7 +6411,17 @@ async fn handle_request(
                             )
                             .await;
 
-                            let client = opencode::OpencodeClient::new(port, None);
+                            let client = pane_opencode_client(config, &pane_id, port).await;
+                            let resume_session = if client.v2 {
+                                read_pane_option(
+                                    config,
+                                    &pane_id,
+                                    libslop::TmuxOption::SlopdSessionId,
+                                )
+                                .await
+                            } else {
+                                resume_session
+                            };
                             // Bind the session slopd will drive. Resume: the pane was
                             // spawned with `-s <id>`, so bind directly to that id —
                             // wait (bounded) for the server to list it as it finishes
@@ -6291,8 +6435,8 @@ async fn handle_request(
                                     std::time::Duration::from_secs(20),
                                     async {
                                         loop {
-                                            match client.session_ids().await {
-                                                Ok(ids) if ids.contains(&sid) => return,
+                                            match client.session_exists(&sid).await {
+                                                Ok(true) => return,
                                                 _ => {
                                                     tokio::time::sleep(
                                                         std::time::Duration::from_millis(300),
@@ -6685,7 +6829,40 @@ async fn handle_request(
                 *oc.pending_prompt.lock().unwrap() = Some(prompt.clone());
                 *state.retry_state.lock().unwrap() = None;
 
-                if let Err(e) = oc.client.replace_prompt(&prompt).await {
+                let inserted = if oc.client.v2 {
+                    // V2 removed the composer HTTP routes. Clear the whole input
+                    // through its native keybinding, then use bracketed paste so
+                    // multiline text and slash commands retain TUI semantics.
+                    async {
+                        let clear = tmux(config)
+                            .args([
+                                "send-keys",
+                                "-t",
+                                &pane_id,
+                                "S-Home",
+                                "BSpace",
+                                "S-End",
+                                "BSpace",
+                            ])
+                            .status()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if !clear.success() {
+                            return Err("failed to clear OpenCode prompt".into());
+                        }
+                        let paste = tmux_paste_text(config, &pane_id, &prompt)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if !paste.success() {
+                            return Err("failed to paste OpenCode prompt".into());
+                        }
+                        Ok(())
+                    }
+                    .await
+                } else {
+                    oc.client.replace_prompt(&prompt).await
+                };
+                if let Err(e) = inserted {
                     *oc.pending_prompt.lock().unwrap() = None;
                     return libslop::ResponseBody::Error { message: e };
                 }

@@ -5,6 +5,7 @@ isolated and removed on success or failure. Only the model response is a fixture
 """
 
 import http.server
+import base64
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,9 @@ def stop(process):
 
 def main():
     binary = os.environ["OPENCODE_TEST_BINARY"]
-    print("Real OpenCode:", subprocess.check_output([binary, "--version"], text=True).strip(), flush=True)
+    version = subprocess.check_output([binary, "--version"], text=True).strip()
+    v2 = any(word.lstrip("v").startswith("2.") for word in version.split())
+    print("Real OpenCode:", version, flush=True)
     with tempfile.TemporaryDirectory(prefix="slopd-opencode-live-") as tmp:
         root = Path(tmp)
         gate = root / "release-tool"
@@ -56,14 +59,18 @@ def main():
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 requests.append(body)
                 tools = [tool["function"]["name"] for tool in body.get("tools", [])]
-                completed = any(message.get("role") == "tool" for message in body["messages"])
+                last_user = max((i for i, m in enumerate(body["messages"]) if m.get("role") == "user"), default=-1)
+                completed = any(message.get("role") == "tool" for message in body["messages"][last_user + 1:])
+                interrupt = "SLOPD_INTERRUPT" in json.dumps(body["messages"][last_user])
                 delta = {"role": "assistant", "content": "SLOPD_LIVE_DONE"}
                 reason = "stop"
-                if "bash" in tools and not completed:
-                    command = f"while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.1; done; printf SLOPD_TOOL_DONE"
+                tool = "shell" if v2 else "bash"
+                if tool in tools and not completed:
+                    release = root / "interrupt-tool" if interrupt else gate
+                    command = f"while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.1; done; printf SLOPD_TOOL_DONE"
                     delta = {"role": "assistant", "tool_calls": [{
                         "index": 0, "id": "call_slopd_live", "type": "function",
-                        "function": {"name": "bash", "arguments": json.dumps({
+                        "function": {"name": tool, "arguments": json.dumps({
                             "command": command, "description": "Wait for test release", "timeout": 120000,
                         })},
                     }]}
@@ -93,7 +100,6 @@ def main():
             (root / name).mkdir(mode=0o700)
             env[key] = str(root / name)
         env.update({
-            "HOME": tmp,
             "OPENCODE_CONFIG": str(root / "opencode.json"),
             "OPENCODE_CONFIG_DIR": str(root / "config/opencode"),
             "OPENCODE_TEST_HOME": tmp,
@@ -101,9 +107,12 @@ def main():
             "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
             "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
             "OPENCODE_SERVER_PASSWORD": "",
+            "OPENCODE_PASSWORD": "",
+            "OPENCODE_DISABLE_MODELS_FETCH": "true",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "true",
         })
         (root / "opencode.json").write_text(json.dumps({
-            "autoupdate": False, "plugin": [], "permission": "allow",
+            "autoupdate": False, "plugin": [], "permission": {"*": "allow", "shell": "ask"} if v2 else "allow",
             "enabled_providers": ["slopd-test"], "model": "slopd-test/test",
             "small_model": "slopd-test/test",
             "provider": {"slopd-test": {
@@ -133,16 +142,20 @@ def main():
         control = str(root / "slopd.sock")
         config = root / "slopd.toml"
         config.write_text(
+            f'config_dir = {json.dumps(str(root / "claude"))}\n'
             f'default_account = "oc"\n[tmux]\nsocket = {json.dumps(tmux_socket)}\n'
             f'[run]\nslopctl = {json.dumps(os.environ["SLOPCTL_TEST_BINARY"])}\n'
             f'start_directory = {json.dumps(tmp)}\n'
-            f'[accounts.oc]\nbackend = "opencode"\nexecutable = {json.dumps(binary)}\n'
+            f'[accounts.oc]\nbackend = "opencode"\nexecutable = {json.dumps(["env", binary] if v2 else binary)}\n'
             '[backup]\nauto_backup = false\nauto_restore = false\n'
         )
 
         def run(args, **kwargs):
-            return subprocess.run(args, env=env, cwd=tmp, text=True, capture_output=True,
-                                  timeout=60, check=True, **kwargs).stdout.strip()
+            result = subprocess.run(args, env=env, cwd=tmp, text=True, capture_output=True,
+                                    timeout=90, **kwargs)
+            if result.returncode:
+                raise AssertionError(f"Command {args!r} failed: {result.stdout}\n{result.stderr}")
+            return result.stdout.strip()
 
         def tmux(*args):
             return run(["tmux", "-S", tmux_socket, *args])
@@ -170,12 +183,21 @@ def main():
             assert process.poll() is None, "slopd exited"
             return process
 
-        def info():
-            return next(p for p in json.loads(run(cli + ["ps", "--json"])) if p["pane_id"] == pane)
+        def info(target=None):
+            return next(p for p in json.loads(run(cli + ["ps", "--json"])) if p["pane_id"] == (target or pane))
 
-        def api(path):
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
-                return json.load(response)
+        def api(path, body=None):
+            headers = {}
+            if v2:
+                path = "/api/session/active" if path == "/session/status" else "/api" + path
+                headers["Authorization"] = "Basic " + base64.b64encode(f"opencode:{token}".encode()).decode()
+            headers["Content-Type"] = "application/json"
+            with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers,
+                                         data=json.dumps(body).encode() if body is not None else None), timeout=5) as response:
+                if response.status == 204:
+                    return None
+                result = json.load(response)
+                return result["data"] if v2 else result
 
         def read_events():
             for line in listener.stdout:
@@ -188,8 +210,9 @@ def main():
             daemon = start_daemon()
             pane = run(cli + ["run", "--ready-timeout", "60"])
             port = int(tmux("show-options", "-pv", "-t", pane, "@slopd_opencode_port"))
+            token = tmux("show-options", "-pqv", "-t", pane, "@slopd_opencode_token")
             initial_session = info()["session_id"]
-            listener = subprocess.Popen(cli + ["listen", "--pane-id", pane], env=env,
+            listener = subprocess.Popen(cli + ["listen"], env=env,
                                         stdout=subprocess.PIPE, stderr=log, text=True)
             threading.Thread(target=read_events, daemon=True).start()
             assert event_queue.get(timeout=10).get("subscribed"), "listener did not subscribe"
@@ -203,9 +226,16 @@ def main():
             run(cli + ["send", pane, "SLOPD_LIVE_PROMPT: run the controlled bash tool."])
             wait_for(tool_started.is_set, "model tool request", 45)
             active = wait_for(lambda: next((sid for sid, status in api("/session/status").items()
-                                           if status.get("type") == "busy"), None), "active OpenCode session")
+                                           if status.get("type") in ("busy", "running")), None), "active OpenCode session")
             assert active != initial_session, "native TUI navigation did not create a different session"
             wait_for(lambda: info()["session_id"] == active, "slopd binding to native TUI session", 10)
+            if v2:
+                permission = wait_for(lambda: next(iter(api(f"/session/{active}/permission")), None), "permission request")
+                wait_for(lambda: info()["detailed_state"] == "awaiting_input_permission", "permission state")
+                time.sleep(4)
+                assert info()["detailed_state"] == "awaiting_input_permission", info()
+                api(f'/session/{active}/permission/{permission["id"]}/reply', {"decision": "always"})
+                print("Permission prompt remains visible across status polling", flush=True)
             wait_for(lambda: any(e.get("event_type") == "PreToolUse" for e in events), "live tool hook")
             wait_for(lambda: any(e.get("event_type") == "StateChange"
                                  and e["payload"]["state"] == "busy" for e in events), "busy state event")
@@ -213,7 +243,7 @@ def main():
                                  and e["payload"]["detailed_state"] == "busy_tool_use" for e in events), "tool state event")
             wait_for(lambda: any(e.get("source") == "transcript" and "SLOPD_LIVE_PROMPT" in json.dumps(e)
                                  for e in events), "live user transcript")
-            assert info()["state"] == "busy", info()
+            wait_for(lambda: info()["state"] == "busy", "running tool after permission reply")
             assert "SLOPD_LIVE_PROMPT" in run(cli + ["transcript", pane])
             print("Native session switch recovered; busy/tool/transcript events observed", flush=True)
 
@@ -226,12 +256,15 @@ def main():
             wait_for(lambda: info()["session_id"] == active and info()["state"] == "busy",
                      "recovery from stale persisted binding", 15)
             events.clear()
-            listener = subprocess.Popen(cli + ["listen", "--pane-id", pane], env=env,
+            listener = subprocess.Popen(cli + ["listen"], env=env,
                                         stdout=subprocess.PIPE, stderr=log, text=True)
             threading.Thread(target=read_events, daemon=True).start()
             wait_for(lambda: any(e.get("subscribed") for e in events), "listener after recovery")
-            time.sleep(31)
+            hold_seconds = float(os.environ.get("OPENCODE_TEST_TOOL_HOLD_SECONDS", "31"))
+            time.sleep(hold_seconds)
             assert info()["state"] == "busy", info()
+            if v2:
+                assert info()["detailed_state"] == "busy_tool_use", info()
             gate.touch()
             wait_for(lambda: info()["state"] == "ready", "idle after real bash tool", 30)
             transcript = run(cli + ["transcript", pane])
@@ -245,7 +278,78 @@ def main():
             assert tmux("show-options", "-pv", "-t", pane, "@slopd_session_id") == active
             log.flush()
             assert "recovered stale session binding" in (root / "slopd.log").read_text()
-            print("Stale-binding restart recovered; >30s tool completed and state returned to ready", flush=True)
+            print(f"Stale-binding restart recovered; tool held {hold_seconds}s and state returned to ready", flush=True)
+
+            tool = "shell" if v2 else "bash"
+            assert any(e.get("event_type") == "PostToolUse" and e["payload"]["extra"]["tool_name"] == tool
+                       for e in events), "tool identity lost across daemon restart"
+
+            fork = run(cli + ["fork", pane, "--ready-timeout", "60"])
+            fork_session = info(fork)["session_id"]
+            assert fork_session != active
+            assert "SLOPD_LIVE_DONE" in run(cli + ["transcript", fork])
+            wait_for(lambda: "Test" in tmux("capture-pane", "-p", "-t", fork), "fork TUI")
+            time.sleep(1)
+            tmux("send-keys", "-t", fork, "-l", "DISCARD_STALE_COMPOSER")
+            prompt = "SLOPD_MULTILINE\n" + "quoted `literal` $value \'text\' " * 800 + "\nEND_MULTILINE"
+            run(cli + ["send", fork, prompt])
+            wait_for(lambda: "END_MULTILINE" in run(cli + ["transcript", fork]), "large multiline prompt")
+            wait_for(lambda: info(fork)["state"] == "ready", "fork completion")
+            assert "DISCARD_STALE_COMPOSER" not in run(cli + ["transcript", fork])
+            assert "SLOPD_MULTILINE" not in run(cli + ["transcript", pane]), "fork changed source conversation"
+
+            tool_started.clear()
+            run(cli + ["send", fork, "SLOPD_INTERRUPT: run the controlled tool until interrupted."])
+            wait_for(tool_started.is_set, "interrupt tool request")
+            wait_for(lambda: info(fork)["state"] == "busy", "busy before interrupt")
+            run(cli + ["interrupt", fork])
+            wait_for(lambda: info(fork)["state"] == "ready", "ready after interrupt")
+            print("Fork history, independent multiline input, and API interrupt passed", flush=True)
+
+            # A fresh TUI must find the same persisted conversation after a full
+            # tmux-server loss, not merely after reconnecting to the old process.
+            run(cli + ["backup"])
+            stop(listener)
+            old_ports = [int(tmux("show-options", "-pv", "-t", target, "@slopd_opencode_port")) for target in (pane, fork)]
+            tmux("kill-server")
+            def servers_closed():
+                for old_port in old_ports:
+                    with socket.socket() as probe:
+                        probe.settimeout(0.2)
+                        if probe.connect_ex(("127.0.0.1", old_port)) == 0:
+                            return False
+                return True
+            wait_for(servers_closed, "private servers stopped with tmux", 15)
+            wait_for(lambda: json.loads(run(cli + ["ps", "--json"])) == [], "old panes gone")
+            run(cli + ["restore"])
+            def restored():
+                rows = json.loads(run(cli + ["ps", "--json"]))
+                return rows if len(rows) == 2 and all(p["state"] == "ready" for p in rows) else None
+            rows = wait_for(restored, "restored sessions", 60)
+            assert {p["session_id"] for p in rows} == {active, fork_session}, rows
+            for row in rows:
+                transcript = run(cli + ["transcript", row["pane_id"]])
+                assert "SLOPD_LIVE_DONE" in transcript
+                assert ("SLOPD_MULTILINE" in transcript) == (row["session_id"] == fork_session)
+            print("Full tmux-server loss restored both exact session histories", flush=True)
+            upgrade = os.environ.get("OPENCODE_TEST_UPGRADE_BINARY")
+            if upgrade and not v2:
+                run(cli + ["backup"])
+                tmux("kill-server")
+                wait_for(lambda: json.loads(run(cli + ["ps", "--json"])) == [], "v1 panes gone before upgrade")
+                stop(daemon)
+                config.write_text(config.read_text().replace(
+                    f'executable = {json.dumps(binary)}', f'executable = {json.dumps(upgrade)}'))
+                run(["tmux", "-S", tmux_socket, "-f", "/dev/null", "new-session", "-d", "-s", "test", "-x", "160", "-y", "50"])
+                daemon = start_daemon()
+                run(cli + ["restore"])
+                rows = wait_for(restored, "v1 histories restored through v2 migration", 60)
+                assert {p["session_id"] for p in rows} == {active, fork_session}, rows
+                for row in rows:
+                    transcript = run(cli + ["transcript", row["pane_id"]])
+                    assert "SLOPD_LIVE_DONE" in transcript
+                    assert ("SLOPD_MULTILINE" in transcript) == (row["session_id"] == fork_session)
+                print("Upgrade to OpenCode 2 preserved both v1 session identities and histories", flush=True)
         except Exception:
             if pane:
                 screen = subprocess.run(["tmux", "-S", tmux_socket, "capture-pane", "-p", "-t", pane],
@@ -257,6 +361,7 @@ def main():
             raise
         finally:
             gate.touch()
+            (root / "interrupt-tool").touch()
             stop(listener)
             stop(daemon)
             subprocess.run(["tmux", "-S", tmux_socket, "kill-server"], env=env,

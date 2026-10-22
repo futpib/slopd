@@ -93,6 +93,10 @@ struct MockState {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("1.19.3");
+        return;
+    }
     let mut port: Option<u16> = None;
     let mut hostname = "127.0.0.1".to_string();
     // `-s <id>` means a session is being resumed → it already exists (mirrors

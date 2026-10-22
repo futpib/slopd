@@ -417,6 +417,7 @@ pub(super) struct ForkContext<'a> {
     pub(super) session_id: &'a str,
     pub(super) extra_args: Vec<String>,
     pub(super) config: &'a libslop::SlopdConfig,
+    pub(super) panes: &'a PaneMap,
 }
 
 pub(super) struct RecoverContext<'a> {
@@ -657,7 +658,14 @@ impl BackendLifecycle for OpencodeBackend {
                     context.pane_id
                 )
             })?;
-        let client = opencode::OpencodeClient::new(port, None);
+        let client = match context
+            .panes
+            .get(context.pane_id)
+            .and_then(|state| state.opencode())
+        {
+            Some(oc) => oc.client,
+            None => pane_opencode_client(context.config, context.pane_id, port).await,
+        };
         let new_id = client
             .fork_session(context.session_id, None)
             .await
@@ -685,7 +693,16 @@ impl BackendLifecycle for OpencodeBackend {
                 ));
             }
         };
-        let client = opencode::OpencodeClient::new(port, context.options.opencode_token.clone());
+        let mut client =
+            opencode::OpencodeClient::new(port, context.options.opencode_token.clone());
+        client.v2 = read_pane_option(
+            context.config,
+            context.pane_id,
+            libslop::TmuxOption::SlopdOpencodeVersion,
+        )
+        .await
+        .as_deref()
+            == Some("2");
         let cancel = tokio_util::sync::CancellationToken::new();
         context
             .panes
@@ -750,7 +767,7 @@ impl BackendLifecycle for OpencodeBackend {
             &port.to_string(),
         )
         .await;
-        let client = opencode::OpencodeClient::new(port, None);
+        let client = pane_opencode_client(context.config, &id, port).await;
         let cancel = tokio_util::sync::CancellationToken::new();
         context
             .panes
