@@ -1,4 +1,4 @@
-//! Codex rollout transcript normalization.
+//! Codex session discovery and rollout transcript normalization.
 //!
 //! Codex panes are deliberately standalone processes. slopd learns lifecycle
 //! and transcript paths from Codex hooks, then tails each pane's rollout JSONL
@@ -7,6 +7,119 @@
 use serde_json::{Value, json};
 
 pub type TranscriptRecord = (String, Value);
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionIdentity {
+    pub session_id: String,
+    pub transcript_path: std::path::PathBuf,
+}
+
+/// Discover an interactive session from the pane's open rollout writer. Hooks
+/// can be delayed until the first prompt, even after Codex persists the fork.
+/// Never search by cwd or newest file: several panes can share both.
+#[cfg(target_os = "linux")]
+pub fn discover_session(pane_pid: u32) -> Result<Option<SessionIdentity>, String> {
+    use std::collections::HashSet;
+
+    let mut level = vec![pane_pid];
+    let mut visited = HashSet::new();
+    while !level.is_empty() {
+        let mut candidates = Vec::new();
+        let mut children = Vec::new();
+        for pid in level {
+            if !visited.insert(pid) {
+                continue;
+            }
+            if visited.len() > 64 {
+                return Err("Codex session discovery exceeded the pane process limit".into());
+            }
+            if let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                for descriptor in descriptors.flatten() {
+                    if let Some(identity) = session_from_descriptor(pid, &descriptor)
+                        && !candidates.contains(&identity)
+                    {
+                        candidates.push(identity);
+                    }
+                }
+            }
+            // A shell or executable wrapper may own the pane PID. Prefer the
+            // nearest writer so a main TUI's nested helpers cannot replace it.
+            if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+                for task in tasks.flatten() {
+                    if let Ok(pids) = std::fs::read_to_string(task.path().join("children")) {
+                        children.extend(
+                            pids.split_whitespace()
+                                .filter_map(|pid| pid.parse::<u32>().ok()),
+                        );
+                    }
+                }
+            }
+        }
+        match candidates.len() {
+            0 => level = children,
+            1 => return Ok(candidates.pop()),
+            _ => return Err("multiple writable Codex CLI rollouts belong to this pane; refusing ambiguous session discovery".into()),
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn session_from_descriptor(pid: u32, descriptor: &std::fs::DirEntry) -> Option<SessionIdentity> {
+    use std::io::{BufRead, Read};
+    use std::os::unix::fs::MetadataExt;
+
+    let path = std::fs::read_link(descriptor.path()).ok()?;
+    let name = path.file_name()?.to_str()?;
+    if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+        return None;
+    }
+    let info = std::fs::read_to_string(format!(
+        "/proc/{pid}/fdinfo/{}",
+        descriptor.file_name().to_str()?
+    ))
+    .ok()?;
+    let flags = info.lines().find_map(|line| line.strip_prefix("flags:"))?;
+    let flags = u32::from_str_radix(flags.trim(), 8).ok()?;
+    if flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32 {
+        return None;
+    }
+    if !std::fs::metadata(descriptor.path()).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(descriptor.path()).ok()?;
+    let metadata = file.metadata().ok()?;
+    let path_metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file()
+        || metadata.dev() != path_metadata.dev()
+        || metadata.ino() != path_metadata.ino()
+    {
+        return None;
+    }
+    let mut header = String::new();
+    std::io::BufReader::new(file.take(1024 * 1024))
+        .read_line(&mut header)
+        .ok()?;
+    let record: Value = serde_json::from_str(&header).ok()?;
+    if record.get("type")?.as_str()? != "session_meta"
+        || record.pointer("/payload/source")?.as_str()? != "cli"
+    {
+        return None;
+    }
+    let id = record.pointer("/payload/id")?.as_str()?;
+    if id.is_empty() || !name.ends_with(&format!("-{id}.jsonl")) {
+        return None;
+    }
+    Some(SessionIdentity {
+        session_id: id.to_string(),
+        transcript_path: path,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn discover_session(_pane_pid: u32) -> Result<Option<SessionIdentity>, String> {
+    Ok(None)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskFailure {

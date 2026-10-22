@@ -747,9 +747,10 @@ than re-sending the conversation:
 
 - **Claude Code** — spawns `claude --resume <src> --fork-session` with a freshly minted `--session-id`, so the new pane is a distinct session whose transcript is copied from the source's.
 - **opencode** — calls the source pane's fork API, which copies its history into an independent session, then binds the new pane to it. V1 forks are roots; v2 records their parent and fork boundary.
-- **Codex** — launches `codex fork <SESSION_ID>`; Codex creates the new rollout
-  lazily when its first prompt is submitted, and the resulting `SessionStart`
-  hook binds the new session ID.
+- **Codex** — launches `codex fork <SESSION_ID>`; `SessionStart` binds the new
+  session ID, but that hook can wait until the first prompt. On Linux, forking
+  an unbound pane discovers its existing rollout from the pane process's open
+  writer, so a fork can be forked again without submitting an extra prompt.
 - **Grok Build** — launches `grok --resume <src> --fork-session --session-id
   <new>`, preserving the source history under a distinct preallocated session
   ID and pane-private leader socket.
@@ -1166,8 +1167,13 @@ in-flight steering follow the same UI path as a person at the terminal.
 `interrupt` sends Codex's native `Escape` cancel key; it never sends `Ctrl-D`,
 which would exit the standalone CLI. `fork` launches Codex's native
 `codex fork <SESSION_ID>` and learns the new ID from its first `SessionStart`
-hook. On a slopd restart, the existing pane remains untouched; slopd recovers
-its identity and state from tmux metadata plus the rollout transcript. Backup
+hook. If that hook has not fired, a subsequent `fork` on Linux discovers the
+pane's writable CLI rollout, validates its session metadata, and persists the
+binding. Read-only source rollouts and subagent rollouts are excluded; ambiguous
+writers are rejected. If discovery is unavailable, submit a normal prompt to
+register the session before forking. On a slopd restart, the existing pane remains
+untouched; slopd recovers its identity and state from tmux metadata plus the
+rollout transcript. Backup
 restore launches `codex resume <SESSION_ID>` in the recorded working directory
 and makes the restored composer immediately sendable.
 

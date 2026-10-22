@@ -16235,6 +16235,250 @@ fn grok_auto_continue_stops_at_the_retry_limit() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    for wrapped in [false, true] {
+        let codex_home = tempfile::tempdir().unwrap();
+        let env = TestEnv::new(None).expect("tmux required");
+        let wrapper = codex_home.path().join("wrapper.sh");
+        std::fs::write(&wrapper, "exec 3<&0\n\"$@\" <&3 &\nwait $!\n").unwrap();
+        let executable = if wrapped {
+            format!(
+                "[\"/bin/sh\", {wrapper:?}, {mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=invalid\"]"
+            )
+        } else {
+            format!(
+                "[{mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=subagent\"]"
+            )
+        };
+        env.append_config(&format!(
+            "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = {executable}\nconfig_dir = {:?}\n",
+            codex_home.path(),
+        ));
+        let mut slopd = env.spawn_slopd();
+        let pane_info = |id: &str| {
+            let panes: Vec<libslop::PaneInfo> =
+                serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+            panes.into_iter().find(|pane| pane.pane_id == id).unwrap()
+        };
+        let mock_session = |id: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let screen = env
+                    .tmux
+                    .tmux()
+                    .args(["capture-pane", "-p", "-t", id])
+                    .output()
+                    .unwrap();
+                if let Some(session) = String::from_utf8_lossy(&screen.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("mock Codex session: "))
+                {
+                    break session.trim().to_string();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "mock Codex did not initialize in {id}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        let run = env.slopctl_raw(&["run", "--account", "codex-lazy", "--ready-timeout", "10"]);
+        assert!(run.status.success(), "run (wrapped={wrapped}): {run:?}");
+        let source = String::from_utf8(run.stdout).unwrap().trim().to_string();
+        let source_session = mock_session(&source);
+        assert!(
+            env.slopctl(&["send", &source, "source history"])
+                .status
+                .success()
+        );
+        wait_until_ready(&env, &source, Duration::from_secs(10));
+
+        let fork = env.slopctl_raw(&["fork", &source, "--ready-timeout", "10"]);
+        assert!(fork.status.success(), "first fork: {fork:?}");
+        let fork = String::from_utf8(fork.stdout).unwrap().trim().to_string();
+        let fork_session = mock_session(&fork);
+        let fork_path = codex_home
+            .path()
+            .join(format!("sessions/rollout-{fork_session}.jsonl"));
+        assert_eq!(pane_info(&fork).session_id, None);
+        assert_eq!(pane_info(&fork).transcript_path, None);
+        let fork_before = std::fs::read(&fork_path).unwrap();
+        let original_pid = env
+            .tmux
+            .tmux()
+            .args(["display-message", "-p", "-t", &fork, "#{pane_pid}"])
+            .output()
+            .unwrap()
+            .stdout;
+
+        // Another unbound fork shares the account, cwd, and source. Discovery
+        // must use the requested pane's writer, not the newest matching file.
+        let sibling = env.slopctl_raw(&["fork", &source, "--ready-timeout", "10"]);
+        assert!(sibling.status.success(), "sibling fork: {sibling:?}");
+        let sibling = String::from_utf8(sibling.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_ne!(mock_session(&sibling), fork_session);
+
+        let second = env.slopctl_raw(&["fork", &fork, "--ready-timeout", "10"]);
+        if !second.status.success() {
+            kill_slopd(slopd);
+            panic!("forking before the first prompt failed (wrapped={wrapped}): {second:?}");
+        }
+        let second = String::from_utf8(second.stdout).unwrap().trim().to_string();
+        let second_session = mock_session(&second);
+        assert_ne!(second_session, fork_session);
+        assert_ne!(fork_session, source_session);
+        let second_path = codex_home
+            .path()
+            .join(format!("sessions/rollout-{second_session}.jsonl"));
+        let meta: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&second_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["payload"]["forked_from_id"], fork_session);
+        assert_eq!(
+            pane_info(&fork).session_id.as_deref(),
+            Some(fork_session.as_str())
+        );
+        assert_eq!(
+            pane_info(&fork).transcript_path.as_deref(),
+            fork_path.to_str()
+        );
+        assert_eq!(
+            pane_info(&second).parent_pane_id.as_deref(),
+            Some(fork.as_str())
+        );
+        assert_eq!(pane_info(&sibling).session_id, None);
+        assert_eq!(
+            std::fs::read(&fork_path).unwrap(),
+            fork_before,
+            "discovery must not submit a prompt or rewrite the rollout"
+        );
+
+        // Persisted discovery survives a daemon restart, while an unbound
+        // child can still be discovered after that restart without any hooks.
+        kill_slopd(slopd);
+        slopd = env.spawn_slopd();
+        assert_eq!(
+            pane_info(&fork).session_id.as_deref(),
+            Some(fork_session.as_str())
+        );
+        assert_eq!(
+            pane_info(&fork).transcript_path.as_deref(),
+            fork_path.to_str()
+        );
+        assert_eq!(pane_info(&second).session_id, None);
+        assert_eq!(
+            pane_info(&fork).detailed_state,
+            libslop::PaneDetailedState::Ready
+        );
+        let third = env.slopctl_raw(&["fork", &second, "--ready-timeout", "10"]);
+        assert!(third.status.success(), "fork after restart: {third:?}");
+        assert_eq!(
+            pane_info(&second).session_id.as_deref(),
+            Some(second_session.as_str())
+        );
+        assert_eq!(
+            env.tmux
+                .tmux()
+                .args(["display-message", "-p", "-t", &fork, "#{pane_pid}"])
+                .output()
+                .unwrap()
+                .stdout,
+            original_pid
+        );
+
+        assert!(
+            env.slopctl(&["send", &fork, "first fork prompt"])
+                .status
+                .success()
+        );
+        wait_until_ready(&env, &fork, Duration::from_secs(10));
+        let transcript = env.slopctl(&["transcript", &fork, "--limit", "20"]);
+        assert!(
+            String::from_utf8_lossy(&transcript.stdout)
+                .contains("mock response: first fork prompt")
+        );
+        assert_eq!(
+            pane_info(&fork).session_id.as_deref(),
+            Some(fork_session.as_str())
+        );
+        assert_eq!(
+            pane_info(&source).session_id.as_deref(),
+            Some(source_session.as_str())
+        );
+        kill_slopd(slopd);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn codex_fork_refuses_ambiguous_rollouts_without_binding_or_spawning() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    let codex_home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = [{mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=cli\"]\nconfig_dir = {:?}\n",
+        codex_home.path(),
+    ));
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "codex-lazy", "--ready-timeout", "10"]);
+    assert!(run.status.success(), "run: {run:?}");
+    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = env
+            .tmux
+            .tmux()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&screen.stdout).contains("mock Codex session:") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "mock Codex did not initialize");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let fork = env.slopctl_raw(&["fork", &pane, "--ready-timeout", "10"]);
+    assert!(!fork.status.success(), "ambiguous fork must fail");
+    assert!(
+        String::from_utf8_lossy(&fork.stderr).contains("ambiguous session discovery"),
+        "{fork:?}"
+    );
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    assert_eq!(panes.len(), 1, "failed discovery must not spawn a pane");
+    assert_eq!(panes[0].session_id, None);
+    assert_eq!(panes[0].transcript_path, None);
+    assert_eq!(panes[0].detailed_state, libslop::PaneDetailedState::Ready);
+    // An authoritative hook still binds normally after a rejected discovery.
+    assert!(
+        env.slopctl(&["send", &pane, "register normally"])
+            .status
+            .success()
+    );
+    wait_until_ready(&env, &pane, Duration::from_secs(10));
+    let panes: Vec<libslop::PaneInfo> =
+        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+    assert!(panes[0].session_id.is_some());
+    kill_slopd(slopd);
+}
+
+#[test]
 fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() {
     build_bin("slopd");
     build_bin("slopctl");

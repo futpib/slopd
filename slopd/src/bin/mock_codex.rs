@@ -152,6 +152,9 @@ fn main() {
         if matches!(
             arg.as_str(),
             "--mock-session-start=lazy"
+                | "--mock-extra-rollout=cli"
+                | "--mock-extra-rollout=subagent"
+                | "--mock-extra-rollout=invalid"
                 | "--mock-require-bracketed-paste"
                 | "--mock-update-available"
         ) || arg
@@ -193,17 +196,52 @@ fn main() {
     let sessions = codex_home.join("sessions");
     std::fs::create_dir_all(&sessions).expect("create mock Codex sessions");
     let transcript = sessions.join(format!("rollout-{session_id}.jsonl"));
+    let fork_source = args
+        .windows(2)
+        .find(|pair| pair[0] == "fork")
+        .map(|pair| pair[1].as_str());
     write_record(
         &transcript,
         json!({
             "type":"session_meta",
-            "payload":{"id":session_id,"cwd":cwd,"originator":"mock_codex"}
+            "payload":{"id":session_id,"cwd":cwd,"originator":"mock_codex",
+                "source":"cli","forked_from_id":fork_source}
         }),
     );
 
-    // Real interactive Codex creates a fresh session lazily on the first
-    // submitted prompt. Tests can request that behavior explicitly while
-    // resume/fork and the older eager-path tests retain their startup hook.
+    // Codex keeps its own rollout writer open before the first lifecycle hook.
+    // A fork can also have its source open for reading; that is not its identity.
+    let _rollout_writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("hold mock Codex rollout writer");
+    let _fork_reader = fork_source.map(|id| {
+        std::fs::File::open(sessions.join(format!("rollout-{id}.jsonl"))).expect("open fork source")
+    });
+    let _extra_writer = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--mock-extra-rollout="))
+        .map(|kind| {
+            let id = format!("mock-codex-{}", uuid::Uuid::new_v4());
+            let path = sessions.join(format!("rollout-{id}.jsonl"));
+            let source = if kind == "subagent" {
+                json!({"subagent":{"thread_spawn":{"parent_thread_id":session_id}}})
+            } else {
+                json!("cli")
+            };
+            if kind == "invalid" {
+                std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
+            } else {
+                write_record(
+                    &path,
+                    json!({"type":"session_meta","payload":{"id":id,"source":source}}),
+                );
+            }
+            std::fs::OpenOptions::new().append(true).open(path).unwrap()
+        });
+
+    // Interactive Codex may persist a rollout before submitting a prompt while
+    // delaying SessionStart. Older eager-path tests retain their startup hook.
     let mut session_started = !args.iter().any(|arg| arg == "--mock-session-start=lazy");
     if session_started {
         fire_hooks(
@@ -249,6 +287,7 @@ fn main() {
     let mut in_bracketed_paste = false;
     let mut saw_bracketed_paste = false;
     let mut capacity_failed_once = false;
+    println!("mock Codex session: {session_id}");
     loop {
         match stdin.read(&mut byte) {
             Ok(0) | Err(_) => break,
