@@ -784,6 +784,7 @@ pub struct Client<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Un
     next_id: u64,
     /// Present in multiplexed mode.
     demux: Option<Arc<Mutex<DemuxState>>>,
+    fork_caller: Option<libslop::ForkCaller>,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite + Unpin>
@@ -797,7 +798,13 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
             writer,
             next_id: 1,
             demux: None,
+            fork_caller: None,
         }
+    }
+
+    /// Set only by a local CLI; remote clients must not forward local identity.
+    pub fn set_fork_caller(&mut self, caller: libslop::ForkCaller) {
+        self.fork_caller = Some(caller);
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -1014,6 +1021,11 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
     ) -> Result<(String, String), Error> {
         match self
             .request(libslop::RequestBody::Fork {
+                caller: self
+                    .fork_caller
+                    .as_ref()
+                    .filter(|caller| caller.pane_id == pane_id)
+                    .cloned(),
                 pane_id,
                 start_directory,
                 env,

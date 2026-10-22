@@ -1,10 +1,10 @@
 //! Deterministic standalone Codex CLI double used by integration tests.
 //!
 //! It reads `$CODEX_HOME/hooks.json`, emits Codex-shaped rollout JSONL, and
-//! runs entirely inside its tmux pane. There is intentionally no app-server.
+//! runs in a tmux pane or serves the short-lived stdio fork API.
 
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -146,15 +146,122 @@ fn finish_turn(settings: &Value, session_id: &str, cwd: &Path, transcript: &Path
     );
 }
 
+fn app_server(args: &[String], home: &Path) {
+    std::fs::write(home.join("app-server-pid"), std::process::id().to_string()).unwrap();
+    let mode = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--mock-app-server="));
+    let mut initialized = false;
+    let mut acknowledged = false;
+    let mut active = None;
+    for line in std::io::stdin().lock().lines() {
+        let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        write_record(
+            &home.join("app-server-requests.jsonl"),
+            json!({
+                "request": request, "cwd": std::env::current_dir().unwrap(),
+                "tmux_pane": std::env::var("TMUX_PANE").ok(), "args": args,
+                "test_env": std::env::var("SLOPD_FORK_TEST_ENV").ok()
+            }),
+        );
+        let method = request["method"].as_str().unwrap();
+        let id = &request["id"];
+        if method == "initialized" {
+            assert!(initialized);
+            acknowledged = true;
+            continue;
+        }
+        let result = match method {
+            "initialize" => {
+                assert!(!initialized);
+                initialized = true;
+                json!({"userAgent":"mock_codex"})
+            }
+            "thread/read" | "thread/fork" => {
+                assert!(acknowledged);
+                let source = request["params"]["threadId"].as_str().unwrap();
+                let path = home.join(format!("sessions/rollout-{source}.jsonl"));
+                let Ok(history) = std::fs::read_to_string(path) else {
+                    println!(
+                        "{}",
+                        json!({"id":id,"error":{"code":-32600,"message":"no rollout found"}})
+                    );
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                };
+                let meta: Value = serde_json::from_str(history.lines().next().unwrap()).unwrap();
+                if method == "thread/read" {
+                    json!({"thread":{"id":source,"source":meta["payload"]["source"],"parentThreadId":meta["payload"]["parent_thread_id"]}})
+                } else {
+                    assert_eq!(request["params"]["excludeTurns"], true);
+                    assert_eq!(request["params"]["deferGoalContinuation"], true);
+                    assert_eq!(request["params"]["ephemeral"], false);
+                    match mode {
+                        Some("error") => {
+                            println!(
+                                "{}",
+                                json!({"id":id,"error":{"code":-32600,"message":"mock fork rejected"}})
+                            );
+                            std::io::stdout().flush().unwrap();
+                            continue;
+                        }
+                        Some("invalid") => {
+                            println!("{}", json!({"id":id,"result":{"thread":{"id":source}}}));
+                            std::io::stdout().flush().unwrap();
+                            continue;
+                        }
+                        Some("hang") => {
+                            std::thread::sleep(std::time::Duration::from_secs(60));
+                            unreachable!();
+                        }
+                        _ => {}
+                    }
+                    let fork = format!("mock-codex-{}", uuid::Uuid::new_v4());
+                    let path = home.join(format!("sessions/rollout-{fork}.jsonl"));
+                    write_record(
+                        &path,
+                        json!({"type":"session_meta","payload":{
+                            "id":fork,"source":"cli","forked_from_id":source,"cwd":request["params"]["cwd"]
+                        }}),
+                    );
+                    for line in history.lines().skip(1) {
+                        write_record(&path, serde_json::from_str(line).unwrap());
+                    }
+                    let marker = home.join(format!("api-active-{fork}"));
+                    std::fs::write(&marker, "API owns fork until EOF").unwrap();
+                    active = Some(marker);
+                    // Real Codex can interleave notifications before replies.
+                    println!(
+                        "{}",
+                        json!({"method":"thread/started","params":{"thread":{"id":fork}}})
+                    );
+                    json!({"thread":{"id":fork,"forkedFromId":source}})
+                }
+            }
+            other => panic!("unexpected mock app-server method: {other}"),
+        };
+        println!("{}", json!({"id":id,"result":result}));
+        std::io::stdout().flush().unwrap();
+    }
+    if let Some(path) = active {
+        std::fs::remove_file(path).unwrap();
+    }
+    if mode == Some("exit-failure") {
+        eprintln!("mock app-server shutdown failed");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
         if matches!(
             arg.as_str(),
             "--mock-session-start=lazy"
-                | "--mock-extra-rollout=cli"
-                | "--mock-extra-rollout=subagent"
-                | "--mock-extra-rollout=invalid"
+                | "--mock-app-server=error"
+                | "--mock-app-server=invalid"
+                | "--mock-app-server=exit-failure"
+                | "--mock-app-server=hang"
                 | "--mock-require-bracketed-paste"
                 | "--mock-update-available"
         ) || arg
@@ -187,6 +294,10 @@ fn main() {
         std::env::var_os("CODEX_HOME")
             .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| ".".into())),
     );
+    if args.iter().any(|arg| arg == "app-server") {
+        app_server(&args, &codex_home);
+        return;
+    }
     let settings: Value = std::fs::read_to_string(codex_home.join("hooks.json"))
         .ok()
         .and_then(|contents| serde_json::from_str(&contents).ok())
@@ -196,49 +307,20 @@ fn main() {
     let sessions = codex_home.join("sessions");
     std::fs::create_dir_all(&sessions).expect("create mock Codex sessions");
     let transcript = sessions.join(format!("rollout-{session_id}.jsonl"));
-    let fork_source = args
-        .windows(2)
-        .find(|pair| pair[0] == "fork")
-        .map(|pair| pair[1].as_str());
-    write_record(
-        &transcript,
-        json!({
-            "type":"session_meta",
-            "payload":{"id":session_id,"cwd":cwd,"originator":"mock_codex",
-                "source":"cli","forked_from_id":fork_source}
-        }),
+    assert!(
+        !args.iter().any(|arg| arg == "fork"),
+        "slopd must fork via API and resume its returned ID"
     );
-
-    // Codex keeps its own rollout writer open before the first lifecycle hook.
-    // A fork can also have its source open for reading; that is not its identity.
-    let _rollout_writer = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&transcript)
-        .expect("hold mock Codex rollout writer");
-    let _fork_reader = fork_source.map(|id| {
-        std::fs::File::open(sessions.join(format!("rollout-{id}.jsonl"))).expect("open fork source")
-    });
-    let _extra_writer = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--mock-extra-rollout="))
-        .map(|kind| {
-            let id = format!("mock-codex-{}", uuid::Uuid::new_v4());
-            let path = sessions.join(format!("rollout-{id}.jsonl"));
-            let source = if kind == "subagent" {
-                json!({"subagent":{"thread_spawn":{"parent_thread_id":session_id}}})
-            } else {
-                json!("cli")
-            };
-            if kind == "invalid" {
-                std::fs::write(&path, "{\"type\":\"session_meta\"").unwrap();
-            } else {
-                write_record(
-                    &path,
-                    json!({"type":"session_meta","payload":{"id":id,"source":source}}),
-                );
-            }
-            std::fs::OpenOptions::new().append(true).open(path).unwrap()
-        });
+    assert!(
+        !codex_home.join(format!("api-active-{session_id}")).exists(),
+        "TUI started before API shutdown"
+    );
+    if !transcript.exists() {
+        write_record(
+            &transcript,
+            json!({"type":"session_meta","payload":{"id":session_id,"cwd":cwd,"source":"cli"}}),
+        );
+    }
 
     // Interactive Codex may persist a rollout before submitting a prompt while
     // delaying SessionStart. Older eager-path tests retain their startup hook.

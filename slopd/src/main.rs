@@ -923,7 +923,7 @@ struct PaneState {
     type_mutex: Mutex<()>,
     /// Serialises state changes and their mirrored tmux option writes.
     state_update_mutex: Mutex<()>,
-    /// Serialises hook binding with on-demand Codex session discovery.
+    /// Serialises hook binding with caller-supplied Codex identity.
     session_binding_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
@@ -5022,94 +5022,6 @@ fn transcript_launch_cwd(transcript_path: &str) -> Option<String> {
     None
 }
 
-async fn codex_pane_pid(config: &libslop::SlopdConfig, pane: &str) -> Option<u32> {
-    let output = tmux(config)
-        .args(["display-message", "-p", "-t", pane, "#{pane_pid}"])
-        .output()
-        .await
-        .ok()?;
-    output.status.success().then_some(())?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
-/// Bind an already-persisted Codex rollout without submitting a prompt or
-/// fabricating SessionStart. This also repairs unbound panes after a restart.
-async fn discover_codex_pane_session(
-    config: &Arc<libslop::SlopdConfig>,
-    panes: &PaneMap,
-    event_tx: &EventTx,
-    pane: &str,
-) -> Result<Option<String>, String> {
-    let state = panes.get_or_insert(pane);
-    let _binding = state.session_binding_mutex.lock().await;
-    if let Some(id) = state.identity.lock().unwrap().session_id.clone() {
-        return Ok(Some(id));
-    }
-    let Some(pid) = codex_pane_pid(config, pane).await else {
-        return Ok(None);
-    };
-    // A freshly forked composer can be reported ready just before its rollout
-    // writer opens. Allow that short startup window without requiring a turn.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let identity = loop {
-        let discovered = tokio::task::spawn_blocking(move || codex::discover_session(pid))
-            .await
-            .map_err(|error| format!("Codex session discovery failed: {error}"))??;
-        if let Some(identity) = discovered {
-            break identity;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
-    if codex_pane_pid(config, pane).await != Some(pid) {
-        return Ok(None);
-    }
-    let transcript = identity.transcript_path.to_string_lossy().into_owned();
-    for (option, value) in [
-        (
-            libslop::TmuxOption::SlopdTranscriptPath,
-            transcript.as_str(),
-        ),
-        (
-            libslop::TmuxOption::SlopdSessionId,
-            identity.session_id.as_str(),
-        ),
-    ] {
-        let status = tmux_set_pane_option(config, pane, option.as_str(), value)
-            .await
-            .map_err(|error| format!("failed to bind Codex session for {pane}: {error}"))?;
-        if !status.success() {
-            return Err(format!(
-                "failed to bind Codex session for {pane}: tmux {status}"
-            ));
-        }
-    }
-    let cancel = tokio_util::sync::CancellationToken::new();
-    {
-        let mut previous = state.transcript_cancel.lock().unwrap();
-        previous.cancel();
-        *previous = cancel.clone();
-    }
-    *state.transcript_path.lock().unwrap() = Some(transcript);
-    state.note_session_id(&identity.session_id);
-    debug!(
-        "discovered Codex session for pane {pane}: {}",
-        identity.session_id
-    );
-    tokio::spawn(tail_transcript(
-        identity.transcript_path,
-        pane.to_string(),
-        state.clone(),
-        config.clone(),
-        panes.clone(),
-        event_tx.clone(),
-        cancel,
-    ));
-    Ok(Some(identity.session_id))
-}
-
 /// Return the main-thread transcript advertised by a hook.
 ///
 /// Codex's `SubagentStart.transcript_path` is the child agent's rollout (unlike
@@ -6137,6 +6049,7 @@ async fn handle_request(
 
         libslop::RequestBody::Fork {
             pane_id,
+            caller,
             start_directory,
             env,
             extra_args,
@@ -6158,28 +6071,50 @@ async fn handle_request(
                     message: format!("pane {} not found", pane_id),
                 };
             };
-            let mut src_session = src.session_id.clone();
-            if src_session.is_none() && src.backend == libslop::Backend::Codex {
-                src_session =
-                    match discover_codex_pane_session(config, panes, event_tx, &pane_id).await {
-                        Ok(session) => session,
-                        Err(message) => return libslop::ResponseBody::Error { message },
-                    };
-            }
-            let Some(src_session) = src_session else {
+            let source_state = panes.get_or_insert(&pane_id);
+            let binding = source_state.session_binding_mutex.lock().await;
+            let bound_session = source_state
+                .identity
+                .lock()
+                .unwrap()
+                .session_id
+                .clone()
+                .or(src.session_id.clone());
+            let caller_session =
+                if src.backend == libslop::Backend::Codex && bound_session.is_none() {
+                    if let Some(caller) = caller.filter(|caller| {
+                        caller.pane_id == pane_id && !caller.codex_thread_id.is_empty()
+                    }) {
+                        if hook_belongs_to_tmux_server(config, Some(&caller.tmux)).await {
+                            Some(caller.codex_thread_id)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            let verify_caller = caller_session.is_some();
+            let Some(src_session) = bound_session.or(caller_session) else {
                 return libslop::ResponseBody::Error {
                     message: if src.backend == libslop::Backend::Codex {
                         format!(
-                            "pane {pane_id} has no bound Codex session and its rollout could not be discovered; submit a normal prompt in that pane to register the session before forking"
+                            "pane {pane_id} has no bound Codex thread; run slopctl fork inside that Codex pane or submit a prompt to register it"
                         )
                     } else {
                         format!(
-                            "pane {} has no known session id yet; cannot fork (is the agent still booting?)",
-                            pane_id
+                            "pane {pane_id} has no known session id yet; cannot fork (is the agent still booting?)"
                         )
                     },
                 };
             };
+            let start_directory =
+                start_directory.or_else(|| src.working_dir.as_ref().map(std::path::PathBuf::from));
+            let fork_cwd = start_directory
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             // Produce the resume args that reconstruct the source session's
             // history in a *fresh* session, and learn that fresh session's id:
             //   - Claude: mint the id ourselves and let `--fork-session` copy the
@@ -6193,6 +6128,10 @@ async fn handle_request(
                 .fork(ForkContext {
                     pane_id: &pane_id,
                     session_id: &src_session,
+                    account: &src.account,
+                    cwd: &fork_cwd,
+                    env: &env,
+                    verify_caller,
                     extra_args,
                     config,
                     panes,
@@ -6202,12 +6141,22 @@ async fn handle_request(
                 Ok(plan) => plan,
                 Err(message) => return libslop::ResponseBody::Error { message },
             };
-            // Default the fork's cwd to the source pane's cwd. Claude resolves a
-            // resumed transcript by (encoded) cwd, so a mismatch would make
-            // `--resume` fail to find the session; opencode's fork inherits the
-            // source directory, so the pane cwd should match it too.
-            let start_directory =
-                start_directory.or_else(|| src.working_dir.as_ref().map(std::path::PathBuf::from));
+            if verify_caller {
+                let persisted = tmux_set_pane_option(
+                    config,
+                    &pane_id,
+                    libslop::TmuxOption::SlopdSessionId.as_str(),
+                    &src_session,
+                )
+                .await;
+                if !persisted.is_ok_and(|status| status.success()) {
+                    return libslop::ResponseBody::Error {
+                        message: format!("failed to persist Codex identity for pane {pane_id}"),
+                    };
+                }
+                source_state.note_session_id(&src_session);
+            }
+            drop(binding);
             // Reuse the entire Run spawn path (account resolution, env merge, port
             // allocation, spawn, session binding, ancestor-chain linkage, events)
             // by dispatching a synthetic Run. Boxed because handle_request recurses.
@@ -6250,15 +6199,10 @@ async fn handle_request(
             ))
             .await
             {
-                libslop::ResponseBody::Run { pane_id } => {
-                    // Standalone Codex may delay SessionStart until its first
-                    // prompt. Return the usable composer now; a hook or later
-                    // fork discovers its ID. Other backends already know it.
-                    libslop::ResponseBody::Forked {
-                        pane_id,
-                        session_id: new_session_id,
-                    }
-                }
+                libslop::ResponseBody::Run { pane_id } => libslop::ResponseBody::Forked {
+                    pane_id,
+                    session_id: new_session_id,
+                },
                 other => other,
             }
         }
@@ -6362,6 +6306,10 @@ async fn handle_request(
                 }
                 _ => None,
             };
+            let codex_session_id = match &prepared {
+                PreparedBackendRun::Codex(runtime) => runtime.resume_session.clone(),
+                _ => None,
+            };
             let spawn_env = merged_env;
             if let Some(port) = prepared.opencode_port() {
                 let mut v = trailing.clone();
@@ -6414,24 +6362,26 @@ async fn handle_request(
                         resolved.backend.canonical_executable(),
                         pane_id
                     );
-                    // Pin a forked Claude pane's session id BEFORE registering it, so
-                    // the SessionStart hook (which won't be processed until the pane is
-                    // in managed_panes) sees the pin and binds the fork id, not the
-                    // resumed source id it reports. Also set @slopd_session_id up front
-                    // so `ps` is correct before the first hook arrives. (opencode forks
-                    // pass None here.)
-                    let known_session_id = pin_session_id.as_ref().or(grok_session_id.as_ref());
-                    if let Some(pin) = known_session_id {
+                    // Persist known identities before registration: Codex can
+                    // defer SessionStart until the first prompt. Claude/Grok
+                    // additionally pin their fork ID over hook-reported IDs.
+                    let known_session_id = pin_session_id
+                        .as_ref()
+                        .or(grok_session_id.as_ref())
+                        .or(codex_session_id.as_ref());
+                    if let Some(pin) = pin_session_id.as_ref().or(grok_session_id.as_ref()) {
                         *panes
                             .get_or_insert(&pane_id)
                             .pinned_session_id
                             .lock()
                             .unwrap() = Some(pin.clone());
+                    }
+                    if let Some(id) = known_session_id {
                         let _ = tmux_set_pane_option(
                             config,
                             &pane_id,
                             libslop::TmuxOption::SlopdSessionId.as_str(),
-                            pin,
+                            id,
                         )
                         .await;
                     }

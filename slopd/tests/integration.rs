@@ -16235,8 +16235,7 @@ fn grok_auto_continue_stops_at_the_retry_limit() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
-fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
+fn codex_fork_api_binds_before_first_prompt_and_survives_restart() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -16247,13 +16246,9 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
         let wrapper = codex_home.path().join("wrapper.sh");
         std::fs::write(&wrapper, "exec 3<&0\n\"$@\" <&3 &\nwait $!\n").unwrap();
         let executable = if wrapped {
-            format!(
-                "[\"/bin/sh\", {wrapper:?}, {mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=invalid\"]"
-            )
+            format!("[\"/bin/sh\", {wrapper:?}, {mock_codex:?}, \"--mock-session-start=lazy\"]")
         } else {
-            format!(
-                "[{mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=subagent\"]"
-            )
+            format!("[{mock_codex:?}, \"--mock-session-start=lazy\"]")
         };
         env.append_config(&format!(
             "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = {executable}\nconfig_dir = {:?}\n",
@@ -16305,7 +16300,10 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
         let fork_path = codex_home
             .path()
             .join(format!("sessions/rollout-{fork_session}.jsonl"));
-        assert_eq!(pane_info(&fork).session_id, None);
+        assert_eq!(
+            pane_info(&fork).session_id.as_deref(),
+            Some(fork_session.as_str())
+        );
         assert_eq!(pane_info(&fork).transcript_path, None);
         let fork_before = std::fs::read(&fork_path).unwrap();
         let original_pid = env
@@ -16316,8 +16314,8 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
             .unwrap()
             .stdout;
 
-        // Another unbound fork shares the account, cwd, and source. Discovery
-        // must use the requested pane's writer, not the newest matching file.
+        // Another fork shares the account, cwd, and source. Each pane must
+        // keep the exact identity returned by its API call.
         let sibling = env.slopctl_raw(&["fork", &source, "--ready-timeout", "10"]);
         assert!(sibling.status.success(), "sibling fork: {sibling:?}");
         let sibling = String::from_utf8(sibling.stdout)
@@ -16326,7 +16324,18 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
             .to_string();
         assert_ne!(mock_session(&sibling), fork_session);
 
-        let second = env.slopctl_raw(&["fork", &fork, "--ready-timeout", "10"]);
+        let alternate = codex_home.path().join("other-workdir");
+        std::fs::create_dir(&alternate).unwrap();
+        let second = env.slopctl_raw(&[
+            "fork",
+            &fork,
+            "--ready-timeout",
+            "10",
+            "--start-directory",
+            alternate.to_str().unwrap(),
+            "--env",
+            "SLOPD_FORK_TEST_ENV=forwarded",
+        ]);
         if !second.status.success() {
             kill_slopd(slopd);
             panic!("forking before the first prompt failed (wrapped={wrapped}): {second:?}");
@@ -16347,38 +16356,50 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
         )
         .unwrap();
         assert_eq!(meta["payload"]["forked_from_id"], fork_session);
+        assert_eq!(meta["payload"]["cwd"], alternate.to_str().unwrap());
+        let calls: Vec<serde_json::Value> =
+            std::fs::read_to_string(codex_home.path().join("app-server-requests.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(calls.iter().all(|call| call["tmux_pane"].is_null()));
+        let fork_call = calls
+            .iter()
+            .rev()
+            .find(|call| call["request"]["method"] == "thread/fork")
+            .unwrap();
+        assert_eq!(fork_call["cwd"], alternate.to_str().unwrap());
+        assert_eq!(fork_call["test_env"], "forwarded");
+        assert!(String::from_utf8_lossy(&fork_before).contains("source history"));
         assert_eq!(
             pane_info(&fork).session_id.as_deref(),
             Some(fork_session.as_str())
         );
-        assert_eq!(
-            pane_info(&fork).transcript_path.as_deref(),
-            fork_path.to_str()
-        );
+        assert_eq!(pane_info(&fork).transcript_path.as_deref(), None);
         assert_eq!(
             pane_info(&second).parent_pane_id.as_deref(),
             Some(fork.as_str())
         );
-        assert_eq!(pane_info(&sibling).session_id, None);
+        assert!(pane_info(&sibling).session_id.is_some());
         assert_eq!(
             std::fs::read(&fork_path).unwrap(),
             fork_before,
-            "discovery must not submit a prompt or rewrite the rollout"
+            "forking must not submit a prompt or rewrite the source rollout"
         );
 
-        // Persisted discovery survives a daemon restart, while an unbound
-        // child can still be discovered after that restart without any hooks.
+        // Both API-created identities survive restart before any hooks fire.
         kill_slopd(slopd);
         slopd = env.spawn_slopd();
         assert_eq!(
             pane_info(&fork).session_id.as_deref(),
             Some(fork_session.as_str())
         );
+        assert_eq!(pane_info(&fork).transcript_path.as_deref(), None);
         assert_eq!(
-            pane_info(&fork).transcript_path.as_deref(),
-            fork_path.to_str()
+            pane_info(&second).session_id.as_deref(),
+            Some(second_session.as_str())
         );
-        assert_eq!(pane_info(&second).session_id, None);
         assert_eq!(
             pane_info(&fork).detailed_state,
             libslop::PaneDetailedState::Ready
@@ -16423,8 +16444,7 @@ fn codex_fork_before_first_prompt_discovers_its_own_rollout() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
-fn codex_fork_refuses_ambiguous_rollouts_without_binding_or_spawning() {
+fn codex_fork_uses_caller_identity_only_for_its_own_tmux_pane() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -16432,50 +16452,219 @@ fn codex_fork_refuses_ambiguous_rollouts_without_binding_or_spawning() {
     let codex_home = tempfile::tempdir().unwrap();
     let env = TestEnv::new(None).expect("tmux required");
     env.append_config(&format!(
-        "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = [{mock_codex:?}, \"--mock-session-start=lazy\", \"--mock-extra-rollout=cli\"]\nconfig_dir = {:?}\n",
+        "\n[accounts.codex-lazy]\nbackend = \"codex\"\nexecutable = [{mock_codex:?}, \"--mock-session-start=lazy\"]\nconfig_dir = {:?}\n",
         codex_home.path(),
     ));
-    let slopd = env.spawn_slopd();
-    let run = env.slopctl_raw(&["run", "--account", "codex-lazy", "--ready-timeout", "10"]);
-    assert!(run.status.success(), "run: {run:?}");
-    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let screen = env
-            .tmux
-            .tmux()
-            .args(["capture-pane", "-p", "-t", &pane])
-            .output()
-            .unwrap();
-        if String::from_utf8_lossy(&screen.stdout).contains("mock Codex session:") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "mock Codex did not initialize");
-        std::thread::sleep(Duration::from_millis(25));
+    let mut slopd = env.spawn_slopd();
+    let mut sources = Vec::new();
+    for _ in 0..2 {
+        let run = env.slopctl_raw(&["run", "--account", "codex-lazy", "--ready-timeout", "10"]);
+        assert!(run.status.success(), "{run:?}");
+        let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            let screen = env
+                .tmux
+                .tmux()
+                .args(["capture-pane", "-p", "-t", &pane])
+                .output()
+                .unwrap();
+            if let Some(id) = String::from_utf8_lossy(&screen.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("mock Codex session: "))
+            {
+                break id.trim().to_string();
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        sources.push((pane, id));
     }
-    let fork = env.slopctl_raw(&["fork", &pane, "--ready-timeout", "10"]);
-    assert!(!fork.status.success(), "ambiguous fork must fail");
-    assert!(
-        String::from_utf8_lossy(&fork.stderr).contains("ambiguous session discovery"),
-        "{fork:?}"
-    );
-    let panes: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
-    assert_eq!(panes.len(), 1, "failed discovery must not spawn a pane");
-    assert_eq!(panes[0].session_id, None);
-    assert_eq!(panes[0].transcript_path, None);
-    assert_eq!(panes[0].detailed_state, libslop::PaneDetailedState::Ready);
-    // An authoritative hook still binds normally after a rejected discovery.
-    assert!(
-        env.slopctl(&["send", &pane, "register normally"])
-            .status
-            .success()
-    );
-    wait_until_ready(&env, &pane, Duration::from_secs(10));
-    let panes: Vec<libslop::PaneInfo> =
-        serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
-    assert!(panes[0].session_id.is_some());
+    // Exercise repair of an old unbound pane after a daemon restart.
     kill_slopd(slopd);
+    slopd = env.spawn_slopd();
+    let (pane, id) = &sources[0];
+    let origin = env
+        .tmux
+        .tmux()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{socket_path},#{pid},0",
+        ])
+        .output()
+        .unwrap();
+    let origin = String::from_utf8(origin.stdout).unwrap().trim().to_string();
+    for (target, caller_pane, tmux, thread) in [
+        (pane.as_str(), "", origin.as_str(), id.as_str()),
+        (
+            pane.as_str(),
+            pane.as_str(),
+            "/wrong/server,1,0",
+            id.as_str(),
+        ),
+        (
+            sources[1].0.as_str(),
+            pane.as_str(),
+            origin.as_str(),
+            id.as_str(),
+        ),
+        (
+            pane.as_str(),
+            pane.as_str(),
+            origin.as_str(),
+            "unknown-thread",
+        ),
+    ] {
+        let result = env.slopctl_raw_envs(
+            &["fork", target, "--ready-timeout", "10"],
+            &[
+                ("TMUX_PANE", caller_pane),
+                ("TMUX", tmux),
+                ("CODEX_THREAD_ID", thread),
+            ],
+        );
+        assert!(
+            !result.status.success(),
+            "wrong caller identity was accepted: {result:?}"
+        );
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert!(panes.iter().all(|pane| pane.session_id.is_none()));
+    }
+    // A subagent can inherit the main pane's environment. Its thread ID must
+    // never become that pane's identity, even if it exists in this account.
+    let subagent_path = codex_home.path().join("sessions/rollout-child.jsonl");
+    std::fs::write(&subagent_path, r#"{"type":"session_meta","payload":{"id":"child","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}},"parent_thread_id":"parent"}}
+"#).unwrap();
+    let subagent = env.slopctl_raw_envs(
+        &["fork", "--ready-timeout", "10"],
+        &[
+            ("TMUX_PANE", pane),
+            ("TMUX", &origin),
+            ("CODEX_THREAD_ID", "child"),
+        ],
+    );
+    assert!(!subagent.status.success());
+    assert!(String::from_utf8_lossy(&subagent.stderr).contains("not a top-level"));
+
+    for (index, (pane, id)) in sources.iter().enumerate() {
+        let path = codex_home
+            .path()
+            .join(format!("sessions/rollout-{id}.jsonl"));
+        if index == 1 {
+            // Resuming an editor-created thread in the TUI retains its origin.
+            let history = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\"source\":\"cli\"", "\"source\":\"vscode\"");
+            std::fs::write(&path, history).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let args = if index == 0 {
+            vec!["fork", "--ready-timeout", "10"]
+        } else {
+            vec!["fork", pane, "--ready-timeout", "10"]
+        };
+        let result = env.slopctl_raw_envs(
+            &args,
+            &[
+                ("TMUX_PANE", pane),
+                ("TMUX", &origin),
+                ("CODEX_THREAD_ID", id),
+                // Codex's session-tree root is not necessarily this thread's ID.
+                ("CODEX_SESSION_ID", "different-root-id"),
+            ],
+        );
+        assert!(
+            result.status.success(),
+            "explicit identity fork failed: {result:?}"
+        );
+        let fork = String::from_utf8(result.stdout).unwrap().trim().to_string();
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        assert_eq!(
+            panes
+                .iter()
+                .find(|info| &info.pane_id == pane)
+                .unwrap()
+                .session_id
+                .as_ref(),
+            Some(id)
+        );
+        let fork_id = panes
+            .iter()
+            .find(|info| info.pane_id == fork)
+            .unwrap()
+            .session_id
+            .as_ref()
+            .unwrap();
+        let history = std::fs::read_to_string(
+            codex_home
+                .path()
+                .join(format!("sessions/rollout-{fork_id}.jsonl")),
+        )
+        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(history.lines().next().unwrap()).unwrap();
+        assert_eq!(meta["payload"]["forked_from_id"], *id);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+    kill_slopd(slopd);
+}
+
+#[test]
+fn codex_fork_api_errors_never_spawn_a_pane_or_change_the_source() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let mock_codex = cargo_bin("mock_codex");
+    for (mode, message) in [
+        ("error", "mock fork rejected"),
+        ("invalid", "did not return a new thread ID"),
+        ("exit-failure", "did not shut down cleanly"),
+        ("hang", "timed out"),
+    ] {
+        let codex_home = tempfile::tempdir().unwrap();
+        let env = TestEnv::new(None).expect("tmux required");
+        env.append_config(&format!(
+            "\n[accounts.codex]\nbackend = \"codex\"\nexecutable = [{mock_codex:?}, \"--mock-app-server={mode}\"]\nconfig_dir = {:?}\n",
+            codex_home.path(),
+        ));
+        let slopd = env.spawn_slopd();
+        let run = env.slopctl_raw(&["run", "--account", "codex", "--ready-timeout", "10"]);
+        assert!(run.status.success(), "{run:?}");
+        let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+        let before: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let transcript = std::fs::read(before[0].transcript_path.as_ref().unwrap()).unwrap();
+        let result = env.slopctl_raw(&["fork", &pane, "--ready-timeout", "10"]);
+        assert!(!result.status.success(), "API {mode} must fail: {result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(message),
+            "API {mode}: {result:?}"
+        );
+        let after: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].session_id, after[0].session_id);
+        assert_eq!(
+            std::fs::read(after[0].transcript_path.as_ref().unwrap()).unwrap(),
+            transcript
+        );
+        let pid: i32 = std::fs::read_to_string(codex_home.path().join("app-server-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "helper is still alive after {mode}"
+        );
+        kill_slopd(slopd);
+    }
 }
 
 #[test]
@@ -16580,7 +16769,10 @@ fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() 
         resume_info.detailed_state,
         libslop::PaneDetailedState::Ready
     );
-    assert_eq!(resume_info.session_id, None);
+    assert_eq!(
+        resume_info.session_id.as_deref(),
+        Some(source_session.as_str())
+    );
     assert!(env.slopctl(&["kill", &resume_pane]).status.success());
 
     let fork = env.slopctl_raw(&["fork", &pane_id, "--ready-timeout", "10"]);
@@ -16593,7 +16785,7 @@ fn fresh_codex_is_ready_before_lazy_session_start_and_interrupt_does_not_exit() 
     let panes: Vec<libslop::PaneInfo> =
         serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
     let fork_info = panes.iter().find(|pane| pane.pane_id == fork_pane).unwrap();
-    assert_eq!(fork_info.session_id, None);
+    assert!(fork_info.session_id.is_some());
     assert_eq!(fork_info.parent_pane_id.as_deref(), Some(pane_id.as_str()));
 
     assert!(

@@ -413,6 +413,10 @@ pub(super) struct PrepareRunContext<'a> {
 }
 
 pub(super) struct ForkContext<'a> {
+    pub(super) account: &'a str,
+    pub(super) cwd: &'a std::path::Path,
+    pub(super) env: &'a [(String, String)],
+    pub(super) verify_caller: bool,
     pub(super) pane_id: &'a str,
     pub(super) session_id: &'a str,
     pub(super) extra_args: Vec<String>,
@@ -802,12 +806,38 @@ impl BackendLifecycle for CodexBackend {
     }
 
     async fn fork(&self, context: ForkContext<'_>) -> Result<(Vec<String>, String), String> {
-        let mut args = codex_unattended_update_args();
-        args.extend(["fork".to_string(), context.session_id.to_string()]);
+        let mut resolved = context.config.resolve_account(Some(context.account))?;
+        if libslop::Backend::infer_from_program(resolved.executable.program())
+            .is_some_and(|backend| backend != libslop::Backend::Codex)
+        {
+            resolved.executable = libslop::Executable::String("codex".to_string());
+        }
+        let env = merge_spawn_env(context.config, context.env.to_vec())?;
+        let executable = resolve_spawn_program(&resolved.executable, &env, context.cwd)?;
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args(resolved.executable.args())
+            .args(codex_unattended_update_args())
+            .current_dir(context.cwd);
+        if let Some(home) = resolved.config_dir {
+            command.env("CODEX_HOME", home);
+        }
+        command.envs(env);
+        // The helper belongs to no pane; inherited hooks must not claim the
+        // daemon's caller or bind a fork to its source pane.
+        for key in ["TMUX", "TMUX_PANE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"] {
+            command.env_remove(key);
+        }
+        let id = codex::fork_session(
+            command,
+            context.session_id,
+            context.cwd,
+            context.verify_caller,
+        )
+        .await?;
+        let mut args = vec!["--resume".to_string(), id.clone()];
         args.extend(context.extra_args);
-        // Standalone `codex fork` creates the new session in the child process.
-        // Its SessionStart hook binds the real id after spawn.
-        Ok((args, String::new()))
+        Ok((args, id))
     }
 
     async fn recover(&self, context: RecoverContext<'_>) -> Result<(), String> {

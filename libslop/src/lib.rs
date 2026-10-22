@@ -3061,6 +3061,14 @@ pub struct EventFilter {
     pub payload_path_match: Vec<PayloadPredicate>,
 }
 
+/// Codex's explicit identity for a command running inside a tmux pane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkCaller {
+    pub pane_id: String,
+    pub tmux: String,
+    pub codex_thread_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RequestBody {
@@ -3100,6 +3108,10 @@ pub enum RequestBody {
     Fork {
         /// The pane to fork from.
         pane_id: String,
+        /// Identity supplied by a local Codex command in the source pane.
+        /// The daemon verifies the pane and tmux server before using it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ForkCaller>,
         /// Working directory for the new pane. Defaults to the source pane's
         /// cwd (Claude resolves its transcript by cwd, so this must match).
         #[serde(default)]

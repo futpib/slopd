@@ -215,6 +215,18 @@ async fn main() {
 
     let (reader, writer) = stream.into_split();
     let mut client = libslopctl::Client::new(reader, writer);
+    if let (Ok(pane_id), Ok(tmux), Ok(codex_thread_id)) = (
+        std::env::var("TMUX_PANE"),
+        std::env::var("TMUX"),
+        std::env::var("CODEX_THREAD_ID"),
+    ) && !codex_thread_id.is_empty()
+    {
+        client.set_fork_caller(libslop::ForkCaller {
+            pane_id,
+            tmux,
+            codex_thread_id,
+        });
+    }
 
     if let Command::Common(cmd) = cli.command {
         // The interactive viewer attaches to slopd's tmux, so resolve its socket

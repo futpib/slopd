@@ -747,10 +747,10 @@ than re-sending the conversation:
 
 - **Claude Code** — spawns `claude --resume <src> --fork-session` with a freshly minted `--session-id`, so the new pane is a distinct session whose transcript is copied from the source's.
 - **opencode** — calls the source pane's fork API, which copies its history into an independent session, then binds the new pane to it. V1 forks are roots; v2 records their parent and fork boundary.
-- **Codex** — launches `codex fork <SESSION_ID>`; `SessionStart` binds the new
-  session ID, but that hook can wait until the first prompt. On Linux, forking
-  an unbound pane discovers its existing rollout from the pane process's open
-  writer, so a fork can be forked again without submitting an extra prompt.
+- **Codex** — calls `thread/fork` through a short-lived `codex app-server`
+  process, records the returned thread ID, then starts `codex resume <ID>`.
+  A fork can be forked again before its first prompt, including after slopd
+  restarts. No shared Codex daemon is needed.
 - **Grok Build** — launches `grok --resume <src> --fork-session --session-id
   <new>`, preserving the source history under a distinct preallocated session
   ID and pane-private leader socket.
@@ -1125,14 +1125,18 @@ has the same meaning regardless of backend.
 
 ### Configuring a Codex account
 
-Each Codex pane is a standalone `codex` process. slopd does not start a shared
-Codex app-server, use `--remote`, or require systemd. It injects `slopctl hook`
-commands into `$CODEX_HOME/hooks.json`; `SessionStart` supplies the session ID
-and rollout transcript path, and slopd tails that per-session JSONL file. The
-interactive Codex CLI creates fresh, forked, and resumed rollouts lazily: the
-pane is ready for input first, then its initial prompt fires `SessionStart` and
-binds the durable session ID. Consequently, `ps` can briefly show
-`session_id: null`, and backup skips that pane until it has received a prompt.
+Each Codex pane is a standalone `codex` process. slopd does not use a shared
+Codex daemon, `--remote`, or systemd for Codex. Forking uses a short-lived stdio
+app-server helper that exits before the new pane starts. The helper runs the
+account's configured executable, config directory, and environment.
+
+slopd injects `slopctl hook` commands into `$CODEX_HOME/hooks.json`;
+`SessionStart` supplies the thread ID and rollout transcript path, and slopd
+tails that per-session JSONL file. A fresh interactive session can be ready
+before its initial prompt fires that hook. Until then, `ps` can show
+`session_id: null` and backup skips the unbound pane. Resumed sessions and
+API-created forks have a known ID immediately; transcript tailing starts when
+a hook supplies its path.
 
 This keeps failure domains independent: a signal, crash, or disconnect affecting
 one Codex process does not take the other Codex panes down with a shared service.
@@ -1160,22 +1164,29 @@ executable = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
 ```
 
 slopd passes configured executable arguments to every standalone launch,
-including `codex fork` and backup restore via `codex resume`.
+including the fork API helper and backup restore via `codex resume`.
 
 `send` always types into the visible Codex TUI in tmux, so both new prompts and
 in-flight steering follow the same UI path as a person at the terminal.
 `interrupt` sends Codex's native `Escape` cancel key; it never sends `Ctrl-D`,
-which would exit the standalone CLI. `fork` launches Codex's native
-`codex fork <SESSION_ID>` and learns the new ID from its first `SessionStart`
-hook. If that hook has not fired, a subsequent `fork` on Linux discovers the
-pane's writable CLI rollout, validates its session metadata, and persists the
-binding. Read-only source rollouts and subagent rollouts are excluded; ambiguous
-writers are rejected. If discovery is unavailable, submit a normal prompt to
-register the session before forking. On a slopd restart, the existing pane remains
-untouched; slopd recovers its identity and state from tmux metadata plus the
-rollout transcript. Backup
-restore launches `codex resume <SESSION_ID>` in the recorded working directory
-and makes the restored composer immediately sendable.
+which would exit the standalone CLI. `fork` asks Codex's `thread/fork` API to
+copy stored history without starting a turn, waits for the helper to exit,
+then launches `codex resume <THREAD_ID>`. The returned ID is persisted in tmux
+before the pane is registered. API failures leave the source pane unchanged
+and do not start a new pane.
+
+For older unbound panes, `slopctl fork` invoked inside Codex forwards
+`CODEX_THREAD_ID` when targeting its own pane. slopd checks the tmux server
+identity and verifies the thread through Codex's API before binding it.
+Subagent identities are rejected. An external caller targeting an unbound pane
+must first register it by submitting a normal prompt there. slopd does not
+inspect process descriptors, search for the newest rollout, or query Codex's
+private database schema to infer pane ownership.
+
+On a slopd restart, the existing pane remains untouched; slopd recovers its
+identity and state from tmux metadata plus any known rollout transcript.
+Backup restore launches `codex resume <THREAD_ID>` in the recorded working
+directory and makes the restored composer immediately sendable.
 
 Codex approval requests are published as normalized `PermissionRequest` hook
 events for observation. They must be answered in the visible TUI; slopd
