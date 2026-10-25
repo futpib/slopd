@@ -78,6 +78,27 @@ pub fn launch_args(input: &[String]) -> Result<(u16, String, Vec<String>, bool),
     ))
 }
 
+/// Keep managed panes on one visible conversation by default, without dropping
+/// other CLI overrides or an explicit per-launch choice to enable tabs.
+fn cli_config(content: Option<&str>) -> Result<String, String> {
+    let mut config: Value = match content.filter(|value| !value.trim().is_empty()) {
+        Some(content) => json5::from_str(content)
+            .map_err(|_| "OPENCODE_CLI_CONFIG_CONTENT must be a JSON object".to_string())?,
+        None => json!({}),
+    };
+    let config = config
+        .as_object_mut()
+        .ok_or("OPENCODE_CLI_CONFIG_CONTENT must be a JSON object")?;
+    let tabs = config.entry("tabs").or_insert_with(|| json!({}));
+    let tabs = tabs
+        .as_object_mut()
+        .ok_or("OPENCODE_CLI_CONFIG_CONTENT.tabs must be an object")?;
+    if !tabs.contains_key("mode") && !tabs.contains_key("enabled") {
+        tabs.insert("mode".into(), json!("off"));
+    }
+    serde_json::to_string(config).map_err(|e| e.to_string())
+}
+
 /// A pipe leases the server to this process. Even SIGKILL or a tmux-server crash
 /// closes the pipe, so the private server cannot survive its pane owner.
 pub async fn run(
@@ -89,6 +110,7 @@ pub async fn run(
 ) -> Result<i32, String> {
     let token = std::env::var("SLOPD_OPENCODE_TOKEN").map_err(|e| e.to_string())?;
     let program = command.first().ok_or("missing OpenCode executable")?;
+    let cli_config = cli_config(std::env::var("OPENCODE_CLI_CONFIG_CONTENT").ok().as_deref())?;
     let mut server = Command::new(program)
         .args(server_args)
         .args([
@@ -137,6 +159,7 @@ pub async fn run(
     let mut tui = Command::new(program)
         .args(&command[1..])
         .args(["--server", &url, "--session", session])
+        .env("OPENCODE_CLI_CONFIG_CONTENT", cli_config)
         .env_remove("SLOPD_OPENCODE_TOKEN")
         .env("OPENCODE_PASSWORD", token)
         .kill_on_drop(true)
@@ -334,6 +357,57 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_cli_defaults_preserve_overrides() {
+        for content in [None, Some(""), Some("  "), Some("{}")] {
+            assert_eq!(cli_config(content).unwrap(), r#"{"tabs":{"mode":"off"}}"#);
+        }
+        let config: Value = serde_json::from_str(
+            &cli_config(Some(
+                r#"{
+            // OpenCode accepts comments and trailing commas in CLI overrides.
+            "tabs": {"layout": "vertical",},
+            "plugins": ["monitor"], "session": {"thinking": "hide"},
+        }"#,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config,
+            json!({"tabs":{"layout":"vertical","mode":"off"},
+            "plugins":["monitor"],"session":{"thinking":"hide"}})
+        );
+        for tabs in [
+            json!({"mode":"on"}),
+            json!({"mode":"auto"}),
+            json!({"mode":"off"}),
+            json!({"enabled":true}),
+            json!({"enabled":false}),
+        ] {
+            let original = json!({"tabs":tabs});
+            let actual: Value =
+                serde_json::from_str(&cli_config(Some(&original.to_string())).unwrap()).unwrap();
+            assert_eq!(actual, original);
+        }
+    }
+
+    #[test]
+    fn invalid_cli_overrides_fail_without_echoing_contents() {
+        for content in [
+            "null",
+            "[]",
+            "false",
+            r#"{"tabs":null}"#,
+            r#"{"tabs":true}"#,
+            r#"{"secret":"do-not-print", broken"#,
+        ] {
+            let error = cli_config(Some(content)).unwrap_err();
+            assert!(error.contains("OPENCODE_CLI_CONFIG_CONTENT"));
+            assert!(!error.contains("do-not-print"));
+        }
+    }
 
     #[test]
     fn tool_completion_recovers_identity_from_history() {

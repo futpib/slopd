@@ -1054,6 +1054,21 @@ and `--session`. Each v2 pane has its own authentication token and pipe lease:
 the server survives a daemon restart and stops when its pane owner exits,
 including after loss of the tmux server.
 
+Managed v2 TUIs default to `tabs.mode = "off"`, so saved tabs from another pane
+do not appear beside the tracked conversation. This is a per-process
+`OPENCODE_CLI_CONFIG_CONTENT` overlay; it does not edit `cli.json` or saved tabs.
+Other CLI override fields are preserved, and an explicit `tabs.mode` or legacy
+`tabs.enabled` in that environment variable wins. For example, to enable tabs
+for one pane:
+
+```sh
+slopctl run --backend opencode \
+  --env 'OPENCODE_CLI_CONFIG_CONTENT={"tabs":{"mode":"on"}}'
+```
+
+Tabs off is a presentation default, not a session lock: `/new` and `/open` still
+work. Forked and restored v2 panes get the same default; v1 is unchanged.
+
 Both versions use SSE plus status polling for lifecycle and transcript events.
 V2's `/api` routes, response envelopes, paginated messages, tool events, and
 interrupt endpoint are translated to the same interfaces as v1. Pending v2
@@ -1073,7 +1088,8 @@ The real-TUI regression test uses an isolated tmux server and a local model
 fixture, without provider credentials. It covers native session switching,
 daemon restart during a tool lasting over 30 seconds, fork independence, large
 multiline input, interruption, and restoration of both histories after losing
-the tmux server. V2 also checks permission polling and private-server cleanup:
+the tmux server. V2 also checks saved-tab suppression, explicit tab opt-in,
+unchanged user config/tab storage, permission polling, and private-server cleanup:
 
 ```sh
 OPENCODE_TEST_BINARY=/path/to/opencode cargo test -p slopd --all-features \

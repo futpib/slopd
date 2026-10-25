@@ -1788,6 +1788,7 @@ dependencies = [
  "atomic-write-file",
  "clap",
  "dashmap",
+ "json5",
  "libc",
  "libslop",
  "libslopctl",

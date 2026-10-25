@@ -10,6 +10,10 @@
 //! It simulates a turn (idle → busy → idle) so the SSE driver has something
 //! real to observe.
 //!
+//! `--mock-v2` selects the V2 split server/TUI launch contract and its basic
+//! session/prompt API. The separate TUI consumes bracketed paste and Enter;
+//! `MOCK_OPENCODE_LAUNCH_LOG` records each process's CLI override in test builds.
+//!
 //! Blocks on `incoming()` so the tmux pane stays alive for the test, like a real
 //! long-running agent. Connections are handled one-per-thread so a long-lived SSE
 //! stream doesn't block other API calls.
@@ -21,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod mock_support;
+#[path = "mock_support/opencode_v2.rs"]
+mod v2;
 
 use mock_support::{
     MockCommand, OPENCODE_HELP as MOCK_HELP, SubagentMode, parse as parse_mock_command,
@@ -93,6 +99,10 @@ struct MockState {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--mock-v2") {
+        v2::run();
+        return;
+    }
     if std::env::args().any(|arg| arg == "--version") {
         println!("1.19.3");
         return;

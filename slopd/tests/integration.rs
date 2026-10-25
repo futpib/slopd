@@ -17278,6 +17278,107 @@ fn fork_claude_pane_mints_new_forked_session() {
 }
 
 #[test]
+fn opencode_v2_tabs_default_and_launch_overrides() {
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let env = TestEnv::new_full(None, None, None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.oc]\nbackend = \"opencode\"\nexecutable = [{:?}, \"--mock-v2\"]\n",
+        cargo_bin("mock_opencode").to_str().unwrap(),
+    ));
+    let slopd = env.spawn_slopd();
+    let settings = serde_json::json!({"session":{"thinking":"hide"},"tabs":{"layout":"vertical"}});
+    let cases = [
+        (None, serde_json::json!({"tabs":{"mode":"off"}})),
+        (
+            Some(settings.to_string()),
+            serde_json::json!({"session":{"thinking":"hide"},
+            "tabs":{"layout":"vertical","mode":"off"}}),
+        ),
+        (
+            Some(r#"{"tabs":{"mode":"on"}}"#.into()),
+            serde_json::json!({"tabs":{"mode":"on"}}),
+        ),
+        (
+            Some(r#"{"tabs":{"enabled":true}}"#.into()),
+            serde_json::json!({"tabs":{"enabled":true}}),
+        ),
+    ];
+    for (index, (content, expected)) in cases.into_iter().enumerate() {
+        let log = env.config_dir.path().join(format!("launch-{index}.jsonl"));
+        let launch_log = format!("MOCK_OPENCODE_LAUNCH_LOG={}", log.display());
+        let override_env = format!(
+            "OPENCODE_CLI_CONFIG_CONTENT={}",
+            content.as_deref().unwrap_or("")
+        );
+        let output = env.slopctl_raw(&[
+            "run",
+            "--account",
+            "oc",
+            "--env",
+            &launch_log,
+            "--env",
+            &override_env,
+        ]);
+        assert!(output.status.success(), "v2 launch failed: {output:?}");
+        let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if let Some(tui) = records.iter().find(|record| record["role"] == "tui") {
+                let actual: serde_json::Value =
+                    serde_json::from_str(tui["cli_config"].as_str().unwrap()).unwrap();
+                assert_eq!(actual, expected);
+                let server = records
+                    .iter()
+                    .find(|record| record["role"] == "server")
+                    .unwrap();
+                assert_eq!(server["cli_config"], content.as_deref().unwrap_or(""));
+                break;
+            }
+            assert!(Instant::now() < deadline, "TUI did not launch: {records:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let screen = env
+                .tmux
+                .tmux()
+                .args(["capture-pane", "-p", "-t", &pane])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&screen.stdout).contains("mock OpenCode v2 session=") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "mock TUI did not render");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let prompt = format!("tabs regression {index}\nsecond line");
+        assert!(env.slopctl(&["send", &pane, &prompt]).status.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let transcript = env.slopctl(&["transcript", &pane]);
+            if String::from_utf8_lossy(&transcript.stdout)
+                .contains(&format!("echo: tabs regression {index}"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "v2 TUI prompt was not delivered: {transcript:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(env.slopctl(&["kill", &pane]).status.success());
+    }
+    kill_slopd(slopd);
+}
+
+#[test]
 fn opencode_ignores_foreign_cli_hooks() {
     build_bin("slopctl");
     build_bin("mock_opencode");

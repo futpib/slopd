@@ -186,14 +186,15 @@ def main():
         def info(target=None):
             return next(p for p in json.loads(run(cli + ["ps", "--json"])) if p["pane_id"] == (target or pane))
 
-        def api(path, body=None):
+        def api(path, body=None, method=None):
             headers = {}
             if v2:
                 path = "/api/session/active" if path == "/session/status" else "/api" + path
                 headers["Authorization"] = "Basic " + base64.b64encode(f"opencode:{token}".encode()).decode()
             headers["Content-Type"] = "application/json"
             with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers,
-                                         data=json.dumps(body).encode() if body is not None else None), timeout=5) as response:
+                                         data=json.dumps(body).encode() if body is not None else None,
+                                         method=method), timeout=5) as response:
                 if response.status == 204:
                     return None
                 result = json.load(response)
@@ -208,7 +209,30 @@ def main():
         try:
             run(["tmux", "-S", tmux_socket, "-f", "/dev/null", "new-session", "-d", "-s", "test", "-x", "160", "-y", "50"])
             daemon = start_daemon()
-            pane = run(cli + ["run", "--ready-timeout", "60"])
+            if v2:
+                # Reproduce the user's saved-tab leak with a real TUI, then use
+                # explicit opt-in as the positive control for the same history.
+                cli_config = root / "config/opencode/cli.json"
+                cli_config.parent.mkdir(parents=True, exist_ok=True)
+                saved_config = '{"animations":false,"session":{"sidebar":"show"}}\n'
+                cli_config.write_text(saved_config)
+                tabs_on = 'OPENCODE_CLI_CONFIG_CONTENT={"tabs":{"mode":"on"}}'
+                pane = run(cli + ["run", "--ready-timeout", "60", "--env", tabs_on])
+                port = int(tmux("show-options", "-pv", "-t", pane, "@slopd_opencode_port"))
+                token = tmux("show-options", "-pqv", "-t", pane, "@slopd_opencode_token")
+                seed_session = info()["session_id"]
+                api(f"/session/{seed_session}", {"title": "SLOPD_SAVED_TAB"}, method="PATCH")
+                wait_for(lambda: "SLOPD_SAVED_TAB" in tmux("capture-pane", "-p", "-t", pane),
+                         "saved tab in seed TUI", 60)
+                tabs_file = wait_for(lambda: next((file for file in (root / "state").rglob("tabs.json")
+                    if seed_session in file.read_text()), None), "persisted seed tab")
+                run(cli + ["kill", pane])
+                saved_tabs = tabs_file.read_bytes()
+
+            launch = ["run", "--ready-timeout", "60"]
+            if v2:
+                launch += ["--env", 'OPENCODE_CLI_CONFIG_CONTENT={"session":{"sidebar":"hide"},"tabs":{"layout":"horizontal"}}']
+            pane = run(cli + launch)
             port = int(tmux("show-options", "-pv", "-t", pane, "@slopd_opencode_port"))
             token = tmux("show-options", "-pqv", "-t", pane, "@slopd_opencode_token")
             initial_session = info()["session_id"]
@@ -219,6 +243,17 @@ def main():
             # Finish initial TUI boot/selection before driving native navigation.
             wait_for(lambda: "Test" in tmux("capture-pane", "-p", "-t", pane), "TUI model display", 60)
             time.sleep(3)
+            if v2:
+                screen = tmux("capture-pane", "-p", "-t", pane)
+                assert "SLOPD_SAVED_TAB" not in screen, screen
+                assert "Context" not in screen, "existing sidebar override was discarded"
+                assert tabs_file.read_bytes() == saved_tabs, "tabs-off launch changed saved tabs"
+                assert cli_config.read_text() == saved_config, "launch changed user CLI config"
+                probe = run(cli + ["run", "--ready-timeout", "60", "--env", tabs_on])
+                wait_for(lambda: "SLOPD_SAVED_TAB" in tmux("capture-pane", "-p", "-t", probe),
+                         "saved tab restored by explicit opt-in", 60)
+                run(cli + ["kill", probe])
+                print("Saved tabs hidden by default; explicit opt-in restores them; CLI overrides and saved files preserved", flush=True)
             # Native navigation creates no tui.session.select event. The next
             # prompt creates a fresh session unknown to slopd's original binding.
             tmux("send-keys", "-t", pane, "C-x", "n")
@@ -289,6 +324,8 @@ def main():
             assert fork_session != active
             assert "SLOPD_LIVE_DONE" in run(cli + ["transcript", fork])
             wait_for(lambda: "Test" in tmux("capture-pane", "-p", "-t", fork), "fork TUI")
+            if v2:
+                assert "SLOPD_SAVED_TAB" not in tmux("capture-pane", "-p", "-t", fork)
             time.sleep(1)
             tmux("send-keys", "-t", fork, "-l", "DISCARD_STALE_COMPOSER")
             prompt = "SLOPD_MULTILINE\n" + "quoted `literal` $value \'text\' " * 800 + "\nEND_MULTILINE"
@@ -331,6 +368,9 @@ def main():
                 transcript = run(cli + ["transcript", row["pane_id"]])
                 assert "SLOPD_LIVE_DONE" in transcript
                 assert ("SLOPD_MULTILINE" in transcript) == (row["session_id"] == fork_session)
+                if v2:
+                    wait_for(lambda: "Test" in tmux("capture-pane", "-p", "-t", row["pane_id"]), "restored TUI", 60)
+                    assert "SLOPD_SAVED_TAB" not in tmux("capture-pane", "-p", "-t", row["pane_id"])
             print("Full tmux-server loss restored both exact session histories", flush=True)
             upgrade = os.environ.get("OPENCODE_TEST_UPGRADE_BINARY")
             if upgrade and not v2:
