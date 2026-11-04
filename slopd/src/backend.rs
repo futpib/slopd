@@ -11,6 +11,7 @@ pub(super) struct OpencodeState {
     pub(super) pending_prompt: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) last_prompt: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) binding_warning: Arc<std::sync::Mutex<Option<String>>>,
+    pub(super) input_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OpencodeState {
@@ -26,6 +27,7 @@ impl OpencodeState {
             pending_prompt: Arc::new(std::sync::Mutex::new(None)),
             last_prompt: Arc::new(std::sync::Mutex::new(None)),
             binding_warning: Arc::new(std::sync::Mutex::new(None)),
+            input_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }

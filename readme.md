@@ -1054,6 +1054,11 @@ and `--session`. Each v2 pane has its own authentication token and pipe lease:
 the server survives a daemon restart and stops when its pane owner exits,
 including after loss of the tmux server.
 
+Before the first v2 send, slopd checks that the terminal composer accepts input;
+API readiness alone can precede plugin loading and discard an early prompt.
+The check never submits its temporary text and uses the send timeout if the
+composer cannot become ready.
+
 Managed v2 TUIs default to `tabs.mode = "off"`, so saved tabs from another pane
 do not appear beside the tracked conversation. This is a per-process
 `OPENCODE_CLI_CONFIG_CONTENT` overlay; it does not edit `cli.json` or saved tabs.

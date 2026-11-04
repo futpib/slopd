@@ -17313,12 +17313,15 @@ fn opencode_v2_tabs_default_and_launch_overrides() {
         );
         let output = env.slopctl_raw(&[
             "run",
+            "--no-wait",
             "--account",
             "oc",
             "--env",
             &launch_log,
             "--env",
             &override_env,
+            "--env",
+            "MOCK_OPENCODE_TUI_DELAY_MS=3000",
         ]);
         assert!(output.status.success(), "v2 launch failed: {output:?}");
         let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
@@ -17343,20 +17346,7 @@ fn opencode_v2_tabs_default_and_launch_overrides() {
             assert!(Instant::now() < deadline, "TUI did not launch: {records:?}");
             std::thread::sleep(Duration::from_millis(50));
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let screen = env
-                .tmux
-                .tmux()
-                .args(["capture-pane", "-p", "-t", &pane])
-                .output()
-                .unwrap();
-            if String::from_utf8_lossy(&screen.stdout).contains("mock OpenCode v2 session=") {
-                break;
-            }
-            assert!(Instant::now() < deadline, "mock TUI did not render");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // Send while the API is ready but terminal input is still being discarded.
         let prompt = format!("tabs regression {index}\nsecond line");
         assert!(env.slopctl(&["send", &pane, &prompt]).status.success());
         let deadline = Instant::now() + Duration::from_secs(10);

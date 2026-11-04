@@ -202,7 +202,7 @@ fn tui(server: &str, session: &str) {
             "on"
         }
     });
-    println!("mock OpenCode v2 session={session} tabs={mode}");
+    print!("\x1b[?1049h");
     let original = unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         assert_eq!(libc::tcgetattr(0, &mut termios), 0);
@@ -212,6 +212,15 @@ fn tui(server: &str, session: &str) {
         original
     };
     print!("\x1b[?2004h");
+    std::io::stdout().flush().unwrap();
+    if let Ok(delay) = std::env::var("MOCK_OPENCODE_TUI_DELAY_MS") {
+        // Like a loading TUI, consume input before a composer is mounted.
+        std::thread::sleep(Duration::from_millis(delay.parse().unwrap()));
+        unsafe {
+            libc::tcflush(0, libc::TCIFLUSH);
+        }
+    }
+    println!("mock OpenCode v2 session={session} tabs={mode}");
     std::io::stdout().flush().unwrap();
     let mut input = Vec::new();
     let mut escape = Vec::new();
@@ -223,6 +232,8 @@ fn tui(server: &str, session: &str) {
             if input.ends_with(b"\x1b[201~") {
                 input.truncate(input.len() - 6);
                 pasted = false;
+                print!("\r\x1b[2K{}", String::from_utf8_lossy(&input));
+                std::io::stdout().flush().unwrap();
             }
             continue;
         }

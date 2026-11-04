@@ -62,10 +62,11 @@ def main():
                 last_user = max((i for i, m in enumerate(body["messages"]) if m.get("role") == "user"), default=-1)
                 completed = any(message.get("role") == "tool" for message in body["messages"][last_user + 1:])
                 interrupt = "SLOPD_INTERRUPT" in json.dumps(body["messages"][last_user])
+                startup = "SLOPD_COLD_START" in json.dumps(body["messages"][last_user])
                 delta = {"role": "assistant", "content": "SLOPD_LIVE_DONE"}
                 reason = "stop"
                 tool = "shell" if v2 else "bash"
-                if tool in tools and not completed:
+                if tool in tools and not completed and not startup:
                     release = root / "interrupt-tool" if interrupt else gate
                     command = f"while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.1; done; printf SLOPD_TOOL_DONE"
                     delta = {"role": "assistant", "tool_calls": [{
@@ -229,10 +230,21 @@ def main():
                 run(cli + ["kill", pane])
                 saved_tabs = tabs_file.read_bytes()
 
-            launch = ["run", "--ready-timeout", "60"]
+            launch = ["run", "--no-wait"] if v2 else ["run", "--ready-timeout", "60"]
             if v2:
                 launch += ["--env", 'OPENCODE_CLI_CONFIG_CONTENT={"session":{"sidebar":"hide"},"tabs":{"layout":"horizontal"}}']
             pane = run(cli + launch)
+            # API readiness can precede the terminal composer. Send immediately,
+            # before any screen polling or boot sleeps can hide dropped input.
+            run(cli + ["send", pane, "SLOPD_COLD_START: reply once without tools."])
+            wait_for(lambda: any("SLOPD_COLD_START" in json.dumps(r) for r in requests),
+                     "cold-start prompt reaching the provider", 30)
+            wait_for(lambda: info()["state"] == "ready", "cold-start completion", 30)
+            history = json.loads(run(cli + ["transcript", pane]))["records"]
+            assert sum(r["event_type"] == "user" and "SLOPD_COLD_START" in json.dumps(r)
+                       for r in history) == 1, "cold-start prompt was not submitted exactly once"
+            assert "slopd-ready-" not in json.dumps(requests), "readiness probe was submitted"
+            print("Immediate cold-start prompt delivered once without readiness-probe leakage", flush=True)
             port = int(tmux("show-options", "-pv", "-t", pane, "@slopd_opencode_port"))
             token = tmux("show-options", "-pqv", "-t", pane, "@slopd_opencode_token")
             initial_session = info()["session_id"]

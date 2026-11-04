@@ -78,6 +78,99 @@ pub fn launch_args(input: &[String]) -> Result<(u16, String, Vec<String>, bool),
     ))
 }
 
+/// A ready API session does not mean the TUI has mounted its composer. Before
+/// the first send, require an unsubmitted probe to appear in the alternate
+/// screen. This also excludes terminal echo before the TUI enters raw mode.
+/// The caller holds the pane's input lock and clears the probe before pasting.
+pub async fn wait_for_input(
+    config: &libslop::SlopdConfig,
+    pane: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let probe = format!(
+        "slopd-ready-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let check = async {
+        loop {
+            let mode = crate::tmux_pane(
+                config,
+                pane,
+                &["display-message", "-p", "-t", pane, "#{alternate_on}"],
+            )
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+            if !mode.status.success() {
+                return Err(format!(
+                    "OpenCode pane {pane} disappeared before input readiness"
+                ));
+            }
+            if mode.stdout == b"1\n" {
+                let clear = crate::tmux_pane(
+                    config,
+                    pane,
+                    &[
+                        "send-keys",
+                        "-t",
+                        pane,
+                        "S-Home",
+                        "BSpace",
+                        "S-End",
+                        "BSpace",
+                    ],
+                )
+                .status()
+                .await
+                .map_err(|e| e.to_string())?;
+                if !clear.success()
+                    || !crate::tmux_paste_text(config, pane, &probe)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .success()
+                {
+                    return Err(format!("could not probe OpenCode input in pane {pane}"));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let screen = crate::tmux_pane(config, pane, &["capture-pane", "-p", "-t", pane])
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if screen.status.success()
+                    && String::from_utf8_lossy(&screen.stdout).contains(&probe)
+                {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let result = tokio::time::timeout_at(deadline, check)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "timed out waiting for OpenCode input in pane {pane}"
+            ))
+        });
+    // Never submit the probe, including when startup fails or times out.
+    let _ = crate::tmux_pane(
+        config,
+        pane,
+        &[
+            "send-keys",
+            "-t",
+            pane,
+            "S-Home",
+            "BSpace",
+            "S-End",
+            "BSpace",
+        ],
+    )
+    .status()
+    .await;
+    result
+}
+
 /// Keep managed panes on one visible conversation by default, without dropping
 /// other CLI overrides or an explicit per-launch choice to enable tabs.
 fn cli_config(content: Option<&str>) -> Result<String, String> {

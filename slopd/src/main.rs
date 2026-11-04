@@ -6881,6 +6881,16 @@ async fn handle_request(
                 // slopctl senders so their composer contents cannot interleave.
                 let _guard = state.type_mutex.lock().await;
 
+                if oc.client.v2 && !oc.input_ready.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Err(message) =
+                        opencode_v2::wait_for_input(config, &pane_id, deadline).await
+                    {
+                        return libslop::ResponseBody::Error { message };
+                    }
+                    oc.input_ready
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+
                 // A new TUI submission supersedes any internal retry. Do not
                 // guess whether this input is retryable from its spelling:
                 // slash-command interpretation belongs exclusively to OpenCode.
