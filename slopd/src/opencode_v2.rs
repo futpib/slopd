@@ -93,24 +93,19 @@ pub async fn wait_for_input(
     );
     let check = async {
         loop {
-            let mode = crate::tmux_pane(
-                config,
-                pane,
-                &["display-message", "-p", "-t", pane, "#{alternate_on}"],
-            )
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
+            let mode = crate::tmux(config)
+                .args(["display-message", "-p", "-t", pane, "#{alternate_on}"])
+                .output()
+                .await
+                .map_err(|e| e.to_string())?;
             if !mode.status.success() {
                 return Err(format!(
                     "OpenCode pane {pane} disappeared before input readiness"
                 ));
             }
             if mode.stdout == b"1\n" {
-                let clear = crate::tmux_pane(
-                    config,
-                    pane,
-                    &[
+                let clear = crate::tmux(config)
+                    .args([
                         "send-keys",
                         "-t",
                         pane,
@@ -118,11 +113,10 @@ pub async fn wait_for_input(
                         "BSpace",
                         "S-End",
                         "BSpace",
-                    ],
-                )
-                .status()
-                .await
-                .map_err(|e| e.to_string())?;
+                    ])
+                    .status()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if !clear.success()
                     || !crate::tmux_paste_text(config, pane, &probe)
                         .await
@@ -132,7 +126,8 @@ pub async fn wait_for_input(
                     return Err(format!("could not probe OpenCode input in pane {pane}"));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let screen = crate::tmux_pane(config, pane, &["capture-pane", "-p", "-t", pane])
+                let screen = crate::tmux(config)
+                    .args(["capture-pane", "-p", "-t", pane])
                     .output()
                     .await
                     .map_err(|e| e.to_string())?;
@@ -153,10 +148,8 @@ pub async fn wait_for_input(
             ))
         });
     // Never submit the probe, including when startup fails or times out.
-    let _ = crate::tmux_pane(
-        config,
-        pane,
-        &[
+    let _ = crate::tmux(config)
+        .args([
             "send-keys",
             "-t",
             pane,
@@ -164,10 +157,9 @@ pub async fn wait_for_input(
             "BSpace",
             "S-End",
             "BSpace",
-        ],
-    )
-    .status()
-    .await;
+        ])
+        .status()
+        .await;
     result
 }
 
