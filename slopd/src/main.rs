@@ -923,7 +923,7 @@ struct PaneState {
     type_mutex: Mutex<()>,
     /// Serialises state changes and their mirrored tmux option writes.
     state_update_mutex: Mutex<()>,
-    /// Serialises hook binding with caller-supplied Codex identity.
+    /// Serialises hook binding, transcript records, and caller-supplied Codex identity.
     session_binding_mutex: Mutex<()>,
     /// Notified whenever UserPromptSubmit fires for this pane.
     prompt_submitted: Notify,
@@ -1776,7 +1776,12 @@ async fn tail_transcript(
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        let read = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            read = reader.read_line(&mut line) => read,
+        };
+        match read {
             Ok(0) => {
                 // EOF — detect truncation/replacement before waiting. Grok's
                 // updates.jsonl is normally append-only, but recovery tools and
@@ -1796,6 +1801,13 @@ async fn tail_transcript(
                 }
             }
             Ok(n) => {
+                // A replacement holds this same lock while cancelling the old
+                // reader. Finish at most the current record before rebinding;
+                // never let buffered history mutate the new session afterward.
+                let _binding = pane_state.session_binding_mutex.lock().await;
+                if cancel.is_cancelled() {
+                    return;
+                }
                 let line_start = byte_pos;
                 byte_pos += n as u64;
 
@@ -5042,11 +5054,11 @@ fn hook_transcript_path<'a>(
         .and_then(|value| value.as_str())
 }
 
-/// Codex may start maintenance helpers (currently memory consolidation) from
-/// inside its TUI process. They inherit `TMUX_PANE`, so their hooks name the
-/// main pane even though they have a different session id. Accept the first
-/// binding and matching hooks; only a new SessionStart with a real transcript
-/// may intentionally rebind an already-bound pane.
+/// Codex helpers inherit `TMUX_PANE`. Maintenance sessions use a different
+/// session id, while subagents use the root session id and their own agent id.
+/// SubagentStart/Stop are parent notifications whose agent id names the child;
+/// other child hooks must not affect the parent's transcript or lifecycle.
+/// Only a main SessionStart with a real transcript may rebind an existing pane.
 fn hook_belongs_to_bound_session(
     backend: libslop::Backend,
     bound_session_id: Option<&str>,
@@ -5061,10 +5073,19 @@ fn hook_belongs_to_bound_session(
     if backend != libslop::Backend::Codex {
         return true;
     }
+    let hook_session_id = payload.get("session_id").and_then(|value| value.as_str());
+    if !matches!(event, "SubagentStart" | "SubagentStop")
+        && let Some(agent_id) = payload.get("agent_id").and_then(|value| value.as_str())
+        && hook_session_id
+            .or(bound_session_id)
+            .is_some_and(|root| agent_id != root)
+    {
+        return false;
+    }
     let Some(bound_session_id) = bound_session_id else {
         return true;
     };
-    let Some(hook_session_id) = payload.get("session_id").and_then(|value| value.as_str()) else {
+    let Some(hook_session_id) = hook_session_id else {
         return true;
     };
     hook_session_id == bound_session_id
@@ -8063,6 +8084,91 @@ mod tests {
             "Stop",
             &helper_stop,
         ));
+    }
+
+    #[test]
+    fn codex_child_hooks_cannot_bind_or_change_the_parent() {
+        let mut payload = serde_json::json!({
+            "session_id": "root-session",
+            "agent_id": "child-session",
+            "transcript_path": "/sessions/child.jsonl",
+        });
+        for bound in [None, Some("root-session")] {
+            for event in [
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "PermissionRequest",
+                "StopFailure",
+                "Stop",
+                "SessionEnd",
+            ] {
+                assert!(
+                    !hook_belongs_to_bound_session(libslop::Backend::Codex, bound, event, &payload),
+                    "{event} with {bound:?}"
+                );
+            }
+            for event in ["SubagentStart", "SubagentStop"] {
+                assert!(hook_belongs_to_bound_session(
+                    libslop::Backend::Codex,
+                    bound,
+                    event,
+                    &payload
+                ));
+            }
+        }
+        payload["agent_id"] = serde_json::json!("root-session");
+        assert!(hook_belongs_to_bound_session(
+            libslop::Backend::Codex,
+            Some("root-session"),
+            "PreToolUse",
+            &payload
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_transcript_reader_does_not_replay_buffered_history() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+        )
+        .unwrap();
+        let panes = PaneMap::new();
+        let state = panes.get_or_insert("%0");
+        state.set_runtime(PaneRuntime::Codex(CodexState));
+        *state.detailed_state.lock().unwrap() = libslop::PaneDetailedState::BusyProcessing;
+        let binding = state.session_binding_mutex.lock().await;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut config = libslop::SlopdConfig::default();
+        config.tmux.socket = Some(dir.path().join("nonexistent.sock"));
+        let task = tokio::spawn(tail_transcript(
+            path,
+            "%0".to_string(),
+            state.clone(),
+            Arc::new(config),
+            panes,
+            Arc::new(tx),
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        drop(binding);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *state.detailed_state.lock().unwrap(),
+            libslop::PaneDetailedState::BusyProcessing
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled history must emit no events"
+        );
     }
 
     #[test]

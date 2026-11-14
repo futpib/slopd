@@ -570,6 +570,47 @@ fn main() {
                     continue;
                 }
 
+                if prompt == "SUBAGENT_HOOK_CANARY" {
+                    active = true;
+                    let settings = settings.clone();
+                    let session_id = session_id.clone();
+                    let cwd = cwd.clone();
+                    let home = codex_home.clone();
+                    let sessions = sessions.clone();
+                    std::thread::spawn(move || {
+                        for phase in ["busy", "background"] {
+                            while !home.join(format!("release-child-hooks-{phase}")).exists() {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            std::thread::scope(|scope| {
+                                for index in 0..2 {
+                                    let settings = &settings;
+                                    let session_id = &session_id;
+                                    let cwd = &cwd;
+                                    let sessions = &sessions;
+                                    scope.spawn(move || {
+                                        let agent_id = format!("mock-child-{index}");
+                                        let transcript = sessions.join(format!("rollout-{agent_id}.jsonl"));
+                                        write_record(&transcript, json!({"type":"event_msg","payload":{
+                                            "type":"task_complete", "turn_id":"child-failed-turn",
+                                            "error":{"message":"child quota exhausted","codex_error_info":"usage_limit_exceeded"}
+                                        }}));
+                                        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "StopFailure", "Stop", "SessionEnd", "PreToolUse"] {
+                                            let mut payload = hook_payload(event, session_id, cwd, &transcript);
+                                            payload["agent_id"] = json!(agent_id);
+                                            payload["agent_type"] = json!("default");
+                                            fire_hooks(settings, event, &payload);
+                                        }
+                                    });
+                                }
+                            });
+                            std::fs::write(home.join(format!("child-hooks-{phase}-done")), "done")
+                                .unwrap();
+                        }
+                    });
+                    continue;
+                }
+
                 if matches!(mock_command, Some(MockCommand::Active)) {
                     active = true;
                     continue;

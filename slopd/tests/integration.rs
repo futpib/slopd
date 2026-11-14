@@ -14653,6 +14653,161 @@ fn fork_opencode_pane_binds_new_pane_to_forked_session() {
 }
 
 #[test]
+fn codex_child_hooks_preserve_parent_transcript_state_and_failure() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new(None).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-children]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        cargo_bin("mock_codex"),
+        home.path(),
+    ));
+    let slopd = env.spawn_slopd();
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-children",
+        "--ready-timeout",
+        "20",
+    ]);
+    assert!(run.status.success(), "run: {run:?}");
+    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    let info = || {
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        panes
+            .into_iter()
+            .find(|entry| entry.pane_id == pane)
+            .unwrap()
+    };
+    let original = info();
+    let wait_for_marker = |marker: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !home.path().join(marker).exists() {
+            assert!(Instant::now() < deadline, "mock never wrote {marker}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let tool_listener = spawn_hook_listener(&env, "PreToolUse");
+    let failure_listener = spawn_hook_listener(&env, "StopFailure");
+    let user_listener = spawn_transcript_listener(&env, "userMessage");
+    assert!(
+        env.slopctl(&["send", &pane, "SUBAGENT_HOOK_CANARY"])
+            .status
+            .success()
+    );
+    wait_for_event(user_listener, |_| true);
+    // Establish the parent lifecycle state after its task_started was tailed,
+    // then release child hooks concurrently with that still-active turn.
+    let started = serde_json::json!({
+        "session_id": original.session_id,
+        "agent_id": "mock-child-0",
+        "transcript_path": home.path().join("sessions/rollout-mock-child-0.jsonl"),
+    });
+    assert!(
+        fire_hook(&env, "SubagentStart", &started.to_string(), Some(&pane))
+            .status
+            .success()
+    );
+    std::fs::write(home.path().join("release-child-hooks-busy"), "release").unwrap();
+    wait_for_marker("child-hooks-busy-done");
+    let busy = info();
+    assert_eq!(busy.session_id, original.session_id);
+    assert_eq!(
+        busy.transcript_path, original.transcript_path,
+        "child hooks replaced the parent rollout"
+    );
+    assert_eq!(
+        busy.detailed_state,
+        libslop::PaneDetailedState::BusySubagent,
+        "child activity changed the parent state"
+    );
+
+    let parent = serde_json::json!({
+        "session_id": original.session_id,
+        "transcript_path": original.transcript_path,
+    });
+    // The first forwarded tool hook must be the parent's sentinel; none of the
+    // concurrent child tool hooks may enter the pane's public event stream.
+    assert!(
+        fire_hook(&env, "PreToolUse", &parent.to_string(), Some(&pane))
+            .status
+            .success()
+    );
+    let tool = wait_for_event(tool_listener, |_| true);
+    assert!(
+        tool["payload"]["agent_id"].is_null(),
+        "forwarded child tool hook: {tool}"
+    );
+    let mut stopped = parent.clone();
+    stopped["agent_id"] = serde_json::json!("mock-child-0");
+    stopped["agent_transcript_path"] =
+        serde_json::json!(home.path().join("sessions/rollout-mock-child-0.jsonl"));
+    assert!(
+        fire_hook(&env, "SubagentStop", &stopped.to_string(), Some(&pane))
+            .status
+            .success()
+    );
+    assert_eq!(
+        env.pane_state(&pane).1,
+        libslop::PaneDetailedState::BusyProcessing
+    );
+
+    assert!(
+        env.slopctl(&["send", &pane, "FAIL_USAGE_LIMIT"])
+            .status
+            .success()
+    );
+    let failure = wait_for_event(failure_listener, |_| true);
+    assert_eq!(
+        failure["payload"]["turn_id"], "mock-usage-limit-turn",
+        "child failure entered the parent's event stream"
+    );
+    assert_eq!(failure["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(failure["payload"]["retry_scheduled"], false);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(
+        home.path().join("release-child-hooks-background"),
+        "release",
+    )
+    .unwrap();
+    wait_for_marker("child-hooks-background-done");
+    let finished = info();
+    assert_eq!(finished.session_id, original.session_id);
+    assert_eq!(finished.transcript_path, original.transcript_path);
+    assert_eq!(
+        finished.detailed_state,
+        libslop::PaneDetailedState::Ready,
+        "background child hooks changed a finished parent"
+    );
+    let transcript = env.slopctl(&["transcript", &pane, "--limit", "50"]);
+    let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
+    let failures: Vec<_> = transcript["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["event_type"] == "turn_failed")
+        .collect();
+    assert_eq!(failures.len(), 1, "parent transcript: {transcript}");
+    assert_eq!(failures[0]["payload"]["turn_id"], "mock-usage-limit-turn");
+    assert!(env.slopctl(&["backup"]).status.success());
+    let checkpoint = latest_lifecycle_checkpoint(&env);
+    let saved = checkpoint
+        .iter()
+        .find(|entry| entry.pane_id == pane)
+        .unwrap();
+    assert_eq!(saved.session_id, original.session_id);
+    assert_eq!(saved.transcript_path, original.transcript_path);
+    kill_slopd(slopd);
+}
+
+#[test]
 fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
     build_bin("slopd");
     build_bin("slopctl");
