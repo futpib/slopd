@@ -260,21 +260,23 @@ async fn tmux_paste_text(
     child.wait().await
 }
 
-/// Submit slopd's synthetic `continue` prompt through the backend's strongest
-/// available transport. Grok uses its attached ACP peer when possible and the
-/// same bracketed-paste path as normal sends otherwise; Claude keeps its
-/// literal-key behavior.
+/// Submit a retry through the backend's normal transport. OpenCode resubmits
+/// its last accepted prompt; the hook-driven backends receive `continue`.
 async fn submit_auto_continue(
     config: &libslop::SlopdConfig,
-    panes: &PaneMap,
+    state: &PaneState,
     pane_id: &str,
+    prompt: &str,
 ) -> bool {
-    let Some(state) = panes.get(pane_id) else {
-        return false;
-    };
     let notified = state.prompt_submitted.notified();
+    if let Some(oc) = state.opencode() {
+        return oc.client.send_message(&oc.session_id, prompt).await.is_ok()
+            && tokio::time::timeout(std::time::Duration::from_secs(10), notified)
+                .await
+                .is_ok();
+    }
     if let Some(client) = state.grok().and_then(|runtime| runtime.client())
-        && client.prompt("continue").await.is_ok()
+        && client.prompt(prompt).await.is_ok()
     {
         return tokio::time::timeout(std::time::Duration::from_secs(10), notified)
             .await
@@ -288,12 +290,12 @@ async fn submit_auto_continue(
     let typed = if settle_before_enter {
         matches!(tmux_send_keys(config, pane_id, "C-u").await, Ok(status) if status.success())
             && matches!(
-                tmux_paste_text(config, pane_id, "continue").await,
+                tmux_paste_text(config, pane_id, prompt).await,
                 Ok(status) if status.success()
             )
     } else {
         matches!(
-            tmux_send_keys(config, pane_id, "continue").await,
+            tmux_send_keys(config, pane_id, prompt).await,
             Ok(status) if status.success()
         )
     };
@@ -688,6 +690,12 @@ fn schedule_auto_continue(
         return None;
     }
     let pane_state = panes.get_or_insert(pane_id);
+    let backend = pane_state.runtime().backend();
+    let session_id = pane_state.identity.lock().unwrap().session_id.clone();
+    let prompt = match pane_state.opencode() {
+        Some(oc) => oc.last_prompt.lock().unwrap().clone()?,
+        None => "continue".to_string(),
+    };
     let policy = BackoffPolicy::from_config(&config.run);
     let now = tokio::time::Instant::now();
     let next = {
@@ -728,18 +736,25 @@ fn schedule_auto_continue(
             tokio::time::sleep(delay).await;
         }
 
-        let should_send = panes
-            .get(&pane_id)
-            .map(|state| {
-                state
+        // Revalidate after waiting for typing and transcript/hook updates.
+        // A manual send, interrupt, session switch, or newer failure can have
+        // superseded this attempt while it slept or waited for either lock.
+        let _typing = pane_state.type_mutex.lock().await;
+        let binding = pane_state.session_binding_mutex.lock().await;
+        let should_send = panes.get(&pane_id).is_some_and(|current| {
+            Arc::ptr_eq(&current, &pane_state)
+                && current.runtime().backend() == backend
+                && current.identity.lock().unwrap().session_id == session_id
+                && *current.detailed_state.lock().unwrap() == libslop::PaneDetailedState::Ready
+                && current
                     .retry_state
                     .lock()
                     .unwrap()
                     .as_ref()
                     .is_some_and(|retry| retry.matches(attempt, next_send_instant))
-            })
-            .unwrap_or(false);
+        });
         if !should_send {
+            pane_state.cancel_retry_if_current(attempt, next_send_instant);
             debug!(
                 "{}: pane {} retry state changed, cancelling auto-continue",
                 reason, pane_id
@@ -748,18 +763,14 @@ fn schedule_auto_continue(
         }
 
         debug!("{}: sending auto-continue to pane {}", reason, pane_id);
-        if let Some(pane) = panes.get(&pane_id) {
-            pane.expecting_auto_continue
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if submit_auto_continue(&config, &panes, &pane_id).await {
+        pane_state
+            .expecting_auto_continue
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(binding);
+        if submit_auto_continue(&config, &pane_state, &pane_id, &prompt).await {
             debug!("{}: auto-continue submitted to pane {}", reason, pane_id);
         } else {
-            if let Some(pane) = panes.get(&pane_id) {
-                pane.expecting_auto_continue
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                *pane.retry_state.lock().unwrap() = None;
-            }
+            pane_state.cancel_retry_if_current(attempt, next_send_instant);
             warn!(
                 "{}: auto-continue was not accepted by pane {}",
                 reason, pane_id
@@ -998,6 +1009,30 @@ impl PaneState {
         }
     }
 
+    fn cancel_retry(&self) {
+        *self.retry_state.lock().unwrap() = None;
+        if let Some(failure) = self.codex_failure.lock().unwrap().as_mut() {
+            failure.retry_schedule = None;
+        }
+        self.expecting_auto_continue
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cancel_retry_if_current(&self, attempt: u32, at: tokio::time::Instant) {
+        let mut retry = self.retry_state.lock().unwrap();
+        if retry
+            .as_ref()
+            .is_some_and(|retry| retry.matches(attempt, at))
+        {
+            *retry = None;
+            if let Some(failure) = self.codex_failure.lock().unwrap().as_mut() {
+                failure.retry_schedule = None;
+            }
+            self.expecting_auto_continue
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Merge a freshly-learned session id into the identity snapshot. Called
     /// wherever slopd binds/rebinds a session (SessionStart, opencode bind,
     /// fork pin) so a later death record names the right session.
@@ -1044,6 +1079,7 @@ impl PaneState {
     /// stops the SSE reader + backstop poll from reconnecting to a now-dead server
     /// forever; Claude panes only have the transcript tailer.
     fn cancel_drivers(&self) {
+        self.cancel_retry();
         self.transcript_cancel.lock().unwrap().cancel();
         self.runtime().cancel();
     }
@@ -1076,6 +1112,7 @@ async fn follow_opencode_session(
     let Some(state) = panes.get(pane_id) else {
         return false;
     };
+    let _typing = state.type_mutex.lock().await;
     {
         let mut runtime = state.runtime.lock().unwrap();
         let PaneRuntime::Opencode(oc) = &mut *runtime else {
@@ -1086,7 +1123,7 @@ async fn follow_opencode_session(
         }
         oc.session_id = selected.to_string();
         *oc.last_prompt.lock().unwrap() = None;
-        *state.retry_state.lock().unwrap() = None;
+        state.cancel_retry();
         state.note_session_id(selected);
         subagents.lock().unwrap().clear();
     }
@@ -1550,6 +1587,11 @@ async fn read_opencode_sse(
                 });
             }
 
+            // Keep the failure outcome and ready edge together before a retry
+            // validates the pane, including when its configured delay is zero.
+            let event_state = panes.get_or_insert(pane_id);
+            let _binding = event_state.session_binding_mutex.lock().await;
+
             // Side effects apply to the main session only (a subagent's internal
             // traffic isn't this pane's transcript/hooks). Emit terminal hooks
             // before their ready state edge so completion consumers see the
@@ -1558,7 +1600,7 @@ async fn read_opencode_sse(
                 // A clean turn end (session.idle) resets the auto-continue retry budget.
                 if opencode::event_type(&event) == Some("session.idle") {
                     let state = panes.get_or_insert(pane_id);
-                    *state.retry_state.lock().unwrap() = None;
+                    state.cancel_retry();
                     if let Some(oc) = state.opencode() {
                         // A TUI-local command can finish without ever creating a
                         // user message. Do not let its composer text leak into a
@@ -1580,7 +1622,7 @@ async fn read_opencode_sse(
                     if let Some(oc) = panes.get_or_insert(pane_id).opencode() {
                         *oc.pending_prompt.lock().unwrap() = None;
                     }
-                    schedule_opencode_auto_continue(pane_id, config, panes)
+                    schedule_auto_continue(pane_id, "opencode session.error", config, panes)
                 } else {
                     None
                 };
@@ -1589,11 +1631,19 @@ async fn read_opencode_sse(
                 // backends — opencode has no native hooks, so we emit hook-NAMED events
                 // derived from its bus).
                 if let Some((hook_name, mut payload)) = opencode::event_to_hook(&event) {
-                    if hook_name == "UserPromptSubmit"
-                        && let Some(oc) = panes.get_or_insert(pane_id).opencode()
-                        && let Some(prompt) = oc.pending_prompt.lock().unwrap().take()
-                    {
-                        *oc.last_prompt.lock().unwrap() = Some(prompt);
+                    if hook_name == "UserPromptSubmit" {
+                        let state = panes.get_or_insert(pane_id);
+                        let automatic = state
+                            .expecting_auto_continue
+                            .swap(false, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(oc) = state.opencode() {
+                            let pending = oc.pending_prompt.lock().unwrap().take();
+                            if !automatic {
+                                state.cancel_retry();
+                                *oc.last_prompt.lock().unwrap() = pending;
+                            }
+                        }
+                        state.prompt_submitted.notify_waiters();
                     }
                     if hook_name == "StopFailure" {
                         annotate_retry(&mut payload, retry_schedule);
@@ -1645,91 +1695,6 @@ fn extract_sse_data(block: &str) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
-}
-
-/// OpenCode analogue of Claude's `StopFailure` auto-continue: on a
-/// `session.error` event, re-send the last non-command prompt via `prompt_async`
-/// with exponential backoff, up to `[run] max_retry_attempts`. Mirrors the Claude
-/// retry path (`expecting_auto_continue` + `RetryState`) so a manual prompt or a
-/// later successful turn cancels a pending retry.
-fn schedule_opencode_auto_continue(
-    pane_id: &str,
-    config: &Arc<libslop::SlopdConfig>,
-    panes: &PaneMap,
-) -> Option<RetrySchedule> {
-    if !config.run.auto_continue_on_failure {
-        return None;
-    }
-    let pane_state = panes.get_or_insert(pane_id);
-    let oc = pane_state.opencode()?;
-    let prompt = oc.last_prompt.lock().unwrap().clone()?;
-    let policy = BackoffPolicy::from_config(&config.run);
-    let (attempt, send_at) = {
-        let mut guard = pane_state.retry_state.lock().unwrap();
-        match RetryState::next(guard.as_ref(), &policy, tokio::time::Instant::now()) {
-            Some(n) => {
-                let attempt = n.attempt_count;
-                let send_at = n.next_send_at;
-                *guard = Some(n);
-                (attempt, send_at)
-            }
-            None => {
-                *guard = None;
-                debug!(
-                    "opencode session.error: pane {} exceeded max retry attempts, giving up",
-                    pane_id
-                );
-                return None;
-            }
-        }
-    };
-    pane_state
-        .expecting_auto_continue
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-    let delay_ms = send_at
-        .saturating_duration_since(tokio::time::Instant::now())
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
-    let client = oc.client;
-    let session_id = oc.session_id;
-    let pid = pane_id.to_string();
-    let panes = panes.clone();
-    tokio::spawn(async move {
-        let delay = send_at.saturating_duration_since(tokio::time::Instant::now());
-        if !delay.is_zero() {
-            debug!(
-                "opencode session.error: pane {} will retry in {:?}",
-                pid, delay
-            );
-            tokio::time::sleep(delay).await;
-        }
-        // Re-validate the retry is still current (a manual prompt or a successful
-        // turn resets retry_state / clears the last prompt).
-        let still_valid = panes
-            .get(&pid)
-            .map(|s| {
-                s.retry_state
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|r| r.matches(attempt, send_at))
-            })
-            .unwrap_or(false);
-        if !still_valid {
-            return;
-        }
-        debug!(
-            "opencode session.error: retrying pane {} (attempt {})",
-            pid, attempt
-        );
-        if client.send_message(&session_id, &prompt).await.is_ok()
-            && let Some(s) = panes.get(&pid)
-        {
-            s.prompt_submitted.notify_waiters();
-        }
-    });
-    Some(RetrySchedule { attempt, delay_ms })
 }
 
 /// Tail a transcript .jsonl file, broadcasting each new JSON record as an event.
@@ -1895,7 +1860,21 @@ async fn tail_transcript(
 
                         let live_record = line_start >= live_boundary;
                         if backend == libslop::Backend::Codex {
+                            let recovering =
+                                !live_record && pane_state.retry_state.lock().unwrap().is_none();
                             if let Some(failure) = codex::task_failure(&record) {
+                                #[cfg(feature = "testing")]
+                                if live_record
+                                    && let Some(gate) =
+                                        std::env::var_os("SLOPD_TEST_CODEX_FAILURE_GATE")
+                                {
+                                    while !tokio::fs::try_exists(&gate).await.unwrap_or(false) {
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => return,
+                                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                                        }
+                                    }
+                                }
                                 let schedule = if live_record && failure.retryable {
                                     schedule_auto_continue(
                                         &pane_id,
@@ -1906,13 +1885,15 @@ async fn tail_transcript(
                                 } else {
                                     None
                                 };
-                                *pane_state.codex_failure.lock().unwrap() =
-                                    Some(CodexFailureState {
-                                        cursor: line_start,
-                                        retry_schedule: schedule,
-                                    });
+                                if live_record || recovering {
+                                    *pane_state.codex_failure.lock().unwrap() =
+                                        Some(CodexFailureState {
+                                            cursor: line_start,
+                                            retry_schedule: schedule,
+                                        });
+                                }
                                 if live_record && !failure.retryable {
-                                    *pane_state.retry_state.lock().unwrap() = None;
+                                    pane_state.cancel_retry();
                                 }
                                 if live_record {
                                     let session_id =
@@ -1936,8 +1917,12 @@ async fn tail_transcript(
                                     });
                                 }
                             } else if codex::task_completed_successfully(&record) {
-                                *pane_state.codex_failure.lock().unwrap() = None;
-                                *pane_state.retry_state.lock().unwrap() = None;
+                                if live_record || recovering {
+                                    *pane_state.codex_failure.lock().unwrap() = None;
+                                }
+                                if live_record {
+                                    pane_state.cancel_retry();
+                                }
                             }
                         }
 
@@ -5779,7 +5764,22 @@ async fn handle_request(
             }
 
             let pane_state = panes.get_or_insert(pane);
-            let binding_guard = pane_state.session_binding_mutex.lock().await;
+            // Serialize an actual session switch with retry delivery. Matching
+            // startup hooks must remain free to acknowledge an in-flight send.
+            let previous_session = pane_state.identity.lock().unwrap().session_id.clone();
+            let switching = event == "SessionStart"
+                && previous_session.as_deref().is_some_and(|previous| {
+                    payload
+                        .get("session_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|next| next != previous)
+                });
+            let _typing = if switching {
+                Some(pane_state.type_mutex.lock().await)
+            } else {
+                None
+            };
+            let _binding_guard = pane_state.session_binding_mutex.lock().await;
             let hook_backend = pane_state.runtime().backend();
             let mut payload = if hook_backend == libslop::Backend::Grok {
                 grok::normalize_hook_payload(payload)
@@ -5908,6 +5908,12 @@ async fn handle_request(
                 });
                 if let Some(session_id) = session_id {
                     debug!("SessionStart: pane={} session_id={}", pane, session_id);
+                    if bound_session_id
+                        .as_deref()
+                        .is_some_and(|old| old != session_id)
+                    {
+                        pane_state.cancel_retry();
+                    }
                     pane_state.note_session_id(&session_id);
                     if let Err(e) = tmux_set_pane_option(
                         config,
@@ -5928,7 +5934,6 @@ async fn handle_request(
                     .store(true, std::sync::atomic::Ordering::Release);
                 pane_state.session_started_notify.notify_waiters();
             }
-            drop(binding_guard);
             if event == "UserPromptSubmit" {
                 debug!(
                     "UserPromptSubmit: notifying pending senders for pane {}",
@@ -5953,13 +5958,17 @@ async fn handle_request(
                 if pane_state
                     .expecting_auto_continue
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    && payload
+                        .get("prompt")
+                        .and_then(|value| value.as_str())
+                        .is_none_or(|prompt| prompt == "continue")
                 {
                     debug!(
                         "UserPromptSubmit: pane {} is slopd's auto-continue, preserving retry counter",
                         pane
                     );
                 } else {
-                    *pane_state.retry_state.lock().unwrap() = None;
+                    pane_state.cancel_retry();
                 }
             }
             if hook_backend == libslop::Backend::Grok && event == "PreCompact" {
@@ -5996,7 +6005,7 @@ async fn handle_request(
             // that Ready edge for successful completion.
             let mut failure_emitted = false;
             if !stale_grok_terminal && event == "Stop" {
-                *panes.get_or_insert(pane).retry_state.lock().unwrap() = None;
+                panes.get_or_insert(pane).cancel_retry();
             } else if !stale_grok_terminal && event == "StopFailure" {
                 let schedule = schedule_auto_continue(pane, "StopFailure", config, panes);
                 annotate_retry(&mut payload, schedule);
@@ -6836,6 +6845,7 @@ async fn handle_request(
                 };
             }
             let state = panes.get_or_insert(&pane_id);
+            state.cancel_retry();
             let send_transport = state.runtime().send_transport();
             if let SendTransport::Unavailable(backend) = send_transport {
                 return libslop::ResponseBody::Error {
@@ -6917,7 +6927,7 @@ async fn handle_request(
                 // slash-command interpretation belongs exclusively to OpenCode.
                 *oc.last_prompt.lock().unwrap() = None;
                 *oc.pending_prompt.lock().unwrap() = Some(prompt.clone());
-                *state.retry_state.lock().unwrap() = None;
+                state.cancel_retry();
 
                 let inserted = if oc.client.v2 {
                     // V2 removed the composer HTTP routes. Clear the whole input
@@ -7024,7 +7034,7 @@ async fn handle_request(
                 }
 
                 let _guard = state.type_mutex.lock().await;
-                *state.retry_state.lock().unwrap() = None;
+                state.cancel_retry();
                 *state.grok_pending_prompt.lock().unwrap() = Some(prompt.clone());
                 let submitted = state.prompt_submitted.notified();
                 let response = match client.prompt(&prompt).await {
@@ -7295,6 +7305,8 @@ async fn handle_request(
                 };
             }
             let state = panes.get_or_insert(&pane_id);
+            state.cancel_retry();
+            let _guard = state.type_mutex.lock().await;
 
             if let Some(result) = state.runtime().interrupt().await {
                 return match result {
@@ -7302,9 +7314,6 @@ async fn handle_request(
                     Err(message) => libslop::ResponseBody::Error { message },
                 };
             }
-
-            // Acquire the type-mutex so we don't interleave with concurrent sends.
-            let _guard = state.type_mutex.lock().await;
 
             if matches!(
                 state.runtime().backend(),
@@ -7759,6 +7768,10 @@ async fn handle_request(
                             let records = records
                                 .into_iter()
                                 .map(|(cursor, event_type, mut payload)| {
+                                    // A newly appended failure can be read before
+                                    // the tailer has classified it. Keep that
+                                    // outcome unknown until its disposition is
+                                    // available instead of reporting it terminal.
                                     if event_type == "turn_failed"
                                         && let Some(failure) = codex_failure
                                         && failure.cursor == cursor
@@ -8125,6 +8138,67 @@ mod tests {
             "PreToolUse",
             &payload
         ));
+    }
+
+    #[tokio::test]
+    async fn historical_codex_records_cannot_cancel_a_live_retry() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"codex_error_info\":\"usage_limit_exceeded\"}}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"replay barrier\"}]}}\n",
+        )).unwrap();
+        let panes = PaneMap::new();
+        let state = panes.get_or_insert("%0");
+        state.set_runtime(PaneRuntime::Codex(CodexState));
+        let pending =
+            RetryState::next(None, &policy(8, 1000, 1000), tokio::time::Instant::now()).unwrap();
+        *state.retry_state.lock().unwrap() = Some(pending.clone());
+        *state.codex_failure.lock().unwrap() = Some(CodexFailureState {
+            cursor: 9999,
+            retry_schedule: Some(RetrySchedule {
+                attempt: 1,
+                delay_ms: 1000,
+            }),
+        });
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut config = libslop::SlopdConfig::default();
+        config.tmux.socket = Some(dir.path().join("nonexistent.sock"));
+        let task = tokio::spawn(tail_transcript(
+            path,
+            "%0".to_string(),
+            state.clone(),
+            Arc::new(config),
+            panes,
+            Arc::new(tx),
+            cancel.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                if event.event_type == "agentMessage" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(
+            state
+                .retry_state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .matches(1, pending.next_send_at)
+        );
+        let failure = state.codex_failure.lock().unwrap().unwrap();
+        assert_eq!(failure.cursor, 9999);
+        assert!(failure.retry_schedule.is_some());
     }
 
     #[tokio::test]

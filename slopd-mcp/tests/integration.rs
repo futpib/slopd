@@ -1765,7 +1765,7 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
         json!({ "account": "codex", "backend": "codex", "ready_timeout": 20 }),
     )
     .await;
-    let usage_pane_id = tool_payload(&created)["pane_id"]
+    let terminal_pane_id = tool_payload(&created)["pane_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1778,7 +1778,7 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
         wait_session.as_deref(),
         174,
         "wait_for_reply",
-        json!({ "pane_id": usage_pane_id.clone(), "timeout": 10 }),
+        json!({ "pane_id": terminal_pane_id.clone(), "timeout": 10 }),
     );
     let send = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1789,19 +1789,19 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
             send_session.as_deref(),
             175,
             "send_prompt",
-            json!({ "pane_id": usage_pane_id.clone(), "prompt": "FAIL_USAGE_LIMIT" }),
+            json!({ "pane_id": terminal_pane_id.clone(), "prompt": "FAIL_AUTHENTICATION" }),
         )
         .await
     };
     let (failed, sent) = tokio::join!(wait, send);
-    assert_eq!(tool_payload(&sent)["pane_ids"], json!([usage_pane_id]));
+    assert_eq!(tool_payload(&sent)["pane_ids"], json!([terminal_pane_id]));
     assert_eq!(failed["result"]["isError"], true, "{failed}");
     let failure = tool_payload(&failed);
     assert!(
         failure["message"]
             .as_str()
-            .is_some_and(|message| message.contains("usage_limit_exceeded")
-                && message.contains("usage limit")),
+            .is_some_and(|message| message.contains("authentication_error")
+                && message.contains("Authentication failed")),
         "{failure}"
     );
 
@@ -1815,7 +1815,7 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
         json!({
             "account": "codex",
             "backend": "codex",
-            "prompt": "FAIL_CAPACITY_ONCE",
+            "prompt": "FAIL_USAGE_LIMIT_ONCE",
             "new_agent": true,
             "wait_seconds": 10
         }),
@@ -1835,7 +1835,7 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
         json!({
             "account": "codex",
             "backend": "codex",
-            "prompt": "FAIL_USAGE_LIMIT",
+            "prompt": "FAIL_AUTHENTICATION",
             "new_agent": true,
             "wait_seconds": 10
         }),
@@ -1844,9 +1844,10 @@ async fn codex_wait_for_reply_crosses_retry_and_reports_terminal_failure() {
     let terminal = tool_payload(&terminal);
     assert_eq!(terminal["status"], "failed", "{terminal}");
     assert!(
-        terminal["error"].as_str().is_some_and(
-            |error| error.contains("usage_limit_exceeded") && error.contains("usage limit")
-        ),
+        terminal["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("authentication_error")
+                && error.contains("Authentication failed")),
         "{terminal}"
     );
 }

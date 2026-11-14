@@ -321,6 +321,7 @@ fn retryable_error_code(code: &str) -> bool {
         "server_overloaded"
             | "server_is_overloaded"
             | "rate_limit_exceeded"
+            | "usage_limit_exceeded"
             | "slow_down"
             | "connection_failed"
             | "http_connection_failed"
@@ -465,6 +466,7 @@ mod tests {
         for code in [
             "server_overloaded",
             "rate_limit_exceeded",
+            "usage_limit_exceeded",
             "connection_failed",
             "response_stream_connection_failed",
             "response_stream_disconnected",
@@ -489,7 +491,6 @@ mod tests {
         }
 
         for code in [
-            "usage_limit_exceeded",
             "session_budget_exceeded",
             "cyber_policy",
             "bio_policy",

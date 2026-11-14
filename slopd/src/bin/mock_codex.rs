@@ -369,6 +369,8 @@ fn main() {
     let mut in_bracketed_paste = false;
     let mut saw_bracketed_paste = false;
     let mut capacity_failed_once = false;
+    let mut quota_failures_remaining = 0;
+    let mut busy_after_quota = false;
     println!("mock Codex session: {session_id}");
     loop {
         match stdin.read(&mut byte) {
@@ -527,7 +529,16 @@ fn main() {
                     continue;
                 }
 
-                if prompt == "FAIL_USAGE_LIMIT" {
+                if prompt != "continue" {
+                    quota_failures_remaining = match prompt.as_str() {
+                        "FAIL_USAGE_LIMIT" => u32::MAX,
+                        "FAIL_USAGE_LIMIT_ONCE" | "FAIL_USAGE_LIMIT_THEN_BUSY" => 1,
+                        _ => 0,
+                    };
+                    busy_after_quota = prompt == "FAIL_USAGE_LIMIT_THEN_BUSY";
+                }
+                if quota_failures_remaining > 0 {
+                    quota_failures_remaining -= 1;
                     write_record(
                         &transcript,
                         json!({
@@ -542,6 +553,23 @@ fn main() {
                                 }
                             }
                         }),
+                    );
+                    continue;
+                }
+
+                if prompt == "continue" && busy_after_quota {
+                    active = true;
+                    busy_after_quota = false;
+                    continue;
+                }
+
+                if prompt == "FAIL_AUTHENTICATION" {
+                    write_record(
+                        &transcript,
+                        json!({"type":"event_msg","payload":{
+                            "type":"task_complete", "turn_id":"mock-authentication-turn",
+                            "error":{"message":"Authentication failed.","codex_error_info":"authentication_error"}
+                        }}),
                     );
                     continue;
                 }

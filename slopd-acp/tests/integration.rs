@@ -476,13 +476,17 @@ fn codex_acp_waits_for_transient_retry_and_reports_terminal_failure() {
     assert_eq!(completed["result"]["stopReason"], "end_turn", "{completed}");
     assert_eq!(streamed_text(&notifications), "mock response: continue");
 
-    let (failed, notifications) = prompt(&mut harness, 4, &session_id, "FAIL_USAGE_LIMIT");
+    let (recovered, notifications) = prompt(&mut harness, 4, &session_id, "FAIL_USAGE_LIMIT_ONCE");
+    assert_eq!(recovered["result"]["stopReason"], "end_turn", "{recovered}");
+    assert_eq!(streamed_text(&notifications), "mock response: continue");
+
+    let (failed, notifications) = prompt(&mut harness, 5, &session_id, "FAIL_AUTHENTICATION");
     assert!(notifications.is_empty(), "{notifications:?}");
     assert!(
         failed["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("usage_limit_exceeded")
-                && message.contains("usage limit")),
+            .is_some_and(|message| message.contains("authentication_error")
+                && message.contains("Authentication failed")),
         "{failed}"
     );
 }

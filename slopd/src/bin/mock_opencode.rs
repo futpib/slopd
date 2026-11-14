@@ -270,6 +270,13 @@ fn run_tui(state: Arc<Mutex<MockState>>) {
                     .to_string(),
                 );
             }
+            0x15 => state.lock().unwrap().prompt.clear(),
+            0x7f => {
+                state.lock().unwrap().prompt.pop();
+            }
+            value if value.is_ascii_graphic() || value == b' ' => {
+                state.lock().unwrap().prompt.push(char::from(value));
+            }
             _ => {}
         }
     }

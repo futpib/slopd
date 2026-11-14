@@ -1334,12 +1334,13 @@ that backend's normal confirmed transport after an exponential backoff.
 OpenCode's corresponding `session.error` path re-submits the last accepted
 non-command prompt. Codex failures arrive in the rollout's structured
 `task_complete.error`; slopd normalizes them to the same `StopFailure` event and
-sends `continue` for transient failures. All retry until the turn succeeds or
-the attempt cap is reached.
+sends `continue` for retryable failures, including usage limits. All retry until
+the turn succeeds or the attempt cap is reached.
 
 Codex retry classification uses `codex_error_info`, not the displayed English
 message. Capacity/overload, throttling, connection, timeout, service, and
-internal-server failures are transient. Usage limits, policy refusals,
+internal-server failures are transient. Usage-limit failures also use the same
+bounded backoff, allowing a recovered quota to resume the turn. Policy refusals,
 authentication, invalid requests, context limits, sandbox failures, version
 mismatches, and unknown codes are surfaced but not retried. The older
 `other`-coded "stream disconnected before completion" condition remains
@@ -1364,7 +1365,8 @@ still active. Retrying stops as soon as any of these happens:
 
 - the turn succeeds (`Stop`, Codex `task_complete`, or `session.idle`) — the counter resets;
 - `max_retry_attempts` consecutive failures are reached — slopd gives up and leaves the pane idle;
-- you submit a prompt yourself — taking over cancels any pending retry.
+- you submit a prompt yourself — taking over cancels any pending retry;
+- you interrupt the pane or switch its session — pending retries are cancelled.
 
 All of this is configurable (or disabled) under `[run]` — see `auto_continue_on_failure`, `max_retry_attempts`, `initial_backoff_ms`, and `max_backoff_ms` in [slopd config](#slopd-config). With the defaults (8 attempts, 1s backoff doubling uncapped) a persistently-failing turn is retried over ~4m15s before slopd stops.
 

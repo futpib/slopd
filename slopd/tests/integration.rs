@@ -14653,6 +14653,307 @@ fn fork_opencode_pane_binds_new_pane_to_forked_session() {
 }
 
 #[test]
+#[cfg(feature = "testing")]
+fn codex_unprocessed_quota_failure_is_not_reported_as_terminal() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new_with_auto_continue(None, None, 8, 20, 40).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-queued-failure]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        cargo_bin("mock_codex"), home.path(),
+    ));
+    let gate = home.path().join("classify-failure");
+    let daemon =
+        env.spawn_slopd_with_envs(&[("SLOPD_TEST_CODEX_FAILURE_GATE", gate.to_str().unwrap())]);
+    let output = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "codex-queued-failure",
+        "--ready-timeout",
+        "20",
+    ]);
+    assert!(output.status.success(), "run: {output:?}");
+    let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    let listener = spawn_hook_listener(&env, "StopFailure");
+    assert!(
+        env.slopctl(&["send", &pane, "FAIL_USAGE_LIMIT_ONCE"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pending = loop {
+        let output = env.slopctl(&["transcript", &pane, "--limit", "50"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if let Some(failure) = value["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["event_type"] == "turn_failed")
+        {
+            break failure.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unprocessed failure never became readable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::write(&gate, "classify").unwrap();
+    assert_eq!(pending["payload"]["retryable"], true);
+    assert!(
+        pending["payload"].get("retry_scheduled").is_none(),
+        "unprocessed failure was prematurely terminal: {pending}"
+    );
+    let failure = wait_for_event(listener, |_| true);
+    assert_eq!(failure["payload"]["retry_scheduled"], true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = env.slopctl(&["transcript", &pane, "--limit", "50"]);
+        if String::from_utf8_lossy(&output.stdout).contains("mock response: continue") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "classified quota retry never completed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    kill_slopd(daemon);
+}
+
+#[test]
+fn codex_quota_retries_recover_stop_at_eight_and_do_not_replay() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new_with_auto_continue(None, None, 8, 20, 40).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-quota]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        cargo_bin("mock_codex"),
+        home.path(),
+    ));
+    let daemon = env.spawn_slopd();
+    let run = || {
+        let output = env.slopctl_raw(&["run", "--account", "codex-quota", "--ready-timeout", "20"]);
+        assert!(output.status.success(), "run: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let records = |pane: &str| {
+        let output = env.slopctl(&["transcript", pane, "--limit", "100"]);
+        assert!(output.status.success(), "transcript: {output:?}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["records"].as_array().unwrap().clone()
+    };
+    let continues = |records: &[serde_json::Value]| {
+        records
+            .iter()
+            .filter(|record| {
+                record["event_type"] == "userMessage" && record["payload"]["text"] == "continue"
+            })
+            .count()
+    };
+
+    let recovered = run();
+    let listener = spawn_hook_listener(&env, "StopFailure");
+    assert!(
+        env.slopctl(&["send", &recovered, "FAIL_USAGE_LIMIT_ONCE"])
+            .status
+            .success()
+    );
+    let failure = wait_for_event(listener, |_| true);
+    assert_eq!(failure["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(failure["payload"]["retryable"], true);
+    assert_eq!(failure["payload"]["retry_attempt"], 1);
+    assert_eq!(failure["payload"]["retry_in_ms"], 20);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if records(&recovered)
+            .iter()
+            .any(|record| record["payload"]["text"] == "mock response: continue")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "quota never recovered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_until_ready(&env, &recovered, Duration::from_secs(5));
+    assert_eq!(continues(&records(&recovered)), 1);
+
+    let busy = run();
+    assert!(
+        env.slopctl(&["send", &busy, "FAIL_USAGE_LIMIT_THEN_BUSY"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while continues(&records(&busy)) == 0 {
+        assert!(Instant::now() < deadline, "quota retry never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        continues(&records(&busy)),
+        1,
+        "active retry received duplicate continues"
+    );
+    assert_eq!(env.pane_state(&busy).0, libslop::PaneState::Busy);
+    assert!(env.slopctl(&["interrupt", &busy]).status.success());
+
+    let capped = run();
+    let listener = spawn_hook_listener(&env, "StopFailure");
+    assert!(
+        env.slopctl(&["send", &capped, "FAIL_USAGE_LIMIT"])
+            .status
+            .success()
+    );
+    let terminal = wait_for_event(listener, |event| {
+        event["payload"]["retry_scheduled"] == false
+    });
+    assert_eq!(terminal["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(terminal["payload"]["retryable"], true);
+    wait_until_ready(&env, &capped, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(200));
+    let capped_records = records(&capped);
+    assert_eq!(
+        continues(&capped_records),
+        8,
+        "quota retry cap: {capped_records:?}"
+    );
+    assert_eq!(
+        capped_records
+            .iter()
+            .filter(|record| record["event_type"] == "turn_failed")
+            .count(),
+        9
+    );
+    assert_eq!(
+        capped_records.last().unwrap()["payload"]["retry_scheduled"],
+        false
+    );
+
+    // Reattach to an exhausted failure as historical state. Its outcome remains
+    // explicitly terminal for late readers and cannot schedule another retry.
+    kill_slopd(daemon);
+    let daemon = env.spawn_slopd();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let after = records(&capped);
+        if after.last().unwrap()["payload"]["retry_scheduled"] == false {
+            assert_eq!(continues(&after), 8);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "historical failure lost terminal metadata"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        continues(&records(&capped)),
+        8,
+        "restart replay resubmitted a historical quota failure"
+    );
+    assert_eq!(continues(&records(&recovered)), 1);
+    kill_slopd(daemon);
+}
+
+#[test]
+fn codex_pending_quota_retry_yields_to_manual_input_interrupt_and_session_changes() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_codex");
+    let home = tempfile::tempdir().unwrap();
+    let env = TestEnv::new_with_auto_continue(None, None, 8, 700, 700).expect("tmux required");
+    env.append_config(&format!(
+        "\n[accounts.codex-cancel]\nbackend = \"codex\"\nexecutable = {:?}\nconfig_dir = {:?}\n",
+        cargo_bin("mock_codex"),
+        home.path(),
+    ));
+    let daemon = env.spawn_slopd();
+    let mut tested = Vec::new();
+    for action in ["send", "native", "interrupt", "session", "busy"] {
+        let output =
+            env.slopctl_raw(&["run", "--account", "codex-cancel", "--ready-timeout", "20"]);
+        assert!(output.status.success(), "run: {output:?}");
+        let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let listener = spawn_hook_listener(&env, "StopFailure");
+        assert!(
+            env.slopctl(&["send", &pane, "FAIL_USAGE_LIMIT"])
+                .status
+                .success()
+        );
+        let failure = wait_for_event(listener, |_| true);
+        assert_eq!(failure["payload"]["retry_scheduled"], true);
+        wait_until_ready(&env, &pane, Duration::from_secs(5));
+        let panes: Vec<libslop::PaneInfo> =
+            serde_json::from_slice(&env.slopctl(&["ps", "--json"]).stdout).unwrap();
+        let info = panes.iter().find(|entry| entry.pane_id == pane).unwrap();
+        match action {
+            "send" => assert!(
+                env.slopctl(&["send", &pane, "manual takeover"])
+                    .status
+                    .success()
+            ),
+            "native" => assert!(
+                env.tmux
+                    .tmux()
+                    .args(["send-keys", "-t", &pane, "native takeover", "Enter"])
+                    .status()
+                    .unwrap()
+                    .success()
+            ),
+            "interrupt" => assert!(env.slopctl(&["interrupt", &pane]).status.success()),
+            "session" => {
+                let payload = serde_json::json!({"session_id":"replacement-session","transcript_path":info.transcript_path});
+                assert!(
+                    fire_hook(&env, "SessionStart", &payload.to_string(), Some(&pane))
+                        .status
+                        .success()
+                );
+            }
+            "busy" => {
+                let payload = serde_json::json!({"session_id":info.session_id});
+                assert!(
+                    fire_hook(&env, "PreToolUse", &payload.to_string(), Some(&pane))
+                        .status
+                        .success()
+                );
+            }
+            _ => unreachable!(),
+        }
+        tested.push((pane, action));
+    }
+    std::thread::sleep(Duration::from_millis(900));
+    for (pane, action) in tested {
+        let output = env.slopctl(&["transcript", &pane, "--limit", "100"]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let records = value["records"].as_array().unwrap();
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["event_type"] == "userMessage"
+                    && record["payload"]["text"] == "continue"),
+            "{action} failed to cancel: {value}"
+        );
+        if action == "interrupt" || action == "session" || action == "busy" {
+            let failure = records
+                .iter()
+                .find(|record| record["event_type"] == "turn_failed")
+                .unwrap();
+            assert_eq!(
+                failure["payload"]["retry_scheduled"], false,
+                "{action} left stale retry metadata"
+            );
+        }
+    }
+    kill_slopd(daemon);
+}
+
+#[test]
 fn codex_child_hooks_preserve_parent_transcript_state_and_failure() {
     build_bin("slopd");
     build_bin("slopctl");
@@ -14756,16 +15057,16 @@ fn codex_child_hooks_preserve_parent_transcript_state_and_failure() {
     );
 
     assert!(
-        env.slopctl(&["send", &pane, "FAIL_USAGE_LIMIT"])
+        env.slopctl(&["send", &pane, "FAIL_AUTHENTICATION"])
             .status
             .success()
     );
     let failure = wait_for_event(failure_listener, |_| true);
     assert_eq!(
-        failure["payload"]["turn_id"], "mock-usage-limit-turn",
+        failure["payload"]["turn_id"], "mock-authentication-turn",
         "child failure entered the parent's event stream"
     );
-    assert_eq!(failure["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(failure["payload"]["error_code"], "authentication_error");
     assert_eq!(failure["payload"]["retry_scheduled"], false);
     let deadline = Instant::now() + Duration::from_secs(5);
     while env.pane_state(&pane).1 != libslop::PaneDetailedState::Ready {
@@ -14795,7 +15096,10 @@ fn codex_child_hooks_preserve_parent_transcript_state_and_failure() {
         .filter(|record| record["event_type"] == "turn_failed")
         .collect();
     assert_eq!(failures.len(), 1, "parent transcript: {transcript}");
-    assert_eq!(failures[0]["payload"]["turn_id"], "mock-usage-limit-turn");
+    assert_eq!(
+        failures[0]["payload"]["turn_id"],
+        "mock-authentication-turn"
+    );
     assert!(env.slopctl(&["backup"]).status.success());
     let checkpoint = latest_lifecycle_checkpoint(&env);
     let saved = checkpoint
@@ -14808,7 +15112,7 @@ fn codex_child_hooks_preserve_parent_transcript_state_and_failure() {
 }
 
 #[test]
-fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
+fn codex_capacity_retries_and_authentication_failures_remain_terminal() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -14910,35 +15214,35 @@ fn codex_failures_use_stop_failure_and_retry_only_transient_errors() {
     };
     wait_for_ready(&capacity_pane);
 
-    let usage_pane = run_codex();
+    let terminal_pane = run_codex();
     let listener = spawn_hook_listener(&env, "StopFailure");
-    let send = env.slopctl(&["send", &usage_pane, "FAIL_USAGE_LIMIT"]);
+    let send = env.slopctl(&["send", &terminal_pane, "FAIL_AUTHENTICATION"]);
     assert!(
         send.status.success(),
-        "usage-limit prompt was not accepted: {send:?}"
+        "authentication prompt was not accepted: {send:?}"
     );
-    let usage_id = usage_pane.clone();
+    let terminal_id = terminal_pane.clone();
     let event = wait_for_event(listener, move |event| {
-        event["pane_id"] == usage_id && event["event_type"] == "StopFailure"
+        event["pane_id"] == terminal_id && event["event_type"] == "StopFailure"
     });
-    assert_eq!(event["payload"]["error_code"], "usage_limit_exceeded");
+    assert_eq!(event["payload"]["error_code"], "authentication_error");
     assert_eq!(event["payload"]["retryable"], false);
     assert_eq!(event["payload"]["retry_scheduled"], false);
 
     std::thread::sleep(Duration::from_millis(300));
-    let transcript = env.slopctl(&["transcript", &usage_pane, "--limit", "50"]);
+    let transcript = env.slopctl(&["transcript", &terminal_pane, "--limit", "50"]);
     assert!(transcript.status.success());
     let transcript: serde_json::Value = serde_json::from_slice(&transcript.stdout).unwrap();
-    let usage_records = transcript["records"].as_array().unwrap();
-    assert!(usage_records.iter().any(|record| {
+    let terminal_records = transcript["records"].as_array().unwrap();
+    assert!(terminal_records.iter().any(|record| {
         record["event_type"] == "turn_failed"
-            && record["payload"]["error_code"] == "usage_limit_exceeded"
+            && record["payload"]["error_code"] == "authentication_error"
             && record["payload"]["retry_scheduled"] == false
     }));
-    assert!(!usage_records.iter().any(|record| {
+    assert!(!terminal_records.iter().any(|record| {
         record["event_type"] == "userMessage" && record["payload"]["text"] == "continue"
     }));
-    wait_for_ready(&usage_pane);
+    wait_for_ready(&terminal_pane);
 
     kill_slopd(slopd);
 }
@@ -18125,6 +18429,64 @@ fn opencode_listen_transcript_streams_live_over_sse() {
 }
 
 #[test]
+fn opencode_pending_retry_yields_to_native_input_and_interrupt() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_opencode");
+    let mock = cargo_bin("mock_opencode");
+    let env = TestEnv::new_with_auto_continue(Some(&[mock.to_str().unwrap()]), None, 8, 700, 700)
+        .expect("tmux required");
+    let daemon = env.spawn_slopd();
+    let mut panes = Vec::new();
+    for action in ["native", "interrupt"] {
+        let output = env.slopctl_raw(&["run", "--backend", "opencode", "--ready-timeout", "20"]);
+        assert!(output.status.success(), "run: {output:?}");
+        let pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let listener = spawn_hook_listener(&env, "StopFailure");
+        assert!(
+            env.slopctl(&["send", &pane, "::mock fail once"])
+                .status
+                .success()
+        );
+        let failure = wait_for_event(listener, |_| true);
+        assert_eq!(failure["payload"]["retry_scheduled"], true);
+        wait_until_ready(&env, &pane, Duration::from_secs(5));
+        if action == "native" {
+            let listener = spawn_hook_listener(&env, "UserPromptSubmit");
+            assert!(
+                env.tmux
+                    .tmux()
+                    .args(["send-keys", "-t", &pane, "manual takeover", "Enter"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            wait_for_event(listener, |_| true);
+        } else {
+            assert!(env.slopctl(&["interrupt", &pane]).status.success());
+        }
+        panes.push((pane, action));
+    }
+    std::thread::sleep(Duration::from_millis(900));
+    for (pane, action) in panes {
+        let transcript = env.slopctl(&["transcript", &pane, "--limit", "100"]);
+        assert!(transcript.status.success(), "transcript: {transcript:?}");
+        let text = String::from_utf8(transcript.stdout).unwrap();
+        assert!(
+            !text.contains("echo: ::mock fail once"),
+            "{action} failed to cancel the pending retry: {text}"
+        );
+        if action == "native" {
+            assert!(
+                text.contains("echo: manual takeover"),
+                "manual prompt missing: {text}"
+            );
+        }
+    }
+    kill_slopd(daemon);
+}
+
+#[test]
 fn opencode_auto_continues_after_session_error() {
     // A "::mock fail once" prompt fails the first time (session.error); slopd's auto-continue
     // retries it, the retry succeeds, and the assistant reply lands — exercising
@@ -18133,7 +18495,7 @@ fn opencode_auto_continues_after_session_error() {
     build_bin("mock_opencode");
     let mock_path = cargo_bin("mock_opencode").to_str().unwrap().to_string();
     // Fast backoff so the retry lands within the test window.
-    let env = TestEnv::new_with_auto_continue(Some(&[mock_path.as_str()]), None, 3, 50, 200)
+    let env = TestEnv::new_with_auto_continue(Some(&[mock_path.as_str()]), None, 3, 0, 0)
         .expect("tmux required");
     let slopd = env.spawn_slopd();
     let pane_id =
