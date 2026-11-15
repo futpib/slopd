@@ -69,20 +69,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags"
-          python3 - <<'PY'
-          import datetime
-          import os
-          import re
-          from pathlib import Path
-          tags = Path(os.environ['RUNNER_TEMP'], 'release-tags').read_text().splitlines()
-          codes = [int(match[1]) for tag in tags if (match := re.fullmatch(r'android-.+\+([0-9]+)', tag))]
-          code = max([1, *codes]) + 1
-          if code > 999999999:
-              raise SystemExit('Android version code exhausted')
-          name = datetime.datetime.now(datetime.timezone.utc).strftime('%y.%m.%d.%H.%M')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'name={name}\ncode={code}\ntag=android-{name}+{code}\n')
-          PY
+          dart scripts/release_version.dart "$RUNNER_TEMP/release-tags" "$GITHUB_OUTPUT"
 
       - name: Build signed APKs
         env:

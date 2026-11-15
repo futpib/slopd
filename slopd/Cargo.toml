@@ -33,6 +33,7 @@ libslopctl = { path = "../libslopctl" }
 libslop = { path = "../libslop" }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+axum = "0.8"
 
 [lints]
 workspace = true

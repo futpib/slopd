@@ -75,6 +75,11 @@ it separately. Release builds require a persistent signing key through
 `KEYSTORE_PATH` and `KEYSTORE_PASSWORD`; `scripts/build-release.sh` creates a
 universal APK, per-architecture APKs, and `SHA256SUMS`.
 
+`flutter test` builds the Rust `libsloptest` SSH authentication fixture with
+Cargo. It exercises both password and multi-round keyboard-interactive login
+over a real loopback SSH connection. Set `SSH_AUTH_SERVER` to use an already
+built fixture executable.
+
 The manually triggered **Build Android APK** workflow requires the GitHub
 Actions secret `KEYSTORE_BASE64`. It uses the `release` alias and `android`
 passwords of the existing `iroh-ssh-android` release keystore. Keep this

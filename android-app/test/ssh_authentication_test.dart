@@ -1,3 +1,6 @@
+@Timeout(Duration(minutes: 10))
+library;
+
 import 'dart:convert';
 import 'dart:io';
 
@@ -6,14 +9,45 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:slopd_control/control.dart';
 
 void main() {
-  test('uses server prompts and falls back for password-only SSH', () async {
-    final python = Platform.environment['SSH_AUTH_PYTHON'] ?? 'python3';
-    final server = await Process.start(python, [
-      'test/fixtures/ssh_auth_server.py',
+  late String executable;
+  setUpAll(() async {
+    final configured = Platform.environment['SSH_AUTH_SERVER'];
+    if (configured != null) {
+      executable = configured;
+      return;
+    }
+    final build = await Process.run('cargo', [
+      'build',
+      '--manifest-path',
+      '../Cargo.toml',
+      '-p',
+      'libsloptest',
+      '--example',
+      'ssh_auth_server',
+      '--locked',
+      '--message-format=json',
     ]);
+    expect(build.exitCode, 0, reason: '${build.stdout}\n${build.stderr}');
+    executable = const LineSplitter()
+        .convert(build.stdout as String)
+        .map((line) => jsonDecode(line) as Map<String, dynamic>)
+        .where(
+          (event) =>
+              event['reason'] == 'compiler-artifact' &&
+              event['target']['name'] == 'ssh_auth_server',
+        )
+        .map((event) => event['executable'] as String)
+        .last;
+  });
+
+  test('uses server prompts and falls back for password-only SSH', () async {
+    final server = await Process.start(executable, []);
+    final errors = server.stderr.transform(utf8.decoder).join();
     addTearDown(() async {
       server.kill();
       await server.exitCode;
+      final error = await errors;
+      if (error.isNotEmpty) stderr.write(error);
     });
     final portLine = await server.stdout
         .transform(utf8.decoder)

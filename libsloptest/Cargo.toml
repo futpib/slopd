@@ -12,3 +12,8 @@ libslop = { path = "../libslop" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rand = "0.10"
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
+tokio = { version = "1", features = ["full"] }
