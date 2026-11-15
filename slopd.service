@@ -1,6 +1,8 @@
 [Unit]
 Description=slopd — Claude agent session manager
 Documentation=https://github.com/futpib/slopd
+Requires=slopd-tmux.service
+After=slopd-tmux.service
 
 [Service]
 ExecStart=%h/.cargo/bin/slopd

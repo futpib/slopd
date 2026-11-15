@@ -208,12 +208,48 @@ Or build without installing:
 cargo build --workspace --release
 ```
 
-To enable the provided systemd user service, copy `slopd.service` to `~/.config/systemd/user/` and enable it:
+For a new source installation, install both systemd user units and enable the
+daemon. Package maintainers must also ship both units; only `slopd.service`
+needs its `ExecStart` adjusted to the packaged binary's location.
 
 ```bash
-cp slopd.service ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user
+cp slopd.service slopd-tmux.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now slopd
+```
+
+`slopd-tmux.service` owns the default tmux server independently of the daemon.
+With systemd-enabled tmux, each pane's scope inherits `PartOf` from the server's
+unit. `KillMode=process` alone cannot protect those scopes from a daemon stop.
+The companion service lets `systemctl --user restart slopd` and stop/start keep
+the server, agent processes, and session identities intact. Restarting the tmux
+companion itself terminates its panes.
+
+When upgrading an existing installation, copying the units does **not** move
+an already-running tmux server or its pane scopes into the companion service.
+Run `slopctl backup` first, and defer the switch until the old tmux server has
+been shut down after finishing its live work (for example, at the next planned
+reboot). Do not stop the old daemon with active panes merely to apply the new
+units. A server started in another service or terminal must also be shut down
+before the companion can own it. This migration preserves saved conversations;
+process continuity requires a separate live cgroup migration.
+
+For a custom `[tmux] socket`, use a separate companion unit with the matching
+`tmux -S /path/to/socket` command and point that daemon unit's `Requires` and
+`After` at it. Keep the companion independent: do not add `PartOf=slopd.service`
+or an `ExecStop` that kills tmux to the daemon. If the socket is in a systemd
+`RuntimeDirectory`, let the companion own that directory and preserve it across
+daemon restarts.
+
+The real systemd regression uses isolated temporary units, sockets, config,
+and a mock backend. It first reproduces the old scope-driven pane death, then
+checks the shipped units preserve process and session identities and can still
+exchange prompts after restart and stop/start. Run it on Linux with a user
+systemd manager and a tmux build with systemd scope support:
+
+```bash
+cargo test -p slopd --all-features --test systemd_restart -- --ignored --nocapture
 ```
 
 ---

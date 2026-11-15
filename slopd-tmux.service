@@ -1,0 +1,12 @@
+[Unit]
+Description=Persistent tmux server for slopd
+Documentation=https://github.com/futpib/slopd
+
+[Service]
+Type=forking
+# Pane scopes inherit PartOf from the server's unit. Keep this unit independent
+# of slopd so restarting the daemon cannot terminate its agents.
+ExecStart=/usr/bin/tmux start-server \; set-option -g exit-empty off
+Restart=always
+RestartSec=2
+KillMode=process
