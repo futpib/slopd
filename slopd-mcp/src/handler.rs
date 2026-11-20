@@ -13,6 +13,7 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
@@ -44,6 +45,17 @@ enum AgentTarget {
     New,
     Existing,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchToolArguments {
+    name: String,
+    arguments: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoverToolsArguments {}
 
 impl AgentTarget {
     fn key(self) -> &'static str {
@@ -353,6 +365,34 @@ impl SlopdMcp {
             ToolSurface::Simple => crate::tools::simple(),
             ToolSurface::Full => crate::tools::all(),
         }
+    }
+
+    fn forwarded_tool_request(
+        &self,
+        mut request: CallToolRequestParams,
+    ) -> Result<CallToolRequestParams, McpError> {
+        let arguments: DispatchToolArguments =
+            serde_json::from_value(Value::Object(request.arguments.take().unwrap_or_default()))
+                .map_err(|error| {
+                    invalid_argument(format!("invalid dispatch_tool arguments: {error}"))
+                })?;
+        if matches!(
+            canonical_tool_name(&arguments.name),
+            "discover_tools" | "dispatch_tool"
+        ) {
+            return Err(invalid_argument(
+                "dispatch_tool cannot invoke higher-order tools; call discover_tools or dispatch_tool directly",
+            ));
+        }
+        if self.get_tool(&arguments.name).is_none() {
+            return Err(invalid_argument(format!(
+                "tool {:?} is not available for dispatch on this endpoint; call discover_tools to choose a currently visible tool",
+                arguments.name
+            )));
+        }
+        request.name = arguments.name.into();
+        request.arguments = Some(arguments.arguments);
+        Ok(request)
     }
 
     pub(crate) fn for_connection(&self) -> Self {
@@ -1716,7 +1756,7 @@ impl ServerHandler for SlopdMcp {
                 .build(),
         )
         .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
-        .with_instructions(format!("{instructions} Use configure_notifications to select the request, panes, and outcomes the user wants to watch. Notification setup is the only exception to the stop-after-an-agent-result rule. The client host must subscribe to the returned resource; do not promise an alert or automatic model turn merely because a watch was created."))
+        .with_instructions(format!("{instructions} Use discover_tools for current visible tool definitions and dispatch_tool to invoke one visible tool by exact name with a JSON arguments object. All target tool-use and follow_up_instruction rules still apply through dispatch_tool. Use configure_notifications to select the request, panes, and outcomes the user wants to watch. Notification setup is the only exception to the stop-after-an-agent-result rule. The client host must subscribe to the returned resource; do not promise an alert or automatic model turn merely because a watch was created."))
     }
 
     async fn list_tools(
@@ -1899,6 +1939,11 @@ impl ServerHandler for SlopdMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let request = if request.name == "dispatch_tool" {
+            self.forwarded_tool_request(request)?
+        } else {
+            request
+        };
         let name = canonical_tool_name(request.name.as_ref());
         let available = self.tools().iter().any(|tool| tool.name == name)
             || (self.surface == ToolSurface::Full
@@ -1912,6 +1957,19 @@ impl ServerHandler for SlopdMcp {
             } else {
                 notify_peer(&context.peer).await;
             }
+        }
+        if request.name == "discover_tools" {
+            let _: DiscoverToolsArguments =
+                serde_json::from_value(Value::Object(request.arguments.unwrap_or_default()))
+                    .map_err(|error| {
+                        invalid_argument(format!("invalid discover_tools arguments: {error}"))
+                    })?;
+            let listed = self.list_tools(None, context).await?;
+            return ok_json(json!({
+                "tools": listed.tools,
+                "dispatch_excluded": ["discover_tools", "dispatch_tool"],
+            }))
+            .map(CallToolResponse::Complete);
         }
         self.dispatch(request).await.map(CallToolResponse::Complete)
     }
@@ -3039,11 +3097,30 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        brief, canonical_tool_name, expand_wait_transcripts, failure_retry_scheduled,
+        SlopdMcp, brief, canonical_tool_name, expand_wait_transcripts, failure_retry_scheduled,
         latest_user_request, overview_pane, parse_backend, preferred_mcp_pane_id,
         reply_failure_message, reply_snapshot, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn forwarding_preserves_request_metadata_and_continuation_fields() {
+        let handler = SlopdMcp::new("/unused.sock".into());
+        let request: rmcp::model::CallToolRequestParams = serde_json::from_value(json!({
+            "name": "dispatch_tool",
+            "arguments": {"name":"get_agent_result", "arguments":{"request_id":"literal $(text)", "wait_seconds":0}},
+            "_meta": {"progressToken":"progress-1", "example.com/approval":{"ticket":"approved-context"}},
+            "requestState": "opaque-state",
+            "inputResponses": {}
+        })).unwrap();
+        let mut expected = serde_json::to_value(&request).unwrap();
+        expected["name"] = json!("get_agent_result");
+        expected["arguments"] = expected["arguments"]["arguments"].clone();
+        assert_eq!(
+            serde_json::to_value(handler.forwarded_tool_request(request).unwrap()).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn parse_backend_accepts_canonical_names() {

@@ -274,7 +274,7 @@ async fn sighup_refreshes_legacy_clients_on_both_endpoints() {
         sighup_pid(server.child.id());
         assert_changed(&simple_events.next().await, None);
         assert_changed(&full_events.next().await, None);
-        for (path, session, count) in [("/mcp", &simple, 6), ("/mcp/slopctl", &full, 23)] {
+        for (path, session, count) in [("/mcp", &simple, 8), ("/mcp/slopctl", &full, 25)] {
             let response = server
                 .post(
                     path,
@@ -336,7 +336,7 @@ async fn modern_subscriptions_refresh_and_survive_another_client_disconnect() {
     sighup_pid(server.child.id());
     assert_changed(&simple.next().await, Some(10));
     assert_changed(&full.next().await, Some(11));
-    for (path, count) in [("/mcp", 6), ("/mcp/slopctl", 23)] {
+    for (path, count) in [("/mcp", 8), ("/mcp/slopctl", 25)] {
         let response = server.modern(path, 12, "tools/list", json!({})).await;
         let listed = Messages::new(response).result().await;
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), count);

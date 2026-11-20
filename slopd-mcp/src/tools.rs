@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 use crate::schema;
 
 const SIMPLE_NAMES: &[&str] = &[
+    "discover_tools",
+    "dispatch_tool",
     "get_work_overview",
     "start_new_agent",
     "message_existing_agent",
@@ -25,6 +27,24 @@ pub fn simple() -> Vec<Tool> {
 
 pub fn all() -> Vec<Tool> {
     let tools = vec![
+        tool(
+            "discover_tools",
+            "Stable discovery entry point. Return the current tools visible on this MCP endpoint, including their names, descriptions, input schemas, output schemas, and approval hints. Use when cached tool definitions are stale, then call a visible tool directly or through dispatch_tool. Discovery does not invoke tools or grant permission to use them.",
+            empty_schema(),
+        ),
+        tool(
+            "dispatch_tool",
+            "Stable named-tool dispatch entry point. Invoke exactly one tool from discover_tools using its exact name and a structured JSON arguments object. Follow the selected tool's description, input schema, permissions, and follow_up_instruction as for a direct call. Returns the target's unmodified result or error through the normal handler. Cannot call discover_tools or dispatch_tool, hidden compatibility aliases, or tools from another endpoint. No code or shell evaluation. May perform destructive actions; clients must review the target name and arguments when approving this tool.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Exact visible tool name returned by discover_tools, excluding the two higher-order tools." },
+                    "arguments": { "type": "object", "additionalProperties": true, "description": "Structured JSON arguments matching the selected tool's inputSchema. Use {} for a tool with no arguments; do not encode JSON as a string." }
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": false
+            }),
+        ),
         tool(
             "configure_notifications",
             "Choose which slopd events to watch: one request_id, selected pane_ids, or all_agents=true. Filter completed replies, terminal failures, and pane closure. Pane watches include turns started outside MCP. Default events are completed and failed, and default duration is one hour. Returns watch_id and a resource link: the MCP host must subscribe to that resource and read it after notifications/resources/updated; this does not itself wake the model or guarantee a user alert. To stop a watch pass enabled=false and watch_id. To change filters, stop it and create a new watch. Does not send prompts or modify agents.",
@@ -245,6 +265,8 @@ fn tool(name: &'static str, description: &'static str, input_schema: Value) -> T
 
 fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
     match name {
+        "discover_tools" => ("Discover current tools", true, false, true),
+        "dispatch_tool" => ("Dispatch a registered tool", false, true, false),
         "get_status" => ("Get daemon status", true, false, true),
         "get_work_overview" => ("Get work overview", true, false, true),
         "start_new_agent" => ("Start new agent", false, false, false),
@@ -276,6 +298,11 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
 
 fn output_schema(name: &str) -> Value {
     let properties = match name {
+        "discover_tools" => json!({
+            "tools": { "type": "array", "items": { "type": "object" }, "description": "Current tools/list definitions for this endpoint." },
+            "dispatch_excluded": { "type": "array", "items": { "type": "string" }, "description": "Higher-order tools callable directly but not through dispatch_tool." }
+        }),
+        "dispatch_tool" => json!({}),
         "configure_notifications" => json!({
             "watch_id": { "type": "string" },
             "resource_uri": { "type": "string" },

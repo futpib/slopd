@@ -12,6 +12,9 @@ use tokio::net::TcpListener;
 #[path = "integration/notifications.rs"]
 mod notifications;
 
+#[path = "integration/higher_order.rs"]
+mod higher_order;
+
 #[test]
 fn extract_parses_sse_tool_result() {
     let buf = concat!(
@@ -400,6 +403,8 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         names,
         vec![
+            "discover_tools",
+            "dispatch_tool",
             "configure_notifications",
             "get_status",
             "get_work_overview",
@@ -554,6 +559,8 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         assert_eq!(tool["annotations"]["openWorldHint"], false, "{tool}");
     }
     let expected_annotations = [
+        ("discover_tools", true, false, true),
+        ("dispatch_tool", false, true, false),
         ("get_status", true, false, true),
         ("get_work_overview", true, false, true),
         ("start_new_agent", false, false, false),
@@ -646,6 +653,8 @@ async fn natural_surface_separates_new_and_existing_agents() {
     assert_eq!(
         tool_names(&listed),
         vec![
+            "discover_tools",
+            "dispatch_tool",
             "configure_notifications",
             "get_work_overview",
             "start_new_agent",

@@ -1802,9 +1802,38 @@ the tools. Notifications tell the host that data changed: the host decides
 whether to refresh context, start a model turn, or show an alert. Creating a
 watch alone does not guarantee a Grok or ChatGPT alert.
 
+Both endpoints also expose two stable higher-order entry points. A client that
+already knows their schemas can discover and invoke updated registered tools
+without adding every new tool definition to its cached connector catalog:
+
+- `discover_tools({})` returns `tools`, the same current definitions as
+  `tools/list`, including names, descriptions, input/output schemas, and
+  annotations. `dispatch_excluded` identifies the two higher-order tools.
+- `dispatch_tool({"name":"get_agent_result","arguments":{}})` invokes one
+  exact visible tool name. `arguments` is a required JSON object, not encoded
+  JSON or source code. It returns the target's MCP result unchanged, including
+  structured content, resource links, and tool errors.
+
+Discovery and dispatch keep the originating endpoint's tool visibility. They
+do not expose hidden compatibility aliases or diagnostic-only tools, and the
+natural endpoint cannot dispatch full-endpoint controls. Dispatch rejects
+`discover_tools` and `dispatch_tool` as targets, preventing recursive dispatch.
+It performs no arbitrary code or shell evaluation.
+
+Forwarded calls reuse the normal `call_tool` handler with the original request
+context, protocol metadata, and continuation state. HTTP bearer/OAuth checks,
+target-specific argument validation, pane restrictions, and pending-work
+guards still apply. Discovery grants no additional authority. Approval remains
+host-managed, as for direct calls: this server has no separate approval engine.
+The dispatcher is marked mutating, potentially destructive, and non-idempotent;
+hosts should review the target name, arguments, and discovered annotations when
+applying their approval policy. Approving the wrapper must not be treated as
+evidence that its target is read-only. Existing target tool-use instructions
+also apply when calling it through the dispatcher.
+
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
-`message_existing_agent`, `close_agent`, `get_agent_result`, and
-`configure_notifications`. The full
+`message_existing_agent`, `close_agent`, `get_agent_result`,
+`configure_notifications`, `discover_tools`, and `dispatch_tool`. The full
 `/mcp/slopctl` endpoint also exposes the following controls:
 
 | Tool | Purpose |
