@@ -33,6 +33,8 @@ impl Server {
             .arg(dir.path().join("absent.sock"))
             .arg("--oauth-state")
             .arg(dir.path().join("oauth.jsonl"))
+            .arg("--memory-state")
+            .arg(dir.path().join("memory.jsonl"))
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
@@ -274,7 +276,7 @@ async fn sighup_refreshes_legacy_clients_on_both_endpoints() {
         sighup_pid(server.child.id());
         assert_changed(&simple_events.next().await, None);
         assert_changed(&full_events.next().await, None);
-        for (path, session, count) in [("/mcp", &simple, 9), ("/mcp/slopctl", &full, 26)] {
+        for (path, session, count) in [("/mcp", &simple, 13), ("/mcp/slopctl", &full, 30)] {
             let response = server
                 .post(
                     path,
@@ -336,7 +338,7 @@ async fn modern_subscriptions_refresh_and_survive_another_client_disconnect() {
     sighup_pid(server.child.id());
     assert_changed(&simple.next().await, Some(10));
     assert_changed(&full.next().await, Some(11));
-    for (path, count) in [("/mcp", 9), ("/mcp/slopctl", 26)] {
+    for (path, count) in [("/mcp", 13), ("/mcp/slopctl", 30)] {
         let response = server.modern(path, 12, "tools/list", json!({})).await;
         let listed = Messages::new(response).result().await;
         assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), count);

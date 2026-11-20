@@ -1714,6 +1714,48 @@ slopd lifecycle journal, at `$XDG_STATE_HOME/slopd/mcp-oauth.jsonl` by default.
 Use `--oauth-state` or `SLOPD_MCP_OAUTH_STATE` to override it. Access tokens
 survive restarts and remain valid until the server token/password is rotated.
 
+Memories use a separate journal at `$XDG_STATE_HOME/slopd/mcp-memory.jsonl`.
+Override it with `--memory-state` or `SLOPD_MCP_MEMORY_STATE`. The four memory
+tools are available on both `/mcp` and `/mcp/slopctl`, including through
+`discover_tools` and `dispatch_tool`:
+
+- `save_memory`: create or replace a fact by `namespace` and `key`, with `content`
+  and optional `tags`. Reusing a key updates the entry; an identical save is a no-op.
+- `get_memory`: retrieve that exact entry, or `found: false` if absent.
+- `search_memories`: search text, optionally filter by namespace and tags, or list
+  entries with an empty query. Results are newest revision first; use `next_offset`
+  for the next page. Every whitespace-separated query term must match a
+  case-insensitive substring across key, namespace, content, and tags.
+- `delete_memory`: remove an exact entry from recall and search across restarts.
+
+For example, save `{"namespace":"project:orchard","key":"ui-language",
+"content":"Prefer Georgian labels","tags":["preference","ui"]}` with
+`save_memory`, then call `search_memories` with `{"query":"Georgian orchard"}`.
+The default namespace for save/get/delete is `default`; omitting it in search
+includes all namespaces. Names and tag filters are case-sensitive. Save replaces
+both content and tags (omitted tags become empty). Returned entries include
+creation/update times and a revision. Save and delete accept `expected_revision`
+to reject stale changes; use `0` to require absence. A conflict requires rereading
+the entry before retrying. Deleted/recreated keys receive fresh revisions.
+
+This server has one owner authentication boundary, shared by its static bearer
+and OAuth clients. Memories follow that existing boundary: ChatGPT, Grok, and
+other authorized clients share the same store. Agent `account` names are backend
+execution profiles, not authenticated users; namespaces are organization, not
+tenant isolation. Use separately configured server instances and journal files
+for separate owners. Anonymous loopback configurations also share their store.
+
+Successful writes are synced before acknowledgement. The journal is mode 0600,
+its directory mode 0700, and only one process may own a journal at a time. A
+partial final write is repaired using the existing JSONL storage. Persistence
+errors stop memory operations until an adapter restart, since the last write's
+durability may be uncertain. Limits are 10,000 active entries, 16 KiB UTF-8
+content, 20 tags per entry, and 100 search results per page. Deletion is logical:
+old journal records and backups are retained, not securely erased. Do not store
+credentials. Memories are recalled data, not executable instructions or proof
+of current agent state. A client must call these tools; storage alone does not
+automatically inject memories into every conversation.
+
 The same token is used two ways:
 
 - **Static bearer** — `Authorization: Bearer <token>`. Use this from the xAI
@@ -1834,7 +1876,8 @@ also apply when calling it through the dispatcher.
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
 `message_existing_agent`, `close_agent`, `get_agent_result`,
 `configure_notifications`, `switch_tmux_focus`, `discover_tools`, and
-`dispatch_tool`. `switch_tmux_focus` accepts optional `window_id` (`@` followed
+`dispatch_tool`, `save_memory`, `get_memory`, `search_memories`, and
+`delete_memory`. `switch_tmux_focus` accepts optional `window_id` (`@` followed
 by digits) and `pane_id` (`%` followed by digits); at least one is required and
 additional properties are rejected. Its three modes are:
 

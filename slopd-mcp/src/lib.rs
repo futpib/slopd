@@ -1,4 +1,5 @@
 mod handler;
+mod memory;
 mod notifications;
 mod oauth;
 mod tool_updates;
@@ -29,6 +30,7 @@ pub use handler::{SlopdMcp, parse_backend};
 pub struct ServeConfig {
     pub socket: PathBuf,
     pub oauth_state: PathBuf,
+    pub memory_state: PathBuf,
     pub token: Option<Arc<str>>,
     pub allowed_hosts: Vec<String>,
     pub path: String,
@@ -98,6 +100,13 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
 
 /// Build a router while retaining a handler for tool-list invalidation.
 pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::Result<Router> {
+    if config.memory_state == config.oauth_state {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "memory and OAuth journals must use different files",
+        ));
+    }
+    let handler = handler.with_memory(memory::MemoryStore::open(config.memory_state)?);
     let path = if config.path.starts_with('/') {
         config.path.clone()
     } else {

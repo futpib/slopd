@@ -55,6 +55,7 @@ async fn start_mcp_with_public_url(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
+        memory_state: socket.with_extension(format!("mcp-memory-{}.jsonl", addr.port())),
         socket,
         oauth_state,
         token: token.map(Arc::from),
@@ -406,6 +407,10 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         names,
         vec![
+            "save_memory",
+            "get_memory",
+            "search_memories",
+            "delete_memory",
             "discover_tools",
             "dispatch_tool",
             "configure_notifications",
@@ -658,6 +663,10 @@ async fn natural_surface_separates_new_and_existing_agents() {
     assert_eq!(
         tool_names(&listed),
         vec![
+            "save_memory",
+            "get_memory",
+            "search_memories",
+            "delete_memory",
             "discover_tools",
             "dispatch_tool",
             "configure_notifications",
@@ -2581,8 +2590,35 @@ async fn oauth_discovery_and_code_flow_issue_a_usable_bearer() {
     assert!(token.get("expires_in").is_none(), "{token}");
     let access = token["access_token"].as_str().unwrap();
 
-    let (initialized, _) = initialize(&http_client(), addr, Some(access)).await;
+    let (initialized, session) = initialize(&http_client(), addr, Some(access)).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
+
+    let saved = call_tool(
+        &client,
+        addr,
+        Some(access),
+        session.as_deref(),
+        2,
+        "save_memory",
+        json!({"key":"oauth-owner", "content":"Shared owner memory"}),
+    )
+    .await;
+    assert_eq!(tool_payload(&saved)["created"], true);
+    let (_, static_session) = initialize(&client, addr, Some("secret")).await;
+    let recalled = call_tool(
+        &client,
+        addr,
+        Some("secret"),
+        static_session.as_deref(),
+        2,
+        "get_memory",
+        json!({"key":"oauth-owner"}),
+    )
+    .await;
+    assert_eq!(
+        tool_payload(&recalled)["memory"],
+        tool_payload(&saved)["memory"]
+    );
 
     let restarted =
         start_mcp_with_public_url(env.socket_path(), Some("secret"), Some(public_url.into())).await;
