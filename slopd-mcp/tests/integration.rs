@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use slopd_mcp::{ServeConfig, default_allowed_hosts, serve};
 use tokio::net::TcpListener;
 
+#[path = "integration/notifications.rs"]
+mod notifications;
+
 #[test]
 fn extract_parses_sse_tool_result() {
     let buf = concat!(
@@ -397,6 +400,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     assert_eq!(
         names,
         vec![
+            "configure_notifications",
             "get_status",
             "get_work_overview",
             "start_new_agent",
@@ -642,6 +646,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
     assert_eq!(
         tool_names(&listed),
         vec![
+            "configure_notifications",
             "get_work_overview",
             "start_new_agent",
             "message_existing_agent",

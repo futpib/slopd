@@ -1756,8 +1756,55 @@ and restarting the MCP server. Clients must receive and honor the notification,
 then call `tools/list` and update the tools given to the model. Clients that keep
 their own connector snapshots may still require a manual connector refresh.
 
+Agents can use `configure_notifications` on either endpoint to choose what to
+watch. Select exactly one scope: a mailbox `request_id`, a nonempty `pane_ids`
+array, or `all_agents: true`. Pane watches also include turns started from the
+CLI or another client. `events` accepts `completed`, `failed`, and `closed`
+(pane exit); request watches support `completed` and `failed`. The default is
+completion and failure for one hour. `duration_seconds` can be 1–86400. Disable
+a watch with `{"watch_id":"...","enabled":false}`; to change filters, disable
+it and create another watch.
+
+For example, watch the ends of turns in two existing panes:
+
+```json
+{"pane_ids":["%30","%31"],"events":["completed","failed"],"duration_seconds":3600}
+```
+
+The result includes a `watch_id`, `resource_uri`, and MCP resource link. Both
+endpoints advertise `resources.subscribe: true`. The **client host** must
+subscribe to the returned URI. With protocol `2026-07-28`, use
+`subscriptions/listen` with
+`{"notifications":{"resourceSubscriptions":["slopd://notifications/<watch-id>"]}}`.
+Legacy clients use `resources/subscribe` with `{"uri":"..."}` and receive
+notifications over their session SSE stream; `resources/unsubscribe` stops
+delivery to that session. Modern clients cancel their subscription stream.
+
+Subscribers receive `notifications/resources/updated` and then use
+`resources/read` to retrieve the feed. A new subscription receives an initial
+update so a fast completion before subscription is not lost. Each event has
+a monotonically increasing `sequence`; clients should keep their last sequence
+to deduplicate rereads. The latest 100 matching events are retained per watch.
+Closed or expired watches publish `active: false` and `closed_reason`, including
+`event_stream_closed` if the daemon connection fails. Reconfigure after that
+failure; the feed does not silently claim complete coverage across reconnects.
+
+Mailbox results also include `slopd://requests/<request-id>` resources, which
+can be subscribed to directly for a single terminal result. Scheduled retries
+do not generate terminal failure notifications. A `ready` state alone is not
+treated as success. Request watches close when the request finishes; pane
+watches continue across turns until disabled or expired.
+
+Watches and results are in memory and disappear when the MCP adapter restarts.
+At most 100 watches and 100 mailbox results are retained; inactive watches may
+be evicted to admit new watches. Resource access uses the same authorization as
+the tools. Notifications tell the host that data changed: the host decides
+whether to refresh context, start a model turn, or show an alert. Creating a
+watch alone does not guarantee a Grok or ChatGPT alert.
+
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
-`message_existing_agent`, `close_agent`, and `get_agent_result`. The full
+`message_existing_agent`, `close_agent`, `get_agent_result`, and
+`configure_notifications`. The full
 `/mcp/slopctl` endpoint also exposes the following controls:
 
 | Tool | Purpose |

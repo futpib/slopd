@@ -9,6 +9,7 @@ const SIMPLE_NAMES: &[&str] = &[
     "message_existing_agent",
     "close_agent",
     "get_agent_result",
+    "configure_notifications",
 ];
 
 pub fn simple_names() -> &'static [&'static str] {
@@ -25,6 +26,23 @@ pub fn simple() -> Vec<Tool> {
 pub fn all() -> Vec<Tool> {
     let tools = vec![
         tool(
+            "configure_notifications",
+            "Choose which slopd events to watch: one request_id, selected pane_ids, or all_agents=true. Filter completed replies, terminal failures, and pane closure. Pane watches include turns started outside MCP. Default events are completed and failed, and default duration is one hour. Returns watch_id and a resource link: the MCP host must subscribe to that resource and read it after notifications/resources/updated; this does not itself wake the model or guarantee a user alert. To stop a watch pass enabled=false and watch_id. To change filters, stop it and create a new watch. Does not send prompts or modify agents.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "pane_ids": { "type": "array", "items": pane_id_schema(), "minItems": 1, "maxItems": 100, "uniqueItems": true },
+                    "all_agents": { "type": "boolean", "default": false },
+                    "events": { "type": "array", "items": { "type": "string", "enum": ["completed", "failed", "closed"] }, "minItems": 1, "uniqueItems": true, "default": ["completed", "failed"] },
+                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 },
+                    "enabled": { "type": "boolean", "default": true },
+                    "watch_id": { "type": "string", "description": "Existing watch to disable with enabled=false." }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "get_status",
             "Show slopd daemon uptime and state.",
             empty_schema(),
@@ -36,7 +54,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "start_new_agent",
-            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications when notification setup was requested. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -52,7 +70,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "message_existing_agent",
-            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications when notification setup was requested. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -114,7 +132,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the mailbox state or completed answer for prior agent work, including creation or startup failures, so an old unrelated result is never substituted. Always call this on every new user turn asking whether work is ready, what happened, current progress, when the result will arrive, or what the result was. Never answer those questions from conversation memory or elapsed time. Call with no arguments first unless a prior tool result supplied the exact request_id or pane_id. Never call start_new_agent or resend the prompt for a status, progress, completion, or result question. After this returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. The top-level status, answer, and follow_up_instruction are authoritative.",
+            "Get the mailbox state or completed answer for prior agent work, including creation or startup failures, so an old unrelated result is never substituted. Always call this on every new user turn asking whether work is ready, what happened, current progress, when the result will arrive, or what the result was. Never answer those questions from conversation memory or elapsed time. Call with no arguments first unless a prior tool result supplied the exact request_id or pane_id. Never call start_new_agent or resend the prompt for a status, progress, completion, or result question. After this returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications when notification setup was requested. The top-level status, answer, and follow_up_instruction are authoritative.",
             json!({
                 "type": "object",
                 "properties": {
@@ -238,6 +256,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "kill_pane" => ("Kill pane", false, true, true),
         "ask_or_tell_agent" => ("Ask or tell agent", false, false, false),
         "get_agent_result" => ("Get agent result", true, false, true),
+        "configure_notifications" => ("Configure agent notifications", false, false, false),
         "send_prompt" => ("Send prompt", false, false, false),
         "wait_for_reply" => ("Wait for reply", true, false, true),
         "interrupt_pane" => ("Interrupt pane", false, true, false),
@@ -257,6 +276,18 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
 
 fn output_schema(name: &str) -> Value {
     let properties = match name {
+        "configure_notifications" => json!({
+            "watch_id": { "type": "string" },
+            "resource_uri": { "type": "string" },
+            "active": { "type": "boolean" },
+            "configuration": { "type": "object" },
+            "expires_at_unix_ms": { "type": "integer" },
+            "sequence": { "type": "integer" },
+            "events": { "type": "array", "items": { "type": "object" } },
+            "subscription_required": { "type": "boolean" },
+            "delivery_instruction": { "type": "string" },
+            "closed_reason": { "type": "string" }
+        }),
         "get_status" => json!({
             "uptime_secs": { "type": "integer" },
             "subscriber_count": { "type": "integer" },
@@ -317,6 +348,7 @@ fn output_schema(name: &str) -> Value {
         }
         "get_agent_result" => json!({
             "found": { "type": "boolean" },
+            "resource_uri": { "type": ["string", "null"] },
             "request_id": { "type": ["string", "null"] },
             "pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }] },
             "prompt": { "type": ["string", "null"] },
@@ -376,6 +408,7 @@ fn mailbox_entry_schema() -> Value {
         "type": "object",
         "properties": {
             "request_id": { "type": "string" },
+            "resource_uri": { "type": "string", "description": "MCP result resource. Hosts may subscribe for terminal updates." },
             "pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }], "description": "The selected pane, or null if startup failed before one was allocated." },
             "prompt": { "type": "string" },
             "created_at_unix_ms": { "type": "integer" },

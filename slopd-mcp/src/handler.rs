@@ -1,22 +1,29 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-    ProtocolVersion, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    ListResourcesResult, ListToolsResult, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 
+use crate::notifications::{Notifications, event_kind};
 use crate::tool_updates::{LegacyPeer, ToolUpdates, notify_peer};
 
 const MCP_PANE_TAG: &str = "slopd-mcp";
 const MAILBOX_LIMIT: usize = 100;
+const REQUEST_RESOURCE_PREFIX: &str = "slopd://requests/";
 const MAILBOX_DEDUPE_WINDOW_MS: u64 = 60_000;
 const MAILBOX_DEFAULT_WAIT_SECONDS: u64 = 3;
 const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -60,7 +67,7 @@ struct MailboxEntry {
     selector_key: String,
     dedupe_key: String,
     created_at_unix_ms: u64,
-    state: Mutex<MailboxState>,
+    state: watch::Sender<MailboxState>,
 }
 
 #[derive(Clone)]
@@ -167,7 +174,7 @@ impl MailboxEntry {
             selector_key,
             dedupe_key,
             created_at_unix_ms,
-            state: Mutex::new(MailboxState::Pending),
+            state: watch::channel(MailboxState::Pending).0,
         }
     }
 
@@ -183,14 +190,27 @@ impl MailboxEntry {
     }
 
     fn state(&self) -> MailboxState {
-        self.state
-            .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .clone()
+        self.state.borrow().clone()
     }
 
     fn finish(&self, state: MailboxState) {
-        *self.state.lock().unwrap_or_else(|lock| lock.into_inner()) = state;
+        self.state.send_if_modified(|current| {
+            if matches!(current, MailboxState::Pending) {
+                *current = state;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn resource(&self) -> Resource {
+        Resource::new(
+            format!("{REQUEST_RESOURCE_PREFIX}{}", self.request_id),
+            format!("Agent request {}", self.request_id),
+        )
+        .with_description("Agent request status and final reply or error. Subscribe for completion notifications, then read this resource or call get_agent_result.")
+        .with_mime_type("application/json")
     }
 
     fn json(&self) -> Value {
@@ -210,7 +230,7 @@ impl MailboxEntry {
                 Value::Null,
                 Value::Null,
                 json!("The agent accepted the task and is still working in the background."),
-                format!("Stop now: call no more tools in this turn and tell the user the agent is working in the background. On every later status, progress, completion, or result turn, re-check with get_agent_result instead of answering from conversation memory. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks to start an additional independent agent."),
+                format!("Stop now: call no more tools in this turn except configure_notifications when notification setup was requested; tell the user the agent is working in the background. On every later status, progress, completion, or result turn, re-check with get_agent_result instead of answering from conversation memory. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks to start an additional independent agent."),
             ),
             MailboxState::Completed(reply) => (
                 "completed",
@@ -218,7 +238,7 @@ impl MailboxEntry {
                 json!(reply.clone()),
                 Value::Null,
                 json!(reply),
-                format!("Give the completed answer to the user and stop now: call no more tools in this turn. On every later status, progress, completion, or result turn, re-check with get_agent_result instead of answering from conversation memory. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks to start an additional independent agent."),
+                format!("Give the completed answer to the user and stop now: call no more tools in this turn except configure_notifications when notification setup was requested. On every later status, progress, completion, or result turn, re-check with get_agent_result instead of answering from conversation memory. {result_instruction} {update_instruction} Only call start_new_agent if the user explicitly asks to start an additional independent agent."),
             ),
             MailboxState::Failed(error) => (
                 "failed",
@@ -233,6 +253,7 @@ impl MailboxEntry {
         };
         json!({
             "request_id": self.request_id,
+            "resource_uri": self.resource().uri,
             "pane_id": pane_id,
             "prompt": self.prompt,
             "created_at_unix_ms": self.created_at_unix_ms,
@@ -247,6 +268,54 @@ impl MailboxEntry {
     }
 }
 
+#[derive(Default)]
+struct ResourceSubscriptions(Mutex<HashMap<String, JoinHandle<()>>>);
+
+enum ResourceChanges {
+    Request(Option<watch::Receiver<MailboxState>>),
+    Events {
+        changes: watch::Receiver<Value>,
+        initial: bool,
+    },
+}
+
+impl ResourceChanges {
+    async fn next(&mut self) -> bool {
+        match self {
+            Self::Request(changes) => match changes.take() {
+                Some(changes) => wait_for_completion(changes).await,
+                None => false,
+            },
+            Self::Events { changes, initial } => {
+                if *initial {
+                    *initial = false;
+                    changes.borrow_and_update();
+                    true
+                } else if !changes.has_changed().unwrap_or(false)
+                    && changes.borrow()["active"] == false
+                {
+                    false
+                } else {
+                    changes.changed().await.is_ok()
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ResourceSubscriptions {
+    fn drop(&mut self) {
+        for task in self
+            .0
+            .get_mut()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .values()
+        {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SlopdMcp {
     socket: PathBuf,
@@ -255,6 +324,8 @@ pub struct SlopdMcp {
     surface: ToolSurface,
     tool_updates: ToolUpdates,
     legacy_peer: Arc<LegacyPeer>,
+    resource_subscriptions: Arc<ResourceSubscriptions>,
+    notifications: Notifications,
 }
 
 impl SlopdMcp {
@@ -266,6 +337,8 @@ impl SlopdMcp {
             surface: ToolSurface::Full,
             tool_updates: ToolUpdates::default(),
             legacy_peer: Arc::default(),
+            resource_subscriptions: Arc::default(),
+            notifications: Notifications::default(),
         }
     }
 
@@ -285,6 +358,7 @@ impl SlopdMcp {
     pub(crate) fn for_connection(&self) -> Self {
         Self {
             legacy_peer: Arc::default(),
+            resource_subscriptions: Arc::default(),
             ..self.clone()
         }
     }
@@ -292,6 +366,30 @@ impl SlopdMcp {
     /// Ask connected clients to fetch the current tool definitions again.
     pub async fn notify_tool_list_changed(&self) {
         self.tool_updates.notify().await;
+    }
+
+    fn resource_entry(&self, uri: &str) -> Result<Arc<MailboxEntry>, McpError> {
+        uri.strip_prefix(REQUEST_RESOURCE_PREFIX)
+            .and_then(|request_id| self.mailbox.get(request_id))
+            .ok_or_else(|| {
+                McpError::resource_not_found(
+                    "Unknown agent result resource",
+                    Some(json!({"uri": uri})),
+                )
+            })
+    }
+
+    fn resource_changes(&self, uri: &str) -> Result<ResourceChanges, McpError> {
+        if let Some(watch) = self.notifications.resource(uri) {
+            Ok(ResourceChanges::Events {
+                changes: watch.state.subscribe(),
+                initial: true,
+            })
+        } else {
+            Ok(ResourceChanges::Request(Some(
+                self.resource_entry(uri)?.state.subscribe(),
+            )))
+        }
     }
 
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
@@ -323,6 +421,10 @@ impl SlopdMcp {
             "close_agent" => self.close_agent(request.arguments.as_ref()).await,
             "ask_or_tell_agent" => self.ask_agent(request.arguments.as_ref()).await,
             "get_agent_result" => self.get_agent_result(request.arguments.as_ref()).await,
+            "configure_notifications" => {
+                self.configure_notifications(request.arguments.as_ref())
+                    .await
+            }
             "send_prompt" => self.send(request.arguments.as_ref()).await,
             "wait_for_reply" => self.wait_for_reply(request.arguments.as_ref()).await,
             "interrupt_pane" => self.interrupt(request.arguments.as_ref()).await,
@@ -352,6 +454,157 @@ impl SlopdMcp {
             "config_generation": state.config_generation,
             "pending_restore": state.pending_restore,
         }))
+    }
+
+    async fn configure_notifications(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        if optional_bool(arguments, "enabled")? == Some(false) {
+            let id = required_string(arguments, "watch_id")?;
+            let watch = self
+                .notifications
+                .get(&id)
+                .ok_or_else(|| invalid_argument("unknown notification watch_id"))?;
+            watch.stop();
+            return ok_json(watch.state.borrow().clone());
+        }
+        if optional_string(arguments, "watch_id").is_some() {
+            return Err(invalid_argument(
+                "To change a watch, disable it with enabled=false and watch_id, then create a new watch with the desired filters",
+            ));
+        }
+        let request_id = optional_string(arguments, "request_id");
+        let pane_ids = optional_string_array(arguments, "pane_ids")?;
+        let all_agents = optional_bool(arguments, "all_agents")?.unwrap_or(false);
+        if usize::from(request_id.is_some())
+            + usize::from(!pane_ids.is_empty())
+            + usize::from(all_agents)
+            != 1
+        {
+            return Err(invalid_argument(
+                "Choose exactly one of request_id, nonempty pane_ids, or all_agents=true",
+            ));
+        }
+        if pane_ids.len() > 100
+            || pane_ids.iter().any(|id| {
+                !id.strip_prefix('%').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+            })
+        {
+            return Err(invalid_argument(
+                "pane_ids must contain at most 100 exact pane IDs such as %30",
+            ));
+        }
+        let mut events = optional_string_array(arguments, "events")?;
+        if events.is_empty() {
+            if arguments.is_some_and(|args| args.contains_key("events")) {
+                return Err(invalid_argument("events must not be empty"));
+            }
+            events = vec!["completed".into(), "failed".into()];
+        }
+        if events
+            .iter()
+            .any(|event| !matches!(event.as_str(), "completed" | "failed" | "closed"))
+            || (request_id.is_some() && events.iter().any(|event| event == "closed"))
+        {
+            return Err(invalid_argument(
+                "events may contain completed, failed, or closed; request_id supports completed and failed",
+            ));
+        }
+        let duration = optional_u64(arguments, "duration_seconds")?.unwrap_or(3600);
+        if !(1..=86400).contains(&duration) {
+            return Err(invalid_argument(
+                "duration_seconds must be between 1 and 86400",
+            ));
+        }
+        let configuration = json!({"request_id": request_id, "pane_ids": pane_ids, "all_agents": all_agents, "events": events, "duration_seconds": duration});
+        let watch;
+        if let Some(id) = request_id {
+            let entry = self
+                .mailbox
+                .get(&id)
+                .ok_or_else(|| invalid_argument("unknown agent request_id"))?;
+            let changes = entry.state.subscribe();
+            watch = self
+                .notifications
+                .create(configuration, duration)
+                .map_err(invalid_argument)?;
+            let weak = Arc::downgrade(&watch);
+            watch.start(tokio::spawn(async move {
+                let completed = tokio::time::timeout(Duration::from_secs(duration), wait_for_completion(changes)).await;
+                if let Some(watch) = weak.upgrade() {
+                    if matches!(completed, Ok(true)) {
+                        let kind = match entry.state() { MailboxState::Completed(_) => "completed", _ => "failed" };
+                        if events.iter().any(|event| event == kind) {
+                            watch.push(json!({"kind": kind, "request_id": entry.request_id, "pane_id": entry.pane_id(), "result": entry.json()}));
+                        }
+                        watch.close("request_finished");
+                    } else {
+                        watch.close("expired");
+                    }
+                }
+            }));
+        } else {
+            let mut client = connect(&self.socket).await?;
+            let panes: Vec<Option<String>> = if all_agents {
+                vec![None]
+            } else {
+                pane_ids.into_iter().map(Some).collect()
+            };
+            let filters = panes
+                .iter()
+                .flat_map(|pane_id| {
+                    events.iter().map(move |kind| {
+                        let (source, event_type) = match kind.as_str() {
+                            "completed" => ("hook", "Stop"),
+                            "failed" => ("hook", "StopFailure"),
+                            _ => ("slopd", "PaneDestroyed"),
+                        };
+                        libslop::EventFilter {
+                            source: Some(source.into()),
+                            event_type: Some(event_type.into()),
+                            pane_id: pane_id.clone(),
+                            ..Default::default()
+                        }
+                    })
+                })
+                .collect();
+            let result = client.subscribe(filters).await;
+            let mut subscription = self.slopd_result(result).await?;
+            watch = self
+                .notifications
+                .create(configuration, duration)
+                .map_err(invalid_argument)?;
+            let weak = Arc::downgrade(&watch);
+            watch.start(tokio::spawn(async move {
+                let _client = client;
+                let expired = tokio::time::sleep(Duration::from_secs(duration));
+                tokio::pin!(expired);
+                let reason = loop {
+                    tokio::select! {
+                        _ = &mut expired => break "expired",
+                        item = subscription.next() => match item {
+                            Ok(Some(libslopctl::SubscriptionItem::Record(record))) => {
+                                if let Some(kind) = event_kind(&record) {
+                                    let Some(watch) = weak.upgrade() else { return; };
+                                    watch.push(json!({"kind": kind, "pane_id": record.pane_id, "record": record}));
+                                }
+                            }
+                            Ok(Some(libslopctl::SubscriptionItem::Subscribed)) => {}
+                            _ => break "event_stream_closed",
+                        }
+                    }
+                };
+                if let Some(watch) = weak.upgrade() { watch.close(reason); }
+            }));
+        }
+        let mut result = ok_json(watch.state.borrow().clone())?;
+        result
+            .content
+            .push(rmcp::model::ContentBlock::resource_link(watch.resource()));
+        Ok(result)
     }
 
     async fn overview(
@@ -659,7 +912,7 @@ impl SlopdMcp {
         debug_assert_eq!(request_reused, entry.request_id != candidate_id);
 
         if !request_reused {
-            let handler = self.clone();
+            let handler = self.for_connection();
             let arguments = arguments.cloned();
             let worker_entry = Arc::clone(&entry);
             tokio::spawn(async move {
@@ -1448,7 +1701,7 @@ impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             ToolSurface::Simple => {
-                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
+                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications when notification setup was requested. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
             }
             ToolSurface::Full => {
                 "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
@@ -1458,10 +1711,12 @@ impl ServerHandler for SlopdMcp {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_resources()
+                .enable_resources_subscribe()
                 .build(),
         )
         .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
-        .with_instructions(instructions)
+        .with_instructions(format!("{instructions} Use configure_notifications to select the request, panes, and outcomes the user wants to watch. Notification setup is the only exception to the stop-after-an-agent-result rule. The client host must subscribe to the returned resource; do not promise an alert or automatic model turn merely because a watch was created."))
     }
 
     async fn list_tools(
@@ -1474,6 +1729,86 @@ impl ServerHandler for SlopdMcp {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.tools().into_iter().find(|tool| tool.name == name)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let resources = self
+            .mailbox
+            .recent(None, MAILBOX_LIMIT)
+            .iter()
+            .map(|entry| entry.resource())
+            .chain(self.notifications.resources())
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let value = if let Some(watch) = self.notifications.resource(&request.uri) {
+            watch.state.borrow().clone()
+        } else {
+            self.resource_entry(&request.uri)?.json()
+        };
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(value.to_string(), request.uri)
+                .with_mime_type("application/json"),
+        ])
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private)
+        .into())
+    }
+
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let mut changes = self.resource_changes(&request.uri)?;
+        let mut subscriptions = self
+            .resource_subscriptions
+            .0
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        subscriptions.retain(|_, task| !task.is_finished());
+        if !subscriptions.contains_key(&request.uri) {
+            let uri = request.uri.clone();
+            subscriptions.insert(request.uri, tokio::spawn(async move {
+                while changes.next().await {
+                    match tokio::time::timeout(Duration::from_secs(2), context.peer.notify_resource_updated(ResourceUpdatedNotificationParam::new(uri.clone()))).await {
+                        Ok(Ok(())) => tracing::debug!("sent MCP agent result notification"),
+                        Ok(Err(error)) => { tracing::debug!(%error, "MCP agent result notification not delivered"); break; }
+                        Err(_) => { tracing::warn!("MCP agent result notification timed out"); break; }
+                    }
+                }
+            }));
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if let Some(task) = self
+            .resource_subscriptions
+            .0
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .remove(&request.uri)
+        {
+            task.abort();
+        }
+        Ok(())
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -1493,17 +1828,43 @@ impl ServerHandler for SlopdMcp {
         &self,
         requested: &SubscriptionFilter,
     ) -> Option<SubscriptionFilter> {
-        Some(requested.supported_by(&self.get_info().capabilities))
+        let mut accepted = requested.supported_by(&self.get_info().capabilities);
+        if let Some(uris) = &mut accepted.resource_subscriptions {
+            uris.retain(|uri| self.resource_changes(uri).is_ok());
+            uris.sort();
+            uris.dedup();
+        }
+        Some(accepted)
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
-        if context.accepted().tools_list_changed != Some(true) {
-            context.cancelled().await;
-            return Ok(());
-        }
         let mut changes = self.tool_updates.subscribe();
+        let tools = context.accepted().tools_list_changed == Some(true);
+        let mut resources = JoinSet::new();
+        for uri in context.accepted().resource_subscriptions.iter().flatten() {
+            let mut changes = self.resource_changes(uri)?;
+            let uri = uri.clone();
+            let sink = context.sink().clone();
+            resources.spawn(async move {
+                while changes.next().await {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        sink.notify_resource_updated(uri.clone()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        McpError::internal_error("agent result notification timed out", None)
+                    })?
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                    tracing::debug!("sent MCP agent result subscription notification");
+                }
+                Ok::<_, McpError>(())
+            });
+        }
+        let mut notify_tools = tools;
         loop {
-            tokio::select! {
+            if notify_tools {
+                tokio::select! {
                 _ = context.cancelled() => return Ok(()),
                 result = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -1515,13 +1876,19 @@ impl ServerHandler for SlopdMcp {
                         Err(_) => return Err(McpError::internal_error("tool list notification timed out", None)),
                     }
                 }
+                }
+                notify_tools = false;
             }
             tokio::select! {
                 _ = context.cancelled() => return Ok(()),
-                result = changes.changed() => {
+                result = changes.changed(), if tools => {
                     if result.is_err() {
                         return Ok(());
                     }
+                    notify_tools = true;
+                }
+                Some(result) = resources.join_next(), if !resources.is_empty() => {
+                    result.map_err(|error| McpError::internal_error(error.to_string(), None))??;
                 }
             }
         }
@@ -1643,13 +2010,21 @@ async fn wait_for_mailbox_entry(entry: &MailboxEntry, wait_seconds: u64) {
     if wait_seconds == 0 {
         return;
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
-    while matches!(entry.state(), MailboxState::Pending) {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(wait_seconds),
+        wait_for_completion(entry.state.subscribe()),
+    )
+    .await;
+}
+
+async fn wait_for_completion(mut changes: watch::Receiver<MailboxState>) -> bool {
+    loop {
+        if !matches!(*changes.borrow_and_update(), MailboxState::Pending) {
+            return true;
         }
-        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        if changes.changed().await.is_err() {
+            return false;
+        }
     }
 }
 

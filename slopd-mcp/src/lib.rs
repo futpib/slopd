@@ -1,4 +1,5 @@
 mod handler;
+mod notifications;
 mod oauth;
 mod tool_updates;
 mod tools;
