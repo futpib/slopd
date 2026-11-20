@@ -1733,7 +1733,32 @@ requests, arguments, results, and errors; these may contain prompts and
 transcripts. `-vvv` adds transport-level traces. Authorization headers and
 OAuth form bodies are never logged.
 
-Tools:
+Both endpoints advertise `tools.listChanged: true`. Legacy MCP sessions receive
+`notifications/tools/list_changed` over their SSE stream. Clients using protocol
+`2026-07-28` subscribe with `subscriptions/listen` and
+`{"notifications":{"toolsListChanged":true}}`. A new session or subscription
+gets an initial notification to revalidate cached definitions, including after
+a deployment. Calls to unavailable tools also request a refresh and return an
+error directing the client to `tools/list`; they never execute the obsolete tool.
+
+Send SIGHUP to reannounce the tool list to all connected clients without
+restarting the MCP process or its managed agents:
+
+```bash
+kill -HUP <slopd-mcp-pid>
+# For a user service (substitute its actual unit name):
+systemctl --user kill --kill-whom=main --signal=HUP slopd-mcp.service
+```
+
+SIGHUP invalidates client caches; it does not load changed Rust source or a new
+executable. Tool definitions are compiled in, so code changes require rebuilding
+and restarting the MCP server. Clients must receive and honor the notification,
+then call `tools/list` and update the tools given to the model. Clients that keep
+their own connector snapshots may still require a manual connector refresh.
+
+The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
+`message_existing_agent`, `close_agent`, and `get_agent_result`. The full
+`/mcp/slopctl` endpoint also exposes the following controls:
 
 | Tool | Purpose |
 |------|---------|

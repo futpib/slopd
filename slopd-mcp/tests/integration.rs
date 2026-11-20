@@ -355,7 +355,10 @@ async fn lists_supervisor_tools_and_requires_bearer() {
 
     let (initialized, session) = initialize(&client, addr, Some("secret")).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
-    assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
+    assert_eq!(
+        initialized["result"]["capabilities"]["tools"],
+        json!({ "listChanged": true })
+    );
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(
         instructions.contains("Full slopctl-compatible"),

@@ -1,5 +1,6 @@
 mod handler;
 mod oauth;
+mod tool_updates;
 mod tools;
 
 use std::net::SocketAddr;
@@ -90,6 +91,12 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub fn router(config: ServeConfig) -> std::io::Result<Router> {
+    let handler = SlopdMcp::new(config.socket.clone());
+    router_with_handler(config, handler)
+}
+
+/// Build a router while retaining a handler for tool-list invalidation.
+pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::Result<Router> {
     let path = if config.path.starts_with('/') {
         config.path.clone()
     } else {
@@ -104,11 +111,10 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
         public_url: config.public_url.clone(),
         mcp_path: path.clone(),
     };
-    let handler = SlopdMcp::new(config.socket.clone());
     let simple_handler = handler.with_surface(ToolSurface::Simple);
     let full_handler = handler.with_surface(ToolSurface::Full);
     let simple_mcp = StreamableHttpService::new(
-        move || Ok(simple_handler.clone()),
+        move || Ok(simple_handler.for_connection()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)
@@ -117,7 +123,7 @@ pub fn router(config: ServeConfig) -> std::io::Result<Router> {
             .with_allowed_hosts(config.allowed_hosts.clone()),
     );
     let full_mcp = StreamableHttpService::new(
-        move || Ok(full_handler.clone()),
+        move || Ok(full_handler.for_connection()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)

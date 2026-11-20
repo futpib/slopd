@@ -5,12 +5,13 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
-use slopd_mcp::{ServeConfig, default_allowed_hosts, is_loopback, serve};
+use slopd_mcp::{ServeConfig, SlopdMcp, default_allowed_hosts, is_loopback, router_with_handler};
 
 #[derive(Parser)]
 #[command(
     name = "slopd-mcp",
     about = "Expose slopd-managed panes as a Streamable HTTP MCP supervisor",
+    after_help = "Send SIGHUP to request a tool-list refresh from connected MCP clients. Tool definitions are compiled in; changing them requires rebuilding and restarting the server.",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
 )]
 struct Cli {
@@ -131,8 +132,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         oauth_state.display()
     );
 
-    serve(
-        listener,
+    let handler = SlopdMcp::new(socket.clone());
+    let router = router_with_handler(
         ServeConfig {
             socket,
             oauth_state,
@@ -141,9 +142,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             path,
             public_url,
         },
+        handler.clone(),
     )
-    .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|error| format!("failed to listen for SIGHUP: {error}"))?;
+    let server = std::future::IntoFuture::into_future(axum::serve(listener, router));
+    tokio::pin!(server);
+    loop {
+        tokio::select! {
+            result = &mut server => return result.map_err(|error| error.to_string()),
+            Some(()) = hangup.recv() => {
+                tracing::info!("SIGHUP: requesting MCP tool list refresh");
+                handler.notify_tool_list_changed().await;
+            }
+        }
+    }
 }
 
 fn parse_public_url(url: &str) -> Result<String, String> {

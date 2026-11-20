@@ -6,12 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-    ServerCapabilities, ServerInfo, Tool,
+    ProtocolVersion, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{NotificationContext, RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
+
+use crate::tool_updates::{LegacyPeer, ToolUpdates, notify_peer};
 
 const MCP_PANE_TAG: &str = "slopd-mcp";
 const MAILBOX_LIMIT: usize = 100;
@@ -251,6 +253,8 @@ pub struct SlopdMcp {
     mailbox: Mailbox,
     spawn_lock: Arc<tokio::sync::Mutex<()>>,
     surface: ToolSurface,
+    tool_updates: ToolUpdates,
+    legacy_peer: Arc<LegacyPeer>,
 }
 
 impl SlopdMcp {
@@ -260,6 +264,8 @@ impl SlopdMcp {
             mailbox: Mailbox::default(),
             spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
             surface: ToolSurface::Full,
+            tool_updates: ToolUpdates::default(),
+            legacy_peer: Arc::default(),
         }
     }
 
@@ -276,11 +282,23 @@ impl SlopdMcp {
         }
     }
 
+    pub(crate) fn for_connection(&self) -> Self {
+        Self {
+            legacy_peer: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Ask connected clients to fetch the current tool definitions again.
+    pub async fn notify_tool_list_changed(&self) {
+        self.tool_updates.notify().await;
+    }
+
     async fn dispatch(&self, request: CallToolRequestParams) -> Result<CallToolResult, McpError> {
         let name = canonical_tool_name(request.name.as_ref());
         if self.surface == ToolSurface::Simple && !crate::tools::simple_names().contains(&name) {
             return Err(invalid_argument(format!(
-                "tool {name} is not available on the natural-language MCP endpoint; use start_new_agent for a new agent or message_existing_agent for an existing agent"
+                "tool {name} is not available on the natural-language MCP endpoint; refresh tools/list for this endpoint before retrying; use start_new_agent for a new agent or message_existing_agent for an existing agent"
             )));
         }
         if matches!(name, "collect_events" | "wait_for_event")
@@ -318,7 +336,9 @@ impl SlopdMcp {
             "list_dead_panes" => self.graveyard(request.arguments.as_ref()).await,
             "revive_pane" => self.revive(request.arguments.as_ref()).await,
             "create_pane" => self.run(request.arguments.as_ref()).await,
-            name => Err(invalid_argument(format!("unknown tool {name}"))),
+            name => Err(invalid_argument(format!(
+                "unknown tool {name}; refresh tools/list for this endpoint before retrying"
+            ))),
         }
     }
 
@@ -1434,9 +1454,14 @@ impl ServerHandler for SlopdMcp {
                 "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
             }
         };
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new("slopd-mcp", env!("CARGO_PKG_VERSION")))
+        .with_instructions(instructions)
     }
 
     async fn list_tools(
@@ -1451,11 +1476,76 @@ impl ServerHandler for SlopdMcp {
         self.tools().into_iter().find(|tool| tool.name == name)
     }
 
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if context
+            .peer
+            .peer_info()
+            .is_some_and(|info| info.protocol_version >= ProtocolVersion::V_2026_07_28)
+        {
+            return;
+        }
+        self.tool_updates
+            .register(&self.legacy_peer, context.peer.clone());
+        notify_peer(&context.peer).await;
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(requested.supported_by(&self.get_info().capabilities))
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), McpError> {
+        if context.accepted().tools_list_changed != Some(true) {
+            context.cancelled().await;
+            return Ok(());
+        }
+        let mut changes = self.tool_updates.subscribe();
+        loop {
+            tokio::select! {
+                _ = context.cancelled() => return Ok(()),
+                result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    context.sink().notify_tool_list_changed(),
+                ) => {
+                    match result {
+                        Ok(Ok(())) => tracing::debug!("sent MCP tool list subscription notification"),
+                        Ok(Err(error)) => return Err(McpError::internal_error(error.to_string(), None)),
+                        Err(_) => return Err(McpError::internal_error("tool list notification timed out", None)),
+                    }
+                }
+            }
+            tokio::select! {
+                _ = context.cancelled() => return Ok(()),
+                result = changes.changed() => {
+                    if result.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let name = canonical_tool_name(request.name.as_ref());
+        let available = self.tools().iter().any(|tool| tool.name == name)
+            || (self.surface == ToolSurface::Full
+                && matches!(name, "collect_events" | "wait_for_event"));
+        if !available {
+            if context
+                .protocol_version()
+                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            {
+                self.tool_updates.notify().await;
+            } else {
+                notify_peer(&context.peer).await;
+            }
+        }
         self.dispatch(request).await.map(CallToolResponse::Complete)
     }
 }
