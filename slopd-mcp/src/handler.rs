@@ -448,6 +448,7 @@ impl SlopdMcp {
         }
         match name {
             "get_status" => self.status().await,
+            "switch_tmux_focus" => self.switch_tmux_focus(request.arguments.as_ref()).await,
             "get_work_overview" => self.overview(request.arguments.as_ref()).await,
             "list_panes" => self.ps(request.arguments.as_ref()).await,
             "fork_pane" => self.fork(request.arguments.as_ref()).await,
@@ -494,6 +495,31 @@ impl SlopdMcp {
             "config_generation": state.config_generation,
             "pending_restore": state.pending_restore,
         }))
+    }
+
+    async fn switch_tmux_focus(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(arguments) = arguments {
+            for (key, value) in arguments {
+                if !matches!(key.as_str(), "window_id" | "pane_id") || !value.is_string() {
+                    return Err(invalid_argument(
+                        "switch_tmux_focus accepts only window_id and pane_id strings",
+                    ));
+                }
+            }
+        }
+        let window_id = arguments.and_then(|args| args.get("window_id")?.as_str());
+        let pane_id = self.optional_pane_id(arguments, "pane_id").await?;
+        libslop::validate_tmux_focus_target(window_id, pane_id.as_deref())
+            .map_err(invalid_argument)?;
+        let mut client = connect(&self.socket).await?;
+        let result = client
+            .switch_tmux_focus(window_id.map(str::to_owned), pane_id)
+            .await;
+        let focus = self.slopd_result(result).await?;
+        ok_json(json!(focus))
     }
 
     async fn configure_notifications(

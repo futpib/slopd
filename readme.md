@@ -1833,8 +1833,27 @@ also apply when calling it through the dispatcher.
 
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
 `message_existing_agent`, `close_agent`, `get_agent_result`,
-`configure_notifications`, `discover_tools`, and `dispatch_tool`. The full
-`/mcp/slopctl` endpoint also exposes the following controls:
+`configure_notifications`, `switch_tmux_focus`, `discover_tools`, and
+`dispatch_tool`. `switch_tmux_focus` accepts optional `window_id` (`@` followed
+by digits) and `pane_id` (`%` followed by digits); at least one is required and
+additional properties are rejected. Its three modes are:
+
+- Window only: activate that window, preserving its selected pane.
+- Pane only: activate that pane and its containing window.
+- Both: verify the pane belongs to the window, then activate both.
+
+The daemon resolves targets on its configured tmux server and exact session,
+checks membership before selecting, and returns the actual `session_id`,
+`window_id`, and `pane_id`. Invalid, missing, foreign, or mismatched targets
+fail before focus changes. Pane selection in a window linked to another
+session is rejected because the selected pane is shared; window-only selection
+remains available without changing the other session's focus. The tool does
+not attach or switch clients, send input, create sessions, or start agents.
+It is discoverable and dispatchable on both endpoints through their existing
+authentication and validation paths, with mutating, non-destructive,
+idempotent annotations.
+
+The full `/mcp/slopctl` endpoint also exposes the following controls:
 
 | Tool | Purpose |
 |------|---------|

@@ -12,6 +12,7 @@ const SIMPLE_NAMES: &[&str] = &[
     "close_agent",
     "get_agent_result",
     "configure_notifications",
+    "switch_tmux_focus",
 ];
 
 pub fn simple_names() -> &'static [&'static str] {
@@ -59,6 +60,19 @@ pub fn all() -> Vec<Tool> {
                     "enabled": { "type": "boolean", "default": true },
                     "watch_id": { "type": "string", "description": "Existing watch to disable with enabled=false." }
                 },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "switch_tmux_focus",
+            "Switch focus within the daemon's configured slopd tmux session using stable IDs, never window names or indexes. With window_id only, activate that window and preserve its selected pane. With pane_id only, activate that pane and its containing window. With both, verify the pane belongs to that window before changing focus. Reject targets outside the session and pane selections in windows linked to other sessions. Does not attach or move clients, send input, or start agents. Use pane_id from get_work_overview or list_panes; the result includes the resolved tmux session, window, and pane IDs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "window_id": { "type": "string", "pattern": "^@[0-9]+$", "description": "Stable tmux window ID, for example @12." },
+                    "pane_id": pane_id_schema()
+                },
+                "anyOf": [{ "required": ["window_id"] }, { "required": ["pane_id"] }],
                 "additionalProperties": false
             }),
         ),
@@ -267,6 +281,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
     match name {
         "discover_tools" => ("Discover current tools", true, false, true),
         "dispatch_tool" => ("Dispatch a registered tool", false, true, false),
+        "switch_tmux_focus" => ("Switch tmux focus", false, false, true),
         "get_status" => ("Get daemon status", true, false, true),
         "get_work_overview" => ("Get work overview", true, false, true),
         "start_new_agent" => ("Start new agent", false, false, false),
@@ -303,6 +318,11 @@ fn output_schema(name: &str) -> Value {
             "dispatch_excluded": { "type": "array", "items": { "type": "string" }, "description": "Higher-order tools callable directly but not through dispatch_tool." }
         }),
         "dispatch_tool" => json!({}),
+        "switch_tmux_focus" => json!({
+            "session_id": { "type": "string", "pattern": "^\\$[0-9]+$" },
+            "window_id": { "type": "string", "pattern": "^@[0-9]+$" },
+            "pane_id": pane_id_schema()
+        }),
         "configure_notifications" => json!({
             "watch_id": { "type": "string" },
             "resource_uri": { "type": "string" },

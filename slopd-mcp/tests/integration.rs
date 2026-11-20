@@ -15,6 +15,9 @@ mod notifications;
 #[path = "integration/higher_order.rs"]
 mod higher_order;
 
+#[path = "integration/tmux_focus.rs"]
+mod tmux_focus;
+
 #[test]
 fn extract_parses_sse_tool_result() {
     let buf = concat!(
@@ -406,6 +409,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "discover_tools",
             "dispatch_tool",
             "configure_notifications",
+            "switch_tmux_focus",
             "get_status",
             "get_work_overview",
             "start_new_agent",
@@ -561,6 +565,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
     let expected_annotations = [
         ("discover_tools", true, false, true),
         ("dispatch_tool", false, true, false),
+        ("switch_tmux_focus", false, false, true),
         ("get_status", true, false, true),
         ("get_work_overview", true, false, true),
         ("start_new_agent", false, false, false),
@@ -656,6 +661,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
             "discover_tools",
             "dispatch_tool",
             "configure_notifications",
+            "switch_tmux_focus",
             "get_work_overview",
             "start_new_agent",
             "message_existing_agent",

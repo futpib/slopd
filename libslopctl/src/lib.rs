@@ -908,6 +908,22 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         }
     }
 
+    pub async fn switch_tmux_focus(
+        &mut self,
+        window_id: Option<String>,
+        pane_id: Option<String>,
+    ) -> Result<libslop::TmuxFocus, Error> {
+        libslop::validate_tmux_focus_target(window_id.as_deref(), pane_id.as_deref())
+            .map_err(Error::SelectError)?;
+        match self
+            .request(libslop::RequestBody::SwitchTmuxFocus { window_id, pane_id })
+            .await?
+        {
+            libslop::ResponseBody::TmuxFocus { focus } => Ok(focus),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
     pub async fn ps(&mut self) -> Result<Vec<libslop::PaneInfo>, Error> {
         match self.request(libslop::RequestBody::Ps).await? {
             libslop::ResponseBody::Ps { panes } => Ok(panes),

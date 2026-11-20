@@ -12,6 +12,7 @@ mod grok;
 mod journal;
 mod opencode;
 mod opencode_v2;
+mod tmux_focus;
 use backend::*;
 
 // Capture before a package upgrade replaces the running binary. On Linux,
@@ -5668,6 +5669,13 @@ async fn handle_request(
                         .as_ref()
                         .map(|pending| pending.panes.len()),
                 },
+            }
+        }
+
+        libslop::RequestBody::SwitchTmuxFocus { window_id, pane_id } => {
+            match tmux_focus::switch(config, window_id.as_deref(), pane_id.as_deref()).await {
+                Ok(focus) => libslop::ResponseBody::TmuxFocus { focus },
+                Err(message) => libslop::ResponseBody::Error { message },
             }
         }
 

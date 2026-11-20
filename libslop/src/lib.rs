@@ -3073,6 +3073,12 @@ pub struct ForkCaller {
 #[serde(tag = "type")]
 pub enum RequestBody {
     Status,
+    /// Select a window, a pane and its window, or a validated window/pane pair
+    /// within the daemon's configured tmux session.
+    SwitchTmuxFocus {
+        window_id: Option<String>,
+        pane_id: Option<String>,
+    },
     Run {
         parent_pane_id: Option<String>,
         extra_args: Vec<String>,
@@ -3261,6 +3267,9 @@ pub enum ResponseBody {
     Status {
         state: DaemonState,
     },
+    TmuxFocus {
+        focus: TmuxFocus,
+    },
     Run {
         pane_id: String,
     },
@@ -3433,6 +3442,35 @@ impl PaneDetailedState {
             | PaneDetailedState::AwaitingInputElicitation => PaneState::AwaitingInput,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TmuxFocus {
+    pub session_id: String,
+    pub window_id: String,
+    pub pane_id: String,
+}
+
+/// Reject tmux target expressions, names, and indexes before resolving IDs.
+pub fn validate_tmux_focus_target(
+    window_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> Result<(), String> {
+    if window_id.is_none() && pane_id.is_none() {
+        return Err("window_id or pane_id is required".into());
+    }
+    for (name, value, prefix) in [("window_id", window_id, '@'), ("pane_id", pane_id, '%')] {
+        if let Some(value) = value
+            && !value.strip_prefix(prefix).is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            return Err(format!(
+                "{name} must be a stable tmux ID such as {prefix}42"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
