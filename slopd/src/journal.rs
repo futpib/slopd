@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -112,6 +113,9 @@ fn same_recovery_checkpoint(a: &[libslop::PaneInfo], b: &[libslop::PaneInfo]) ->
 
 pub(crate) struct LifecycleJournal {
     root: PathBuf,
+    // Control sockets can differ while the managed tmux target is identical.
+    // Own the whole target, including atomic compaction/rename, for our lifetime.
+    _writer_lock: File,
     current: Mutex<CurrentState>,
     generation_refresh: tokio::sync::Mutex<()>,
 }
@@ -134,9 +138,30 @@ impl LifecycleJournal {
                 generations.display()
             )
         })?;
+        let lock_path = root.join("writer.lock");
+        let writer_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| {
+                format!(
+                    "failed to open lifecycle writer lock {}: {e}",
+                    lock_path.display()
+                )
+            })?;
+        if unsafe { libc::flock(writer_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(format!(
+                "failed to lock lifecycle target {} (another daemon may own it): {}",
+                root.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
         let (file, state) = open_generation(&generations, &generation, started_at)?;
         Ok(Self {
             root,
+            _writer_lock: writer_lock,
             current: Mutex::new(CurrentState {
                 generation,
                 file,
@@ -521,7 +546,8 @@ impl LifecycleJournal {
         }
         let mut file = OpenOptions::new()
             .create_new(true)
-            .write(true)
+            .append(true)
+            .read(true)
             .open(&path)
             .map_err(|e| format!("failed to create legacy journal {}: {e}", path.display()))?;
         append_event(
@@ -961,6 +987,69 @@ mod tests {
                 revived_as: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_after_partial_death_record_remains_replayable() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let key = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = open(dir.path(), &config, key.clone(), 1);
+        journal.checkpoint(vec![pane("%1", "first")]).unwrap();
+        // A disk-full death write can leave this prefix without restarting the
+        // daemon. A later successful checkpoint must not concatenate onto it.
+        journal
+            .current
+            .lock()
+            .unwrap()
+            .file
+            .write_all(b"{\"event\":\"destroyed\",\"entry\":{\"grave_id\":\"partial")
+            .unwrap();
+        let expected = vec![pane("%1", "first"), pane("%2", "second")];
+        journal.checkpoint(expected.clone()).unwrap();
+        assert_eq!(
+            journal.manual_restore_source().unwrap().unwrap().1,
+            expected
+        );
+        drop(journal);
+        let reopened = open(dir.path(), &config, key, 1);
+        assert_eq!(
+            reopened.manual_restore_source().unwrap().unwrap().1,
+            expected
+        );
+    }
+
+    #[test]
+    fn one_writer_per_target_even_with_different_control_sockets() {
+        let dir = libsloptest::tempfile::tempdir().unwrap();
+        let config = config(dir.path(), "slopd");
+        let root = target_root_at(&config, &dir.path().join("state"));
+        let key = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$1".into(),
+        };
+        let journal = LifecycleJournal::open_at(root.clone(), key.clone(), 1).unwrap();
+        journal.checkpoint(vec![pane("%1", "session")]).unwrap();
+        // A different control socket bypasses the daemon's existing socket lock,
+        // but still must not share this journal or race its atomic compaction.
+        let error = LifecycleJournal::open_at(root.clone(), key.clone(), 1)
+            .err()
+            .unwrap();
+        assert!(error.contains("failed to lock lifecycle target"), "{error}");
+        let other_generation = GenerationKey {
+            tmux_boot_id: "boot".into(),
+            tmux_session_id: "$2".into(),
+        };
+        assert!(LifecycleJournal::open_at(root.clone(), other_generation, 2).is_err());
+        drop(journal);
+        let reopened = LifecycleJournal::open_at(root, key, 1).unwrap();
+        assert_eq!(
+            reopened.manual_restore_source().unwrap().unwrap().1,
+            vec![pane("%1", "session")]
+        );
     }
 
     #[test]
