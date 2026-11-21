@@ -480,6 +480,12 @@ fn info_json_does_not_require_a_running_daemon() {
         info["capabilities"]
             .as_array()
             .unwrap()
+            .contains(&serde_json::json!("accounts"))
+    );
+    assert!(
+        info["capabilities"]
+            .as_array()
+            .unwrap()
             .contains(&serde_json::json!("listen"))
     );
 }

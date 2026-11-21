@@ -64,6 +64,12 @@ pub enum SelectMode {
 
 #[derive(Subcommand)]
 pub enum CommonCommand {
+    /// List configured accounts and the daemon's default account.
+    Accounts {
+        /// Output as JSON array instead of table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show slopd uptime and state.
     Status {
         /// Output the daemon state as JSON.
@@ -920,6 +926,13 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
             .await?
         {
             libslop::ResponseBody::TmuxFocus { focus } => Ok(focus),
+            other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    pub async fn accounts(&mut self) -> Result<Vec<libslop::AccountInfo>, Error> {
+        match self.request(libslop::RequestBody::Accounts).await? {
+            libslop::ResponseBody::Accounts { accounts } => Ok(accounts),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
         }
     }
@@ -2357,6 +2370,36 @@ where
     }
 
     match command {
+        CommonCommand::Accounts { json } => {
+            let accounts = client.accounts().await?;
+            if json {
+                println!("{}", serde_json::to_string(&accounts).unwrap());
+            } else {
+                let width = accounts
+                    .iter()
+                    .map(|a| a.name.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(7);
+                println!(
+                    "{:<width$}  {:<8}  {:<7}  CONFIG_DIR",
+                    "ACCOUNT", "BACKEND", "DEFAULT"
+                );
+                for account in accounts {
+                    let config_dir = account
+                        .config_dir
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "(backend default)".to_string());
+                    println!(
+                        "{:<width$}  {:<8}  {:<7}  {}",
+                        account.name,
+                        account.backend.canonical_executable(),
+                        if account.is_default { "*" } else { "" },
+                        config_dir
+                    );
+                }
+            }
+        }
         CommonCommand::Status { json } => {
             let state = client.status().await?;
             if json {

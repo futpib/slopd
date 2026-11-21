@@ -666,6 +666,25 @@ config_generation: 0
 pending_restore: 7 pane(s) — run `slopctl restore`
 ```
 
+### `slopctl accounts [--json]`
+
+List accounts from the connected daemon's active configuration, sorted by name.
+Includes the reserved `default` account even when it is not explicitly configured.
+The `DEFAULT` column marks the account used when `run` has no explicit or inherited
+account. Config directories are expanded on the daemon; `(backend default)` means
+the backend uses its standard location.
+
+```
+ACCOUNT  BACKEND   DEFAULT  CONFIG_DIR
+codex    codex     *        /home/me/.codex-work
+default  claude             (backend default)
+work     claude             /home/me/.claude-work
+```
+
+`--json` returns an array with `name`, `backend`, `config_dir` (string or null), and
+`is_default` fields. This command requires a daemon that supports the `Accounts`
+request and reflects configuration changes after a successful SIGHUP reload.
+
 ### `slopctl ps [--filter KEY=VALUE] [--json]`
 
 List all panes managed by slopd.

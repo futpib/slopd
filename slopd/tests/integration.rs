@@ -10830,6 +10830,117 @@ fn pane_account(env: &TestEnv, pane_id: &str) -> String {
 }
 
 #[test]
+fn accounts_lists_daemon_configuration_and_tracks_reload() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let env = TestEnv::new(None).expect("tmux required");
+    let original = std::fs::read_to_string(env.config_path()).unwrap();
+    let configured = format!(
+        "default_account = \"work\"\n{original}\n[accounts]\nwork = \"~/work\"\n[accounts.codex]\nbackend = \"codex\"\n"
+    );
+    std::fs::write(env.config_path(), &configured).unwrap();
+    let slopd = env.spawn_slopd();
+
+    // The client has unrelated accounts and selects the daemon by socket.
+    let client_config = env.config_dir.path().join("client.toml");
+    std::fs::write(&client_config, "[accounts]\nclient_only = \"/unused\"\n").unwrap();
+    let socket = env.socket_path();
+    let args = [
+        "--config",
+        client_config.to_str().unwrap(),
+        "--socket",
+        socket.to_str().unwrap(),
+        "accounts",
+        "--json",
+    ];
+    let output = env.slopctl(&args);
+    assert!(output.status.success(), "accounts: {output:?}");
+    let accounts: Vec<libslop::AccountInfo> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["codex", "default", "work"]
+    );
+    assert_eq!(accounts[0].backend, libslop::Backend::Codex);
+    assert_eq!(accounts[0].config_dir, None);
+    assert_eq!(
+        accounts[2].config_dir,
+        Some(env.config_dir.path().join("work"))
+    );
+    assert_eq!(
+        accounts
+            .iter()
+            .filter(|a| a.is_default)
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["work"]
+    );
+
+    let table = env.slopctl(&["accounts"]);
+    assert!(table.status.success(), "accounts table: {table:?}");
+    let table = String::from_utf8(table.stdout).unwrap();
+    assert_eq!(
+        table
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["ACCOUNT", "BACKEND", "DEFAULT", "CONFIG_DIR"]
+    );
+    assert!(
+        table
+            .lines()
+            .any(|line| line.split_whitespace().take(3).collect::<Vec<_>>()
+                == ["work", "claude", "*"])
+    );
+    assert!(table.contains("(backend default)"));
+
+    // Unloaded file edits must not change the daemon's account list.
+    std::fs::write(
+        env.config_path(),
+        format!("default_account = \"codex\"\n{original}\n[accounts.codex]\nbackend = \"codex\"\n"),
+    )
+    .unwrap();
+    let before_reload = env.slopctl(&args);
+    assert!(before_reload.status.success());
+    assert_eq!(before_reload.stdout, output.stdout);
+    sighup_pid(slopd.id());
+    wait_for_config_generation_at_least(&env, 1, Duration::from_secs(5));
+    let reloaded = env.slopctl(&args);
+    kill_slopd(slopd);
+    assert!(reloaded.status.success(), "reloaded accounts: {reloaded:?}");
+    let accounts: Vec<libslop::AccountInfo> = serde_json::from_slice(&reloaded.stdout).unwrap();
+    assert_eq!(
+        accounts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["codex", "default"]
+    );
+    assert!(accounts[0].is_default);
+    assert!(!accounts[1].is_default);
+}
+
+#[test]
+fn accounts_reports_invalid_daemon_default() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    let env = TestEnv::new(None).expect("tmux required");
+    let original = std::fs::read_to_string(env.config_path()).unwrap();
+    std::fs::write(
+        env.config_path(),
+        format!("default_account = \"missing\"\n{original}"),
+    )
+    .unwrap();
+    let slopd = env.spawn_slopd();
+    let output = env.slopctl(&["accounts", "--json"]);
+    kill_slopd(slopd);
+    assert!(
+        !output.status.success(),
+        "invalid config must fail: {output:?}"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown account \"missing\""));
+}
+
+#[test]
 fn run_account_sets_config_dir_and_shows_in_ps() {
     build_bin("slopd");
     build_bin("slopctl");

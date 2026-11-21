@@ -106,6 +106,7 @@ async fn main() {
             "info",
             "status",
             "status_json",
+            "accounts",
             "pane_list",
             "run",
             "fork",

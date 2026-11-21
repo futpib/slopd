@@ -5653,6 +5653,10 @@ async fn handle_request(
     leases: &LeaseRegistry,
 ) -> libslop::ResponseBody {
     match body {
+        libslop::RequestBody::Accounts => match config.list_accounts() {
+            Ok(accounts) => libslop::ResponseBody::Accounts { accounts },
+            Err(message) => libslop::ResponseBody::Error { message },
+        },
         libslop::RequestBody::Status => {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -1363,6 +1363,70 @@ mod tests {
     }
 
     #[test]
+    fn list_accounts_includes_implicit_default() {
+        let accounts = config_from_toml("").list_accounts().unwrap();
+        assert_eq!(
+            accounts,
+            vec![AccountInfo {
+                name: "default".into(),
+                backend: Backend::Claude,
+                config_dir: None,
+                is_default: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn list_accounts_resolves_sorts_and_deduplicates() {
+        let cfg = config_from_toml(
+            r#"
+            default_account = "work"
+            config_dir = "/top-level"
+            backend = "opencode"
+            [accounts]
+            work = "~/work"
+            [accounts.default]
+            config_dir = "/explicit-default"
+            backend = "grok"
+            [accounts.codex]
+            executable = "codex"
+        "#,
+        );
+        assert_eq!(
+            cfg.list_accounts().unwrap(),
+            vec![
+                AccountInfo {
+                    name: "codex".into(),
+                    backend: Backend::Codex,
+                    config_dir: None,
+                    is_default: false,
+                },
+                AccountInfo {
+                    name: "default".into(),
+                    backend: Backend::Grok,
+                    config_dir: Some(PathBuf::from("/explicit-default")),
+                    is_default: false,
+                },
+                AccountInfo {
+                    name: "work".into(),
+                    backend: Backend::Claude,
+                    config_dir: Some(home_dir().join("work")),
+                    is_default: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_accounts_reports_invalid_configuration() {
+        let cfg = config_from_toml("default_account = \"missing\"");
+        assert!(cfg.list_accounts().unwrap_err().contains("missing"));
+        let cfg =
+            config_from_toml("[accounts.bad]\nbackend = \"claude\"\nexecutable = \"codex\"\n");
+        assert!(cfg.list_accounts().unwrap_err().contains("conflict"));
+    }
+
+    #[test]
     fn resolve_account_none_uses_default_account() {
         let cfg =
             config_from_toml("default_account = \"work\"\n[accounts]\nwork = \"/srv/work\"\n");
@@ -2159,6 +2223,17 @@ pub struct ResolvedAccount {
     pub executable: Executable,
 }
 
+/// Public account metadata from the daemon's active configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub name: String,
+    pub backend: Backend,
+    /// Expanded config directory, or None to use the backend's standard location.
+    pub config_dir: Option<PathBuf>,
+    /// Selected when no explicit or inherited account is provided to `run`.
+    pub is_default: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SlopdControlConfig {
     /// Unix socket used by slopd and local clients. Supports `~` and `$VAR` /
@@ -2666,6 +2741,26 @@ impl SlopdConfig {
         })
     }
 
+    /// List launchable accounts in name order, including the reserved default.
+    pub fn list_accounts(&self) -> Result<Vec<AccountInfo>, String> {
+        let default = self.resolve_account(None)?.name;
+        let mut names: std::collections::BTreeSet<&str> =
+            self.accounts.keys().map(String::as_str).collect();
+        names.insert(DEFAULT_ACCOUNT);
+        names
+            .into_iter()
+            .map(|name| {
+                let resolved = self.resolve_account(Some(name))?;
+                Ok(AccountInfo {
+                    is_default: resolved.name == default,
+                    name: resolved.name,
+                    backend: resolved.backend,
+                    config_dir: resolved.config_dir,
+                })
+            })
+            .collect()
+    }
+
     /// The `settings.json` path where hooks are injected for a resolved account.
     /// Falls back to `~/.claude/settings.json` when no dir is in effect, so it
     /// always names a concrete file.
@@ -3079,6 +3174,8 @@ pub enum RequestBody {
         window_id: Option<String>,
         pane_id: Option<String>,
     },
+    /// List accounts from the daemon's active configuration.
+    Accounts,
     Run {
         parent_pane_id: Option<String>,
         extra_args: Vec<String>,
@@ -3269,6 +3366,9 @@ pub enum ResponseBody {
     },
     TmuxFocus {
         focus: TmuxFocus,
+    },
+    Accounts {
+        accounts: Vec<AccountInfo>,
     },
     Run {
         pane_id: String,
