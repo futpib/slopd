@@ -1324,6 +1324,31 @@ mod tests {
     }
 
     #[test]
+    fn account_mcp_defaults_on_and_can_be_disabled_per_account() {
+        let cfg = config_from_toml(
+            r#"
+            [accounts]
+            shorthand = "/same-login"
+            [accounts.default]
+            mcp = false
+            [accounts.codex]
+            backend = "codex"
+            mcp = false
+            [accounts.claude]
+            mcp = true
+        "#,
+        );
+        assert!(!cfg.resolve_account(None).unwrap().mcp);
+        assert!(!cfg.resolve_account(Some("codex")).unwrap().mcp);
+        assert!(cfg.resolve_account(Some("shorthand")).unwrap().mcp);
+        assert!(cfg.resolve_account(Some("claude")).unwrap().mcp);
+        assert!(config_from_toml("").resolve_account(None).unwrap().mcp);
+        assert!(toml::from_str::<SlopdConfig>("[accounts.test]\nmcp = \"off\"").is_err());
+        let info = cfg.list_accounts().unwrap();
+        assert!(!info.iter().find(|a| a.name == "codex").unwrap().mcp);
+    }
+
+    #[test]
     fn resolve_account_named_returns_name_and_dir() {
         let cfg = config_from_toml("[accounts]\nwork = \"/srv/work\"\n");
         let resolved = cfg.resolve_account(Some("work")).unwrap();
@@ -1368,6 +1393,7 @@ mod tests {
         assert_eq!(
             accounts,
             vec![AccountInfo {
+                mcp: true,
                 name: "default".into(),
                 backend: Backend::Claude,
                 config_dir: None,
@@ -1396,18 +1422,21 @@ mod tests {
             cfg.list_accounts().unwrap(),
             vec![
                 AccountInfo {
+                    mcp: true,
                     name: "codex".into(),
                     backend: Backend::Codex,
                     config_dir: None,
                     is_default: false,
                 },
                 AccountInfo {
+                    mcp: true,
                     name: "default".into(),
                     backend: Backend::Grok,
                     config_dir: Some(PathBuf::from("/explicit-default")),
                     is_default: false,
                 },
                 AccountInfo {
+                    mcp: true,
                     name: "work".into(),
                     backend: Backend::Claude,
                     config_dir: Some(home_dir().join("work")),
@@ -2158,6 +2187,10 @@ pub enum AccountConfig {
 /// backward-compatible), plus a matching accessor on [`AccountConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSettings {
+    /// Whether the agent may load MCP integrations. Defaults to its normal
+    /// configuration; false disables MCP at launch on supported backends.
+    #[serde(default = "mcp_enabled_by_default")]
+    pub mcp: bool,
     /// The account's agent config directory (exported as `CLAUDE_CONFIG_DIR`
     /// for [`Backend::Claude`], `OPENCODE_CONFIG_DIR` for [`Backend::Opencode`],
     /// `CODEX_HOME` for [`Backend::Codex`], or `GROK_HOME` for
@@ -2177,6 +2210,13 @@ pub struct AccountSettings {
 }
 
 impl AccountConfig {
+    pub fn mcp_enabled(&self) -> bool {
+        match self {
+            Self::Dir(_) => true,
+            Self::Settings(settings) => settings.mcp,
+        }
+    }
+
     /// The account's agent config directory, as written in config (unexpanded).
     pub fn config_dir(&self) -> Option<&PathBuf> {
         match self {
@@ -2207,6 +2247,7 @@ impl AccountConfig {
 /// executable to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
+    pub mcp: bool,
     /// The account name in effect (always set; [`DEFAULT_ACCOUNT`] for the
     /// default). Recorded on the pane as `@slopd_account` so it shows in `ps`
     /// and child panes can inherit it.
@@ -2226,12 +2267,18 @@ pub struct ResolvedAccount {
 /// Public account metadata from the daemon's active configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountInfo {
+    #[serde(default = "mcp_enabled_by_default")]
+    pub mcp: bool,
     pub name: String,
     pub backend: Backend,
     /// Expanded config directory, or None to use the backend's standard location.
     pub config_dir: Option<PathBuf>,
     /// Selected when no explicit or inherited account is provided to `run`.
     pub is_default: bool,
+}
+
+fn mcp_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -2711,6 +2758,7 @@ impl SlopdConfig {
                 .or(self.run.executable.as_ref());
             let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
             return Ok(ResolvedAccount {
+                mcp: acct.is_none_or(AccountConfig::mcp_enabled),
                 name,
                 config_dir,
                 backend,
@@ -2734,6 +2782,7 @@ impl SlopdConfig {
         let explicit_executable = account.executable().or(self.run.executable.as_ref());
         let (backend, executable) = Backend::resolve(explicit_backend, explicit_executable)?;
         Ok(ResolvedAccount {
+            mcp: account.mcp_enabled(),
             name,
             config_dir: account.config_dir().map(|path| expand_path(path)),
             backend,
@@ -2752,6 +2801,7 @@ impl SlopdConfig {
             .map(|name| {
                 let resolved = self.resolve_account(Some(name))?;
                 Ok(AccountInfo {
+                    mcp: resolved.mcp,
                     is_default: resolved.name == default,
                     name: resolved.name,
                     backend: resolved.backend,

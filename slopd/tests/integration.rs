@@ -10836,7 +10836,7 @@ fn accounts_lists_daemon_configuration_and_tracks_reload() {
     let env = TestEnv::new(None).expect("tmux required");
     let original = std::fs::read_to_string(env.config_path()).unwrap();
     let configured = format!(
-        "default_account = \"work\"\n{original}\n[accounts]\nwork = \"~/work\"\n[accounts.codex]\nbackend = \"codex\"\n"
+        "default_account = \"work\"\n{original}\n[accounts]\nwork = \"~/work\"\n[accounts.codex]\nbackend = \"codex\"\nmcp = false\n"
     );
     std::fs::write(env.config_path(), &configured).unwrap();
     let slopd = env.spawn_slopd();
@@ -10861,6 +10861,7 @@ fn accounts_lists_daemon_configuration_and_tracks_reload() {
         ["codex", "default", "work"]
     );
     assert_eq!(accounts[0].backend, libslop::Backend::Codex);
+    assert!(!accounts[0].mcp);
     assert_eq!(accounts[0].config_dir, None);
     assert_eq!(
         accounts[2].config_dir,
@@ -10885,7 +10886,7 @@ fn accounts_lists_daemon_configuration_and_tracks_reload() {
             .unwrap()
             .split_whitespace()
             .collect::<Vec<_>>(),
-        ["ACCOUNT", "BACKEND", "DEFAULT", "CONFIG_DIR"]
+        ["ACCOUNT", "BACKEND", "DEFAULT", "MCP", "CONFIG_DIR"]
     );
     assert!(
         table
@@ -10915,6 +10916,7 @@ fn accounts_lists_daemon_configuration_and_tracks_reload() {
         ["codex", "default"]
     );
     assert!(accounts[0].is_default);
+    assert!(accounts[0].mcp);
     assert!(!accounts[1].is_default);
 }
 
@@ -17654,7 +17656,7 @@ fn assert_mock_codex_yolo(env: &TestEnv, pane_id: &str) {
 }
 
 #[test]
-fn codex_standalone_args_survive_fork_recovery_and_restore() {
+fn codex_account_policy_survives_fork_recovery_and_restore() {
     build_bin("slopd");
     build_bin("slopctl");
     build_bin("mock_codex");
@@ -17662,7 +17664,7 @@ fn codex_standalone_args_survive_fork_recovery_and_restore() {
     let codex_home = tempfile::tempdir().unwrap();
     let env = TestEnv::new(None).expect("tmux required");
     env.append_config(&format!(
-        "\n[accounts.codex-yolo]\nbackend = \"codex\"\nexecutable = [{:?}, \"--dangerously-bypass-approvals-and-sandbox\"]\nconfig_dir = {:?}\n",
+        "\n[accounts.codex-yolo]\nmcp = false\nbackend = \"codex\"\nexecutable = [{:?}, \"--dangerously-bypass-approvals-and-sandbox\"]\nconfig_dir = {:?}\n",
         mock_codex.to_str().unwrap(),
         codex_home.path().to_str().unwrap(),
     ));
@@ -17676,6 +17678,7 @@ fn codex_standalone_args_survive_fork_recovery_and_restore() {
     );
     let source = String::from_utf8_lossy(&run.stdout).trim().to_string();
     assert_mock_codex_yolo(&env, &source);
+    assert_codex_mcp_disabled(&pane_process_args(&env, &source));
 
     // A fork is another standalone CLI process and receives the configured
     // executable arguments independently.
@@ -17687,6 +17690,13 @@ fn codex_standalone_args_survive_fork_recovery_and_restore() {
     );
     let fork_pane = String::from_utf8_lossy(&fork.stdout).trim().to_string();
     assert_mock_codex_yolo(&env, &fork_pane);
+    assert_codex_mcp_disabled(&pane_process_args(&env, &fork_pane));
+    let helper_requests =
+        std::fs::read_to_string(codex_home.path().join("app-server-requests.jsonl")).unwrap();
+    let helper: serde_json::Value =
+        serde_json::from_str(helper_requests.lines().next().unwrap()).unwrap();
+    let helper_args: Vec<String> = serde_json::from_value(helper["args"].clone()).unwrap();
+    assert_codex_mcp_disabled(&helper_args);
 
     // A daemon restart recovers hooks/transcript state; it does not reconnect
     // either pane to a shared service or mutate the live process policy.
@@ -17725,8 +17735,89 @@ fn codex_standalone_args_survive_fork_recovery_and_restore() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert_mock_codex_yolo(&env, &restored_fork);
+    assert_codex_mcp_disabled(&pane_process_args(&env, &restored_fork));
 
     kill_slopd(slopd);
+}
+
+fn pane_process_args(env: &TestEnv, pane: &str) -> Vec<String> {
+    let pid = env
+        .tmux
+        .tmux()
+        .args(["display-message", "-p", "-t", pane, "#{pane_pid}"])
+        .output()
+        .unwrap();
+    assert!(pid.status.success());
+    let pid = String::from_utf8(pid.stdout).unwrap();
+    std::fs::read(format!("/proc/{}/cmdline", pid.trim()))
+        .unwrap()
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8(part.to_vec()).unwrap())
+        .collect()
+}
+
+fn assert_codex_mcp_disabled(args: &[String]) {
+    assert!(args.iter().any(|arg| arg == "--no-daemon"), "{args:?}");
+    for feature in ["apps", "plugins"] {
+        assert!(
+            args.windows(2).any(|pair| pair == ["--disable", feature]),
+            "{args:?}"
+        );
+    }
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("mcp_servers = {") && arg.contains("enabled = false")),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn claude_account_mcp_toggle_is_launch_local_and_forked() {
+    build_bin("slopd");
+    build_bin("slopctl");
+    build_bin("mock_claude");
+    let env =
+        TestEnv::new(Some(&[cargo_bin("mock_claude").to_str().unwrap()])).expect("tmux required");
+    let account_home = env.config_dir.path().join("claude-account");
+    env.append_config(&format!(
+        "\n[accounts.off]\nconfig_dir = {0:?}\nmcp = false\n[accounts.on]\nconfig_dir = {0:?}\nmcp = true\n",
+        account_home.to_str().unwrap()
+    ));
+    let daemon = env.spawn_slopd();
+    let run = env.slopctl_raw(&["run", "--account", "off", "--ready-timeout", "20"]);
+    assert!(run.status.success(), "{run:?}");
+    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    let args = pane_process_args(&env, &pane);
+    assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+    enable_always_submit(&env, &pane);
+    assert!(query_pane_env(&env, &pane, "ENABLE_CLAUDEAI_MCP_SERVERS").ends_with("=false"));
+    let fork = env.slopctl_raw(&["fork", &pane, "--ready-timeout", "20"]);
+    assert!(fork.status.success(), "{fork:?}");
+    let fork = String::from_utf8(fork.stdout).unwrap().trim().to_string();
+    assert!(
+        pane_process_args(&env, &fork)
+            .iter()
+            .any(|arg| arg == "--strict-mcp-config")
+    );
+    let run = env.slopctl_raw(&[
+        "run",
+        "--account",
+        "on",
+        "--ready-timeout",
+        "20",
+        "--",
+        "--session-id",
+        "00000000-0000-4000-8000-000000000001",
+    ]);
+    assert!(run.status.success(), "{run:?}");
+    let pane = String::from_utf8(run.stdout).unwrap().trim().to_string();
+    assert!(
+        !pane_process_args(&env, &pane)
+            .iter()
+            .any(|arg| arg == "--strict-mcp-config")
+    );
+    kill_slopd(daemon);
 }
 
 #[test]

@@ -2382,8 +2382,8 @@ where
                     .unwrap_or(0)
                     .max(7);
                 println!(
-                    "{:<width$}  {:<8}  {:<7}  CONFIG_DIR",
-                    "ACCOUNT", "BACKEND", "DEFAULT"
+                    "{:<width$}  {:<8}  {:<7}  {:<3}  CONFIG_DIR",
+                    "ACCOUNT", "BACKEND", "DEFAULT", "MCP"
                 );
                 for account in accounts {
                     let config_dir = account
@@ -2391,10 +2391,11 @@ where
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "(backend default)".to_string());
                     println!(
-                        "{:<width$}  {:<8}  {:<7}  {}",
+                        "{:<width$}  {:<8}  {:<7}  {:<3}  {}",
                         account.name,
                         account.backend.canonical_executable(),
                         if account.is_default { "*" } else { "" },
+                        if account.mcp { "on" } else { "off" },
                         config_dir
                     );
                 }

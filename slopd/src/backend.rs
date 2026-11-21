@@ -619,6 +619,7 @@ impl BackendLifecycle for ClaudeBackend {
             context.config,
             context.session_lock,
             &SpawnSpec {
+                disable_mcp: !context.resolved.mcp,
                 working_dir: launch_dir,
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
@@ -737,6 +738,7 @@ impl BackendLifecycle for OpencodeBackend {
             context.config,
             context.session_lock,
             &SpawnSpec {
+                disable_mcp: !context.resolved.mcp,
                 working_dir: context.working_dir.clone(),
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
@@ -816,11 +818,23 @@ impl BackendLifecycle for CodexBackend {
         }
         let env = merge_spawn_env(context.config, context.env.to_vec())?;
         let executable = resolve_spawn_program(&resolved.executable, &env, context.cwd)?;
+        let mut args = resolved.executable.args().to_vec();
+        args.extend(codex_unattended_update_args());
+        if !resolved.mcp {
+            args = mcp::disabled_launch(
+                libslop::Backend::Codex,
+                &executable,
+                &args,
+                &env,
+                resolved.config_dir.as_deref(),
+                context.cwd,
+                false,
+            )
+            .await?
+            .args;
+        }
         let mut command = tokio::process::Command::new(executable);
-        command
-            .args(resolved.executable.args())
-            .args(codex_unattended_update_args())
-            .current_dir(context.cwd);
+        command.args(args).current_dir(context.cwd);
         if let Some(home) = resolved.config_dir {
             command.env("CODEX_HOME", home);
         }
@@ -872,6 +886,7 @@ impl BackendLifecycle for CodexBackend {
             context.config,
             context.session_lock,
             &SpawnSpec {
+                disable_mcp: !context.resolved.mcp,
                 working_dir: launch_dir.clone(),
                 config_dir: context.resolved.config_dir.clone(),
                 backend: context.resolved.backend,
@@ -1060,6 +1075,7 @@ impl BackendLifecycle for GrokBackend {
             context.config,
             context.session_lock,
             &SpawnSpec {
+                disable_mcp: !context.resolved.mcp,
                 working_dir: launch_dir,
                 config_dir: context.resolved.config_dir.clone(),
                 backend: libslop::Backend::Grok,

@@ -124,7 +124,7 @@ fn config_override<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
             argument => argument.strip_prefix("--config="),
         };
         if let Some((candidate, candidate_value)) = expression.and_then(|item| item.split_once('='))
-            && candidate == key
+            && candidate.trim() == key
         {
             value = Some(candidate_value);
         }
@@ -254,6 +254,19 @@ fn app_server(args: &[String], home: &Path) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.windows(2).any(|pair| pair == ["mcp", "list"]) {
+        let disabled = config_override(&args, "mcp_servers")
+            .is_some_and(|value| value.contains("enabled = false"));
+        println!(
+            "{}",
+            json!([{
+                "name": "fixture",
+                "enabled": !disabled,
+                "transport": {"type": "stdio", "command": "/bin/false"}
+            }])
+        );
+        return;
+    }
     for arg in args.iter().filter(|arg| arg.starts_with("--mock-")) {
         if matches!(
             arg.as_str(),

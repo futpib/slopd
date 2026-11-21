@@ -471,7 +471,8 @@ session named `slopd`.
 Run different panes under different agent accounts and backends. There is always
 a reserved account named `default`, backed by the top-level `backend`,
 `config_dir`, and `[run] executable`. Define additional entries under
-`[accounts]`; the table form accepts `backend`, `config_dir`, and `executable`.
+`[accounts]`; the table form accepts `backend`, `config_dir`, `executable`, and
+`mcp` (default `true`).
 
 `default_account` is a pointer to one of those named accounts. Keeping every
 backend in a named account makes changing the default a one-line edit:
@@ -490,6 +491,37 @@ backend = "opencode"
 [accounts.grok]
 backend = "grok"
 ```
+
+Set `mcp = false` on an account to launch it without MCP integrations:
+
+```toml
+[accounts.codex-no-mcp]
+backend = "codex"
+config_dir = "~/.codex-work" # reuse the same login and history
+mcp = false
+
+[accounts.claude-no-mcp]
+backend = "claude"
+mcp = false
+```
+
+Select the preset with `slopctl run --account codex-no-mcp`. `mcp = true` leaves
+the backend's normal configuration in effect; it does not turn on servers that
+you disabled there. The setting is applied to launches, forks, restores, and
+revivals using the account's current configuration. Reloading slopd does not
+change MCP availability in an already-running agent.
+
+| Backend | Behavior with `mcp = false` |
+| --- | --- |
+| Claude Code | Uses an empty strict MCP config and disables claude.ai connectors and Chrome integration. Conflicting `--mcp-config` or `--chrome` arguments are rejected. |
+| Codex | Resolves the selected account/project/profile's servers, disables each server, and disables apps and plugins for this invocation. This also disables plugin skills. Launches a standalone process; remote app-server connections are rejected. |
+| OpenCode 1 | Reads the resolved config and passes a per-process `OPENCODE_CONFIG_CONTENT` override disabling each configured MCP server, preserving other inline settings. |
+| OpenCode 2 / Grok Build | Currently returns an explicit unsupported error before launching a pane. |
+
+slopd does not write these MCP overrides into account or project config files.
+Codex and OpenCode configuration probes have a 30-second timeout and must confirm
+that their configured servers are disabled before launch. This controls startup
+configuration, not what a user or agent can subsequently change from a terminal.
 
 The target account name—not the literal name `default`—is recorded on newly
 created panes, so their children continue to inherit the account they were
@@ -675,14 +707,15 @@ account. Config directories are expanded on the daemon; `(backend default)` mean
 the backend uses its standard location.
 
 ```
-ACCOUNT  BACKEND   DEFAULT  CONFIG_DIR
-codex    codex     *        /home/me/.codex-work
-default  claude             (backend default)
-work     claude             /home/me/.claude-work
+ACCOUNT  BACKEND   DEFAULT  MCP  CONFIG_DIR
+codex    codex     *        on   /home/me/.codex-work
+default  claude             on   (backend default)
+work     claude             off  /home/me/.claude-work
 ```
 
-`--json` returns an array with `name`, `backend`, `config_dir` (string or null), and
-`is_default` fields. This command requires a daemon that supports the `Accounts`
+`--json` returns an array with `name`, `backend`, `config_dir` (string or null),
+`mcp` (boolean), and `is_default` fields. `MCP` shows the account's launch setting.
+This command requires a daemon that supports the `Accounts`
 request and reflects configuration changes after a successful SIGHUP reload.
 
 ### `slopctl ps [--filter KEY=VALUE] [--json]`

@@ -10,6 +10,7 @@ mod backend;
 mod codex;
 mod grok;
 mod journal;
+mod mcp;
 mod opencode;
 mod opencode_v2;
 mod tmux_focus;
@@ -4699,6 +4700,8 @@ async fn read_pane_manifest(manifest_path: &std::path::Path) -> Vec<libslop::Pan
 /// [`spawn_pane`], the single chokepoint both go through.
 #[derive(Default)]
 struct SpawnSpec {
+    /// Disable MCP integrations for this account at every launch.
+    disable_mcp: bool,
     /// `-c` working directory for the new pane (also the cwd a relative
     /// executable resolves against). `None` → tmux default.
     working_dir: Option<String>,
@@ -4744,6 +4747,8 @@ async fn spawn_pane(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let resolved = resolve_spawn_program(&spec.executable, &spec.extra_env, &lookup_cwd)?;
+    let mut launch_args = spec.executable.args().to_vec();
+    launch_args.extend(spec.trailing_args.iter().cloned());
     let v2 = spec.backend == libslop::Backend::Opencode
         && opencode_v2::detect(
             &resolved,
@@ -4752,6 +4757,21 @@ async fn spawn_pane(
             &lookup_cwd,
         )
         .await?;
+    let mut policy_env = Vec::new();
+    if spec.disable_mcp {
+        let policy = mcp::disabled_launch(
+            spec.backend,
+            &resolved,
+            &launch_args,
+            &spec.extra_env,
+            spec.config_dir.as_deref(),
+            &lookup_cwd,
+            v2,
+        )
+        .await?;
+        launch_args = policy.args;
+        policy_env = policy.env;
+    }
     let v2_launch = if v2 {
         let args = spec
             .executable
@@ -4850,6 +4870,9 @@ async fn spawn_pane(
             for (k, v) in &spec.extra_env {
                 cmd.args(["-e", &format!("{}={}", k, v)]);
             }
+            for (key, value) in &policy_env {
+                cmd.args(["-e", &format!("{key}={value}")]);
+            }
             // Spawn the resolved absolute path, not the bare program name, so
             // the launch never depends on the pane's own PATH.
             if let Some(((port, session, args, create_session), launcher)) = &v2_launch {
@@ -4885,9 +4908,7 @@ async fn spawn_pane(
                 }
                 cmd.arg("--").arg(&resolved).args(args);
             } else {
-                cmd.arg(&resolved)
-                    .args(spec.executable.args())
-                    .args(&spec.trailing_args);
+                cmd.arg(&resolved).args(&launch_args);
             }
 
             match cmd.output().await {
@@ -6378,6 +6399,7 @@ async fn handle_request(
                 config,
                 session_lock,
                 &SpawnSpec {
+                    disable_mcp: !resolved.mcp,
                     working_dir: effective_start_dir
                         .as_ref()
                         .and_then(|d| d.to_str().map(str::to_string)),
