@@ -1030,18 +1030,23 @@ impl SlopdMcp {
                 "a new-agent request cannot include pane_id; omit pane_id to create exactly one new agent",
             ));
         }
-        // A running agent's model cannot be changed safely: Claude's `/model`
-        // also rewrites the account's default for every new session, and the
-        // other backends have no argument form. Fail rather than ignore it.
+        // A running agent's model and effort cannot be changed safely: Claude's
+        // `/model` and `/effort` also rewrite the account's default for every
+        // new session, and Codex has no argument form. Fail rather than ignore.
         let model = agent_model(arguments)?;
-        if model.is_some() && !matches!(target, AgentTarget::New) {
+        let effort = agent_effort(arguments)?;
+        if (model.is_some() || effort.is_some()) && !matches!(target, AgentTarget::New) {
             return Err(invalid_argument(
-                "model applies only when a new agent is created (start_new_agent, or ask_or_tell_agent with new_agent=true); an existing agent keeps the model it started with, so no message was sent",
+                "model and effort apply only when a new agent is created (start_new_agent, or ask_or_tell_agent with new_agent=true); an existing agent keeps the model and effort it started with, so no message was sent",
             ));
+        }
+        if effort.is_some() {
+            // Reject an effort the backend would ignore before accepting work.
+            self.launch_args(arguments).await?;
         }
         let selector_key = agent_selector_key(arguments, explicit_pane_id.as_deref());
         let dedupe_key = format!(
-            "{selector_key}\ntarget={}\ninterrupt={interrupt}\nmodel={model:?}\nprompt={prompt}",
+            "{selector_key}\ntarget={}\ninterrupt={interrupt}\nmodel={model:?}\neffort={effort:?}\nprompt={prompt}",
             target.key()
         );
         let candidate = Arc::new(self.mailbox.entry(
@@ -1272,6 +1277,51 @@ impl SlopdMcp {
         ))
     }
 
+    /// Launch flags for a new agent's `model` and `effort`, in the form its
+    /// backend's CLI takes them.
+    async fn launch_args(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<Vec<String>, McpError> {
+        let mut args = Vec::new();
+        if let Some(model) = agent_model(arguments)? {
+            args.extend(["--model".to_string(), model]);
+        }
+        if let Some(effort) = agent_effort(arguments)? {
+            let backend = self.launch_backend(arguments).await?;
+            args.extend(effort_args(backend, &effort).map_err(invalid_argument)?);
+        }
+        Ok(args)
+    }
+
+    /// The backend a new pane will run: the explicit backend, else the named
+    /// account's, else the default account's (as the daemon resolves `run`).
+    async fn launch_backend(
+        &self,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<libslop::Backend, McpError> {
+        if let Some(name) = optional_string(arguments, "backend") {
+            return parse_backend(&name).map_err(invalid_argument);
+        }
+        let account = optional_string(arguments, "account");
+        let mut client = connect(&self.socket).await?;
+        let result = client.accounts().await;
+        let accounts = self.slopd_result(result).await?;
+        let found = match &account {
+            Some(name) => accounts.iter().find(|info| &info.name == name),
+            None => accounts
+                .iter()
+                .find(|info| info.is_default)
+                .or_else(|| accounts.iter().find(|info| info.name == "default")),
+        };
+        found.map(|info| info.backend).ok_or_else(|| {
+            invalid_argument(match account {
+                Some(name) => format!("unknown account {name:?}"),
+                None => "slopd has no default account".to_string(),
+            })
+        })
+    }
+
     async fn create_agent_pane(
         &self,
         arguments: Option<&Map<String, Value>>,
@@ -1283,9 +1333,7 @@ impl SlopdMcp {
             None => None,
         };
         let extra_tag = optional_string(arguments, "tag");
-        let extra_args = agent_model(arguments)?
-            .map(|model| vec!["--model".to_string(), model])
-            .unwrap_or_default();
+        let extra_args = self.launch_args(arguments).await?;
         let mut client = connect(&self.socket).await?;
         let result = client.subscribe(ready_event_filters()).await;
         let mut subscription = self.slopd_result(result).await?;
@@ -1986,7 +2034,7 @@ impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             ToolSurface::Simple => {
-                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After an agent tool returns pending or completed, follow its follow_up_instruction: never resend that prompt or start another agent for the same request, but other reads and follow-ups in the same turn are fine. To read a long or truncated reply in full, call read_agent_reply. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Omit model unless the user names one; only start_new_agent accepts it, because an existing agent keeps the model it started with. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
+                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After an agent tool returns pending or completed, follow its follow_up_instruction: never resend that prompt or start another agent for the same request, but other reads and follow-ups in the same turn are fine. To read a long or truncated reply in full, call read_agent_reply. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Omit model and effort unless the user names them; only start_new_agent accepts them, because an existing agent keeps the model and effort it started with. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
             }
             ToolSurface::Full => {
                 "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
@@ -3243,6 +3291,49 @@ fn agent_model(arguments: Option<&Map<String, Value>>) -> Result<Option<String>,
         )));
     }
     Ok(Some(model.to_string()))
+}
+
+/// The optional reasoning `effort` for a new agent, lowercased. Which levels
+/// are valid depends on the backend; see `effort_args`.
+fn agent_effort(arguments: Option<&Map<String, Value>>) -> Result<Option<String>, McpError> {
+    match arguments.and_then(|arguments| arguments.get("effort")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(effort)) if effort.trim().is_empty() => Ok(None),
+        Some(Value::String(effort)) => Ok(Some(effort.trim().to_ascii_lowercase())),
+        Some(other) => Err(invalid_argument(format!(
+            "effort must be a string, got {other}"
+        ))),
+    }
+}
+
+/// Launch flags for `effort` on `backend`. Validated here because neither CLI
+/// rejects a bad level at launch: Claude warns and falls back to its default,
+/// and Codex sends the value to the API, failing only on the first turn.
+fn effort_args(backend: libslop::Backend, effort: &str) -> Result<Vec<String>, String> {
+    let (levels, args): (&[&str], Vec<String>) = match backend {
+        libslop::Backend::Claude => (
+            &["low", "medium", "high", "xhigh", "max"],
+            vec!["--effort".to_string(), effort.to_string()],
+        ),
+        libslop::Backend::Codex => (
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            vec!["-c".to_string(), format!("model_reasoning_effort={effort}")],
+        ),
+        other => {
+            return Err(format!(
+                "effort is not supported for the {} backend; omit effort",
+                other.canonical_executable()
+            ));
+        }
+    };
+    if !levels.contains(&effort) {
+        return Err(format!(
+            "effort {effort:?} is not valid for the {} backend; expected one of {}",
+            backend.canonical_executable(),
+            levels.join(", ")
+        ));
+    }
+    Ok(args)
 }
 
 fn agent_selector_key(arguments: Option<&Map<String, Value>>, pane_id: Option<&str>) -> String {

@@ -970,6 +970,29 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
         .await;
         assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
     }
+    for (id, arguments) in [
+        (207, json!({ "account": "codex", "effort": "ultra" })),
+        (208, json!({ "backend": "opencode", "effort": "high" })),
+        (
+            209,
+            json!({ "account": "no-such-account", "effort": "high" }),
+        ),
+    ] {
+        let mut arguments = arguments;
+        arguments["prompt"] = json!("MUST_NOT_START");
+        let rejected = call_tool_at(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            "/mcp",
+            id,
+            "start_new_agent",
+            arguments,
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    }
 
     let started = call_tool_at(
         &client,
@@ -983,6 +1006,7 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
             "account": "codex",
             "prompt": "MODEL_CANARY",
             "model": "mock-model-1.5",
+            "effort": "Max",
             "wait_seconds": 10
         }),
     )
@@ -995,6 +1019,11 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
     assert!(
         args.windows(2)
             .any(|pair| pair == ["--model", "mock-model-1.5"]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=max"]),
         "{args:?}"
     );
 
@@ -1013,7 +1042,7 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
     assert!(
         existing["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("keeps the model it started with")),
+            .is_some_and(|message| message.contains("keeps the model and effort it started with")),
         "{existing}"
     );
 
@@ -1043,6 +1072,69 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
     let transcript = transcript.to_string();
     assert!(transcript.contains("MODEL_CANARY"), "{transcript}");
     assert!(!transcript.contains("MUST_NOT_SEND"), "{transcript}");
+}
+
+#[tokio::test]
+async fn claude_agents_take_effort_and_existing_ones_refuse_it() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+
+    // The default account is Claude, which has no "minimal" level.
+    let rejected = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        300,
+        "start_new_agent",
+        json!({ "prompt": "MUST_NOT_START", "effort": "minimal" }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("low, medium, high, xhigh, max")),
+        "{rejected}"
+    );
+
+    let started = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        301,
+        "start_new_agent",
+        json!({ "prompt": "EFFORT_CANARY", "effort": "max", "wait_seconds": 10 }),
+    )
+    .await;
+    let started = tool_payload(&started);
+    let pane_id = started["pane_id"].as_str().unwrap().to_string();
+    let args = pane_process_args(&env, &pane_id);
+    assert!(
+        args.windows(2).any(|pair| pair == ["--effort", "max"]),
+        "{args:?}"
+    );
+
+    let existing = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        302,
+        "message_existing_agent",
+        json!({ "pane_id": pane_id, "prompt": "MUST_NOT_SEND", "effort": "low" }),
+    )
+    .await;
+    assert_eq!(existing["error"]["code"], -32602, "{existing}");
 }
 
 #[tokio::test]
