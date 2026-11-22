@@ -2728,6 +2728,11 @@ fn overview_messages(records: &[libslop::Record]) -> Vec<OverviewMessage> {
         if role == "user" && internal_text(&text) {
             continue;
         }
+        let text = if role == "user" {
+            without_paste_markers(&text)
+        } else {
+            text
+        };
         let kind = if role == "user" {
             "request"
         } else if progress_record(record) {
@@ -3069,6 +3074,11 @@ fn simple_record(record: &libslop::Record) -> Option<Value> {
     if role == "user" && internal_text(&text) {
         return None;
     }
+    let text = if role == "user" {
+        without_paste_markers(&text)
+    } else {
+        text
+    };
     Some(json!({ "role": role, "text": text }))
 }
 
@@ -3106,24 +3116,37 @@ fn prompt_record(record: &libslop::Record) -> bool {
 /// and may re-flow whitespace, so compare text with both removed.
 fn same_prompt(recorded: &str, prompt: &str) -> bool {
     fn normalized(text: &str) -> String {
-        let mut unwrapped = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(start) = [rest.find("<pasted_content"), rest.find("</pasted_content")]
-            .into_iter()
-            .flatten()
-            .min()
-        {
-            let Some(end) = rest[start..].find('>') else {
-                break;
-            };
-            unwrapped.push_str(&rest[..start]);
-            unwrapped.push(' ');
-            rest = &rest[start + end + 1..];
-        }
-        unwrapped.push_str(rest);
-        unwrapped.split_whitespace().collect::<Vec<_>>().join(" ")
+        without_paste_markers(text)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     normalized(recorded) == normalized(prompt)
+}
+
+/// A prompt as the user wrote it, without the paste markers Claude Code
+/// records around pasted text, so callers never see or speak them.
+fn without_paste_markers(text: &str) -> String {
+    if !text.contains("pasted_content") {
+        // Leave other text, including streamed chunks, exactly as recorded.
+        return text.to_string();
+    }
+    let mut unwrapped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = [rest.find("<pasted_content"), rest.find("</pasted_content")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        unwrapped.push_str(&rest[..start]);
+        unwrapped.push(' ');
+        rest = &rest[start + end + 1..];
+    }
+    unwrapped.push_str(rest);
+    unwrapped.trim().to_string()
 }
 
 fn unix_ms() -> u64 {
@@ -3553,6 +3576,23 @@ mod tests {
 
         let other = request_reply_snapshot(&records, "a different prompt");
         assert!(other.reply.is_none());
+    }
+
+    #[test]
+    fn overview_and_transcript_hide_paste_markers() {
+        let records = [transcript(
+            1,
+            "user",
+            json!({"message": {"role": "user", "content": "\n<pasted_content id=\"32fb\">\nCheck the picture.\n</pasted_content id=\"32fb\">\n"}}),
+        )];
+        assert_eq!(
+            latest_user_request(&records).as_deref(),
+            Some("Check the picture.")
+        );
+        assert_eq!(
+            simple_record(&records[0]).unwrap()["text"],
+            "Check the picture."
+        );
     }
 
     #[test]
