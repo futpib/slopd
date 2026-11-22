@@ -33,6 +33,8 @@ impl Server {
             .arg(dir.join("oauth.jsonl"))
             .arg("--memory-state")
             .arg(dir.join("memory.jsonl"))
+            .arg("--request-state")
+            .arg(dir.join("requests.json"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

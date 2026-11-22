@@ -56,12 +56,35 @@ async fn start_mcp_with_public_url(
     let addr = listener.local_addr().expect("local addr");
     let config = ServeConfig {
         memory_state: socket.with_extension(format!("mcp-memory-{}.jsonl", addr.port())),
+        request_state: socket.with_extension(format!("mcp-requests-{}.json", addr.port())),
         socket,
         oauth_state,
         token: token.map(Arc::from),
         allowed_hosts: default_allowed_hosts(addr),
         path: "/mcp".into(),
         public_url,
+    };
+    tokio::spawn(async move {
+        serve(listener, config).await.expect("serve mcp");
+    });
+    addr
+}
+
+async fn start_mcp_with_request_state(
+    socket: std::path::PathBuf,
+    request_state: std::path::PathBuf,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mcp");
+    let addr = listener.local_addr().expect("local addr");
+    let config = ServeConfig {
+        memory_state: socket.with_extension(format!("mcp-memory-{}.jsonl", addr.port())),
+        oauth_state: socket.with_extension(format!("mcp-oauth-{}.jsonl", addr.port())),
+        request_state,
+        socket,
+        token: None,
+        allowed_hosts: default_allowed_hosts(addr),
+        path: "/mcp".into(),
+        public_url: None,
     };
     tokio::spawn(async move {
         serve(listener, config).await.expect("serve mcp");
@@ -1242,6 +1265,108 @@ async fn natural_surface_mailboxes_slow_work_after_three_seconds() {
         guidance.contains("additional independent agent"),
         "{pending}"
     );
+}
+
+/// A restart used to forget every mailbox request. A request whose prompt was
+/// delivered must come back and resolve from the transcript, even when the
+/// agent finished while slopd-mcp was down; one whose delivery was never
+/// confirmed must fail plainly instead of staying pending.
+#[tokio::test]
+async fn delivered_requests_resume_after_a_restart() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let run = env.slopctl_raw(&["run", "--ready-timeout", "20"]);
+    assert!(run.status.success(), "slopctl run failed: {run:?}");
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let prompt = "summarise the pipeline";
+    let sent = env.slopctl_raw(&["send", &pane_id, prompt]);
+    assert!(sent.status.success(), "slopctl send failed: {sent:?}");
+
+    let state = env
+        .socket_path()
+        .with_extension("mcp-requests-restart.json");
+    let request = |id: &str, delivered: bool| {
+        json!({
+            "request_id": id,
+            "pane_id": pane_id,
+            "prompt": prompt,
+            "created_at_unix_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            "delivered": delivered,
+            "after_cursor": null,
+            "status": "pending",
+        })
+    };
+    std::fs::write(
+        &state,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "requests": [request("delivered", true), request("undelivered", false)],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let addr = start_mcp_with_request_state(env.socket_path(), state.clone()).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+    let result = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        2,
+        "get_agent_result",
+        json!({ "request_id": "delivered", "wait_seconds": 30 }),
+    )
+    .await;
+    let result = tool_payload(&result);
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(
+        result["reply"].as_str().map(str::trim_end),
+        Some(format!("mock response to: {prompt}").as_str()),
+        "{result}"
+    );
+
+    let result = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        3,
+        "get_agent_result",
+        json!({ "request_id": "undelivered" }),
+    )
+    .await;
+    let result = tool_payload(&result);
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(
+        result["error"].as_str().unwrap().contains("restarted"),
+        "{result}"
+    );
+
+    // The outcome is saved for the next restart.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let saved: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        let statuses = saved["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|request| request["status"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        if statuses == ["completed", "failed"] {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{saved}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

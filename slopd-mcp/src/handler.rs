@@ -16,11 +16,12 @@ use rmcp::{ErrorData as McpError, RoleServer};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::net::UnixStream;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::memory::MemoryStore;
 use crate::notifications::{Notifications, event_kind};
+use crate::request_store::{RequestStore, StoredRequest, StoredStatus};
 use crate::tool_updates::{LegacyPeer, ToolUpdates, notify_peer};
 
 const MCP_PANE_TAG: &str = "slopd-mcp";
@@ -29,6 +30,12 @@ const REQUEST_RESOURCE_PREFIX: &str = "slopd://requests/";
 const MAILBOX_DEDUPE_WINDOW_MS: u64 = 60_000;
 const MAILBOX_DEFAULT_WAIT_SECONDS: u64 = 3;
 const MAILBOX_WORKER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// Re-read a pending request's pane at least this often, so a missed or
+/// coalesced event cannot leave a finished request pending.
+const MAILBOX_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Wait before reconnecting a request watcher whose slopd connection dropped.
+const MAILBOX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const TRANSCRIPT_TAIL_PAGE_LIMIT: u64 = 200;
 const OVERVIEW_CONTEXT_LIMIT: u64 = 100;
 const OVERVIEW_PAGE_LIMIT: u64 = 500;
 const OVERVIEW_MAX_PAGES: usize = 8;
@@ -71,6 +78,8 @@ impl AgentTarget {
 #[derive(Clone, Default)]
 struct Mailbox {
     entries: Arc<Mutex<VecDeque<Arc<MailboxEntry>>>>,
+    /// Signalled on every change that the request store must save.
+    changed: Arc<Notify>,
 }
 
 struct MailboxEntry {
@@ -80,7 +89,16 @@ struct MailboxEntry {
     selector_key: String,
     dedupe_key: String,
     created_at_unix_ms: u64,
+    delivery: Mutex<Option<Delivery>>,
     state: watch::Sender<MailboxState>,
+    changed: Arc<Notify>,
+}
+
+/// slopd confirmed the prompt was submitted. The reply is the first matching
+/// prompt after `after_cursor` (None: the transcript was empty) and what follows.
+#[derive(Clone, Copy)]
+struct Delivery {
+    after_cursor: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -96,6 +114,45 @@ enum MailboxInsert {
 }
 
 impl Mailbox {
+    fn entry(&self, prompt: String, selector_key: String, dedupe_key: String) -> MailboxEntry {
+        MailboxEntry::new(prompt, selector_key, dedupe_key, Arc::clone(&self.changed))
+    }
+
+    /// Load requests saved by an earlier process and keep saving every change.
+    fn persist(&self, store: RequestStore, requests: Vec<StoredRequest>) {
+        {
+            let mut entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
+            let skip = requests.len().saturating_sub(MAILBOX_LIMIT);
+            entries.extend(requests.into_iter().skip(skip).map(|request| {
+                Arc::new(MailboxEntry::restored(request, Arc::clone(&self.changed)))
+            }));
+        }
+        let mailbox = self.clone();
+        let store = Arc::new(store);
+        tokio::spawn(async move {
+            loop {
+                mailbox.changed.notified().await;
+                let requests = mailbox.stored();
+                let store = Arc::clone(&store);
+                match tokio::task::spawn_blocking(move || store.save(requests)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!("failed to save request mailbox: {error}"),
+                    Err(error) => tracing::warn!("failed to save request mailbox: {error}"),
+                }
+            }
+        });
+        self.changed.notify_one();
+    }
+
+    fn stored(&self) -> Vec<StoredRequest> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .iter()
+            .map(|entry| entry.stored())
+            .collect()
+    }
+
     fn insert(&self, entry: Arc<MailboxEntry>, block_on_pending: bool) -> MailboxInsert {
         let mut entries = self.entries.lock().unwrap_or_else(|lock| lock.into_inner());
         if let Some(existing) = entries.iter().rev().find(|existing| {
@@ -119,6 +176,7 @@ impl Mailbox {
             entries.pop_front();
         }
         entries.push_back(Arc::clone(&entry));
+        self.changed.notify_one();
         MailboxInsert::Accepted(entry, false)
     }
 
@@ -175,20 +233,76 @@ impl Mailbox {
 }
 
 impl MailboxEntry {
-    fn new(prompt: String, selector_key: String, dedupe_key: String) -> Self {
-        let created_at_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+    fn new(prompt: String, selector_key: String, dedupe_key: String, changed: Arc<Notify>) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             pane_id: Mutex::new(None),
             prompt,
             selector_key,
             dedupe_key,
-            created_at_unix_ms,
+            created_at_unix_ms: unix_ms(),
+            delivery: Mutex::new(None),
             state: watch::channel(MailboxState::Pending).0,
+            changed,
         }
+    }
+
+    fn restored(request: StoredRequest, changed: Arc<Notify>) -> Self {
+        let state = match request.status {
+            StoredStatus::Pending => MailboxState::Pending,
+            StoredStatus::Completed => MailboxState::Completed(request.reply.unwrap_or_default()),
+            StoredStatus::Failed => MailboxState::Failed(request.error.unwrap_or_default()),
+        };
+        Self {
+            request_id: request.request_id,
+            pane_id: Mutex::new(request.pane_id),
+            prompt: request.prompt,
+            selector_key: request.selector_key,
+            dedupe_key: request.dedupe_key,
+            created_at_unix_ms: request.created_at_unix_ms,
+            delivery: Mutex::new(request.delivered.then_some(Delivery {
+                after_cursor: request.after_cursor,
+            })),
+            state: watch::channel(state).0,
+            changed,
+        }
+    }
+
+    fn stored(&self) -> StoredRequest {
+        let delivery = self.delivery();
+        let (status, reply, error) = match self.state() {
+            MailboxState::Pending => (StoredStatus::Pending, None, None),
+            MailboxState::Completed(reply) => (StoredStatus::Completed, Some(reply), None),
+            MailboxState::Failed(error) => (StoredStatus::Failed, None, Some(error)),
+        };
+        StoredRequest {
+            request_id: self.request_id.clone(),
+            pane_id: self.pane_id(),
+            prompt: self.prompt.clone(),
+            selector_key: self.selector_key.clone(),
+            dedupe_key: self.dedupe_key.clone(),
+            created_at_unix_ms: self.created_at_unix_ms,
+            delivered: delivery.is_some(),
+            after_cursor: delivery.and_then(|delivery| delivery.after_cursor),
+            status,
+            reply,
+            error,
+        }
+    }
+
+    fn delivery(&self) -> Option<Delivery> {
+        *self
+            .delivery
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+    }
+
+    fn set_delivered(&self, after_cursor: Option<u64>) {
+        *self
+            .delivery
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner()) = Some(Delivery { after_cursor });
+        self.changed.notify_one();
     }
 
     fn pane_id(&self) -> Option<String> {
@@ -200,6 +314,7 @@ impl MailboxEntry {
 
     fn set_pane_id(&self, pane_id: String) {
         *self.pane_id.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(pane_id);
+        self.changed.notify_one();
     }
 
     fn state(&self) -> MailboxState {
@@ -207,7 +322,7 @@ impl MailboxEntry {
     }
 
     fn finish(&self, state: MailboxState) {
-        self.state.send_if_modified(|current| {
+        let finished = self.state.send_if_modified(|current| {
             if matches!(current, MailboxState::Pending) {
                 *current = state;
                 true
@@ -215,6 +330,9 @@ impl MailboxEntry {
                 false
             }
         });
+        if finished {
+            self.changed.notify_one();
+        }
     }
 
     fn resource(&self) -> Resource {
@@ -974,7 +1092,7 @@ impl SlopdMcp {
             "{selector_key}\ntarget={}\ninterrupt={interrupt}\nmodel={model:?}\nprompt={prompt}",
             target.key()
         );
-        let candidate = Arc::new(MailboxEntry::new(
+        let candidate = Arc::new(self.mailbox.entry(
             prompt.clone(),
             selector_key.clone(),
             dedupe_key,
@@ -1041,38 +1159,58 @@ impl SlopdMcp {
             .await?;
         entry.set_pane_id(pane_id.clone());
         let mut client = connect(&self.socket).await?;
-        let result = client.subscribe(reply_event_filters(&pane_id)).await;
-        let subscription = self.slopd_result(result).await?;
         let after_cursor = client
-            .read_transcript(pane_id.clone(), None, 500)
+            .read_transcript(pane_id.clone(), None, 20)
             .await
             .unwrap_or_default()
             .iter()
             .filter_map(|record| record.cursor)
-            .max()
-            .unwrap_or(0);
+            .max();
         let result = client
             .send_prompt(pane_id.clone(), entry.prompt.clone(), 60, interrupt)
             .await;
         self.slopd_result(result).await?;
-
-        let worker_entry = Arc::clone(&entry);
-        tokio::spawn(async move {
-            let state = match wait_for_mailbox_reply(
-                client,
-                subscription,
-                &pane_id,
-                &worker_entry.prompt,
-                after_cursor,
-            )
-            .await
-            {
-                Ok(reply) => MailboxState::Completed(reply),
-                Err(error) => MailboxState::Failed(error),
-            };
-            worker_entry.finish(state);
-        });
+        entry.set_delivered(after_cursor);
+        tokio::spawn(watch_request(
+            self.socket.clone(),
+            entry,
+            pane_id,
+            after_cursor,
+        ));
         Ok(())
+    }
+
+    /// Restore the request mailbox saved by an earlier slopd-mcp and resume
+    /// watching every delivered request that was still pending, so a restart
+    /// does not strand work that finishes while the server is down.
+    pub(crate) fn with_request_store(self, path: PathBuf) -> std::io::Result<Self> {
+        let (store, requests) = RequestStore::open(path)?;
+        self.mailbox.persist(store, requests);
+        for entry in self.mailbox.recent(None, MAILBOX_LIMIT) {
+            if !matches!(entry.state(), MailboxState::Pending) {
+                continue;
+            }
+            match (entry.pane_id(), entry.delivery()) {
+                (Some(pane_id), Some(delivery)) => {
+                    tokio::spawn(watch_request(
+                        self.socket.clone(),
+                        entry,
+                        pane_id,
+                        delivery.after_cursor,
+                    ));
+                }
+                (pane_id, _) => {
+                    let target = pane_id.map_or_else(
+                        || "an agent".to_string(),
+                        |pane_id| format!("pane {pane_id}"),
+                    );
+                    entry.finish(MailboxState::Failed(format!(
+                        "slopd-mcp restarted before it confirmed this prompt reached {target}; check get_work_overview before sending it again"
+                    )));
+                }
+            }
+        }
+        Ok(self)
     }
 
     async fn resolve_agent_pane(
@@ -2049,32 +2187,79 @@ async fn connect(
     Ok(libslopctl::Client::new(reader, writer))
 }
 
+/// Follow a delivered request until its reply, a terminal failure, or the
+/// 24-hour deadline (counted from when the request was made, so a resumed
+/// request keeps its original deadline). A dropped slopd connection reconnects
+/// instead of failing the request: the agent keeps working without us.
+async fn watch_request(
+    socket: PathBuf,
+    entry: Arc<MailboxEntry>,
+    pane_id: String,
+    after_cursor: Option<u64>,
+) {
+    let age = Duration::from_millis(unix_ms().saturating_sub(entry.created_at_unix_ms));
+    let deadline = tokio::time::Instant::now() + MAILBOX_WORKER_TIMEOUT.saturating_sub(age);
+    let mut tail = TranscriptTail::new(after_cursor);
+    let state = loop {
+        match wait_for_mailbox_reply(&socket, &pane_id, &entry.prompt, &mut tail, deadline).await {
+            Ok(reply) => break MailboxState::Completed(reply),
+            Err(ReplyWait::Failed(error)) => break MailboxState::Failed(error),
+            Err(ReplyWait::Disconnected(error)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break MailboxState::Failed(format!(
+                        "pane {pane_id} did not reply within 24 hours"
+                    ));
+                }
+                tracing::warn!(
+                    "request {} lost its slopd connection ({error}); reconnecting",
+                    entry.request_id
+                );
+                tokio::time::sleep(MAILBOX_RECONNECT_DELAY).await;
+            }
+        }
+    };
+    entry.finish(state);
+}
+
+enum ReplyWait {
+    /// The request is over without a reply.
+    Failed(String),
+    /// slopd went away; the agent may still be working.
+    Disconnected(String),
+}
+
 async fn wait_for_mailbox_reply(
-    mut client: libslopctl::Client<
-        tokio::net::unix::OwnedReadHalf,
-        tokio::net::unix::OwnedWriteHalf,
-    >,
-    mut subscription: libslopctl::Subscription,
+    socket: &Path,
     pane_id: &str,
     prompt: &str,
-    after_cursor: u64,
-) -> Result<String, String> {
-    let deadline = tokio::time::Instant::now() + MAILBOX_WORKER_TIMEOUT;
+    tail: &mut TranscriptTail,
+    deadline: tokio::time::Instant,
+) -> Result<String, ReplyWait> {
+    let mut client = connect(socket)
+        .await
+        .map_err(|error| ReplyWait::Disconnected(error.message.into_owned()))?;
+    // Subscribe before the first read so nothing between them is missed.
+    let mut subscription = client
+        .subscribe(reply_event_filters(pane_id))
+        .await
+        .map_err(|error| ReplyWait::Disconnected(error.to_string()))?;
     let mut retry_pending = false;
     loop {
-        let records = client
-            .read_transcript(pane_id.to_string(), None, 500)
+        if let Err(error) = tail.refresh(&mut client, pane_id).await {
+            tracing::debug!("failed to read transcript of {pane_id}: {error}");
+        }
+        let snapshot = request_reply_snapshot(&tail.records, prompt);
+        let panes = client
+            .ps()
             .await
-            .unwrap_or_default();
-        let snapshot = request_reply_snapshot(&records, after_cursor, prompt);
-        let panes = client.ps().await.map_err(|error| error.to_string())?;
+            .map_err(|error| ReplyWait::Disconnected(error.to_string()))?;
         let pane = panes
             .iter()
             .find(|pane| pane.pane_id == pane_id)
-            .ok_or_else(|| format!("pane {pane_id} no longer exists"))?;
+            .ok_or_else(|| ReplyWait::Failed(format!("pane {pane_id} no longer exists")))?;
         if let Some(failure) = snapshot.failure.as_ref() {
             if failure_retry_scheduled(failure) == Some(false) || !failure_retryable(failure) {
-                return Err(reply_failure_message(failure));
+                return Err(ReplyWait::Failed(reply_failure_message(failure)));
             }
             if failure_retry_scheduled(failure) == Some(true) {
                 retry_pending = true;
@@ -2088,19 +2273,25 @@ async fn wait_for_mailbox_reply(
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(format!("pane {pane_id} did not reply within 24 hours"));
+            return Err(ReplyWait::Failed(format!(
+                "pane {pane_id} did not reply within 24 hours"
+            )));
         }
-        match tokio::time::timeout(remaining, subscription.next()).await {
+        match tokio::time::timeout(remaining.min(MAILBOX_RECHECK_INTERVAL), subscription.next())
+            .await
+        {
             Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
                 if record.source == "slopd" && record.event_type == "PaneDestroyed" =>
             {
-                return Err(format!("pane {pane_id} exited before replying"));
+                return Err(ReplyWait::Failed(format!(
+                    "pane {pane_id} exited before replying"
+                )));
             }
             Ok(Ok(Some(libslopctl::SubscriptionItem::Record(record))))
                 if record.source == "hook" && record.event_type == "StopFailure" =>
             {
                 if failure_retry_scheduled(&record.payload) != Some(true) {
-                    return Err(reply_failure_message(&record.payload));
+                    return Err(ReplyWait::Failed(reply_failure_message(&record.payload)));
                 }
                 retry_pending = true;
             }
@@ -2110,9 +2301,93 @@ async fn wait_for_mailbox_reply(
                 }
             }
             Ok(Ok(Some(libslopctl::SubscriptionItem::Subscribed))) => {}
-            Ok(Ok(None)) | Ok(Err(_)) => return Err("reply subscription closed".into()),
-            Err(_) => return Err(format!("pane {pane_id} did not reply within 24 hours")),
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                return Err(ReplyWait::Disconnected("reply subscription closed".into()));
+            }
+            // Periodic re-check; the deadline is tested at the top of the loop.
+            Err(_) => {}
         }
+    }
+}
+
+trait TranscriptPages {
+    /// Up to `limit` records strictly before `before` (newest when None), oldest first.
+    async fn page(
+        &mut self,
+        pane_id: &str,
+        before: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<libslop::Record>, String>;
+}
+
+impl TranscriptPages
+    for libslopctl::Client<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>
+{
+    async fn page(
+        &mut self,
+        pane_id: &str,
+        before: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<libslop::Record>, String> {
+        self.read_transcript(pane_id.to_string(), before, limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Every transcript record after a request's starting cursor, oldest first.
+/// A refresh pages backwards from the newest record only until it reaches the
+/// records already held, so a long turn can never push the request's own
+/// prompt out of a fixed-size window (Claude writes ~10 records per step).
+struct TranscriptTail {
+    after_cursor: Option<u64>,
+    records: Vec<libslop::Record>,
+}
+
+impl TranscriptTail {
+    fn new(after_cursor: Option<u64>) -> Self {
+        Self {
+            after_cursor,
+            records: Vec::new(),
+        }
+    }
+
+    async fn refresh(
+        &mut self,
+        pages: &mut impl TranscriptPages,
+        pane_id: &str,
+    ) -> Result<(), String> {
+        let known = self
+            .records
+            .last()
+            .and_then(|record| record.cursor)
+            .or(self.after_cursor);
+        let is_new = |record: &libslop::Record| {
+            record
+                .cursor
+                .is_some_and(|cursor| known.is_none_or(|known| cursor > known))
+        };
+        let mut newer: Vec<libslop::Record> = Vec::new();
+        let mut before = None;
+        loop {
+            let mut page = pages
+                .page(pane_id, before, TRANSCRIPT_TAIL_PAGE_LIMIT)
+                .await?;
+            let oldest = page.first().and_then(|record| record.cursor);
+            let exhausted = (page.len() as u64) < TRANSCRIPT_TAIL_PAGE_LIMIT
+                || page.first().is_none_or(|record| !is_new(record))
+                || oldest.is_none()
+                || oldest == before;
+            page.retain(is_new);
+            page.append(&mut newer);
+            newer = page;
+            if exhausted {
+                break;
+            }
+            before = oldest;
+        }
+        self.records.append(&mut newer);
+        Ok(())
     }
 }
 
@@ -2685,15 +2960,12 @@ fn reply_snapshot(records: &[libslop::Record]) -> ReplySnapshot {
     reply_snapshot_from(records, last_user)
 }
 
-fn request_reply_snapshot(
-    records: &[libslop::Record],
-    after_cursor: u64,
-    prompt: &str,
-) -> ReplySnapshot {
+/// The reply to `prompt`, searched for in records that all follow the point
+/// where it was sent.
+fn request_reply_snapshot(records: &[libslop::Record], prompt: &str) -> ReplySnapshot {
     let matching_user = records.iter().position(|record| {
-        record.cursor.is_some_and(|cursor| cursor > after_cursor)
-            && conversation_role(record) == Some("user")
-            && transcript_text(&record.payload).is_some_and(|text| text.trim() == prompt.trim())
+        prompt_record(record)
+            && transcript_text(&record.payload).is_some_and(|text| same_prompt(&text, prompt))
     });
     let Some(matching_user) = matching_user else {
         return ReplySnapshot {
@@ -2721,7 +2993,7 @@ fn reply_snapshot_from(records: &[libslop::Record], user_index: usize) -> ReplyS
             explicit_complete = true;
             break;
         }
-        if conversation_role(record) == Some("user") {
+        if prompt_record(record) {
             let retry_continuation = failure.is_some()
                 && transcript_text(&record.payload)
                     .is_some_and(|text| text.trim().eq_ignore_ascii_case("continue"));
@@ -2818,6 +3090,55 @@ fn conversation_role(record: &libslop::Record) -> Option<&'static str> {
             _ => None,
         },
     }
+}
+
+/// A user-role record that is a prompt: not one of Claude's tool results or
+/// injected meta messages, which share the user role but sit inside a turn.
+fn prompt_record(record: &libslop::Record) -> bool {
+    conversation_role(record) == Some("user")
+        && record.payload.get("toolUseResult").is_none()
+        && record.payload.get("isMeta").and_then(Value::as_bool) != Some(true)
+        && !record
+            .payload
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+}
+
+/// Whether a recorded prompt is the one slopd-mcp sent. Claude Code records
+/// a pasted prompt wrapped in `<pasted_content id="…">…</pasted_content id="…">`
+/// and may re-flow whitespace, so compare text with both removed.
+fn same_prompt(recorded: &str, prompt: &str) -> bool {
+    fn normalized(text: &str) -> String {
+        let mut unwrapped = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = [rest.find("<pasted_content"), rest.find("</pasted_content")]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            let Some(end) = rest[start..].find('>') else {
+                break;
+            };
+            unwrapped.push_str(&rest[..start]);
+            unwrapped.push(' ');
+            rest = &rest[start + end + 1..];
+        }
+        unwrapped.push_str(rest);
+        unwrapped.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    normalized(recorded) == normalized(prompt)
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn progress_record(record: &libslop::Record) -> bool {
@@ -3170,11 +3491,167 @@ fn actionable_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        SlopdMcp, brief, canonical_tool_name, expand_wait_transcripts, failure_retry_scheduled,
-        latest_user_request, overview_pane, parse_backend, preferred_mcp_pane_id,
-        reply_failure_message, reply_snapshot, simple_record, transcript_text, valid_pane_id,
+        SlopdMcp, TranscriptPages, TranscriptTail, brief, canonical_tool_name,
+        expand_wait_transcripts, failure_retry_scheduled, latest_user_request, overview_pane,
+        parse_backend, preferred_mcp_pane_id, reply_failure_message, reply_snapshot,
+        request_reply_snapshot, same_prompt, simple_record, transcript_text, valid_pane_id,
     };
     use serde_json::{Value, json};
+
+    fn transcript(cursor: u64, event_type: &str, payload: Value) -> libslop::Record {
+        libslop::Record {
+            cursor: Some(cursor),
+            source: "transcript".into(),
+            event_type: event_type.into(),
+            pane_id: Some("%87".into()),
+            payload,
+        }
+    }
+
+    /// The shape Claude Code 2.1.330 writes for a long prompt slopd typed in
+    /// and the tool-using turn that answered it (pane %87, request 4903ab83).
+    #[test]
+    fn request_reply_matches_a_pasted_prompt_and_waits_past_tool_results() {
+        let prompt = "Figure out how the pipeline works.\nKeep it short.";
+        let records = [
+            transcript(
+                1726,
+                "user",
+                json!({"type": "user", "message": {"role": "user", "content":
+                "\n\n<pasted_content id=\"32fb\">\nFigure out how the pipeline works.\nKeep it short.\n</pasted_content id=\"32fb\">\n"}}),
+            ),
+            transcript(
+                1800,
+                "assistant",
+                json!({"message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]}}),
+            ),
+            transcript(
+                2000,
+                "assistant",
+                json!({"message": {"role": "assistant", "content": [{"type": "text", "text": "Reading the repo first."}]}}),
+            ),
+            transcript(
+                2100,
+                "assistant",
+                json!({"message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}}),
+            ),
+            transcript(
+                2200,
+                "user",
+                json!({"type": "user", "toolUseResult": {"stdout": "src"}, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "src"}]}}),
+            ),
+            transcript(
+                2300,
+                "user",
+                json!({"type": "user", "isMeta": true, "message": {"role": "user", "content": [{"type": "text", "text": "Base directory for this skill"}]}}),
+            ),
+            transcript(
+                2400,
+                "assistant",
+                json!({"message": {"role": "assistant", "content": [{"type": "text", "text": "The picture you described is right."}]}}),
+            ),
+            transcript(
+                2500,
+                "system",
+                json!({"type": "system", "subtype": "stop_hook_summary"}),
+            ),
+        ];
+        let snapshot = request_reply_snapshot(&records, prompt);
+        assert_eq!(
+            snapshot.reply.as_deref(),
+            Some("The picture you described is right.")
+        );
+        assert!(snapshot.failure.is_none());
+
+        let other = request_reply_snapshot(&records, "a different prompt");
+        assert!(other.reply.is_none());
+    }
+
+    #[test]
+    fn same_prompt_ignores_paste_markers_and_whitespace_only() {
+        assert!(same_prompt(
+            "<pasted_content id=\"a1\">\nfix  the\nbug\n</pasted_content id=\"a1\">",
+            "fix the bug"
+        ));
+        assert!(same_prompt(
+            "please <pasted_content id=\"b\">fix it</pasted_content id=\"b\">",
+            "please fix it"
+        ));
+        assert!(!same_prompt("fix the bug now", "fix the bug"));
+    }
+
+    /// A pager over a fixed transcript, newest page first, like ReadTranscript.
+    struct Pages(Vec<libslop::Record>, usize);
+
+    impl TranscriptPages for Pages {
+        async fn page(
+            &mut self,
+            _pane_id: &str,
+            before: Option<u64>,
+            limit: u64,
+        ) -> Result<Vec<libslop::Record>, String> {
+            self.1 += 1;
+            let older = self
+                .0
+                .iter()
+                .filter(|record| before.is_none_or(|before| record.cursor.unwrap() < before))
+                .cloned()
+                .collect::<Vec<_>>();
+            let skip = older.len().saturating_sub(limit as usize);
+            Ok(older.into_iter().skip(skip).collect())
+        }
+    }
+
+    /// Pane %86 finished with 614 records after its prompt, which a single
+    /// 500-record read of the newest records no longer reached.
+    #[tokio::test]
+    async fn transcript_tail_keeps_the_prompt_of_a_long_turn() {
+        let prompt = "add model selection";
+        let mut records = vec![
+            transcript(0, "mode", json!({"type": "mode"})),
+            transcript(
+                10,
+                "user",
+                json!({"message": {"role": "user", "content": prompt}}),
+            ),
+        ];
+        for index in 2..614 {
+            records.push(transcript(
+                index * 10,
+                "last-prompt",
+                json!({"type": "last-prompt"}),
+            ));
+        }
+        records.push(transcript(
+            6140,
+            "assistant",
+            json!({"message": {"role": "assistant", "content": "done"}}),
+        ));
+        let mut pages = Pages(records, 0);
+        let mut tail = TranscriptTail::new(Some(0));
+        tail.refresh(&mut pages, "%86").await.unwrap();
+        assert_eq!(tail.records.len(), 614);
+        assert_eq!(
+            request_reply_snapshot(&tail.records, prompt)
+                .reply
+                .as_deref(),
+            Some("done")
+        );
+
+        // Later refreshes read only what is new.
+        pages
+            .0
+            .push(transcript(6150, "system", json!({"type": "system"})));
+        pages.1 = 0;
+        tail.refresh(&mut pages, "%86").await.unwrap();
+        assert_eq!(tail.records.len(), 615);
+        assert_eq!(pages.1, 1);
+
+        // An empty transcript at send time (no cursor) admits every record.
+        let mut tail = TranscriptTail::new(None);
+        tail.refresh(&mut pages, "%86").await.unwrap();
+        assert_eq!(tail.records.len(), 616);
+    }
 
     #[test]
     fn forwarding_preserves_request_metadata_and_continuation_fields() {

@@ -35,6 +35,8 @@ impl Server {
             .arg(dir.path().join("oauth.jsonl"))
             .arg("--memory-state")
             .arg(dir.path().join("memory.jsonl"))
+            .arg("--request-state")
+            .arg(dir.path().join("requests.json"))
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()

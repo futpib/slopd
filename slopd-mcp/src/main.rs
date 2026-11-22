@@ -59,6 +59,11 @@ struct Cli {
     /// Durable owner-shared memory journal. Defaults below $XDG_STATE_HOME/slopd.
     #[arg(long, env = "SLOPD_MCP_MEMORY_STATE", value_name = "PATH")]
     memory_state: Option<PathBuf>,
+
+    /// Durable agent-request mailbox, so get_agent_result survives restarts.
+    /// Defaults below $XDG_STATE_HOME/slopd.
+    #[arg(long, env = "SLOPD_MCP_REQUEST_STATE", value_name = "PATH")]
+    request_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -105,6 +110,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         .as_deref()
         .map(libslop::expand_path)
         .unwrap_or_else(|| libslop::state_dir().join("slopd/mcp-memory.jsonl"));
+    let request_state = cli
+        .request_state
+        .as_deref()
+        .map(libslop::expand_path)
+        .unwrap_or_else(|| libslop::state_dir().join("slopd/mcp-requests.json"));
 
     let listener = TcpListener::bind(cli.bind)
         .await
@@ -147,6 +157,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             socket,
             oauth_state,
             memory_state,
+            request_state,
             token: token.map(Arc::from),
             allowed_hosts,
             path,

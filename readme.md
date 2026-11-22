@@ -1889,7 +1889,12 @@ do not generate terminal failure notifications. A `ready` state alone is not
 treated as success. Request watches close when the request finishes; pane
 watches continue across turns until disabled or expired.
 
-Watches and results are in memory and disappear when the MCP adapter restarts.
+Watches are in memory and disappear when the MCP adapter restarts. Mailbox
+results are saved to `$XDG_STATE_HOME/slopd/mcp-requests.json` (override with
+`--request-state` or `SLOPD_MCP_REQUEST_STATE`). After a restart, a request
+whose prompt was delivered resumes and resolves from the agent's transcript,
+even if the agent finished while the adapter was down. A request whose
+delivery was not yet confirmed is reported as failed rather than left pending.
 At most 100 watches and 100 mailbox results are retained; inactive watches may
 be evicted to admit new watches. Resource access uses the same authorization as
 the tools. Notifications tell the host that data changed: the host decides
