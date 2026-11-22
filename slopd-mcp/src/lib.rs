@@ -3,7 +3,6 @@ mod memory;
 mod notifications;
 mod oauth;
 mod request_store;
-mod tool_updates;
 mod tools;
 
 use std::net::SocketAddr;
@@ -96,12 +95,6 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub fn router(config: ServeConfig) -> std::io::Result<Router> {
-    let handler = SlopdMcp::new(config.socket.clone());
-    router_with_handler(config, handler)
-}
-
-/// Build a router while retaining a handler for tool-list invalidation.
-pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::Result<Router> {
     if config.memory_state == config.oauth_state
         || config.request_state == config.oauth_state
         || config.request_state == config.memory_state
@@ -111,7 +104,7 @@ pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::R
             "memory, OAuth, and request state must use different files",
         ));
     }
-    let handler = handler
+    let handler = SlopdMcp::new(config.socket.clone())
         .with_memory(memory::MemoryStore::open(config.memory_state)?)
         .with_request_store(config.request_state)?;
     let path = if config.path.starts_with('/') {
@@ -135,8 +128,6 @@ pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::R
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)
-            .with_sse_keep_alive(None)
-            .with_sse_retry(None)
             .with_allowed_hosts(config.allowed_hosts.clone()),
     );
     let full_mcp = StreamableHttpService::new(
@@ -144,8 +135,6 @@ pub fn router_with_handler(config: ServeConfig, handler: SlopdMcp) -> std::io::R
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_json_response(true)
-            .with_sse_keep_alive(None)
-            .with_sse_retry(None)
             .with_allowed_hosts(config.allowed_hosts.clone()),
     );
     let full_path = format!("{}/slopctl", path.trim_end_matches('/'));

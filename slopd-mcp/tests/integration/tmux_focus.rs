@@ -84,19 +84,19 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
 
     for path in ["/mcp", "/mcp/slopctl"] {
         let (_, session) = initialize_at(&client, addr, Some("secret"), path).await;
-        let discovered = call_tool_at(
-            &client,
-            addr,
-            Some("secret"),
-            session.as_deref(),
-            path,
-            600,
-            "discover_tools",
-            json!({}),
+        let listed = read_rpc_message(
+            rpc_at(
+                &client,
+                addr,
+                Some("secret"),
+                session.as_deref(),
+                path,
+                json!({"jsonrpc":"2.0","id":600,"method":"tools/list"}),
+            )
+            .await,
         )
         .await;
-        let discovered = tool_payload(&discovered);
-        let definition = discovered["tools"]
+        let definition = listed["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -114,7 +114,7 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
         assert_eq!(definition["annotations"]["destructiveHint"], false);
         assert_eq!(definition["annotations"]["idempotentHint"], true);
 
-        for forwarded in [false, true] {
+        {
             tmux(&env, &["select-pane", "-t", &a1]);
             tmux(&env, &["select-pane", "-t", &b1]);
             tmux(&env, &["select-window", "-t", &format!("{session_id}:{b}")]);
@@ -125,14 +125,6 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
                 (json!({"window_id":a,"pane_id":a2}), &a, &a2),
                 (json!({"window_id":b}), &b, &b2),
             ] {
-                let (name, args) = if forwarded {
-                    (
-                        "dispatch_tool",
-                        json!({"name":"switch_tmux_focus","arguments":args}),
-                    )
-                } else {
-                    ("switch_tmux_focus", args)
-                };
                 let result = call_tool_at(
                     &client,
                     addr,
@@ -140,7 +132,7 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
                     session.as_deref(),
                     path,
                     601,
-                    name,
+                    "switch_tmux_focus",
                     args,
                 )
                 .await;
@@ -184,14 +176,6 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
                 json!({"window_id":foreign,"pane_id":a1}),
             ] {
                 let before = snapshot(&env, None);
-                let (name, args) = if forwarded {
-                    (
-                        "dispatch_tool",
-                        json!({"name":"switch_tmux_focus","arguments":args}),
-                    )
-                } else {
-                    ("switch_tmux_focus", args)
-                };
                 let result = call_tool_at(
                     &client,
                     addr,
@@ -199,7 +183,7 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
                     session.as_deref(),
                     path,
                     602,
-                    name,
+                    "switch_tmux_focus",
                     args.clone(),
                 )
                 .await;
@@ -208,13 +192,7 @@ async fn focus_switching_checks_membership_and_preserves_other_sessions() {
             }
         }
         for token in [None, Some("wrong")] {
-            for (name, arguments) in [
-                ("switch_tmux_focus", json!({"pane_id":a1})),
-                (
-                    "dispatch_tool",
-                    json!({"name":"switch_tmux_focus","arguments":{"pane_id":a1}}),
-                ),
-            ] {
+            for (name, arguments) in [("switch_tmux_focus", json!({"pane_id":a1}))] {
                 let before = snapshot(&env, None);
                 let result = rpc_at(&client, addr, token, session.as_deref(), path, json!({"jsonrpc":"2.0","id":603,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await;
                 assert_eq!(result.status(), reqwest::StatusCode::UNAUTHORIZED);

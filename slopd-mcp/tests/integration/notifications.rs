@@ -162,7 +162,14 @@ async fn configured_pane_notifications_cross_retries_and_reach_both_protocols() 
     .await;
     let watch = tool_payload(&configured);
     let uri = watch["resource_uri"].as_str().unwrap();
-    assert_eq!(configured["result"]["content"][0]["type"], "resource_link");
+    assert!(
+        configured["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block["type"] == "resource_link"),
+        "{configured}"
+    );
     let mut modern_events = subscribe_modern(&client, addr, uri).await;
     modern_events.updated(uri).await;
     let mut legacy_events = Events::new(
@@ -173,10 +180,6 @@ async fn configured_pane_notifications_cross_retries_and_reach_both_protocols() 
             .send()
             .await
             .unwrap(),
-    );
-    assert_eq!(
-        legacy_events.next().await["method"],
-        "notifications/tools/list_changed"
     );
     let subscribed = rpc_json(
         &client,

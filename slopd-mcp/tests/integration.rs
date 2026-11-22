@@ -12,9 +12,6 @@ use tokio::net::TcpListener;
 #[path = "integration/notifications.rs"]
 mod notifications;
 
-#[path = "integration/higher_order.rs"]
-mod higher_order;
-
 #[path = "integration/tmux_focus.rs"]
 mod tmux_focus;
 
@@ -344,9 +341,19 @@ async fn call_tool_at(
     .await
 }
 
+/// A tool's structured result, checked against the serialized copy in its
+/// first text block that the spec asks servers to include for compatibility.
 fn tool_payload(response: &Value) -> Value {
-    assert_eq!(response["result"]["content"], json!([]), "{response}");
-    response["result"]["structuredContent"].clone()
+    let structured = response["result"]["structuredContent"].clone();
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content: {response}"));
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        structured,
+        "{response}"
+    );
+    structured
 }
 
 #[tokio::test]
@@ -388,10 +395,8 @@ async fn lists_supervisor_tools_and_requires_bearer() {
 
     let (initialized, session) = initialize(&client, addr, Some("secret")).await;
     assert_eq!(initialized["result"]["serverInfo"]["name"], "slopd-mcp");
-    assert_eq!(
-        initialized["result"]["capabilities"]["tools"],
-        json!({ "listChanged": true })
-    );
+    // Tool definitions are compiled in, so the list never changes in a session.
+    assert_eq!(initialized["result"]["capabilities"]["tools"], json!({}));
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(
         instructions.contains("Full slopctl-compatible"),
@@ -434,8 +439,6 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "get_memory",
             "search_memories",
             "delete_memory",
-            "discover_tools",
-            "dispatch_tool",
             "configure_notifications",
             "switch_tmux_focus",
             "get_status",
@@ -592,8 +595,6 @@ async fn lists_supervisor_tools_and_requires_bearer() {
         assert_eq!(tool["annotations"]["openWorldHint"], false, "{tool}");
     }
     let expected_annotations = [
-        ("discover_tools", true, false, true),
-        ("dispatch_tool", false, true, false),
         ("switch_tmux_focus", false, false, true),
         ("get_status", true, false, true),
         ("get_work_overview", true, false, true),
@@ -691,8 +692,6 @@ async fn natural_surface_separates_new_and_existing_agents() {
             "get_memory",
             "search_memories",
             "delete_memory",
-            "discover_tools",
-            "dispatch_tool",
             "configure_notifications",
             "switch_tmux_focus",
             "get_work_overview",
@@ -1037,7 +1036,7 @@ async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it(
         None,
         full_session.as_deref(),
         206,
-        "transcript",
+        "read_transcript",
         json!({ "pane_id": pane_id }),
     )
     .await;
@@ -1901,7 +1900,7 @@ async fn ps_send_and_transcript_drive_a_mock_pane() {
 }
 
 #[tokio::test]
-async fn cached_run_alias_creates_idle_panes_and_rejects_prompts() {
+async fn create_pane_creates_idle_panes_and_rejects_prompts() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {
         eprintln!("skipping: tmux is unavailable");
         return;
@@ -1917,7 +1916,7 @@ async fn cached_run_alias_creates_idle_panes_and_rejects_prompts() {
         None,
         session,
         70,
-        "run",
+        "create_pane",
         json!({
             "backend": "claude",
             "prompt": "CACHED_RUN_CANARY",
@@ -1939,7 +1938,7 @@ async fn cached_run_alias_creates_idle_panes_and_rejects_prompts() {
         None,
         session,
         71,
-        "run",
+        "create_pane",
         json!({ "backend": "claude", "ready_timeout": 20 }),
     )
     .await;
@@ -1954,11 +1953,24 @@ async fn cached_run_alias_creates_idle_panes_and_rejects_prompts() {
         None,
         session,
         72,
-        "kill",
+        "kill_pane",
         json!({ "pane_id": pane_id }),
     )
     .await;
     assert_eq!(tool_payload(&killed)["pane_id"], pane_id);
+
+    // Former short names are not hidden aliases: only listed tools are callable.
+    let alias = call_tool(
+        &client,
+        addr,
+        None,
+        session,
+        73,
+        "run",
+        json!({ "backend": "claude", "ready_timeout": 20 }),
+    )
+    .await;
+    assert_eq!(alias["error"]["code"], -32602, "{alias}");
 }
 
 #[tokio::test]

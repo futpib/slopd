@@ -8,8 +8,6 @@ const SIMPLE_NAMES: &[&str] = &[
     "get_memory",
     "search_memories",
     "delete_memory",
-    "discover_tools",
-    "dispatch_tool",
     "get_work_overview",
     "start_new_agent",
     "message_existing_agent",
@@ -52,24 +50,6 @@ pub fn all() -> Vec<Tool> {
             "delete_memory",
             "Forget one memory by exact namespace and key when the user requests deletion. Use expected_revision from get/search to avoid deleting a newer entry. Returns deleted=false if already absent. Deletion persists across restarts; historical journal records and backups are not securely erased.",
             memory_input_schema("delete_memory"),
-        ),
-        tool(
-            "discover_tools",
-            "Stable discovery entry point. Return the current tools visible on this MCP endpoint, including their names, descriptions, input schemas, output schemas, and approval hints. Use when cached tool definitions are stale, then call a visible tool directly or through dispatch_tool. Discovery does not invoke tools or grant permission to use them.",
-            empty_schema(),
-        ),
-        tool(
-            "dispatch_tool",
-            "Stable named-tool dispatch entry point. Invoke exactly one tool from discover_tools using its exact name and a structured JSON arguments object. Follow the selected tool's description, input schema, permissions, and follow_up_instruction as for a direct call. Returns the target's unmodified result or error through the normal handler. Cannot call discover_tools or dispatch_tool, hidden compatibility aliases, or tools from another endpoint. No code or shell evaluation. May perform destructive actions; clients must review the target name and arguments when approving this tool.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Exact visible tool name returned by discover_tools, excluding the two higher-order tools." },
-                    "arguments": { "type": "object", "additionalProperties": true, "description": "Structured JSON arguments matching the selected tool's inputSchema. Use {} for a tool with no arguments; do not encode JSON as a string." }
-                },
-                "required": ["name", "arguments"],
-                "additionalProperties": false
-            }),
         ),
         tool(
             "configure_notifications",
@@ -325,8 +305,6 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "get_memory" => ("Recall a memory", true, false, true),
         "search_memories" => ("Search memories", true, false, true),
         "delete_memory" => ("Delete a memory", false, true, true),
-        "discover_tools" => ("Discover current tools", true, false, true),
-        "dispatch_tool" => ("Dispatch a registered tool", false, true, false),
         "switch_tmux_focus" => ("Switch tmux focus", false, false, true),
         "get_status" => ("Get daemon status", true, false, true),
         "get_work_overview" => ("Get work overview", true, false, true),
@@ -370,11 +348,6 @@ fn output_schema(name: &str) -> Value {
             json!({"memories": {"type":"array", "items": memory_entry_schema()}, "total": {"type":"integer"}, "next_offset": {"type":["integer","null"]}})
         }
         "delete_memory" => json!({"deleted": {"type":"boolean"}}),
-        "discover_tools" => json!({
-            "tools": { "type": "array", "items": { "type": "object" }, "description": "Current tools/list definitions for this endpoint." },
-            "dispatch_excluded": { "type": "array", "items": { "type": "string" }, "description": "Higher-order tools callable directly but not through dispatch_tool." }
-        }),
-        "dispatch_tool" => json!({}),
         "switch_tmux_focus" => json!({
             "session_id": { "type": "string", "pattern": "^\\$[0-9]+$" },
             "window_id": { "type": "string", "pattern": "^@[0-9]+$" },

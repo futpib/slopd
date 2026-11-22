@@ -119,20 +119,18 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn memories_survive_real_process_restarts_and_are_discoverable_on_both_surfaces() {
+async fn memories_survive_real_process_restarts_and_are_listed_on_both_surfaces() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(dir.path()).await;
     for path in ["/mcp", "/mcp/slopctl"] {
         let listed = server.rpc(path, "tools/list", json!({})).await;
-        let discovery = payload(&server.call(path, "discover_tools", json!({})).await);
-        assert_eq!(listed["result"]["tools"], discovery["tools"]);
         for name in [
             "save_memory",
             "get_memory",
             "search_memories",
             "delete_memory",
         ] {
-            let tool = discovery["tools"]
+            let tool = listed["result"]["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -156,8 +154,16 @@ async fn memories_survive_real_process_restarts_and_are_discoverable_on_both_sur
     let same = payload(&server.call("/mcp/slopctl", "save_memory", json!({"namespace":"project:orchard","key":"ui-language","content":"Prefer Georgian labels","tags":["ui","preference"]})).await);
     assert_eq!(same["changed"], false);
     assert_eq!(same["memory"], saved["memory"]);
-    let forwarded = payload(&server.call("/mcp/slopctl", "dispatch_tool", json!({"name":"get_memory","arguments":{"namespace":"project:orchard","key":"ui-language"}})).await);
-    assert_eq!(forwarded["memory"], saved["memory"]);
+    let fetched = payload(
+        &server
+            .call(
+                "/mcp/slopctl",
+                "get_memory",
+                json!({"namespace":"project:orchard","key":"ui-language"}),
+            )
+            .await,
+    );
+    assert_eq!(fetched["memory"], saved["memory"]);
     drop(server);
 
     let server = Server::start(dir.path()).await;
@@ -184,7 +190,7 @@ async fn memories_survive_real_process_restarts_and_are_discoverable_on_both_sur
     assert_eq!(other["created"], true);
     let conflict = server.call("/mcp", "save_memory", args).await;
     assert_eq!(conflict["error"]["code"], -32602);
-    let updated = payload(&server.call("/mcp", "dispatch_tool", json!({"name":"save_memory","arguments":{"namespace":"project:orchard","key":"ui-language","content":"Prefer Georgian and English labels","tags":["ui"],"expected_revision":revision}})).await);
+    let updated = payload(&server.call("/mcp", "save_memory", json!({"namespace":"project:orchard","key":"ui-language","content":"Prefer Georgian and English labels","tags":["ui"],"expected_revision":revision})).await);
     assert_eq!(updated["created"], false);
     assert_eq!(
         updated["memory"]["created_at_unix_ms"],

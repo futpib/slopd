@@ -1768,8 +1768,7 @@ survive restarts and remain valid until the server token/password is rotated.
 
 Memories use a separate journal at `$XDG_STATE_HOME/slopd/mcp-memory.jsonl`.
 Override it with `--memory-state` or `SLOPD_MCP_MEMORY_STATE`. The four memory
-tools are available on both `/mcp` and `/mcp/slopctl`, including through
-`discover_tools` and `dispatch_tool`:
+tools are available on both `/mcp` and `/mcp/slopctl`:
 
 - `save_memory`: create or replace a fact by `namespace` and `key`, with `content`
   and optional `tags`. Reusing a key updates the entry; an identical save is a no-op.
@@ -1827,28 +1826,9 @@ requests, arguments, results, and errors; these may contain prompts and
 transcripts. `-vvv` adds transport-level traces. Authorization headers and
 OAuth form bodies are never logged.
 
-Both endpoints advertise `tools.listChanged: true`. Legacy MCP sessions receive
-`notifications/tools/list_changed` over their SSE stream. Clients using protocol
-`2026-07-28` subscribe with `subscriptions/listen` and
-`{"notifications":{"toolsListChanged":true}}`. A new session or subscription
-gets an initial notification to revalidate cached definitions, including after
-a deployment. Calls to unavailable tools also request a refresh and return an
-error directing the client to `tools/list`; they never execute the obsolete tool.
-
-Send SIGHUP to reannounce the tool list to all connected clients without
-restarting the MCP process or its managed agents:
-
-```bash
-kill -HUP <slopd-mcp-pid>
-# For a user service (substitute its actual unit name):
-systemctl --user kill --kill-whom=main --signal=HUP slopd-mcp.service
-```
-
-SIGHUP invalidates client caches; it does not load changed Rust source or a new
-executable. Tool definitions are compiled in, so code changes require rebuilding
-and restarting the MCP server. Clients must receive and honor the notification,
-then call `tools/list` and update the tools given to the model. Clients that keep
-their own connector snapshots may still require a manual connector refresh.
+Tool definitions are compiled in, so the tool list is fixed for the life of
+the process and `tools.listChanged` is not advertised. A rebuilt binary takes
+effect on restart; clients see the new list when they start a new session.
 
 Agents can use `configure_notifications` on either endpoint to choose what to
 watch. Select exactly one scope: a mailbox `request_id`, a nonempty `pane_ids`
@@ -1901,40 +1881,10 @@ the tools. Notifications tell the host that data changed: the host decides
 whether to refresh context, start a model turn, or show an alert. Creating a
 watch alone does not guarantee a Grok or ChatGPT alert.
 
-Both endpoints also expose two stable higher-order entry points. A client that
-already knows their schemas can discover and invoke updated registered tools
-without adding every new tool definition to its cached connector catalog:
-
-- `discover_tools({})` returns `tools`, the same current definitions as
-  `tools/list`, including names, descriptions, input/output schemas, and
-  annotations. `dispatch_excluded` identifies the two higher-order tools.
-- `dispatch_tool({"name":"get_agent_result","arguments":{}})` invokes one
-  exact visible tool name. `arguments` is a required JSON object, not encoded
-  JSON or source code. It returns the target's MCP result unchanged, including
-  structured content, resource links, and tool errors.
-
-Discovery and dispatch keep the originating endpoint's tool visibility. They
-do not expose hidden compatibility aliases or diagnostic-only tools, and the
-natural endpoint cannot dispatch full-endpoint controls. Dispatch rejects
-`discover_tools` and `dispatch_tool` as targets, preventing recursive dispatch.
-It performs no arbitrary code or shell evaluation.
-
-Forwarded calls reuse the normal `call_tool` handler with the original request
-context, protocol metadata, and continuation state. HTTP bearer/OAuth checks,
-target-specific argument validation, pane restrictions, and pending-work
-guards still apply. Discovery grants no additional authority. Approval remains
-host-managed, as for direct calls: this server has no separate approval engine.
-The dispatcher is marked mutating, potentially destructive, and non-idempotent;
-hosts should review the target name, arguments, and discovered annotations when
-applying their approval policy. Approving the wrapper must not be treated as
-evidence that its target is read-only. Existing target tool-use instructions
-also apply when calling it through the dispatcher.
-
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
 `message_existing_agent`, `close_agent`, `get_agent_result`,
 `read_agent_reply`, `configure_notifications`, `switch_tmux_focus`,
-`discover_tools`, and `dispatch_tool`, `save_memory`, `get_memory`,
-`search_memories`, and `delete_memory`.
+`save_memory`, `get_memory`, `search_memories`, and `delete_memory`.
 
 `get_work_overview` shortens replies to excerpts and sets
 `latest_reply_truncated` when it did. `read_agent_reply` returns the complete
@@ -1959,16 +1909,15 @@ fail before focus changes. Pane selection in a window linked to another
 session is rejected because the selected pane is shared; window-only selection
 remains available without changing the other session's focus. The tool does
 not attach or switch clients, send input, create sessions, or start agents.
-It is discoverable and dispatchable on both endpoints through their existing
-authentication and validation paths, with mutating, non-destructive,
-idempotent annotations.
+It is available on both endpoints with mutating, non-destructive, idempotent
+annotations.
 
 The full `/mcp/slopctl` endpoint also exposes the following controls:
 
 | Tool | Purpose |
 |------|---------|
 | `get_status`, `list_panes` | Inspect daemon state and filtered live panes |
-| `create_pane` | Create a pane and optionally send its first `prompt` |
+| `create_pane` | Create an idle pane |
 | `fork_pane`, `kill_pane` | Fork or terminate a managed pane |
 | `send_prompt`, `wait_for_reply`, `interrupt_pane` | Prompt a pane, wait for its completed reply, or interrupt it |
 | `read_transcript` | Read user prompts and completed agent text |
@@ -1976,7 +1925,9 @@ The full `/mcp/slopctl` endpoint also exposes the following controls:
 | `create_backup`, `restore_backup` | Checkpoint or restore lifecycle state |
 | `list_dead_panes`, `revive_pane` | Inspect or resume durable pane deaths |
 
-Every tool declares an output schema and returns only MCP `structuredContent`.
+Every tool declares an output schema and returns `structuredContent`, plus the
+same JSON serialized in a text content block as the MCP specification
+recommends.
 By default, `read_transcript` returns only `{role, text}` records and omits
 internal context, progress, reasoning, tool activity, backend event names,
 payloads, and cursors. Pass `advanced: true` on a diagnostic call to unlock
@@ -1985,9 +1936,6 @@ advertised to ordinary models but remain callable with `advanced: true` for
 clients that need full event filters and predicates. `list_panes` and
 `list_dead_panes` remain compact by default. Tool annotations identify
 read-only, destructive, idempotent, and closed-world operations.
-
-The former terse tool names remain accepted as hidden compatibility aliases for
-clients that cache MCP schemas, but they are not returned by `tools/list`.
 
 `send_prompt` does not wait for the underlying agent to finish. Keep the exact
 `pane_id` returned by `create_pane` or `list_panes`, including its leading `%`;

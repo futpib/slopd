@@ -5,13 +5,12 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
-use slopd_mcp::{ServeConfig, SlopdMcp, default_allowed_hosts, is_loopback, router_with_handler};
+use slopd_mcp::{ServeConfig, default_allowed_hosts, is_loopback, router};
 
 #[derive(Parser)]
 #[command(
     name = "slopd-mcp",
     about = "Expose slopd-managed panes as a Streamable HTTP MCP supervisor",
-    after_help = "Send SIGHUP to request a tool-list refresh from connected MCP clients. Tool definitions are compiled in; changing them requires rebuilding and restarting the server.",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
 )]
 struct Cli {
@@ -151,34 +150,20 @@ async fn run(cli: Cli) -> Result<(), String> {
         oauth_state.display()
     );
 
-    let handler = SlopdMcp::new(socket.clone());
-    let router = router_with_handler(
-        ServeConfig {
-            socket,
-            oauth_state,
-            memory_state,
-            request_state,
-            token: token.map(Arc::from),
-            allowed_hosts,
-            path,
-            public_url,
-        },
-        handler.clone(),
-    )
+    let router = router(ServeConfig {
+        socket,
+        oauth_state,
+        memory_state,
+        request_state,
+        token: token.map(Arc::from),
+        allowed_hosts,
+        path,
+        public_url,
+    })
     .map_err(|error| error.to_string())?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .map_err(|error| format!("failed to listen for SIGHUP: {error}"))?;
-    let server = std::future::IntoFuture::into_future(axum::serve(listener, router));
-    tokio::pin!(server);
-    loop {
-        tokio::select! {
-            result = &mut server => return result.map_err(|error| error.to_string()),
-            Some(()) = hangup.recv() => {
-                tracing::info!("SIGHUP: requesting MCP tool list refresh");
-                handler.notify_tool_list_changed().await;
-            }
-        }
-    }
+    axum::serve(listener, router)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn parse_public_url(url: &str) -> Result<String, String> {
