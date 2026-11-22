@@ -356,6 +356,42 @@ fn tool_payload(response: &Value) -> Value {
     structured
 }
 
+/// Protocol 2026-07-28 requires ttlMs and cacheScope on server/discover, every
+/// list result, and resources/read. tools/list once omitted them, so clients
+/// that parse that version strictly (Claude.ai's "refresh tool list") failed.
+#[tokio::test]
+async fn modern_protocol_results_carry_required_cache_fields() {
+    let dir = libsloptest::tempfile::tempdir().unwrap();
+    let addr = start_mcp(dir.path().join("absent.sock"), None).await;
+    let client = http_client();
+    for (id, method) in [
+        (1, "server/discover"),
+        (2, "tools/list"),
+        (3, "resources/list"),
+        (4, "resources/templates/list"),
+    ] {
+        let response = notifications::modern(&client, addr, id, method, json!({})).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{method}");
+        let body = read_rpc_message(response).await;
+        let result = &body["result"];
+        assert!(result["ttlMs"].is_u64(), "{method}: {body}");
+        assert!(
+            matches!(result["cacheScope"].as_str(), Some("private" | "public")),
+            "{method}: {body}"
+        );
+        if method == "tools/list" {
+            assert!(
+                result["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "read_agent_reply"),
+                "{body}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn lists_supervisor_tools_and_requires_bearer() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {

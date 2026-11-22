@@ -6,10 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
-    ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter, Tool,
-    UnsubscribeRequestParams,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData as McpError, RoleServer};
@@ -2056,7 +2056,22 @@ impl ServerHandler for SlopdMcp {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tools()))
+        // Protocol 2026-07-28 requires ttlMs and cacheScope on every list
+        // result; clients that parse it strictly reject a list without them.
+        // A zero TTL makes a redeploy's tools visible on the next listing.
+        Ok(ListToolsResult::with_all_items(self.tools())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(Vec::new())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

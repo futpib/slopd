@@ -68,7 +68,7 @@ impl Events {
     }
 }
 
-async fn modern(
+pub(super) async fn modern(
     client: &reqwest::Client,
     addr: SocketAddr,
     id: u64,
