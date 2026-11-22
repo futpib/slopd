@@ -15,6 +15,7 @@ const SIMPLE_NAMES: &[&str] = &[
     "message_existing_agent",
     "close_agent",
     "get_agent_result",
+    "read_agent_reply",
     "configure_notifications",
     "switch_tmux_focus",
 ];
@@ -112,7 +113,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "start_new_agent",
-            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Omit model unless the user names one. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, follow follow_up_instruction and never resend the prompt or start another agent for the same request. Other reads and follow-ups are fine. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Omit model unless the user names one. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -129,7 +130,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "message_existing_agent",
-            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. Omit backend unless the user explicitly names an agent type. An existing agent keeps the model it started with; this tool cannot change it, so a request for a different model needs a new agent, which only an explicit user request permits. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, follow follow_up_instruction and never resend the prompt or start another agent for the same request. Other reads and follow-ups are fine. Omit backend unless the user explicitly names an agent type. An existing agent keeps the model it started with; this tool cannot change it, so a request for a different model needs a new agent, which only an explicit user request permits. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -172,7 +173,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_or_tell_agent",
-            "The one lower-level tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits three seconds by default, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional independent agent; model requires new_agent=true because an existing agent keeps the model it started with; corrections, clarifications, updates, redirects, continuations, retries, and result questions are not new-agent requests. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending continues in the background, so obey follow_up_instruction and stop calling tools for this turn; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
+            "The one lower-level tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits three seconds by default, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional independent agent; model requires new_agent=true because an existing agent keeps the model it started with; corrections, clarifications, updates, redirects, continuations, retries, and result questions are not new-agent requests. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending continues in the background, so obey follow_up_instruction and never resend the prompt or start another agent for it; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -192,7 +193,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "get_agent_result",
-            "Get the mailbox state or completed answer for prior agent work, including creation or startup failures, so an old unrelated result is never substituted. Always call this on every new user turn asking whether work is ready, what happened, current progress, when the result will arrive, or what the result was. Never answer those questions from conversation memory or elapsed time. Call with no arguments first unless a prior tool result supplied the exact request_id or pane_id. Never call start_new_agent or resend the prompt for a status, progress, completion, or result question. After this returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. The top-level status, answer, and follow_up_instruction are authoritative.",
+            "Get the mailbox state or completed answer for prior agent work, including creation or startup failures, so an old unrelated result is never substituted. Always call this on every new user turn asking whether work is ready, what happened, current progress, when the result will arrive, or what the result was. Never answer those questions from conversation memory or elapsed time. Call with no arguments first unless a prior tool result supplied the exact request_id or pane_id. Never call start_new_agent or resend the prompt for a status, progress, completion, or result question. After this returns pending or completed, follow follow_up_instruction; other reads and follow-ups are fine. Use read_agent_reply to read a long reply in pages. The top-level status, answer, and follow_up_instruction are authoritative.",
             json!({
                 "type": "object",
                 "properties": {
@@ -200,6 +201,21 @@ pub fn all() -> Vec<Tool> {
                     "pane_id": pane_id_schema(),
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 0 }
                 },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "read_agent_reply",
+            "Read the complete final reply of an agent, which get_work_overview only excerpts. Pass request_id for a mailbox request, or pane_id for that agent's latest turn. Long replies are paged: read text, then call again with next_offset until it is null. status is completed, in_progress (text is the latest message so far), pending, failed, or no_reply. Read-only; never sends a prompt.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "pane_id": pane_id_schema(),
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Character offset to start from; use next_offset from the previous page." },
+                    "max_chars": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 6000 }
+                },
+                "anyOf": [{ "required": ["request_id"] }, { "required": ["pane_id"] }],
                 "additionalProperties": false
             }),
         ),
@@ -323,6 +339,7 @@ fn metadata(name: &str) -> (&'static str, bool, bool, bool) {
         "kill_pane" => ("Kill pane", false, true, true),
         "ask_or_tell_agent" => ("Ask or tell agent", false, false, false),
         "get_agent_result" => ("Get agent result", true, false, true),
+        "read_agent_reply" => ("Read agent reply", true, false, true),
         "configure_notifications" => ("Configure agent notifications", false, false, false),
         "send_prompt" => ("Send prompt", false, false, false),
         "wait_for_reply" => ("Wait for reply", true, false, true),
@@ -447,6 +464,17 @@ fn output_schema(name: &str) -> Value {
             "answer": { "type": "string", "description": "Authoritative answer to give the user without translating it." },
             "agent_reply_received": { "type": "boolean", "description": "True only when reply contains a real completed agent reply." },
             "follow_up_instruction": { "type": "string", "description": "Required routing rule for a later user turn about this agent." }
+        }),
+        "read_agent_reply" => json!({
+            "request_id": { "type": ["string", "null"] },
+            "pane_id": { "anyOf": [pane_id_schema(), { "type": "null" }] },
+            "status": { "type": "string", "enum": ["completed", "in_progress", "pending", "failed", "no_reply"] },
+            "text": { "type": ["string", "null"], "description": "This page of the reply, verbatim in its original language." },
+            "offset": { "type": "integer" },
+            "next_offset": { "type": ["integer", "null"], "description": "Offset of the next page, or null when this page ends the reply." },
+            "total_chars": { "type": "integer" },
+            "error": { "type": ["string", "null"] },
+            "answer": { "type": "string" }
         }),
         "send_prompt" => json!({
             "pane_ids": { "type": "array", "items": pane_id_schema() }
@@ -596,6 +624,7 @@ fn overview_pane_schema() -> Value {
             "current_activity_excerpt": { "type": ["string", "null"], "description": "Latest agent progress message since the latest user prompt." },
             "latest_tool_name": { "type": ["string", "null"], "description": "Latest tool name recorded since the latest user prompt; a fallback when no progress message is available." },
             "latest_reply_excerpt": { "type": ["string", "null"], "description": "Verbatim agent excerpt in its original language; do not translate unless asked." },
+            "latest_reply_truncated": { "type": "boolean", "description": "The excerpt is shortened; call read_agent_reply with this pane_id for the complete reply." },
             "reply_complete": { "type": "boolean" },
             "context_before": { "type": "array", "items": overview_context_schema(), "description": "Requested messages immediately before the latest user prompt, oldest first." },
             "context_after": { "type": "array", "items": overview_context_schema(), "description": "Requested agent messages after the latest user prompt, oldest first. The newest requested messages are returned." },
@@ -603,7 +632,7 @@ fn overview_pane_schema() -> Value {
             "more_after": { "type": "boolean", "description": "More meaningful messages exist after context_after. Increase context_after to retrieve them." },
             "transcript_error": { "type": ["string", "null"] }
         },
-        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "last_request_excerpt", "task_context_excerpt", "current_activity_excerpt", "latest_tool_name", "latest_reply_excerpt", "reply_complete", "context_before", "context_after", "more_before", "more_after", "transcript_error"],
+        "required": ["pane_id", "backend", "account", "state", "detailed_state", "tags", "title", "working_dir", "last_request_excerpt", "task_context_excerpt", "current_activity_excerpt", "latest_tool_name", "latest_reply_excerpt", "latest_reply_truncated", "reply_complete", "context_before", "context_after", "more_before", "more_after", "transcript_error"],
         "additionalProperties": false
     })
 }

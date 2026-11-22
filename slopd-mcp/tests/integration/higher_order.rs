@@ -36,7 +36,7 @@ async fn discovery_matches_the_current_visible_registry_on_both_endpoints() {
     let dir = libsloptest::tempfile::tempdir().unwrap();
     let addr = start_mcp(dir.path().join("absent.sock"), Some("secret")).await;
     let client = http_client();
-    for (path, count) in [("/mcp", 13), ("/mcp/slopctl", 30)] {
+    for (path, count) in [("/mcp", 14), ("/mcp/slopctl", 31)] {
         let (_, session) = initialize_at(&client, addr, Some("secret"), path).await;
         let listed = read_rpc_message(
             rpc_at(

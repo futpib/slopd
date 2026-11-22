@@ -449,6 +449,7 @@ async fn lists_supervisor_tools_and_requires_bearer() {
             "kill_pane",
             "ask_or_tell_agent",
             "get_agent_result",
+            "read_agent_reply",
             "send_prompt",
             "wait_for_reply",
             "interrupt_pane",
@@ -699,6 +700,7 @@ async fn natural_surface_separates_new_and_existing_agents() {
             "message_existing_agent",
             "close_agent",
             "get_agent_result",
+            "read_agent_reply",
         ]
     );
     for name in ["start_new_agent", "message_existing_agent"] {
@@ -1333,6 +1335,22 @@ async fn delivered_requests_resume_after_a_restart() {
         "{result}"
     );
 
+    let page = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        4,
+        "read_agent_reply",
+        json!({ "request_id": "delivered" }),
+    )
+    .await;
+    let page = tool_payload(&page);
+    assert_eq!(page["status"], "completed", "{page}");
+    assert_eq!(page["text"], result["reply"], "{page}");
+    assert_eq!(page["next_offset"], Value::Null, "{page}");
+
     let result = call_tool_at(
         &client,
         addr,
@@ -1367,6 +1385,84 @@ async fn delivered_requests_resume_after_a_restart() {
         assert!(std::time::Instant::now() < deadline, "{saved}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// get_work_overview only excerpts a reply; read_agent_reply returns all of
+/// it, in pages a caller can concatenate back into the exact text.
+#[tokio::test]
+async fn read_agent_reply_pages_a_long_final_reply() {
+    let Some((env, _daemon, _claude_config)) = spawn_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let run = env.slopctl_raw(&["run", "--ready-timeout", "20"]);
+    assert!(run.status.success(), "slopctl run failed: {run:?}");
+    let pane_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let prompt = (0..60)
+        .map(|index| format!("part{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sent = env.slopctl_raw(&["send", &pane_id, &prompt]);
+    assert!(sent.status.success(), "slopctl send failed: {sent:?}");
+    let expected = format!("mock response to: {prompt}");
+
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+    let session = session.as_deref();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let overview = loop {
+        let overview = call_tool_at(
+            &client,
+            addr,
+            None,
+            session,
+            "/mcp",
+            2,
+            "get_work_overview",
+            json!({ "pane_id": pane_id }),
+        )
+        .await;
+        let overview = tool_payload(&overview);
+        if overview["panes"][0]["reply_complete"] == true {
+            break overview;
+        }
+        assert!(std::time::Instant::now() < deadline, "{overview}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        overview["panes"][0]["latest_reply_truncated"], true,
+        "{overview}"
+    );
+
+    let mut text = String::new();
+    let mut offset = 0;
+    let mut pages = 0;
+    loop {
+        let page = call_tool_at(
+            &client,
+            addr,
+            None,
+            session,
+            "/mcp",
+            3 + pages,
+            "read_agent_reply",
+            json!({ "pane_id": pane_id, "offset": offset, "max_chars": 100 }),
+        )
+        .await;
+        let page = tool_payload(&page);
+        assert_eq!(page["status"], "completed", "{page}");
+        assert_eq!(page["offset"], offset, "{page}");
+        text.push_str(page["text"].as_str().unwrap());
+        pages += 1;
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert!(pages > 3, "{pages}");
+    assert_eq!(text.trim_end(), expected);
 }
 
 #[tokio::test]

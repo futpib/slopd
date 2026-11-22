@@ -1932,9 +1932,19 @@ also apply when calling it through the dispatcher.
 
 The default `/mcp` endpoint exposes `get_work_overview`, `start_new_agent`,
 `message_existing_agent`, `close_agent`, `get_agent_result`,
-`configure_notifications`, `switch_tmux_focus`, `discover_tools`, and
-`dispatch_tool`, `save_memory`, `get_memory`, `search_memories`, and
-`delete_memory`. `switch_tmux_focus` accepts optional `window_id` (`@` followed
+`read_agent_reply`, `configure_notifications`, `switch_tmux_focus`,
+`discover_tools`, and `dispatch_tool`, `save_memory`, `get_memory`,
+`search_memories`, and `delete_memory`.
+
+`get_work_overview` shortens replies to excerpts and sets
+`latest_reply_truncated` when it did. `read_agent_reply` returns the complete
+final reply, either for a mailbox `request_id` or for a `pane_id`'s latest
+turn, in pages of `max_chars` (default 6,000). Call it again with `next_offset`
+until that is `null`; the pages concatenate to the exact text. After
+`start_new_agent`, `message_existing_agent`, or `get_agent_result` return,
+`follow_up_instruction` forbids only duplicate work (resending the prompt or
+starting another agent for the same request). Clients may make other reads and
+follow-up calls in the same turn. `switch_tmux_focus` accepts optional `window_id` (`@` followed
 by digits) and `pane_id` (`%` followed by digits); at least one is required and
 additional properties are rejected. Its three modes are:
 
