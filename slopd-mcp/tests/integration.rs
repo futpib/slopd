@@ -871,6 +871,156 @@ async fn natural_surface_separates_new_and_existing_agents() {
     assert_eq!(overview["panes"][0]["pane_id"], pane_id, "{overview}");
 }
 
+fn pane_process_args(env: &TestEnv, pane: &str) -> Vec<String> {
+    let pid = env
+        .tmux
+        .tmux()
+        .args(["display-message", "-p", "-t", pane, "#{pane_pid}"])
+        .output()
+        .unwrap();
+    assert!(pid.status.success());
+    let pid = String::from_utf8(pid.stdout).unwrap();
+    std::fs::read(format!("/proc/{}/cmdline", pid.trim()))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8(part.to_vec()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn new_agents_launch_with_the_requested_model_and_existing_ones_refuse_it() {
+    let Some((env, _daemon, _codex_home)) = spawn_codex_env() else {
+        eprintln!("skipping: tmux is unavailable");
+        return;
+    };
+    let addr = start_mcp(env.socket_path(), None).await;
+    let client = http_client();
+    let (_, session) = initialize_at(&client, addr, None, "/mcp").await;
+
+    let listed = read_rpc_message(
+        rpc_at(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 200, "method": "tools/list" }),
+        )
+        .await,
+    )
+    .await;
+    let schema = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()["inputSchema"]
+            .clone()
+    };
+    assert_eq!(
+        schema("start_new_agent")["properties"]["model"]["type"],
+        "string"
+    );
+    assert!(
+        schema("message_existing_agent")["properties"]
+            .get("model")
+            .is_none()
+    );
+
+    for (id, model) in [
+        (201, "--dangerously-skip-permissions"),
+        (202, "haiku sonnet"),
+    ] {
+        let rejected = call_tool_at(
+            &client,
+            addr,
+            None,
+            session.as_deref(),
+            "/mcp",
+            id,
+            "start_new_agent",
+            json!({ "account": "codex", "prompt": "MUST_NOT_START", "model": model }),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    }
+
+    let started = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        203,
+        "start_new_agent",
+        json!({
+            "account": "codex",
+            "prompt": "MODEL_CANARY",
+            "model": "mock-model-1.5",
+            "wait_seconds": 10
+        }),
+    )
+    .await;
+    let started = tool_payload(&started);
+    assert_eq!(started["status"], "completed", "{started}");
+    assert_eq!(started["reply"], "mock response: MODEL_CANARY");
+    let pane_id = started["pane_id"].as_str().unwrap().to_string();
+    let args = pane_process_args(&env, &pane_id);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "mock-model-1.5"]),
+        "{args:?}"
+    );
+
+    let existing = call_tool_at(
+        &client,
+        addr,
+        None,
+        session.as_deref(),
+        "/mcp",
+        204,
+        "message_existing_agent",
+        json!({ "pane_id": pane_id, "prompt": "MUST_NOT_SEND", "model": "other-model" }),
+    )
+    .await;
+    assert_eq!(existing["error"]["code"], -32602, "{existing}");
+    assert!(
+        existing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("keeps the model it started with")),
+        "{existing}"
+    );
+
+    let (_, full_session) = initialize(&client, addr, None).await;
+    let automatic = call_tool(
+        &client,
+        addr,
+        None,
+        full_session.as_deref(),
+        205,
+        "ask_or_tell_agent",
+        json!({ "account": "codex", "prompt": "MUST_NOT_SEND", "model": "other-model" }),
+    )
+    .await;
+    assert_eq!(automatic["error"]["code"], -32602, "{automatic}");
+
+    let transcript = call_tool(
+        &client,
+        addr,
+        None,
+        full_session.as_deref(),
+        206,
+        "transcript",
+        json!({ "pane_id": pane_id }),
+    )
+    .await;
+    let transcript = transcript.to_string();
+    assert!(transcript.contains("MODEL_CANARY"), "{transcript}");
+    assert!(!transcript.contains("MUST_NOT_SEND"), "{transcript}");
+}
+
 #[tokio::test]
 async fn natural_surface_blocks_unconfirmed_parallel_starts() {
     let Some((env, _daemon, _claude_config)) = spawn_env() else {

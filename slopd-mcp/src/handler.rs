@@ -960,9 +960,18 @@ impl SlopdMcp {
                 "a new-agent request cannot include pane_id; omit pane_id to create exactly one new agent",
             ));
         }
+        // A running agent's model cannot be changed safely: Claude's `/model`
+        // also rewrites the account's default for every new session, and the
+        // other backends have no argument form. Fail rather than ignore it.
+        let model = agent_model(arguments)?;
+        if model.is_some() && !matches!(target, AgentTarget::New) {
+            return Err(invalid_argument(
+                "model applies only when a new agent is created (start_new_agent, or ask_or_tell_agent with new_agent=true); an existing agent keeps the model it started with, so no message was sent",
+            ));
+        }
         let selector_key = agent_selector_key(arguments, explicit_pane_id.as_deref());
         let dedupe_key = format!(
-            "{selector_key}\ntarget={}\ninterrupt={interrupt}\nprompt={prompt}",
+            "{selector_key}\ntarget={}\ninterrupt={interrupt}\nmodel={model:?}\nprompt={prompt}",
             target.key()
         );
         let candidate = Arc::new(MailboxEntry::new(
@@ -1184,11 +1193,14 @@ impl SlopdMcp {
             None => None,
         };
         let extra_tag = optional_string(arguments, "tag");
+        let extra_args = agent_model(arguments)?
+            .map(|model| vec!["--model".to_string(), model])
+            .unwrap_or_default();
         let mut client = connect(&self.socket).await?;
         let result = client.subscribe(ready_event_filters()).await;
         let mut subscription = self.slopd_result(result).await?;
         let result = client
-            .run(None, Vec::new(), None, Vec::new(), account, backend)
+            .run(None, extra_args, None, Vec::new(), account, backend)
             .await;
         let pane_id = self.slopd_result(result).await?;
         if let Some(entry) = entry {
@@ -1781,7 +1793,7 @@ impl ServerHandler for SlopdMcp {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             ToolSurface::Simple => {
-                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
+                "Natural-language supervisor for slopd agents. Call start_new_agent exactly once only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Referring to the same, first, second, prior, or additional agent means an existing agent: call message_existing_agent before claiming work started. A correction, clarification, update, redirect, continuation, or retry also requires message_existing_agent exactly once. While work is pending, start_new_agent requires parallel=true and only an explicit request for another independent concurrent agent permits it. On every new status, progress, completion, or result turn, call get_agent_result and never answer from conversation memory or resend the prompt. If the intended existing agent is unclear, call get_work_overview first. Every new close, cleanup, or deletion turn requires a fresh close_agent call. When pane_id is given, call close_agent directly; otherwise identify exact pane IDs first. Call close_agent separately once per requested pane; there is no bulk close. Never reuse a prior close result or claim a pane was closed without a successful close_agent result for that same pane_id. After any agent tool returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. If the user asks to stop or cancel, do not start or message an agent; explain that this natural endpoint cannot cancel work. Never claim an agent accepted, replied, or stopped unless the tool result says so. Omit backend unless the user explicitly names Claude, OpenCode, Codex, or Grok. Omit model unless the user names one; only start_new_agent accepts it, because an existing agent keeps the model it started with. Write prompts in English unless the user requests another language, and preserve agent replies in their original language."
             }
             ToolSurface::Full => {
                 "Full slopctl-compatible supervisor for slopd-managed agent panes. Prefer start_new_agent only when the user explicitly asks for an additional independent agent. Use message_existing_agent for a correction, clarification, update, redirect, or continuation of existing work. Use get_agent_result with no arguments for status, progress, completion, or result unless a prior result supplied an exact request_id; never resend the prompt. Both mutating operations wait three seconds by default, then return a completed result or a pending background mailbox request with authoritative follow_up_instruction. ask_or_tell_agent remains available as a lower-level combined operation. Use get_work_overview to identify an existing pane from human context. create_pane, send_prompt, and wait_for_reply are low-level controls and must not substitute for the atomic operations. Omit backend unless the user explicitly names an agent type. Preserve the language of agent replies and transcript excerpts."
@@ -2874,6 +2886,27 @@ fn pane_filters(arguments: Option<&Map<String, Value>>) -> Result<Vec<(String, S
         filters.push(("account".into(), account));
     }
     Ok(filters)
+}
+
+/// The optional `model` for a new agent, validated so it can only ever become
+/// the value of the agent CLI's `--model` flag, never another flag.
+fn agent_model(arguments: Option<&Map<String, Value>>) -> Result<Option<String>, McpError> {
+    let model = match arguments.and_then(|arguments| arguments.get("model")) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(model)) if model.is_empty() => return Ok(None),
+        Some(Value::String(model)) => model.trim(),
+        Some(other) => {
+            return Err(invalid_argument(format!(
+                "model must be a string, got {other}"
+            )));
+        }
+    };
+    if model.is_empty() || model.starts_with('-') || model.chars().any(char::is_whitespace) {
+        return Err(invalid_argument(format!(
+            "invalid model {model:?}: expected a model name such as haiku, without spaces or a leading '-'"
+        )));
+    }
+    Ok(Some(model.to_string()))
 }
 
 fn agent_selector_key(arguments: Option<&Map<String, Value>>, pane_id: Option<&str>) -> String {

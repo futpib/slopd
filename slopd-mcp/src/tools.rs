@@ -112,14 +112,15 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "start_new_agent",
-            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Start exactly one new independent agent. Use only when the user explicitly asks to start, create, or add a new, separate, or additional independent agent. Never use for a correction, clarification, update, redirect, continuation, retry, progress question, or result question about prior work: use message_existing_agent or get_agent_result. Referring to the same, first, second, prior, or additional agent means an existing agent, not a new one. A changed or repeated wording does not mean the user wants another agent. While another agent request is pending, this tool rejects the call unless parallel=true; set parallel=true only when the user explicitly asks for another independent concurrent agent. Call this tool before saying work started. This tool waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. This tool never accepts or reuses a pane_id. Omit backend for the usual or default agent. Omit model unless the user names one. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
                     "backend": backend_schema(),
                     "account": { "type": "string" },
+                    "model": model_schema(),
                     "prompt": { "type": "string", "description": "Translate the user's task to English for this prompt unless the user explicitly requests another language." },
-                    "parallel": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks for another independent agent to run concurrently with pending work." },
+                    "parallel":{ "type": "boolean", "default": false, "description": "True only when the user explicitly asks for another independent agent to run concurrently with pending work." },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." }
                 },
                 "required": ["prompt"],
@@ -128,7 +129,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "message_existing_agent",
-            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. Omit backend unless the user explicitly names an agent type. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
+            "Send one task or follow-up to an existing agent. When the user says to tell, ask, or have the same, first, second, prior, or additional agent do something, call this tool before saying the work started. Also use it for corrections, clarifications, updates, redirects, continuations, and retries concerning prior work; never call start_new_agent for those. This tool never creates an agent. Use pane_id from the prior tool result or get_work_overview; omit it for the most recently contacted existing agent. It waits three seconds by default; after it returns pending or completed, obey follow_up_instruction, speak the answer, and call no more tools in that turn except configure_notifications or memory tools when the user requested notification setup or memory operations. Omit backend unless the user explicitly names an agent type. An existing agent keeps the model it started with; this tool cannot change it, so a request for a different model needs a new agent, which only an explicit user request permits. Translate the user's task to English unless the user explicitly requests another language; preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -171,7 +172,7 @@ pub fn all() -> Vec<Tool> {
         ),
         tool(
             "ask_or_tell_agent",
-            "The one lower-level tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits three seconds by default, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional independent agent; corrections, clarifications, updates, redirects, continuations, retries, and result questions are not new-agent requests. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending continues in the background, so obey follow_up_instruction and stop calling tools for this turn; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
+            "The one lower-level tool for asking or telling an agent to do work. Call it exactly once for requests including ask, tell it, tell the same agent, update it, correct it, change direction, continue, or try something else; never answer those from conversation memory. It selects or creates the agent, sends the prompt, waits three seconds by default, and records success or failure. Never call create_pane, send_prompt, wait_for_reply, or get_work_overview for the same request. Omit backend unless the user names an agent type. Set new_agent=true only when the user explicitly asks to start a new, separate, or additional independent agent; model requires new_agent=true because an existing agent keeps the model it started with; corrections, clarifications, updates, redirects, continuations, retries, and result questions are not new-agent requests. Repeated identical calls within one minute return the original request and never create duplicate panes. Treat status, agent_reply_received, answer, and follow_up_instruction as authoritative: pending continues in the background, so obey follow_up_instruction and stop calling tools for this turn; failed means report the failure and do not retry or claim acceptance. Write the prompt in English unless another language is explicitly requested, and preserve the agent reply's language.",
             json!({
                 "type": "object",
                 "properties": {
@@ -179,10 +180,11 @@ pub fn all() -> Vec<Tool> {
                     "tag": { "type": "string" },
                     "backend": backend_schema(),
                     "account": { "type": "string" },
+                    "model": model_schema(),
                     "prompt": { "type": "string" },
                     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "default": 3, "description": "Seconds to wait before returning a pending background mailbox request." },
                     "interrupt": { "type": "boolean", "default": false },
-                    "new_agent": { "type": "boolean", "default": false, "description": "True only when the user explicitly asks for a new, separate, or additional agent." }
+                    "new_agent":{ "type": "boolean", "default": false, "description": "True only when the user explicitly asks for a new, separate, or additional agent." }
                 },
                 "required": ["prompt"],
                 "additionalProperties": false
@@ -670,6 +672,13 @@ fn backend_schema() -> Value {
         "type": "string",
         "enum": ["claude", "opencode", "codex", "grok"],
         "description": "Set only when the user explicitly names Claude, OpenCode, Codex, or Grok. Omit for 'default', 'usual', or an unspecified agent type so slopd chooses its configured default. Never infer this from the current voice model or client."
+    })
+}
+
+fn model_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Model for the new agent, passed to the agent CLI as --model for this session only. Set only when the user explicitly names a model; omit to use the account's default. The value must suit the backend: Claude takes an alias such as haiku, sonnet, opus, or fable, or a full model ID; Codex takes a model slug; OpenCode takes provider/model; Grok takes a Grok model ID. Never infer this from the current voice model or client."
     })
 }
 
