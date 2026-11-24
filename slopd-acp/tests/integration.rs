@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use libsloptest::{TestEnv, build_bin, cargo_bin, kill_child, kill_slopd};
 use serde_json::{Value, json};
 
+#[path = "integration/pool_failover.rs"]
+mod pool_failover;
+
 struct Harness {
     child: Option<Child>,
     stdin: Option<ChildStdin>,

@@ -1,4 +1,6 @@
 pub mod jsonl;
+mod pools;
+pub use pools::AccountPoolConfig;
 
 use std::path::PathBuf;
 
@@ -2141,6 +2143,9 @@ pub struct SlopdConfig {
     /// [`DEFAULT_ACCOUNT`]).
     #[serde(default)]
     pub accounts: std::collections::BTreeMap<String, AccountConfig>,
+    /// Ordered same-backend failover pools, selected with slopd-acp --account-pool.
+    #[serde(default)]
+    pub account_pools: std::collections::BTreeMap<String, AccountPoolConfig>,
     /// Account used by `slopctl run` when no `--account` is given and none is
     /// inherited from the parent pane. When unset, the [`DEFAULT_ACCOUNT`]
     /// account is used.
@@ -3226,6 +3231,14 @@ pub enum RequestBody {
     },
     /// List accounts from the daemon's active configuration.
     Accounts,
+    /// Select an eligible member, retaining a preferred member if it is healthy.
+    SelectAccountPool {
+        name: String,
+        #[serde(default)]
+        preferred: Option<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
     Run {
         parent_pane_id: Option<String>,
         extra_args: Vec<String>,
@@ -3261,6 +3274,9 @@ pub enum RequestBody {
     Fork {
         /// The pane to fork from.
         pane_id: String,
+        /// Destination account. Cross-account forks retain the source backend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
         /// Identity supplied by a local Codex command in the source pane.
         /// The daemon verifies the pane and tmux server before using it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3419,6 +3435,9 @@ pub enum ResponseBody {
     },
     Accounts {
         accounts: Vec<AccountInfo>,
+    },
+    AccountPoolSelected {
+        account: AccountInfo,
     },
     Run {
         pane_id: String,

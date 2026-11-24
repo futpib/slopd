@@ -180,7 +180,10 @@ fn app_server(args: &[String], home: &Path) {
             "thread/read" | "thread/fork" => {
                 assert!(acknowledged);
                 let source = request["params"]["threadId"].as_str().unwrap();
-                let path = home.join(format!("sessions/rollout-{source}.jsonl"));
+                let path = request["params"]["path"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join(format!("sessions/rollout-{source}.jsonl")));
                 let Ok(history) = std::fs::read_to_string(path) else {
                     println!(
                         "{}",
@@ -193,6 +196,10 @@ fn app_server(args: &[String], home: &Path) {
                 if method == "thread/read" {
                     json!({"thread":{"id":source,"source":meta["payload"]["source"],"parentThreadId":meta["payload"]["parent_thread_id"]}})
                 } else {
+                    while home.join("mock-fork-pause").exists() {
+                        std::fs::write(home.join("mock-fork-waiting"), "waiting").unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
                     assert_eq!(request["params"]["excludeTurns"], true);
                     assert_eq!(request["params"]["deferGoalContinuation"], true);
                     assert_eq!(request["params"]["ephemeral"], false);
@@ -217,6 +224,7 @@ fn app_server(args: &[String], home: &Path) {
                         _ => {}
                     }
                     let fork = format!("mock-codex-{}", uuid::Uuid::new_v4());
+                    std::fs::create_dir_all(home.join("sessions")).unwrap();
                     let path = home.join(format!("sessions/rollout-{fork}.jsonl"));
                     write_record(
                         &path,
@@ -549,6 +557,9 @@ fn main() {
                         _ => 0,
                     };
                     busy_after_quota = prompt == "FAIL_USAGE_LIMIT_THEN_BUSY";
+                }
+                if codex_home.join("mock-depleted").exists() {
+                    quota_failures_remaining = 1;
                 }
                 if quota_failures_remaining > 0 {
                     quota_failures_remaining -= 1;

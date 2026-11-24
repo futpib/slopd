@@ -416,6 +416,7 @@ pub(super) struct PrepareRunContext<'a> {
 
 pub(super) struct ForkContext<'a> {
     pub(super) account: &'a str,
+    pub(super) source_path: Option<&'a str>,
     pub(super) cwd: &'a std::path::Path,
     pub(super) env: &'a [(String, String)],
     pub(super) verify_caller: bool,
@@ -847,6 +848,7 @@ impl BackendLifecycle for CodexBackend {
         let id = codex::fork_session(
             command,
             context.session_id,
+            context.source_path,
             context.cwd,
             context.verify_caller,
         )

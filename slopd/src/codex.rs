@@ -14,6 +14,7 @@ pub type TranscriptRecord = (String, Value);
 pub async fn fork_session(
     mut command: tokio::process::Command,
     source: &str,
+    source_path: Option<&str>,
     cwd: &std::path::Path,
     verify_caller: bool,
 ) -> Result<String, String> {
@@ -91,7 +92,7 @@ pub async fn fork_session(
             3,
             "thread/fork",
             json!({
-                "threadId": source, "cwd": cwd, "excludeTurns": true,
+                "threadId": source, "path": source_path, "cwd": cwd, "excludeTurns": true,
                 "deferGoalContinuation": true, "ephemeral": false
             }),
         )

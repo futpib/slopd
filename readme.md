@@ -468,6 +468,25 @@ session named `slopd`.
 
 #### Multiple accounts
 
+For quota failover, group independently authenticated Codex or Claude accounts:
+
+```toml
+[account_pools.codex]
+accounts = ["codex-primary", "codex-spare"]
+
+[account_pools.claude]
+accounts = ["claude-primary", "claude-spare"]
+```
+
+Use `slopd-acp --account-pool codex` (or `claude`). Each member is a normal
+`[accounts.NAME]` entry. Members must share a backend, executable arguments,
+and MCP policy; give them separate authenticated `config_dir` directories.
+Aliases sharing a directory share cooldowns. Sessions stay on their current
+account until depleted, then continue their native history on the next member.
+Provider reset times are honored; when absent, `cooldown_secs` defaults to 300
+(configurable per pool). An exhausted pool returns an error. Single-account
+`--account` behavior is unchanged.
+
 Run different panes under different agent accounts and backends. There is always
 a reserved account named `default`, backed by the top-level `backend`,
 `config_dir`, and `[run] executable`. Define additional entries under

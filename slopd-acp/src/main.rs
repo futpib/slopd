@@ -72,8 +72,12 @@ struct Cli {
     socket: Option<PathBuf>,
 
     /// Named slopd account used for newly-created panes.
-    #[arg(short, long, value_name = "NAME")]
+    #[arg(short, long, value_name = "NAME", conflicts_with = "account_pool")]
     account: Option<String>,
+
+    /// Ordered same-backend failover pool from slopd's account_pools config.
+    #[arg(long, value_name = "NAME")]
+    account_pool: Option<String>,
 
     /// Underlying CLI backend used for newly-created panes.
     #[arg(long, value_enum)]
@@ -183,6 +187,9 @@ async fn main() {
         std::process::exit(2);
     }
     let session_scope = cli.session_scope.clone().unwrap_or_else(|| {
+        if let Some(pool) = &cli.account_pool {
+            return format!("pool:{pool}");
+        }
         let account = cli.account.as_deref().unwrap_or(libslop::DEFAULT_ACCOUNT);
         let backend = cli
             .backend
@@ -203,6 +210,7 @@ async fn main() {
     let adapter = Adapter::new(adapter::Config {
         transport,
         account: cli.account.clone(),
+        account_pool: cli.account_pool.clone(),
         backend: cli.backend.map(Into::into),
         extra_args: cli.agent_args.clone(),
         env,

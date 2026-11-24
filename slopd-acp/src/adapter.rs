@@ -11,12 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::transport::Transport;
 use crate::wire::{self, Sender};
+mod failover;
 
 const PROTOCOL_VERSION: u32 = 2;
 const STEER_METHOD: &str = "_session/steering";
 const ACP_TAG: &str = "acp";
 const ACP_RESUMABLE_TAG: &str = "acp-resumable";
 const ACP_DELETED_TAG: &str = "acp-deleted";
+const ACP_POOL_TAG: &str = "acp-account-pool";
 const ACP_SESSION_TAG_PREFIX: &str = "acp-session-";
 const ACP_CWD_TAG_PREFIX: &str = "acp-cwd-";
 const ACP_SCOPE_TAG_PREFIX: &str = "acp-scope-";
@@ -38,6 +40,7 @@ pub enum SystemPromptMode {
 pub struct Config {
     pub transport: Transport,
     pub account: Option<String>,
+    pub account_pool: Option<String>,
     pub backend: Option<libslop::Backend>,
     pub extra_args: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -67,6 +70,7 @@ pub struct Adapter {
 }
 
 struct Session {
+    account: Option<String>,
     pane_id: Option<String>,
     grave_id: Option<String>,
     backend: Option<libslop::Backend>,
@@ -85,6 +89,7 @@ struct Session {
 }
 
 struct StartedPane {
+    account: String,
     pane_id: String,
     backend: libslop::Backend,
     native_session_id: Option<String>,
@@ -113,6 +118,7 @@ struct TurnLease {
 struct TurnResult {
     accepted: bool,
     stop_reason: &'static str,
+    depleted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,10 +234,26 @@ impl Adapter {
     pub async fn recover_sessions(&self) -> Result<(), String> {
         tracing::debug!("loading live panes for ACP recovery");
         let mut client = self.config.transport.connect().await?;
-        let live_panes = client.ps().await.map_err(|error| error.to_string())?;
+        let mut live_panes = client.ps().await.map_err(|error| error.to_string())?;
+        live_panes.sort_by_key(|pane| failover::generation(&pane.tags));
         drop(client);
         tracing::debug!("loading graveyard pages for ACP recovery");
         let graves = self.scoped_graves().await?;
+        let mut generations = HashMap::<String, u128>::new();
+        for pane in live_panes
+            .iter()
+            .chain(graves.iter().map(|grave| &grave.pane))
+        {
+            if self.pane_is_in_scope(pane)
+                && let Some(id) = tagged_session_id(&pane.tags)
+            {
+                let generation = failover::generation(&pane.tags);
+                generations
+                    .entry(id)
+                    .and_modify(|current| *current = (*current).max(generation))
+                    .or_insert(generation);
+            }
+        }
         tracing::debug!(
             graves = graves.len(),
             "loaded graveyard pages for ACP recovery"
@@ -246,6 +268,9 @@ impl Adapter {
             let Some(session_id) = tagged_session_id(&grave.pane.tags) else {
                 continue;
             };
+            if generations[&session_id] > failover::generation(&grave.pane.tags) {
+                continue;
+            }
             if !seen_grave_sessions.insert(session_id.clone()) {
                 continue;
             }
@@ -268,6 +293,7 @@ impl Adapter {
                 .clone()
                 .unwrap_or_else(|| cwd.clone());
             recovered.entry(session_id).or_insert_with(|| Session {
+                account: Some(grave.pane.account),
                 pane_id: None,
                 grave_id: Some(grave.grave_id),
                 backend: None,
@@ -295,6 +321,18 @@ impl Adapter {
                 continue;
             }
             let tagged_id = tagged_session_id(&pane.tags);
+            if tagged_id
+                .as_ref()
+                .is_some_and(|id| generations[id] > failover::generation(&pane.tags))
+            {
+                let mut client = self.config.transport.connect().await?;
+                client
+                    .tag(pane.pane_id.clone(), ACP_DELETED_TAG.into())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                incomplete.push((pane.pane_id, pane.tags, true));
+                continue;
+            }
             let legacy = tagged_id.is_none();
             let session_id = tagged_id.unwrap_or_else(|| format!("slopd:{}", pane.pane_id));
             let explicitly_resumable = pane.tags.iter().any(|tag| tag == ACP_RESUMABLE_TAG);
@@ -318,6 +356,7 @@ impl Adapter {
             recovered.insert(
                 session_id,
                 Session {
+                    account: Some(pane.account),
                     pane_id: Some(pane.pane_id),
                     grave_id: None,
                     backend: Some(pane.backend),
@@ -341,11 +380,30 @@ impl Adapter {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        // A failover may have published its replacement immediately before a
+        // crash. Retire older live generations before adopting the winner.
+        let mut winners = Vec::new();
+        for metadata in live_metadata {
+            if recovered
+                .get(&metadata.1)
+                .and_then(|s| s.pane_id.as_deref())
+                == Some(metadata.0.as_str())
+            {
+                winners.push(metadata);
+            } else {
+                let mut client = self.config.transport.connect().await?;
+                client
+                    .tag(metadata.0.clone(), ACP_DELETED_TAG.into())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.kill_pane(&metadata.0).await?;
+            }
+        }
         *self.sessions.lock().await = recovered;
         self.next_activity_id
             .store(next_activity.max(1), Ordering::Relaxed);
 
-        for (pane_id, session_id, cwd) in live_metadata {
+        for (pane_id, session_id, cwd) in winners {
             self.tag_session_pane(&pane_id, &session_id, &cwd, true)
                 .await?;
         }
@@ -496,11 +554,13 @@ impl Adapter {
                     session.pane_id = Some(pane.pane_id.clone());
                     session.grave_id = None;
                     session.backend = Some(pane.backend);
+                    session.account = Some(pane.account.clone());
                     session.native_session_id = pane.session_id.clone();
                     session.last_touched_at = touched;
                     session.last_used = touched;
                 })
                 .or_insert_with(|| Session {
+                    account: Some(pane.account.clone()),
                     pane_id: Some(pane.pane_id.clone()),
                     grave_id: None,
                     backend: Some(pane.backend),
@@ -559,6 +619,9 @@ impl Adapter {
             .find(|tag| tag.starts_with(ACP_SCOPE_TAG_PREFIX))
         {
             return scope_tag == &self.scope_tag;
+        }
+        if self.config.account_pool.is_some() {
+            return false;
         }
         let account = self
             .config
@@ -775,7 +838,7 @@ impl Adapter {
         if let Err(error) = self.make_live_pane_room().await {
             return server_error(sender, id, format!("session/new: {error}")).await;
         }
-        let started = match self.start_pane(start_directory.clone(), None).await {
+        let started = match self.start_pane(start_directory.clone(), None, None).await {
             Ok(started) => started,
             Err(error) => return server_error(sender, id, error).await,
         };
@@ -796,6 +859,7 @@ impl Adapter {
         sessions.insert(
             session_id.clone(),
             Session {
+                account: Some(started.account),
                 pane_id: Some(started.pane_id),
                 grave_id: None,
                 backend: Some(started.backend),
@@ -1053,7 +1117,7 @@ impl Adapter {
             if let Err(error) = self.ensure_session_resident(&params.session_id).await {
                 return server_error(sender, id, format!("session/prompt: {error}")).await;
             }
-            let lease = {
+            let mut lease = {
                 let mut sessions = self.sessions.lock().await;
                 let Some(session) = sessions.get_mut(&params.session_id) else {
                     return reject(sender, id, "session/prompt: unknown session".into()).await;
@@ -1106,19 +1170,14 @@ impl Adapter {
             drop(creation);
 
             let accepted = Arc::new(AtomicBool::new(false));
-            let run = self.run_turn(&params.session_id, &lease, Arc::clone(&accepted), sender);
-            let result = match tokio::time::timeout(self.config.turn_timeout, run).await {
-                Ok(result) => result,
-                Err(_) => {
-                    if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
-                        tracing::warn!("failed to interrupt timed-out pane: {error}");
-                    }
-                    Err(format!(
-                        "turn timed out after {} seconds",
-                        self.config.turn_timeout.as_secs()
-                    ))
-                }
-            };
+            let result = self
+                .run_turn(
+                    &params.session_id,
+                    &mut lease,
+                    Arc::clone(&accepted),
+                    sender,
+                )
+                .await;
 
             lease.done.cancel();
             let _steering = lease
@@ -1145,6 +1204,8 @@ impl Adapter {
                     }
                     if lease.discard_replayed_history && !was_accepted {
                         session.pending_resume_history = true;
+                    } else if was_accepted {
+                        session.pending_resume_history = false;
                     }
                 }
             }
@@ -1182,7 +1243,7 @@ impl Adapter {
         }
     }
 
-    async fn run_turn(
+    async fn run_turn_once(
         &self,
         session_id: &str,
         lease: &TurnLease,
@@ -1192,7 +1253,7 @@ impl Adapter {
         let mut client = tokio::select! {
             result = self.config.transport.connect() => result?,
             _ = lease.cancel.cancelled() => {
-                return Ok(TurnResult { accepted: false, stop_reason: "cancelled" });
+                return Ok(TurnResult { depleted: false, accepted: false, stop_reason: "cancelled" });
             }
         };
         let mut state = tokio::select! {
@@ -1205,7 +1266,7 @@ impl Adapter {
                 pane_event_filter(&lease.pane_id, "hook", "SessionEnd"),
             ]) => result.map_err(|error| error.to_string())?,
             _ = lease.cancel.cancelled() => {
-                return Ok(TurnResult { accepted: false, stop_reason: "cancelled" });
+                return Ok(TurnResult { depleted: false, accepted: false, stop_reason: "cancelled" });
             }
         };
         let mut transcript = tokio::select! {
@@ -1213,7 +1274,7 @@ impl Adapter {
                 result.map_err(|error| error.to_string())?
             }
             _ = lease.cancel.cancelled() => {
-                return Ok(TurnResult { accepted: false, stop_reason: "cancelled" });
+                return Ok(TurnResult { depleted: false, accepted: false, stop_reason: "cancelled" });
             }
         };
 
@@ -1229,7 +1290,7 @@ impl Adapter {
                 if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
                     tracing::warn!("failed to interrupt cancelled pane: {error}");
                 }
-                return Ok(TurnResult { accepted: false, stop_reason: "cancelled" });
+                return Ok(TurnResult { depleted: false, accepted: false, stop_reason: "cancelled" });
             }
         };
         accepted.store(true, Ordering::Release);
@@ -1244,195 +1305,203 @@ impl Adapter {
         let mut retry_pending = false;
         loop {
             tokio::select! {
-                item = transcript.next() => {
-                    match subscription_event(item)? {
-                        SubscriptionEvent::Record(record) => {
-                            tracing::debug!(
-                                pane_id = lease.pane_id,
-                                event_type = record.event_type,
-                                cursor = record.cursor,
-                                "received transcript record"
-                            );
-                            if transcript_gate.accepts(&record) {
-                                saw_answer |= emit_record_updates(
-                                    &mut projection,
-                                    lease.backend,
-                                    &record,
-                                    session_id,
-                                    sender,
-                                ).await;
-                            }
-                        }
-                        SubscriptionEvent::Subscribed => continue,
-                        SubscriptionEvent::Closed => {
-                            return Err("transcript subscription closed during turn".into());
-                        }
-                    }
-                }
-                item = state.next() => {
-                    let record = match subscription_event(item)? {
-                        SubscriptionEvent::Record(record) => record,
-                        SubscriptionEvent::Subscribed => continue,
-                        SubscriptionEvent::Closed => {
-                            return Err("state subscription closed during turn".into());
-                        }
-                    };
-                    tracing::debug!(
-                        pane_id = lease.pane_id,
-                        event_type = record.event_type,
-                        payload = %record.payload,
-                        "received state record"
-                    );
-                    match record.event_type.as_str() {
-                        "PaneDestroyed" => {
-                            self.mark_pane_gone(
-                                session_id,
-                                &lease.pane_id,
-                                record.payload.get("session_id").and_then(Value::as_str),
-                            )
-                            .await;
-                            return Err(format!(
-                                "underlying pane {} ended during the turn",
-                                lease.pane_id
-                            ));
-                        }
-                        "SessionEnd" if hook_matches_session(
-                            lease.backend,
-                            lease.native_session_id.as_deref(),
-                            &record.payload,
-                        ) => {
-                            self.mark_pane_gone(
-                                session_id,
-                                &lease.pane_id,
-                                record.payload.get("session_id").and_then(Value::as_str),
-                            )
-                            .await;
-                            return Err(format!(
-                                "underlying pane {} ended during the turn",
-                                lease.pane_id
-                            ));
-                        }
-                        "Stop" if hook_matches_session(
-                            lease.backend,
-                            lease.native_session_id.as_deref(),
-                            &record.payload,
-                        ) => {
-                            return complete_turn(
-                                &mut transcript,
-                                &mut projection,
-                                &mut transcript_gate,
-                                lease.backend,
-                                session_id,
-                                sender,
-                            ).await;
-                        }
-                        "StopFailure" if hook_matches_session(
-                            lease.backend,
-                            lease.native_session_id.as_deref(),
-                            &record.payload,
-                        ) => {
-                            if record
-                                .payload
-                                .get("retry_scheduled")
-                                .and_then(Value::as_bool)
-                                == Some(true)
-                            {
-                                retry_pending = true;
-                            } else {
-                                return Err(turn_failure_message(&record.payload));
-                            }
-                        }
-                        "Stop" | "StopFailure" | "SessionEnd" => {
-                            tracing::debug!(
-                                pane_id = lease.pane_id,
-                                expected_session_id = ?lease.native_session_id,
-                                hook_session_id = ?record.payload.get("session_id").and_then(|value| value.as_str()),
-                                event_type = record.event_type,
-                                "ignoring lifecycle hook from a foreign Codex session",
-                            );
-                        }
-                        "StateChange" => {
-                            match record.payload.get("state").and_then(Value::as_str) {
-                                Some("busy") => {
-                                    saw_busy = true;
-                                    retry_pending = false;
-                                }
-                                Some("ready")
-                                    if !retry_pending && state_ready_completes(
-                                        lease.backend,
-                                        saw_busy,
-                                        saw_answer,
-                                    ) =>
-                                {
-                                    // State and transcript records travel through
-                                    // independent slopd subscriptions. A fast
-                                    // turn can deliver ready first even though
-                                    // its assistant record is already queued (or
-                                    // about to be tailed). Give transcript
-                                    // delivery one short quiet window before
-                                    // resolving the ACP prompt.
-                                    return complete_turn(
-                                        &mut transcript,
+                    item = transcript.next() => {
+                        match subscription_event(item)? {
+                            SubscriptionEvent::Record(record) => {
+                                tracing::debug!(
+                                    pane_id = lease.pane_id,
+                                    event_type = record.event_type,
+                                    cursor = record.cursor,
+                                    "received transcript record"
+                                );
+                                if transcript_gate.accepts(&record) {
+                                    saw_answer |= emit_record_updates(
                                         &mut projection,
-                                        &mut transcript_gate,
                                         lease.backend,
+                                        &record,
                                         session_id,
                                         sender,
                                     ).await;
                                 }
-                                _ => {}
+                            }
+                            SubscriptionEvent::Subscribed => continue,
+                            SubscriptionEvent::Closed => {
+                                return Err("transcript subscription closed during turn".into());
                             }
                         }
-                        "DetailedStateChange" => {
-                            let detailed_state = record
-                                .payload
-                                .get("detailed_state")
-                                .and_then(Value::as_str);
-                            match detailed_state {
-                                Some("busy_processing" | "busy_tool_use" | "busy_subagent" | "busy_compacting") => {
-                                    saw_busy = true;
-                                    retry_pending = false;
-                                }
-                                Some("awaiting_input_permission") => {
-                                    wire::send(
-                                        sender,
-                                        wire::session_update(
-                                            session_id,
-                                            message_chunk(
-                                                "\n\n[slopd-acp: the underlying agent is awaiting permission in its terminal pane.]\n",
-                                            ),
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                Some("awaiting_input_elicitation") => {
-                                    wire::send(
-                                        sender,
-                                        wire::session_update(
-                                            session_id,
-                                            message_chunk(
-                                                "\n\n[slopd-acp: the underlying agent is awaiting input in its terminal pane.]\n",
-                                            ),
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                _ => {}
+                    }
+                    item = state.next() => {
+                        let record = match subscription_event(item)? {
+                            SubscriptionEvent::Record(record) => record,
+                            SubscriptionEvent::Subscribed => continue,
+                            SubscriptionEvent::Closed => {
+                                return Err("state subscription closed during turn".into());
                             }
+                        };
+                        tracing::debug!(
+                            pane_id = lease.pane_id,
+                            event_type = record.event_type,
+                            payload = %record.payload,
+                            "received state record"
+                        );
+                        match record.event_type.as_str() {
+                            "PaneDestroyed" => {
+                                self.mark_pane_gone(
+                                    session_id,
+                                    &lease.pane_id,
+                                    record.payload.get("session_id").and_then(Value::as_str),
+                                )
+                                .await;
+                                return Err(format!(
+                                    "underlying pane {} ended during the turn",
+                                    lease.pane_id
+                                ));
+                            }
+                            "SessionEnd" if hook_matches_session(
+                                lease.backend,
+                                lease.native_session_id.as_deref(),
+                                &record.payload,
+                            ) => {
+                                self.mark_pane_gone(
+                                    session_id,
+                                    &lease.pane_id,
+                                    record.payload.get("session_id").and_then(Value::as_str),
+                                )
+                                .await;
+                                return Err(format!(
+                                    "underlying pane {} ended during the turn",
+                                    lease.pane_id
+                                ));
+                            }
+                            "Stop" if hook_matches_session(
+                                lease.backend,
+                                lease.native_session_id.as_deref(),
+                                &record.payload,
+                            ) => {
+                                return complete_turn(
+                                    &mut transcript,
+                                    &mut projection,
+                                    &mut transcript_gate,
+                                    lease.backend,
+                                    session_id,
+                                    sender,
+                                ).await;
+                            }
+                            "StopFailure" if hook_matches_session(
+                                lease.backend,
+                                lease.native_session_id.as_deref(),
+                                &record.payload,
+                            ) => {
+                                if self.config.account_pool.is_some() && record.payload["account_depleted"] == true {
+                                    drain_transcript(&mut transcript, &mut projection, &mut transcript_gate, lease.backend, session_id, sender).await?;
+                                    for record in transcript_gate.take_buffered() {
+                                        emit_record_updates(&mut projection, lease.backend, &record, session_id, sender).await;
+                                    }
+                                    return Ok(TurnResult { accepted: true, stop_reason: "end_turn", depleted: true });
+                                }
+                                if record
+                                    .payload
+                                    .get("retry_scheduled")
+                                    .and_then(Value::as_bool)
+                                    == Some(true)
+                                {
+                                    retry_pending = true;
+                                } else {
+                                    return Err(turn_failure_message(&record.payload));
+                                }
+                            }
+                            "Stop" | "StopFailure" | "SessionEnd" => {
+                                tracing::debug!(
+                                    pane_id = lease.pane_id,
+                                    expected_session_id = ?lease.native_session_id,
+                                    hook_session_id = ?record.payload.get("session_id").and_then(|value| value.as_str()),
+                                    event_type = record.event_type,
+                                    "ignoring lifecycle hook from a foreign Codex session",
+                                );
+                            }
+                            "StateChange" => {
+                                match record.payload.get("state").and_then(Value::as_str) {
+                                    Some("busy") => {
+                                        saw_busy = true;
+                                        retry_pending = false;
+                                    }
+                                    Some("ready")
+                                    if self.config.account_pool.is_none() && !retry_pending && state_ready_completes(
+                                            lease.backend,
+                                            saw_busy,
+                                            saw_answer,
+                                        ) =>
+                                    {
+                                        // State and transcript records travel through
+                                        // independent slopd subscriptions. A fast
+                                        // turn can deliver ready first even though
+                                        // its assistant record is already queued (or
+                                        // about to be tailed). Give transcript
+                                        // delivery one short quiet window before
+                                        // resolving the ACP prompt.
+                                        return complete_turn(
+                                            &mut transcript,
+                                            &mut projection,
+                                            &mut transcript_gate,
+                                            lease.backend,
+                                            session_id,
+                                            sender,
+                                        ).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            "DetailedStateChange" => {
+                                let detailed_state = record
+                                    .payload
+                                    .get("detailed_state")
+                                    .and_then(Value::as_str);
+                                match detailed_state {
+                                    Some("busy_processing" | "busy_tool_use" | "busy_subagent" | "busy_compacting") => {
+                                        saw_busy = true;
+                                        retry_pending = false;
+                                    }
+                                    Some("awaiting_input_permission") => {
+                                        wire::send(
+                                            sender,
+                                            wire::session_update(
+                                                session_id,
+                                                message_chunk(
+                                                    "\n\n[slopd-acp: the underlying agent is awaiting permission in its terminal pane.]\n",
+                                                ),
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    Some("awaiting_input_elicitation") => {
+                                        wire::send(
+                                            sender,
+                                            wire::session_update(
+                                                session_id,
+                                                message_chunk(
+                                                    "\n\n[slopd-acp: the underlying agent is awaiting input in its terminal pane.]\n",
+                                                ),
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                    _ = lease.cancel.cancelled() => {
+                        if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
+                            tracing::warn!("failed to interrupt cancelled pane: {error}");
+                        }
+                        return Ok(TurnResult {
+            depleted: false,
+                            accepted: true,
+                            stop_reason: "cancelled",
+                        });
                     }
                 }
-                _ = lease.cancel.cancelled() => {
-                    if let Err(error) = self.interrupt_pane(&lease.pane_id).await {
-                        tracing::warn!("failed to interrupt cancelled pane: {error}");
-                    }
-                    return Ok(TurnResult {
-                        accepted: true,
-                        stop_reason: "cancelled",
-                    });
-                }
-            }
         }
     }
 
@@ -1440,8 +1509,27 @@ impl Adapter {
         &self,
         start_directory: PathBuf,
         native_session_id: Option<&str>,
+        account: Option<&str>,
     ) -> Result<StartedPane, String> {
         let mut client = self.config.transport.connect().await?;
+        let account = if let Some(account) = account {
+            Some(account.to_string())
+        } else if let Some(pool) = &self.config.account_pool {
+            let selected = client
+                .select_account_pool(pool.clone(), None, vec![])
+                .await
+                .map_err(|e| e.to_string())?;
+            if self
+                .config
+                .backend
+                .is_some_and(|backend| backend != selected.backend)
+            {
+                return Err("--backend conflicts with the account pool backend".into());
+            }
+            Some(selected.name)
+        } else {
+            self.config.account.clone()
+        };
         let filters = vec![
             event_filter("slopd", "DetailedStateChange"),
             event_filter("slopd", "PaneDestroyed"),
@@ -1457,7 +1545,7 @@ impl Adapter {
                 launch_args(&self.config.extra_args, native_session_id),
                 Some(start_directory),
                 self.config.env.clone(),
-                self.config.account.clone(),
+                account,
                 self.config.backend,
             )
             .await
@@ -1492,9 +1580,9 @@ impl Adapter {
                 return Err(error);
             }
         };
-        let (backend, native_session_id) = match client.ps().await {
+        let (backend, native_session_id, account) = match client.ps().await {
             Ok(panes) => match panes.into_iter().find(|pane| pane.pane_id == pane_id) {
-                Some(pane) => (pane.backend, pane.session_id),
+                Some(pane) => (pane.backend, pane.session_id, pane.account),
                 None => {
                     if let Err(cleanup_error) = self.kill_pane(&pane_id).await {
                         tracing::warn!(
@@ -1519,6 +1607,7 @@ impl Adapter {
             tracing::warn!("could not tag ACP pane {pane_id}: {error}");
         }
         Ok(StartedPane {
+            account,
             pane_id,
             backend,
             native_session_id,
@@ -1541,6 +1630,7 @@ impl Adapter {
                 && pane.detailed_state != libslop::PaneDetailedState::BootingUp
             {
                 return Ok(StartedPane {
+                    account: pane.account,
                     pane_id,
                     backend: pane.backend,
                     native_session_id: pane.session_id,
@@ -1589,6 +1679,17 @@ impl Adapter {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        if self.config.account_pool.is_some() {
+            client
+                .tag(pane_id.to_string(), ACP_POOL_TAG.into())
+                .await
+                .map_err(|e| e.to_string())?;
+        } else if existing.iter().any(|tag| tag == ACP_POOL_TAG) {
+            client
+                .untag(pane_id.to_string(), ACP_POOL_TAG.into())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         if resumable {
             client
                 .tag(pane_id.to_string(), ACP_RESUMABLE_TAG.to_string())
@@ -1612,6 +1713,8 @@ impl Adapter {
         for tag in tags.iter().filter(|tag| {
             *tag == ACP_TAG
                 || *tag == ACP_RESUMABLE_TAG
+                || *tag == ACP_POOL_TAG
+                || tag.starts_with(failover::GENERATION_TAG)
                 || tag.starts_with(ACP_SESSION_TAG_PREFIX)
                 || tag.starts_with(ACP_CWD_TAG_PREFIX)
                 || tag.starts_with(ACP_SCOPE_TAG_PREFIX)
@@ -1683,14 +1786,20 @@ impl Adapter {
                 return;
             }
         };
-        let Some(grave) = graves.into_iter().find(|grave| {
-            tagged_session_id(&grave.pane.tags).as_deref() == Some(session_id)
-                && grave.revived_at.is_none()
-        }) else {
+        let Some(grave) = graves
+            .into_iter()
+            .filter(|grave| {
+                tagged_session_id(&grave.pane.tags).as_deref() == Some(session_id)
+                    && grave.revived_at.is_none()
+                    && !grave.pane.tags.iter().any(|tag| tag == ACP_DELETED_TAG)
+            })
+            .max_by_key(|grave| (failover::generation(&grave.pane.tags), grave.destroyed_at))
+        else {
             return;
         };
         if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
             session.grave_id = Some(grave.grave_id);
+            session.account = Some(grave.pane.account);
             if grave.pane.session_id.is_some() {
                 session.native_session_id = grave.pane.session_id;
             }
@@ -1712,7 +1821,7 @@ impl Adapter {
             let panes = client.ps().await.map_err(|error| error.to_string())?;
             self.reconcile_live_sessions(&panes).await;
         }
-        let (start_directory, cwd, native_session_id, grave_id) = {
+        let (start_directory, cwd, native_session_id, grave_id, account) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(session_id)
@@ -1728,6 +1837,7 @@ impl Adapter {
                 session.cwd.to_string_lossy().into_owned(),
                 session.native_session_id.clone(),
                 session.grave_id.clone(),
+                session.account.clone(),
             )
         };
 
@@ -1742,16 +1852,24 @@ impl Adapter {
                         "grave revival failed, falling back to native resume: {error}"
                     );
                     (
-                        self.start_pane(start_directory, native_session_id.as_deref())
-                            .await?,
+                        self.start_pane(
+                            start_directory,
+                            native_session_id.as_deref(),
+                            account.as_deref(),
+                        )
+                        .await?,
                         native_session_id.is_some(),
                     )
                 }
             }
         } else {
             (
-                self.start_pane(start_directory, native_session_id.as_deref())
-                    .await?,
+                self.start_pane(
+                    start_directory,
+                    native_session_id.as_deref(),
+                    account.as_deref(),
+                )
+                .await?,
                 native_session_id.is_some(),
             )
         };
@@ -1785,6 +1903,7 @@ impl Adapter {
         session.pane_id = Some(started.pane_id);
         session.grave_id = None;
         session.backend = Some(started.backend);
+        session.account = Some(started.account);
         session.native_session_id = started.native_session_id.or(native_session_id);
         session.pending_resume_history =
             resumed && session.backend == Some(libslop::Backend::Codex);
@@ -2214,7 +2333,8 @@ struct TurnTranscriptGate<'a> {
 
 impl<'a> TurnTranscriptGate<'a> {
     fn new(backend: libslop::Backend, prompt: &'a str, discard_replayed_history: bool) -> Self {
-        let gated = backend == libslop::Backend::Codex && discard_replayed_history;
+        let gated = matches!(backend, libslop::Backend::Codex | libslop::Backend::Claude)
+            && discard_replayed_history;
         Self {
             prompt: gated.then_some(prompt),
             saw_boundary: false,
@@ -2226,8 +2346,12 @@ impl<'a> TurnTranscriptGate<'a> {
         let Some(prompt) = self.prompt else {
             return true;
         };
-        if record.event_type == "userMessage"
-            && record.payload.get("text").and_then(Value::as_str) == Some(prompt)
+        if (record.event_type == "userMessage"
+            && record.payload.get("text").and_then(Value::as_str) == Some(prompt))
+            || (record.event_type == "user"
+                && content_text(record.payload.pointer("/message/content")).is_some_and(|text| {
+                    text.trim_end_matches(['\r', '\n']) == prompt.trim_end_matches(['\r', '\n'])
+                }))
         {
             // A repeated prompt can also occur in the replayed history. Keep
             // only records after the last matching user echo; Stop provides
@@ -2269,6 +2393,7 @@ async fn complete_turn(
         wire::send(sender, wire::session_update(session_id, update)).await;
     }
     Ok(TurnResult {
+        depleted: false,
         accepted: true,
         stop_reason: "end_turn",
     })

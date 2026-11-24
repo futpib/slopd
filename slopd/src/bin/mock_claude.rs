@@ -611,6 +611,15 @@ fn main() {
     // file. slopd must rewrite this to the fork's file. Non-fork: identical to
     // transcript_path.
     let session_start_transcript_path = transcript_dir.join(format!("{}.jsonl", session_start_sid));
+    if forking && session_start_transcript_path.exists() {
+        std::fs::copy(&session_start_transcript_path, &transcript_path).expect("copy fork history");
+    }
+    if forking && let Some(home) = transcript_dir.parent().and_then(|p| p.parent()) {
+        while home.join("mock-fork-pause").exists() {
+            std::fs::write(home.join("mock-fork-waiting"), "waiting").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     // Put the terminal in raw mode so we receive key bytes directly (Ctrl+C = 0x03,
     // Ctrl+D = 0x04, Escape = 0x1b) rather than having the terminal driver intercept them.
@@ -1312,6 +1321,38 @@ fn main() {
                         }
                     }
                     // Fall through to fire UserPromptSubmit so slopctl send unblocks.
+                }
+
+                if transcript_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .is_some_and(|home| home.join("mock-depleted").exists())
+                {
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "user",
+                            session_id,
+                            serde_json::json!({"message":{"role":"user","content":&prompt}}),
+                        ),
+                    );
+                    let mut payload =
+                        hook_payload("UserPromptSubmit", session_id, &cwd, &transcript_path);
+                    payload["prompt"] = serde_json::json!(&prompt);
+                    fire_hooks(no_hooks, &settings, "UserPromptSubmit", &payload);
+                    write_transcript_record(
+                        &transcript_path,
+                        &transcript_record(
+                            "assistant",
+                            session_id,
+                            serde_json::json!({"error":"rate_limit","quotaLimits":{"status":"rejected","rateLimitType":"five_hour"},"message":{"role":"assistant","content":""}}),
+                        ),
+                    );
+                    let mut failure =
+                        hook_payload("StopFailure", session_id, &cwd, &transcript_path);
+                    failure["error"] = serde_json::json!("rate_limit");
+                    fire_hooks(no_hooks, &settings, "StopFailure", &failure);
+                    continue;
                 }
 
                 // Write transcript records like real Claude does.

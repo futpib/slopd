@@ -13,6 +13,7 @@ mod journal;
 mod mcp;
 mod opencode;
 mod opencode_v2;
+mod pools;
 mod tmux_focus;
 use backend::*;
 
@@ -792,6 +793,47 @@ fn annotate_retry(payload: &mut serde_json::Value, schedule: Option<RetrySchedul
         payload.insert("retry_attempt".to_string(), schedule.attempt.into());
         payload.insert("retry_in_ms".to_string(), schedule.delay_ms.into());
     }
+}
+
+/// Publish depletion and suppress same-account retry only for opted-in ACP panes.
+async fn annotate_depletion(
+    pane: &str,
+    backend: libslop::Backend,
+    payload: &mut serde_json::Value,
+    config: &libslop::SlopdConfig,
+    panes: &PaneMap,
+) -> bool {
+    let state = panes.get_or_insert(pane);
+    let transcript = state.transcript_path.lock().unwrap().clone();
+    let Some(reset) = pools::depletion(backend, payload, transcript.as_deref()).await else {
+        return false;
+    };
+    let identity = state.identity.lock().unwrap().clone();
+    let account = identity
+        .account
+        .as_deref()
+        .unwrap_or(libslop::DEFAULT_ACCOUNT);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    match panes
+        .account_health
+        .lock()
+        .unwrap()
+        .note(config, account, reset, now)
+    {
+        Ok(until) => {
+            payload["account_retry_at"] = until.into();
+        }
+        Err(error) => tracing::warn!("could not record account depletion: {error}"),
+    }
+    payload["account_depleted"] = true.into();
+    let pooled = identity.tags.iter().any(|tag| tag == pools::POOL_TAG);
+    if pooled {
+        state.cancel_retry();
+    }
+    pooled
 }
 
 /// Why a managed pane was torn down. Recorded on every death so the systemd
@@ -1877,7 +1919,25 @@ async fn tail_transcript(
                                         }
                                     }
                                 }
-                                let schedule = if live_record && failure.retryable {
+                                let mut payload = serde_json::json!({
+                                    "hook_event_name": "StopFailure",
+                                    "backend": "codex",
+                                    "session_id": pane_state.identity.lock().unwrap().session_id.clone(),
+                                    "turn_id": record.pointer("/payload/turn_id").cloned().unwrap_or(serde_json::Value::Null),
+                                    "error": failure.error,
+                                    "error_code": failure.code,
+                                    "retryable": failure.retryable,
+                                });
+                                let failover = live_record
+                                    && annotate_depletion(
+                                        &pane_id,
+                                        backend,
+                                        &mut payload,
+                                        &config,
+                                        &panes,
+                                    )
+                                    .await;
+                                let schedule = if live_record && failure.retryable && !failover {
                                     schedule_auto_continue(
                                         &pane_id,
                                         "Codex task failure",
@@ -1898,17 +1958,6 @@ async fn tail_transcript(
                                     pane_state.cancel_retry();
                                 }
                                 if live_record {
-                                    let session_id =
-                                        pane_state.identity.lock().unwrap().session_id.clone();
-                                    let mut payload = serde_json::json!({
-                                        "hook_event_name": "StopFailure",
-                                        "backend": "codex",
-                                        "session_id": session_id,
-                                        "turn_id": record.pointer("/payload/turn_id").cloned().unwrap_or(serde_json::Value::Null),
-                                        "error": failure.error,
-                                        "error_code": failure.code,
-                                        "retryable": failure.retryable,
-                                    });
                                     annotate_retry(&mut payload, schedule);
                                     let _ = event_tx.send(libslop::Record {
                                         source: "hook".to_string(),
@@ -2277,12 +2326,14 @@ async fn read_transcript_before(
 #[derive(Clone)]
 struct PaneMap {
     inner: Arc<dashmap::DashMap<String, Arc<PaneState>>>,
+    account_health: Arc<std::sync::Mutex<pools::AccountHealth>>,
 }
 
 impl PaneMap {
     fn new() -> Self {
         Self {
             inner: Arc::new(dashmap::DashMap::new()),
+            account_health: Arc::new(std::sync::Mutex::new(pools::AccountHealth::default())),
         }
     }
 
@@ -5674,6 +5725,26 @@ async fn handle_request(
     leases: &LeaseRegistry,
 ) -> libslop::ResponseBody {
     match body {
+        libslop::RequestBody::SelectAccountPool {
+            name,
+            preferred,
+            exclude,
+        } => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            match panes.account_health.lock().unwrap().select(
+                config,
+                &name,
+                preferred.as_deref(),
+                &exclude,
+                now,
+            ) {
+                Ok(account) => libslop::ResponseBody::AccountPoolSelected { account },
+                Err(message) => libslop::ResponseBody::Error { message },
+            }
+        }
         libslop::RequestBody::Accounts => match config.list_accounts() {
             Ok(accounts) => libslop::ResponseBody::Accounts { accounts },
             Err(message) => libslop::ResponseBody::Error { message },
@@ -6040,7 +6111,13 @@ async fn handle_request(
             if !stale_grok_terminal && event == "Stop" {
                 panes.get_or_insert(pane).cancel_retry();
             } else if !stale_grok_terminal && event == "StopFailure" {
-                let schedule = schedule_auto_continue(pane, "StopFailure", config, panes);
+                let failover =
+                    annotate_depletion(pane, hook_backend, &mut payload, config, panes).await;
+                let schedule = if failover {
+                    None
+                } else {
+                    schedule_auto_continue(pane, "StopFailure", config, panes)
+                };
                 annotate_retry(&mut payload, schedule);
                 let _ = event_tx.send(libslop::Record {
                     source: "hook".to_string(),
@@ -6112,6 +6189,7 @@ async fn handle_request(
 
         libslop::RequestBody::Fork {
             pane_id,
+            account,
             caller,
             start_directory,
             env,
@@ -6173,6 +6251,62 @@ async fn handle_request(
                     },
                 };
             };
+            let destination =
+                match config.resolve_account(Some(account.as_deref().unwrap_or(&src.account))) {
+                    Ok(destination) if account.is_none() || destination.backend == src.backend => {
+                        destination
+                    }
+                    Ok(_) => {
+                        return libslop::ResponseBody::Error {
+                            message: "cross-backend forks are not supported".into(),
+                        };
+                    }
+                    Err(message) => return libslop::ResponseBody::Error { message },
+                };
+            let cross_account = destination.name != src.account;
+            let source_path = source_state
+                .transcript_path
+                .lock()
+                .unwrap()
+                .clone()
+                .or(src.transcript_path.clone());
+            if cross_account {
+                if !matches!(
+                    src.backend,
+                    libslop::Backend::Codex | libslop::Backend::Claude
+                ) {
+                    return libslop::ResponseBody::Error {
+                        message: "cross-account forks only support Codex and Claude".into(),
+                    };
+                }
+                if src.backend == libslop::Backend::Claude {
+                    let source = match config.resolve_account(Some(&src.account)) {
+                        Ok(source) => source,
+                        Err(message) => return libslop::ResponseBody::Error { message },
+                    };
+                    let Some(path) = source_path.clone() else {
+                        return libslop::ResponseBody::Error {
+                            message: "source transcript is not bound".into(),
+                        };
+                    };
+                    let target = destination.clone();
+                    let session_id = src_session.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        pools::transfer_claude(
+                            &source,
+                            &target,
+                            std::path::Path::new(&path),
+                            &session_id,
+                        )
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|result| result);
+                    if let Err(message) = result {
+                        return libslop::ResponseBody::Error { message };
+                    }
+                }
+            }
             let start_directory =
                 start_directory.or_else(|| src.working_dir.as_ref().map(std::path::PathBuf::from));
             let fork_cwd = start_directory
@@ -6191,7 +6325,12 @@ async fn handle_request(
                 .fork(ForkContext {
                     pane_id: &pane_id,
                     session_id: &src_session,
-                    account: &src.account,
+                    account: &destination.name,
+                    source_path: if cross_account {
+                        source_path.as_deref()
+                    } else {
+                        None
+                    },
                     cwd: &fork_cwd,
                     env: &env,
                     verify_caller,
@@ -6241,7 +6380,7 @@ async fn handle_request(
                 extra_args: fork_args,
                 start_directory,
                 env,
-                account: Some(src.account.clone()),
+                account: Some(destination.name),
                 backend: Some(src.backend),
                 pin_session_id,
             };

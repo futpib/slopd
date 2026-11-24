@@ -1048,8 +1048,22 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
         env: Vec<(String, String)>,
         extra_args: Vec<String>,
     ) -> Result<(String, String), Error> {
+        self.fork_to_account(pane_id, start_directory, env, extra_args, None)
+            .await
+    }
+
+    /// Fork native history into another account of the same backend.
+    pub async fn fork_to_account(
+        &mut self,
+        pane_id: String,
+        start_directory: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        extra_args: Vec<String>,
+        account: Option<String>,
+    ) -> Result<(String, String), Error> {
         match self
             .request(libslop::RequestBody::Fork {
+                account,
                 caller: self
                     .fork_caller
                     .as_ref()
@@ -1067,6 +1081,26 @@ impl<R: tokio::io::AsyncRead + Unpin + Send + 'static, W: tokio::io::AsyncWrite 
                 session_id,
             } => Ok((pane_id, session_id)),
             other => Err(Error::UnexpectedResponse(format!("{:?}", other))),
+        }
+    }
+
+    /// Select a healthy account from a daemon-owned pool.
+    pub async fn select_account_pool(
+        &mut self,
+        name: String,
+        preferred: Option<String>,
+        exclude: Vec<String>,
+    ) -> Result<libslop::AccountInfo, Error> {
+        match self
+            .request(libslop::RequestBody::SelectAccountPool {
+                name,
+                preferred,
+                exclude,
+            })
+            .await?
+        {
+            libslop::ResponseBody::AccountPoolSelected { account } => Ok(account),
+            other => Err(Error::UnexpectedResponse(format!("{other:?}"))),
         }
     }
 
